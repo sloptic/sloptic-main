@@ -36,7 +36,10 @@ def load(path):
     for line in pathlib.Path(path).read_text().splitlines():
         if not line.strip():
             continue
-        r = json.loads(line)
+        try:
+            r = json.loads(line)
+        except json.JSONDecodeError:
+            continue   # tolerate a concurrent-append-corrupted line instead of crashing the whole report
         key = r.get("repo")
         if key not in recs or r.get("ts", 0) >= recs[key].get("ts", 0):
             recs[key] = r
