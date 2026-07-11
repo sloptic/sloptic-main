@@ -56,6 +56,46 @@ def test_browser_discovery_finds_formless_inputs(spa_url):
     assert profile.capabilities["any_endpoint_accepts_text_input"] is True
 
 
+def test_interaction_reveals_click_gated_login_and_upload():
+    # the AfroSecured/SPA-login gap: controls that only MOUNT on click (React-style) are invisible to a
+    # static render; the interacting render clicks reveal-triggers and surfaces login (password) + upload
+    import http.server
+    import threading
+
+    from hacklet_runner.discovery import _scan_form_inputs
+    page = (
+        "<!doctype html><html><body><h1>SPA</h1>"
+        "<button id='lb'>Log in</button><button id='ub'>Upload evidence</button>"
+        "<div id='lm'></div><div id='um'></div><script>"
+        "function mk(t,a){var e=document.createElement(t);for(var k in a)e.setAttribute(k,a[k]);return e;}"
+        "document.getElementById('lb').onclick=function(){var f=mk('form',{action:'/login'});"
+        "f.appendChild(mk('input',{name:'email'}));f.appendChild(mk('input',{name:'password',type:'password'}));"
+        "document.getElementById('lm').appendChild(f);};"
+        "document.getElementById('ub').onclick=function(){"
+        "document.getElementById('um').appendChild(mk('input',{name:'doc',type:'file'}));};"
+        "</script></body></html>").encode("ascii")
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200); self.send_header("Content-Type", "text/html"); self.end_headers()
+            self.wfile.write(page)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        static = browser.render_routes(base, ["/"], interact=False)["/"]
+        live = browser.render_routes(base, ["/"], interact=True)["/"]
+        assert _scan_form_inputs(static)[2] is False           # static render is blind to the gated controls
+        _, files, has_pw = _scan_form_inputs(live)
+        assert has_pw is True and files == ["doc"]             # interaction surfaces login + upload
+    finally:
+        srv.shutdown()
+
+
 @pytest.fixture
 def serve():
     deployers = []

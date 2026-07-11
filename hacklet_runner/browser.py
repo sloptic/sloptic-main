@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import json
 import pathlib
+import re
 import time
 import urllib.parse
 
@@ -62,8 +63,64 @@ def _apply_auth(page, url: str, headers) -> None:
             page.context.add_cookies(jar)
 
 
+# Modern SPAs paint the login modal / upload dialog / tabbed form only ON INTERACTION — a static render
+# (even multi-route) never sees them, so the login/upload surface and the whole auth-probe cluster read
+# N/A (AfroSecured's upload, most SPA logins). These reveal-INTENT triggers are clicked to surface those
+# controls; _NO_CLICK is the safety denylist — we OPEN UI, never submit/pay/delete/logout, so clicking a
+# live third-party demo can't act on it.
+_REVEAL = re.compile(
+    r"log ?in|sign ?in|sign ?up|register|create account|get started|get access|"
+    r"upload|attach|evidence|screenshot|choose file|select file|browse|drop|"
+    r"add (a |an )?(file|photo|image|evidence|attachment|document|screenshot|picture)|"
+    r"account|profile|menu|new (post|note|item|entry|report|upload)", re.I)
+_NO_CLICK = re.compile(
+    r"log ?out|sign ?out|delete|remove|pay\b|buy\b|checkout|subscribe|purchase|confirm|"
+    r"download|share|tweet|facebook|instagram|external|https?://", re.I)
+
+
+def _reveal_hidden_controls(page, max_clicks: int = 6, per_wait_ms: int = 350) -> str:
+    """Click reveal-intent controls (login / upload / menu triggers) to surface INTERACTION-GATED forms
+    and inputs a static render misses, and return the revealed <form>/modal HTML (appended to the route's
+    dom for discovery to scan). Reveal-ONLY: never clicks a submit / pay / delete / logout / external
+    control (_NO_CLICK), so it opens UI without acting on the app; bounded by max_clicks + an Escape reset
+    between clicks so one page can't loop or drift far from its initial state."""
+    revealed, seen, clicked = [], set(), 0
+    _controls = "input, textarea, select, form"
+    with contextlib.suppress(Exception):   # baseline: controls already present -> append only NEWLY revealed
+        for h in (page.eval_on_selector_all(_controls, "els => els.map(e => e.outerHTML)") or []):
+            seen.add(h[:160])
+    triggers = []
+    with contextlib.suppress(Exception):
+        triggers = page.query_selector_all("button, a, [role=button], [role=tab], summary, [onclick]")
+    for el in triggers:
+        if clicked >= max_clicks:
+            break
+        try:
+            label = ((el.inner_text() or "") + " " + (el.get_attribute("aria-label") or "")).strip().lower()[:80]
+        except Exception:
+            continue
+        if not label or not _REVEAL.search(label) or _NO_CLICK.search(label):
+            continue
+        try:
+            el.click(timeout=1500)
+            page.wait_for_timeout(per_wait_ms)
+            clicked += 1
+        except Exception:
+            continue
+        with contextlib.suppress(Exception):   # controls that APPEARED since baseline (a revealed login/upload)
+            for frag in (page.eval_on_selector_all(_controls, "els => els.map(e => e.outerHTML)") or []):
+                key = frag[:160]
+                if key not in seen:
+                    seen.add(key)
+                    revealed.append(frag)
+        with contextlib.suppress(Exception):   # close a modal so the next trigger stays clickable
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(120)
+    return ("<!--revealed-controls-->" + "".join(revealed)) if revealed else ""
+
+
 def render_routes(base_url: str, paths, headers=None, timeout: float = 12.0,
-                  total_timeout: float = 60.0) -> dict[str, str]:
+                  total_timeout: float = 60.0, interact: bool = True) -> dict[str, str]:
     """Render each same-origin path in ONE reused browser session and return {path: rendered_DOM}.
     Paths that fail to load are omitted; {} if no browser is available. A single launch is amortized
     across all routes — a launch-per-route helper would relaunch (and re-warm) the browser each time.
@@ -92,7 +149,10 @@ def render_routes(base_url: str, paths, headers=None, timeout: float = 12.0,
                     with contextlib.suppress(Exception):
                         page.goto(url, timeout=timeout * 1000, wait_until="load")
                         page.wait_for_timeout(300)  # let client JS paint the route's forms/inputs
-                        out[path] = page.content()
+                        dom = page.content()
+                        if interact:                # + surface interaction-gated login/upload controls
+                            dom += _reveal_hidden_controls(page)
+                        out[path] = dom
             finally:
                 b.close()
     except Exception:
