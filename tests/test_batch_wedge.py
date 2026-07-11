@@ -9,36 +9,61 @@ import sys
 import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
-from run_batch import _done_repos, _hard_kill, _load_urls, _record_wedge  # noqa: E402
+from run_batch import _hard_kill, _load_urls, _pending, _plan_jobs, _record_wedge  # noqa: E402
 
 
-def test_done_repos_skips_graded_and_skipped_but_not_failed(tmp_path):
-    # resume semantics: successfully graded + skipped-as-non-web = done; deploy-failed / wedged = retry
+def _runset(jobs, path, mode):
+    return {(j["target"], j["source"]) for j in _pending(jobs, path, mode)}
+
+
+def test_plan_jobs_expands_a_submission_into_repo_and_url_jobs():
+    jobs = _plan_jobs([
+        {"repo": "gh/a", "url": "https://a.app", "project": "p/a"},   # both -> two jobs
+        {"repo": "gh/b", "project": "p/b"},                           # repo only -> one
+        {"url": "https://c.app", "project": "p/c"},                   # url only -> one
+    ])
+    assert [(j["target"], j["source"]) for j in jobs] == [
+        ("gh/a", "repo"), ("https://a.app", "url"), ("gh/b", "repo"), ("https://c.app", "url")]
+
+
+def test_pending_default_retries_failed_and_catches_missing_url(tmp_path):
     f = tmp_path / "r.jsonl"
     f.write_text("\n".join(json.dumps(r) for r in [
-        {"repo": "gh/graded", "deployed": True, "slop_score": 40},
-        {"repo": "gh/skipped", "skipped": True, "app_kind": "mobile"},
-        {"repo": "gh/build-failed", "deployed": False, "deploy_error": "BUILD FAILED:"},
-        {"repo": "gh/wedged", "deployed": False, "timeout": "wedge"},
-        {"repo": "gh/grade-timeout", "deployed": True, "grade_timeout": True},   # deployed but no score -> retry
+        {"repo": "gh/a", "source": "repo", "project": "p/a", "deployed": True, "slop_score": 40},  # graded
+        {"repo": "gh/b", "source": "repo", "project": "p/b", "deployed": False},                   # failed
     ]))
-    assert _done_repos(str(f)) == {"gh/graded", "gh/skipped"}
+    jobs = _plan_jobs([
+        {"repo": "gh/a", "url": "https://a.app", "project": "p/a"},   # repo graded, url missing -> url runs
+        {"repo": "gh/b", "url": "https://b.app", "project": "p/b"},   # repo failed -> retry; url -> run
+        {"repo": "gh/c", "project": "p/c"},                          # brand new -> run
+    ])
+    assert _runset(jobs, str(f), "default") == {
+        ("https://a.app", "url"),                        # caught the missing url on an already-graded repo
+        ("gh/b", "repo"), ("https://b.app", "url"),      # retried the failed repo + its url
+        ("gh/c", "repo")}                                 # new
+    # gh/a repo already graded -> not repeated
 
 
-def test_done_repos_no_repeat_also_skips_failed(tmp_path):
-    # --no-repeat (include_failed): ANY prior record counts as done, so failed deploys aren't retried either
+def test_pending_no_repeat_repo_skips_failed_repo_but_still_catches_url(tmp_path):
     f = tmp_path / "r.jsonl"
-    f.write_text("\n".join(json.dumps(r) for r in [
-        {"repo": "gh/graded", "deployed": True, "slop_score": 40},
-        {"repo": "gh/build-failed", "deployed": False, "deploy_error": "BUILD FAILED:"},
-        {"repo": "gh/wedged", "deployed": False, "timeout": "wedge"},
-        {"nope": "no repo key -> ignored"},
-    ]))
-    assert _done_repos(str(f), include_failed=True) == {"gh/graded", "gh/build-failed", "gh/wedged"}
+    f.write_text(json.dumps({"repo": "gh/b", "source": "repo", "project": "p/b", "deployed": False}))
+    jobs = _plan_jobs([{"repo": "gh/b", "url": "https://b.app", "project": "p/b"}])
+    assert _runset(jobs, str(f), "no_repeat_repo") == {("https://b.app", "url")}   # repo locked, url runs
 
 
-def test_done_repos_empty_when_file_absent(tmp_path):
-    assert _done_repos(str(tmp_path / "nope.jsonl")) == set()
+def test_pending_whatsoever_skips_any_touched_project(tmp_path):
+    f = tmp_path / "r.jsonl"
+    f.write_text(json.dumps({"repo": "gh/b", "source": "repo", "project": "p/b", "deployed": False}))
+    jobs = _plan_jobs([
+        {"repo": "gh/b", "url": "https://b.app", "project": "p/b"},   # project touched -> BOTH jobs skipped
+        {"repo": "gh/c", "project": "p/c"},                          # untouched -> runs
+    ])
+    assert _runset(jobs, str(f), "whatsoever") == {("gh/c", "repo")}
+
+
+def test_pending_all_when_file_absent(tmp_path):
+    jobs = _plan_jobs([{"repo": "gh/a", "project": "p"}])
+    assert len(_pending(jobs, str(tmp_path / "nope.jsonl"), "default")) == 1
 
 
 def test_load_urls_parses_url_project_winner_and_skips_comments(tmp_path):
@@ -48,10 +73,11 @@ def test_load_urls_parses_url_project_winner_and_skips_comments(tmp_path):
                  "\n"
                  "https://api.example.railway.app , My API , winner\n")
     recs = _load_urls(str(f), hackathon="hackharvard")
-    assert [r["repo"] for r in recs] == ["https://cool.vercel.app", "https://api.example.railway.app"]
-    assert recs[0]["project"] == "cool.vercel.app" and recs[0]["winner"] is False   # host fallback
-    assert recs[1]["project"] == "My API" and recs[1]["winner"] is True             # explicit project + winner
-    assert all(r["url_ingest"] and r["hackathon"] == "hackharvard" for r in recs)
+    assert [r["url"] for r in recs] == ["https://cool.vercel.app", "https://api.example.railway.app"]
+    assert "repo" not in recs[0]                                                     # url-only record
+    assert recs[0]["project"] == "cool.vercel.app" and recs[0]["winner"] is False    # host fallback
+    assert recs[1]["project"] == "My API" and recs[1]["winner"] is True              # explicit project+winner
+    assert all(r["hackathon"] == "hackharvard" for r in recs)
 
 # a child that IGNORES SIGTERM (so only SIGKILL ends it) + spawns a 'chrome-like' descendant + CPU-spins
 _SPIN = (
@@ -100,16 +126,19 @@ def test_hard_kill_reaps_the_whole_process_group(tmp_path):
 
 def test_record_wedge_writes_a_findable_row(tmp_path):
     f = tmp_path / "r.jsonl"
-    _record_wedge(str(f), {"repo": "gh/x", "hackathon": "h", "project": "p", "winner": False}, 900)
+    _record_wedge(str(f), {"hackathon": "h", "project": "p", "winner": False}, 900,
+                  target="gh/x", source="repo")
     r = json.loads(f.read_text())
-    assert r["repo"] == "gh/x" and r["deployed"] is False and "WEDGED" in r["deploy_error"]
+    assert r["repo"] == "gh/x" and r["source"] == "repo"
+    assert r["deployed"] is False and "WEDGED" in r["deploy_error"]
 
 
 def test_record_wedge_recovers_checkpointed_stack_id(tmp_path):
     # a wedged app keeps the classification the child checkpointed before it was killed -> deploy-parity
     f = tmp_path / "r.jsonl"
     extra = {"app_kind": "web-app", "stack_profile": {"routing": "spa-path"}, "features": [{"name": "x"}]}
-    _record_wedge(str(f), {"repo": "gh/w", "hackathon": "h", "project": "p", "winner": False}, 900, extra=extra)
+    _record_wedge(str(f), {"hackathon": "h", "project": "p", "winner": False}, 900,
+                  target="gh/w", source="repo", extra=extra)
     r = json.loads(f.read_text())
     assert r["app_kind"] == "web-app" and r["stack_profile"]["routing"] == "spa-path"
     assert r["timeout"] == "wedge" and r["deployed"] is False   # base fields not clobbered by extra

@@ -6,7 +6,7 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
-from devpost_repos import repo_for  # noqa: E402
+from devpost_repos import links_for, repo_for  # noqa: E402
 
 _VENDOR = '<script>d("https://github.com/newrelic/newrelic-browser-agent")</script>'   # on EVERY page
 
@@ -21,6 +21,44 @@ class _Stub:
 
 def _page(html):
     return repo_for(_Stub(_VENDOR + html), "https://devpost.com/software/x")
+
+
+def _links(html):
+    return links_for(_Stub(_VENDOR + html), "https://devpost.com/software/x")
+
+
+def test_links_for_extracts_repo_and_live_url_together():
+    # the demo link is the live URL — not the repo, not the video
+    repo, url = _links('<ul class="app-links">'
+                       '<li><a href="https://github.com/alice/proj">GitHub</a></li>'
+                       '<li><a href="https://alice-proj.vercel.app">Try it</a></li>'
+                       '<li><a href="https://youtu.be/xyz">Video</a></li></ul>')
+    assert repo == "https://github.com/alice/proj" and url == "https://alice-proj.vercel.app"
+
+
+def test_links_for_url_only_submission_has_no_repo():
+    repo, url = _links('<ul class="app-links"><li><a href="https://cool.netlify.app">demo</a></li></ul>')
+    assert repo is None and url == "https://cool.netlify.app"
+
+
+def test_links_for_repo_href_with_a_path_is_trimmed_to_user_repo():
+    # a deep-link (…/tree/main) must reduce to the cloneable github.com/user/repo, not the full path
+    repo, _ = _links('<ul class="app-links"><li>'
+                     '<a href="https://github.com/alice/proj/tree/main/src">code</a></li></ul>')
+    assert repo == "https://github.com/alice/proj"
+
+
+def test_links_for_real_devpost_software_urls_markup():
+    # the ACTUAL Devpost shape (verified live): a div.app-links section wrapping <ul data-role=
+    # "software-urls"> whose <a> carry target/title/rel attrs — both repo and demo must extract
+    repo, url = _links(
+        '<div class="app-links section"><h2>Try it out</h2>'
+        '<ul data-role="software-urls" class="no-bullet">'
+        '<li><a target="_blank" title="x" rel="nofollow" href="https://github.com/team/proj">'
+        '<i class="ss-icon ss-link"></i><span>github.com</span></a></li>'
+        '<li><a target="_blank" rel="nofollow" href="https://proj.vercel.app"><span>demo</span></a></li>'
+        '</ul></div>')
+    assert repo == "https://github.com/team/proj" and url == "https://proj.vercel.app"
 
 
 def test_real_repo_from_app_links_block_not_the_vendor_url():

@@ -42,33 +42,68 @@ def _cleanup_containers():
     subprocess.run(["docker", "rm", "-f", "-v", "hl-deploy-app", "hl-db"], capture_output=True)
 
 
-def _done_repos(results_path, include_failed=False):
-    """Repos already FINISHED in a prior run of this --results file: successfully graded (has a slop_score)
-    OR skipped as non-web (out of scope). A re-run doesn't retest these — only untested (new) repos and
-    FAILED ones (deploy-failed / wedged / timed-out, i.e. no score and not skipped) run again. With
-    include_failed (--no-repeat), EVERY repo that has ANY record counts as done, so even failed deploys
-    are never retried — a re-run then touches only brand-new entries."""
-    done = set()
+def _results_index(results_path):
+    """From a prior run of this --results file: (attempted targets, successfully-done targets, touched
+    projects). A target is a repo URL or a live URL (the record's "repo" field); done = graded or skipped
+    (out of scope); a project is 'touched' if any of its grades landed a row."""
+    attempted, done, touched = set(), set(), set()
     p = pathlib.Path(results_path)
     if not p.exists():
-        return done
+        return attempted, done, touched
     for line in p.read_text().splitlines():
         if not line.strip():
             continue
         with contextlib.suppress(json.JSONDecodeError):
             r = json.loads(line)
-            if r.get("repo") is None:
+            t = r.get("repo")
+            if t is None:
                 continue
-            if include_failed or r.get("slop_score") is not None or r.get("skipped"):
-                done.add(r.get("repo"))
-    return done
+            attempted.add(t)
+            if r.get("slop_score") is not None or r.get("skipped"):
+                done.add(t)
+            if r.get("project"):
+                touched.add(r["project"])
+    return attempted, done, touched
+
+
+def _plan_jobs(records):
+    """Expand each submission into up to two grade JOBS — a repo deploy-grade and a live-URL raw-grade —
+    each its own source-tagged result row (distinct target identity). A submission with both yields both:
+    the two are complementary lenses (our controlled Docker deploy vs their live URL with real keys)."""
+    jobs = []
+    for rec in records:
+        if rec.get("repo"):
+            jobs.append({"target": rec["repo"], "source": "repo", "rec": rec})
+        if rec.get("url"):
+            jobs.append({"target": rec["url"], "source": "url", "rec": rec})
+    return jobs
+
+
+def _pending(jobs, results_path, mode):
+    """Jobs still needing to run under resume `mode`:
+      "default"        every job not yet SUCCESSFULLY done — retries failed repos+urls, AND catches a
+                       missing url on a submission whose repo already graded.
+      "no_repeat_repo" repo jobs skip once ATTEMPTED (no expensive re-deploys); url jobs as default.
+      "whatsoever"     skip any job whose PROJECT already has a record — brand-new submissions only."""
+    attempted, done, touched = _results_index(results_path)
+    out = []
+    for j in jobs:
+        t, src, proj = j["target"], j["source"], j["rec"].get("project")
+        if mode == "whatsoever":
+            run = t not in attempted and (not proj or proj not in touched)
+        elif mode == "no_repeat_repo" and src == "repo":
+            run = t not in attempted
+        else:
+            run = t not in done
+        if run:
+            out.append(j)
+    return out
 
 
 def _load_urls(path, hackathon=None):
     """Parse a file of ALREADY-DEPLOYED app URLs to raw-fuzz (no clone/deploy). One entry per line:
-    `URL`, or `URL,project`, or `URL,project,winner`; blank lines and `#` comments skipped. Each becomes
-    a record shaped like a Devpost one but tagged url_ingest=True, so the batch routes it to
-    `deploy_and_grade --url` (grade the live app directly — enables the HTTPS-only probes)."""
+    `URL`, or `URL,project`, or `URL,project,winner`; blank lines and `#` comments skipped. Each becomes a
+    record with a `url` field (no repo) — a single url grade job routed to `deploy_and_grade --url`."""
     recs = []
     for line in pathlib.Path(path).read_text().splitlines():
         line = line.strip()
@@ -78,18 +113,17 @@ def _load_urls(path, hackathon=None):
         url = parts[0]
         project = parts[1] if len(parts) > 1 and parts[1] else (urlparse(url).netloc or url)
         winner = len(parts) > 2 and parts[2].lower() in ("1", "true", "yes", "winner", "y")
-        recs.append({"repo": url, "url_ingest": True, "project": project,
-                     "winner": winner, "hackathon": hackathon})
+        recs.append({"url": url, "project": project, "winner": winner, "hackathon": hackathon})
     return recs
 
 
-def _record_wedge(results, rec, secs, extra=None):
+def _record_wedge(results, rec, secs, target, source, extra=None):
     """A wedged app is killed mid-run, so its own finally never writes a record — write one here so it
     isn't silently dropped from the batch (shows as a distinct WEDGED reason in the stats deploy view).
     `extra` is the stack-ID the child checkpointed before it wedged, so the app keeps its classification
     (app_kind / routing) for deploy-parity — else wedged apps show as '?' and can't be grouped by stack."""
     row = {
-        "repo": rec["repo"], "deployed": False, "timeout": "wedge",
+        "repo": target, "source": source, "deployed": False, "timeout": "wedge",
         "timings": {"total_s": float(secs)},   # it ran at least this long before we killed it
         "deploy_error": f"WEDGED — killed after {secs}s (hung past internal build/grade caps)",
         "ts": time.time(), "hackathon": rec.get("hackathon"),
@@ -110,9 +144,14 @@ def main():
                     "per line, `URL[,project[,winner]]`) — raw-fuzz over HTTP(S), no clone/plan/deploy. "
                     "For submissions that ship a live Vercel/Railway/*.app link but no gradeable repo. "
                     "Combines with a Devpost source or stands alone.")
-    ap.add_argument("--no-repeat", action="store_true", help="on re-run, skip EVERY repo already in "
-                    "--results, INCLUDING failed deploys/wedges (default retries the failed ones). Use to "
-                    "grind through only brand-new entries across passes.")
+    resume = ap.add_mutually_exclusive_group()
+    resume.add_argument("--no-repeat-repo", action="store_true", help="on re-run, don't re-attempt a REPO "
+                        "job that already has ANY record (failed deploys included) — deploys are the "
+                        "expensive part; url jobs still retry-failed + catch a missing url. (Default retries "
+                        "everything not successfully done.)")
+    resume.add_argument("--no-repeat-whatsoever", action="store_true", help="on re-run, skip any job whose "
+                        "PROJECT already has a record — only brand-new submissions run (don't even chase a "
+                        "missing url on an already-touched submission).")
     ap.add_argument("--hackathons", type=int, default=5, help="(--search) how many hackathons")
     ap.add_argument("--completed", action="store_true", help="(--search) only ended hackathons")
     ap.add_argument("--max-pages", type=int, default=25, dest="max_pages",
@@ -161,27 +200,28 @@ def main():
         records += url_recs
     if not records:
         sys.exit("no repos or urls found")
-    # resume: skip repos already done in this --results file. Default: done = graded/skipped (failed ones
-    # re-run). --no-repeat: done = anything already attempted (failed deploys skipped too).
-    done = _done_repos(args.results, include_failed=args.no_repeat)
-    to_run = [rec for rec in records if rec["repo"] not in done]
-    if done:
-        _what = "attempted" if args.no_repeat else "graded/skipped"
-        print(f"== {len(records)} entries · {len(done)} already {_what} → "
-              f"{len(to_run)} to (re)run ==\n", flush=True)
-    else:
-        print(f"== {len(to_run)} entries to grade ==\n", flush=True)
+    # expand submissions into repo+url grade jobs, then resume-filter them by mode (see _pending)
+    mode = ("whatsoever" if args.no_repeat_whatsoever else
+            "no_repeat_repo" if args.no_repeat_repo else "default")
+    jobs = _plan_jobs(records)
+    to_run = _pending(jobs, args.results, mode)
+    n_repo = sum(j["source"] == "repo" for j in to_run)
+    done_n = len(jobs) - len(to_run)
+    print(f"== {len(records)} submissions → {len(jobs)} grade jobs · "
+          + (f"{done_n} already done [{mode}] → " if done_n else "")
+          + f"{len(to_run)} to run ({n_repo} repo, {len(to_run) - n_repo} url) ==\n", flush=True)
 
-    # 2) deploy + grade each, appending to --results (failures recorded, batch continues)
-    for i, rec in enumerate(to_run, 1):
-        print(f"\n{'#' * 60}\n[{i}/{len(to_run)}] {rec['repo']}\n{'#' * 60}", flush=True)
+    # 2) run each job (repo deploy-grade or url raw-grade), appending to --results (failures recorded)
+    for i, j in enumerate(to_run, 1):
+        rec, target, source = j["rec"], j["target"], j["source"]
+        print(f"\n{'#' * 60}\n[{i}/{len(to_run)}] {target}  [{source}]\n{'#' * 60}", flush=True)
         ckpt = pathlib.Path(tempfile.gettempdir()) / "hl-deploy-ckpt.json"
         ckpt.unlink(missing_ok=True)   # stale from the previous app -> clear before this one writes its own
-        cmd = PY + [str(_HERE / "deploy_and_grade.py"), rec["repo"], "--record", args.results,
+        cmd = PY + [str(_HERE / "deploy_and_grade.py"), target, "--record", args.results,
                     "--grade-timeout", str(args.grade_timeout), "--meta", json.dumps(
                         {"hackathon": rec.get("hackathon"), "project": rec.get("project"),
                          "winner": rec.get("winner")})]
-        if rec.get("url_ingest"):   # live app: grade raw, no clone/plan/Docker deploy
+        if source == "url":   # live app: grade raw, no clone/plan/Docker deploy
             cmd += ["--url"]
         else:
             cmd += ["--attempts", str(args.attempts), "--build-timeout", str(args.build_timeout),
@@ -199,10 +239,10 @@ def main():
             _hard_kill(proc)
             _cleanup_containers()
             stack = {}                            # recover the stack-ID the child checkpointed before wedging
-            if ckpt.exists():
+            if source == "repo" and ckpt.exists():   # url jobs never plan, so never checkpoint
                 with contextlib.suppress(Exception):
                     stack = json.loads(ckpt.read_text())
-            _record_wedge(args.results, rec, args.app_timeout, extra=stack)
+            _record_wedge(args.results, rec, args.app_timeout, target=target, source=source, extra=stack)
             print(f"\n  !! WEDGED — killed after {args.app_timeout}s (hung past its internal caps); "
                   f"recorded{' (stack recovered)' if stack else ''}, moving on", flush=True)
         except KeyboardInterrupt:

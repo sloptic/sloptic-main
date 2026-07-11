@@ -38,6 +38,13 @@ _APP_LINKS = re.compile(r'class="[^"]*app-links.*?</ul>', re.S)   # the submissi
 # Devpost embeds a vendor RUM script (New Relic) whose OWN source repo link sits in the page JS on
 # EVERY project — never a submission's repo. Deny-list it so it can't be mistaken for the project.
 _VENDOR_REPO = re.compile(r"github\.com/newrelic/", re.I)
+_LINK = re.compile(r'href="(https?://[^"]+)"')   # every outbound link inside the app-links block
+# a live-demo URL is a link that is NOT version control, a video, a slide/doc/design host, or social —
+# i.e. the submission's "Try it out" deployment. Best heuristic; a stray portfolio link is possible noise.
+_NOT_LIVE = re.compile(
+    r"github\.com|gitlab\.com|bitbucket\.org|youtube\.com|youtu\.be|vimeo\.com|devpost\.com|"
+    r"docs\.google|drive\.google|figma\.com|canva\.com|notion\.|loom\.com|dropbox\.com|slideshare|"
+    r"pitch\.com|newrelic|medium\.com|linkedin\.com|twitter\.com|facebook\.com|x\.com/|t\.co/", re.I)
 
 
 def _get(client, url, **kw):
@@ -89,20 +96,33 @@ def page_projects(client, slug, page):
     return out
 
 
-def repo_for(client, project_url):
-    """The project's declared GitHub repo — the FIRST github link INSIDE its app-links block, or None.
-    We do NOT fall back to a whole-page scan: a project that links no repo still has Devpost's embedded
-    vendor URL (github.com/newrelic/newrelic-browser-agent, in the RUM script on every page) in its
-    markup, and grabbing that would clone+deploy+grade the wrong thing entirely. So app-links absent, or
-    holding no non-vendor github link, -> None (the project is skipped)."""
+def links_for(client, project_url):
+    """(repo, live_url) from the submission's OWN app-links block. repo = first non-vendor GitHub link;
+    live_url = first link that is neither version control, a video, a slide/doc/design host, nor social —
+    Devpost's "Try it out" deployment. We do NOT fall back to a whole-page scan: a project that links no
+    repo still has Devpost's embedded vendor URL (github.com/newrelic/..., in the RUM script on every page)
+    in its markup, and grabbing that would clone+deploy the wrong thing. Either field may be None; a
+    submission with neither is skipped by the caller."""
     r = _get(client, project_url)
     if not r or r.status_code != 200:
-        return None
+        return None, None
     block = _APP_LINKS.search(r.text)
     if not block:
-        return None
-    repos = [g for g in dict.fromkeys(_GH.findall(block.group(0))) if not _VENDOR_REPO.search(g)]
-    return repos[0].rstrip('.,);"\'') if repos else None
+        return None, None
+    hrefs = list(dict.fromkeys(_LINK.findall(block.group(0))))
+    repo = url = None
+    for h in hrefs:
+        m = _GH.match(h)
+        if m and not _VENDOR_REPO.search(h):
+            repo = repo or m.group(0).rstrip('.,);"\'')   # just github.com/user/repo, not any /tree/... suffix
+        elif not _NOT_LIVE.search(h):
+            url = url or h.rstrip('.,);"\'')               # the live "Try it out" demo (full URL)
+    return repo, url
+
+
+def repo_for(client, project_url):
+    """The submission's declared GitHub repo (see links_for). Retained for callers/tests wanting only it."""
+    return links_for(client, project_url)[0]
 
 
 def main():
@@ -118,7 +138,7 @@ def main():
     ap.add_argument("--max-pages", type=int, default=25, dest="max_pages",
                     help="safety cap on gallery pages fetched per hackathon (~24 projects/page; default 25)")
     ap.add_argument("--json", action="store_true",
-                    help="emit {hackathon, project, repo, winner} JSON records (feeds a batch driver)")
+                    help="emit {hackathon, project, repo, url, winner} JSON records (feeds a batch driver)")
     args = ap.parse_args()
 
     with httpx.Client(follow_redirects=True) as c:
@@ -127,7 +147,7 @@ def main():
         if not slugs:
             sys.exit("no hackathons matched")
         sys.stderr.write(f"hackathons ({len(slugs)}): {', '.join(slugs)}\n")
-        records, seen = [], set()
+        records, seen, seen_urls = [], set(), set()
         for slug in slugs:
             if len(records) >= args.limit:
                 break
@@ -139,21 +159,28 @@ def main():
                 for project_url, winner in hits:
                     if len(records) >= args.limit:
                         break
-                    repo = repo_for(c, project_url)
-                    if repo and repo not in seen:
+                    repo, url = links_for(c, project_url)
+                    dup = (repo and repo in seen) or (url and url in seen_urls)
+                    if dup or not (repo or url):   # already have it, or nothing gradeable -> skip
+                        time.sleep(0.2)
+                        continue
+                    if repo:
                         seen.add(repo)
-                        got += 1
-                        records.append({"hackathon": slug, "project": project_url, "repo": repo,
-                                        "winner": winner})   # best-effort: True=badge found; False=none seen
-                        if not args.json:
-                            print(repo, flush=True)
+                    if url:
+                        seen_urls.add(url)
+                    got += 1
+                    records.append({"hackathon": slug, "project": project_url, "repo": repo,
+                                    "url": url, "winner": winner})   # winner: True=badge found; False=none
+                    if not args.json:
+                        print(f"{repo or '(no repo)'}   url={url or '-'}", flush=True)
                     time.sleep(0.2)
                 page += 1
                 time.sleep(0.3)
-            sys.stderr.write(f"  {slug}: {got} repos (through page {page - 1})\n")
+            sys.stderr.write(f"  {slug}: {got} submissions (through page {page - 1})\n")
         if args.json:
             print(json.dumps(records, indent=2))
-        sys.stderr.write(f"\n{len(records)} repos.\n")
+        sys.stderr.write(f"\n{len(records)} submissions ({sum(bool(r['repo']) for r in records)} with repo, "
+                         f"{sum(bool(r['url']) for r in records)} with url).\n")
 
 
 if __name__ == "__main__":

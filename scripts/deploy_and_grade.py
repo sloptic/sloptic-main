@@ -537,8 +537,11 @@ def main():
     args = ap.parse_args()
 
     meta = json.loads(args.meta) if args.meta.strip() else {}
-    result = {"repo": args.repo, "deployed": False, "attempts_used": 0,
-              "browser": args.browser, "ts": time.time(), **meta}   # ts: recorder stamps it (sortable)
+    # source: the LENS this grade is — "repo" (our controlled Docker deploy, dummy keys, powers the
+    # reproducibility metric) vs "url" (their live deployment, real keys + full surface but their infra
+    # headers). A submission can be graded BOTH ways; stats keep the two separate — never blended.
+    result = {"repo": args.repo, "deployed": False, "attempts_used": 0, "browser": args.browser,
+              "source": "url" if args.url_ingest else "repo", "ts": time.time(), **meta}
 
     plan, url, error, repo = None, None, "", None
     # wall-clock per phase, as MEASUREMENT not just gates — which stacks are expensive to deploy vs grade,

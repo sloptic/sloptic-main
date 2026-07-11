@@ -24,11 +24,14 @@ _ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 
 from hacklet_runner.aggregate import CATEGORY_DECAY, _damped_total  # noqa: E402
+from hacklet_runner.catalog import load_catalog  # noqa: E402
 from hacklet_runner.schema import Outcome  # noqa: E402
 
 
 def load(path):
-    """Records, deduped by repo (latest ts wins) so re-runs don't double-count."""
+    """Records, deduped by repo (latest ts wins) so re-runs don't double-count. The dedup key is the
+    record's "repo" field = its TARGET (a github URL for repo grades, a live URL for url grades), so a
+    submission graded BOTH ways keeps both rows (distinct targets) — they're separate lenses."""
     recs = {}
     for line in pathlib.Path(path).read_text().splitlines():
         if not line.strip():
@@ -38,6 +41,12 @@ def load(path):
         if key not in recs or r.get("ts", 0) >= recs[key].get("ts", 0):
             recs[key] = r
     return list(recs.values())
+
+
+def _source(r):
+    """The grade's lens: 'repo' (our controlled Docker deploy) vs 'url' (their live deployment). Explicit
+    on new records; inferred from the legacy url_ingest flag on older ones; defaults to 'repo'."""
+    return r.get("source") or ("url" if r.get("url_ingest") else "repo")
 
 
 def cat_subtotals(rec):
@@ -118,12 +127,18 @@ def main():
     # them). URL-INGEST apps were already live and graded raw over HTTP(S) — NOT deployed by us, and graded
     # with a different applicable-probe set (the HTTPS-only probes apply). Keep them distinct so neither the
     # deploy-rate nor the score cohorts get silently conflated.
-    url_apps = [r for r in recs if r.get("url_ingest")]
-    repo_recs = [r for r in recs if not r.get("url_ingest")]
+    url_apps = [r for r in recs if _source(r) == "url"]
+    repo_recs = [r for r in recs if _source(r) == "repo"]
     deployed = [r for r in repo_recs if r.get("deployed")]      # deploy-success is a REPO-only concept
     graded = [r for r in recs if r.get("deployed") and "slop_score" in r]   # all graded (both cohorts)
     ungraded = [r for r in deployed if "slop_score" not in r]   # repo app came up but grading aborted
     scores = [r["slop_score"] for r in graded]
+    # (g) pairing: a submission graded BOTH ways — keyed by project, the delta is the reproducibility signal
+    by_project = defaultdict(dict)
+    for r in recs:
+        if r.get("project"):
+            by_project[r["project"]][_source(r)] = r
+    paired = {p: d for p, d in by_project.items() if "repo" in d and "url" in d}
     timed = [r for r in recs if r.get("timings")]               # per-phase wall-clock, as measurement
     _PHASES = [("clone_s", "clone"), ("plan_s", "plan(LLM)"), ("deploy_s", "deploy"),
                ("grade_s", "grade"), ("total_s", "total")]
@@ -172,8 +187,8 @@ def main():
 
     if args.json:
         print(json.dumps({
-            "n_records": len(recs), "n_repo": len(repo_recs), "n_url_ingest": len(url_apps),
-            "n_deployed": len(deployed), "n_graded": len(graded),
+            "n_records": len(recs), "n_repo": len(repo_recs), "n_url": len(url_apps),
+            "n_paired": len(paired), "n_deployed": len(deployed), "n_graded": len(graded),
             "deploy_rate": round(len(deployed) / ((len(repo_recs) - len(skipped)) or 1), 3),   # repo web apps
             "scores": {"avg": round(statistics.mean(scores), 1) if scores else None,
                        "median": round(statistics.median(scores), 1) if scores else None,
@@ -220,8 +235,8 @@ def main():
     print(f"\n(a) SLOP-SCORE DISTRIBUTION  (all graded apps)")
     print(f"    {_stat_line(scores)}")
     if url_apps:   # don't conflate cohorts — live apps grade over HTTPS with a different applicable-probe set
-        print(f"      ├─ repo-deployed  {_stat_line([r['slop_score'] for r in graded if not r.get('url_ingest')])}")
-        print(f"      └─ live-URL       {_stat_line([r['slop_score'] for r in graded if r.get('url_ingest')])}")
+        print(f"      ├─ repo-deployed  {_stat_line([r['slop_score'] for r in graded if _source(r) == 'repo'])}")
+        print(f"      └─ live-URL       {_stat_line([r['slop_score'] for r in graded if _source(r) == 'url'])}")
     for line in _histogram(scores):
         print(line)
     print(f"\n    slop concentration by category (damped, summed across apps):")
@@ -238,6 +253,28 @@ def main():
         b, c = probe_meta[pid]
         bar = "█" * round(n / (freq[0][1] or 1) * 30)
         print(f"      {pid:20} {n:>3} │ {bar}")
+
+    # (b2) NEVER FIRED — catalog probes that tripped ZERO of the graded apps. Either genuinely never
+    # present (real apps lack that flaw) OR silently never-applicable / broken. At scale, an unexpected
+    # entry here is the tell that a probe isn't reaching its target — audit it.
+    try:
+        all_probes = {p.id: p.bundle for p in load_catalog(str(_ROOT / "catalog"))}
+    except Exception as e:                     # never let a catalog hiccup break the whole report
+        all_probes = {}
+        print(f"\n(b2) NEVER FIRED — (catalog load failed: {e})")
+    if all_probes:
+        never = sorted(pid for pid in all_probes if pid not in probe_apps)
+        print(f"\n(b2) NEVER FIRED across the {len(graded)} graded apps  "
+              f"({len(never)}/{len(all_probes)} probes tripped nothing):")
+        if never:
+            by_bundle = defaultdict(list)
+            for pid in never:
+                by_bundle[all_probes[pid]].append(pid)
+            for b in sorted(by_bundle):
+                print(f"      [{b}]  " + ", ".join(sorted(by_bundle[b])))
+            print(f"      ↳ genuinely-rare vs never-applicable/broken: audit any that SHOULD have fired")
+        else:
+            print("      (every catalog probe fired on at least one app)")
 
     # (c)
     print(f"\n(c) WINNERS vs NON-WINNERS")
@@ -281,6 +318,27 @@ def main():
                 t = r["timings"]
                 print(f"      {r['repo'][:48]:48} {t['total_s']:>5.0f}s   "
                       f"(deploy {t.get('deploy_s', 0):.0f} · grade {t.get('grade_s', 0):.0f})")
+        print()
+
+    # (g) PAIRED — same submission graded BOTH ways (repo deploy vs live URL). The DELTA is the signal:
+    # repo-failed-but-URL-works = pure reproducibility failure; URL much cleaner = their infra hardens or
+    # the repo is missing config; similar = genuinely clean AND reproducible. Never a blended average.
+    if paired:
+        repro_fail = [(p, d) for p, d in paired.items()
+                      if "slop_score" not in d["repo"] and "slop_score" in d["url"]]
+        both = [(p, d["repo"]["slop_score"], d["url"]["slop_score"]) for p, d in paired.items()
+                if "slop_score" in d["repo"] and "slop_score" in d["url"]]
+        print(f"(g) PAIRED repo-vs-URL  ({len(paired)} submissions graded both ways — the delta is signal)")
+        print(f"    {len(both)} scored on both · {len(repro_fail)} repo-FAILED-but-URL-works "
+              f"(pure reproducibility failures)")
+        for p, rs, us in sorted(both, key=lambda x: -(x[1] - x[2]))[:12]:
+            tag = ("URL cleaner — their infra hardens / repo missing config" if rs - us >= 20 else
+                   "repo cleaner — live infra adds slop (their headers/CDN)" if us - rs >= 20 else
+                   "similar — clean AND reproducible")
+            print(f"      {p.rsplit('/', 1)[-1][:30]:30} repo {rs:>4} · url {us:>4} · Δ{rs - us:>+5}  {tag}")
+        for p, d in repro_fail[:6]:
+            print(f"      {p.rsplit('/', 1)[-1][:30]:30} repo FAILED · url {d['url']['slop_score']:>4}  "
+                  f"→ live only (not reproducible from source)")
         print()
 
 
