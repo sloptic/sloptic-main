@@ -509,12 +509,50 @@ _DEAD_PAGE = re.compile(
     r"Site not found|Not Found - Request ID|"                         # Netlify
     r"no such app|couldn't find that app|no application configured",  # generic PaaS not-found
     re.I)
+# a CLIENT-SIDE 404: the host answers 200 but the SPA ROUTER renders a 'page not found' at the entry (a
+# broken/missing root route). Only visible in the RENDERED dom — the static shell doesn't carry it. Match
+# the not-found message as the page's main content, tolerant of the exact wording (React/Vue/Angular defaults).
+_CLIENT_404 = re.compile(
+    r"page not ?found|could(n'?t| not) be found|this page (does ?n'?t|does not) exist|"
+    r"404\D{0,40}(not ?found|error|does ?n'?t exist)|nothing (to see )?here", re.I)
+# a working-LOOKING but empty deployment: a coming-soon / maintenance / service-down splash, or a web
+# server's DEFAULT page (nginx/Apache) — the deploy 'succeeded' but hosts no real app. Placeholder, not app.
+_PLACEHOLDER = re.compile(
+    r"coming soon|under construction|under maintenance|scheduled maintenance|be right back|"
+    r"we'?ll be back (soon|shortly)|temporarily (unavailable|down)|service (temporarily )?unavailable|"
+    r"site is (down|offline)|parked (domain|free)|future home of|default (web )?page|"
+    r"welcome to nginx|apache2? (ubuntu )?default page|\bit works!", re.I)
 
 
-def _dead_url_reason(url: str, timeout: float = 10.0):
-    """Returns a reason string if `url` is NOT a working deployment (unreachable / 4xx-5xx entry / host
-    placeholder shell), else None. A NOTE, not a grade — the record just says the URL didn't work, so a
-    dead demo link is counted honestly instead of grading a 404 page or crashing the batch child."""
+def _visible_text(html: str) -> str:
+    """Served/rendered markup -> visible text, scripts stripped (inline JS carries route/handler-name
+    strings that would false-match the dead-shell patterns)."""
+    t = re.sub(r"<script\b[^>]*>.*?</script>", " ", html, flags=re.S | re.I)
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", t)).strip()
+
+
+def _looks_like_client_404(dom: str) -> bool:
+    """True if a RENDERED dom's main content is a 'page not found' shell (client-side 404)."""
+    return bool(_CLIENT_404.search(_visible_text(dom)[:1500]))
+
+
+def _dead_shell_reason(html: str):
+    """A dead/placeholder SHELL (served OR rendered markup): a client-side 404, or a coming-soon /
+    maintenance / server-default splash. Only the PROMINENT top of the visible text is checked (low FP —
+    a real app that merely mentions 'coming soon' for a future feature isn't flagged)."""
+    vis = _visible_text(html)[:1500]
+    if _CLIENT_404.search(vis):
+        return "client-side 404 (renders 'not found' at HTTP 200)"
+    if _PLACEHOLDER.search(vis):
+        return "placeholder page (coming-soon / maintenance / server default)"
+    return None
+
+
+def _dead_url_reason(url: str, render=None, timeout: float = 10.0):
+    """Returns a reason string if `url` is NOT a working deployment, else None. A NOTE, not a grade — so a
+    dead demo link is counted honestly instead of grading a 404 page or crashing the batch child. Catches:
+    unreachable / 4xx-5xx entry / host placeholder shell / coming-soon-maintenance splash (static), and —
+    when `render` is supplied — a client-side 404 or rendered placeholder the static shell hides."""
     try:
         r = httpx.get(url, timeout=timeout, follow_redirects=True, verify=False,
                       headers={"User-Agent": _UA})
@@ -524,6 +562,17 @@ def _dead_url_reason(url: str, timeout: float = 10.0):
         return f"HTTP {r.status_code}"
     if _DEAD_PAGE.search(r.text[:6000]):
         return "host placeholder / 404 shell (no app deployed)"
+    static_shell = _dead_shell_reason(r.text)   # static coming-soon / server-default (or a rare inlined 404)
+    if static_shell:
+        return static_shell
+    if render is not None:   # SPA client-side 404 / rendered placeholder: only the rendered entry shows it
+        with contextlib.suppress(Exception):
+            doms = render(url, ["/"])
+            dom = doms.get("/") or (next(iter(doms.values()), "") if doms else "")
+            if dom:
+                rendered_shell = _dead_shell_reason(dom)
+                if rendered_shell:
+                    return rendered_shell
     return None
 
 
@@ -581,7 +630,9 @@ def main():
             url = args.repo
             result.update(url_ingest=True, app_kind="web-app", web_gradeable=True,
                           stack="live app (url-ingest)", stack_profile={"routing": "url-ingest"})
-            dead = _dead_url_reason(url)   # link-rot is common -> don't grade a dead deployment's 404 shell
+            # link-rot is common -> don't grade a dead deployment's 404 shell. With the browser on, this
+            # also catches a client-side 404 (SPA renders 'not found' at HTTP 200) via a one-route render.
+            dead = _dead_url_reason(url, render=(browser.render_routes if args.browser else None))
             if dead:
                 result["dead_url"] = True                         # counted as "url does not work" (deployed=False)
                 result["deploy_error"] = f"URL DEAD — {dead}"

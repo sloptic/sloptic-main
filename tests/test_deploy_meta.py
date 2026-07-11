@@ -9,7 +9,25 @@ import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
 from deploy_and_grade import (  # noqa: E402
-    CloneError, _dead_url_reason, _inject_build_cache, _record_plan_meta, _trigger_str, clone)
+    CloneError, _dead_shell_reason, _dead_url_reason, _inject_build_cache, _looks_like_client_404,
+    _record_plan_meta, _trigger_str, clone)
+
+
+def test_looks_like_client_404_detects_spa_not_found_shell():
+    # a SPA that answers 200 but RENDERS 'page not found' (the LifeLine case) — scripts stripped so an
+    # inline route-name string can't false-match; a real rendered app is not flagged
+    shell = ('<div id="root"><script>var r="/home"; function nf(){}</script>'
+             '<h1>404</h1><p>Page Not Found</p><p>The page "" could not be found in this application.</p></div>')
+    assert _looks_like_client_404(shell) is True
+    real = '<div id="root"><h1>LifeLine</h1><nav>Home Settings</nav><main>Welcome back, log a vital</main></div>'
+    assert _looks_like_client_404(real) is False
+
+
+def test_dead_shell_reason_flags_placeholder_and_default_pages_but_not_a_real_app():
+    assert _dead_shell_reason("<h1>Coming Soon</h1><p>we're building something great</p>").startswith("placeholder")
+    assert _dead_shell_reason("<title>Welcome to nginx!</title><h1>Welcome to nginx!</h1>").startswith("placeholder")
+    assert _dead_shell_reason("<div>404</div><p>Page Not Found</p>").startswith("client-side 404")
+    assert _dead_shell_reason("<h1>Receipts</h1><p>Welcome back — upload a receipt to get started</p>") is None
 
 
 class _LivenessHandler(http.server.BaseHTTPRequestHandler):
