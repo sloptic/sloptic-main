@@ -428,6 +428,8 @@ def surface_metrics(profile: Profile) -> dict:
     return {
         "routes": len(app_routes),
         "routes_all": len(profile.routes),           # incl. vendor assets, for reference
+        "routes_list": app_routes[:12],              # the actual APP route PATHS (vendor-stripped, capped) —
+                                                     # lets the coverage auditor render sub-routes, not just "/"
         "forms": len(forms),
         "inputs": inputs,
         "endpoints": len(healthy_eps),               # healthy = responds to a baseline without a 5xx

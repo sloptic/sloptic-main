@@ -845,9 +845,12 @@ def main():
         if args.audit_coverage:   # LLM coverage CRITIC — read the live page, ALWAYS print + record what
             audit, why = None, ""  # discovery missed (like the deploy notes). Best-effort: never breaks a grade.
             try:
-                # observed_surface carries route COUNTS, not the list, so audit the ENTRY page (interact ON
-                # so a click-gated login/upload on the landing lands in the skeleton the LLM reasons over).
-                doms = browser.render_routes(url, ["/"], interact=True) if args.browser else {}
+                # audit the entry page + the head app sub-routes discovery found (routes_list), interact ON
+                # so a click-gated login/upload — on the landing OR a sub-route like /report — lands in the
+                # skeleton the LLM reasons over. Bounded to a handful of routes to keep the audit cheap.
+                _rl = report.surface.get("routes_list") or []
+                routes = ["/"] + [r for r in _rl if isinstance(r, str) and r != "/"][:4]
+                doms = browser.render_routes(url, routes, interact=True) if args.browser else {}
                 skeleton = "\n\n".join(_surface_skeleton(d) for d in doms.values() if d)
                 if not skeleton:
                     why = "no rendered page surface (browser off or render empty)"
