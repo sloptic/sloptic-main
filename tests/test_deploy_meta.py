@@ -10,7 +10,24 @@ import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
 from deploy_and_grade import (  # noqa: E402
     CloneError, _dead_shell_reason, _dead_url_reason, _inject_build_cache, _looks_like_client_404,
-    _record_plan_meta, _trigger_str, clone)
+    _record_plan_meta, _surface_skeleton, _trigger_str, audit_coverage, clone)
+
+
+def test_surface_skeleton_extracts_interactive_surface_not_scripts():
+    dom = ('<html><body><h1>Scam Reporter</h1>'
+           '<button>Add Evidence</button><a href="/login">Log in</a>'
+           '<form action="/report"><input name="title"><input type="file" name="doc"></form>'
+           '<script>var secret=1</script></body></html>')
+    sk = _surface_skeleton(dom)
+    assert "Add Evidence" in sk and "Log in" in sk           # button + link labels for the LLM to read
+    assert "/report" in sk and "file:doc" in sk              # form action + the file input
+    assert "Scam Reporter" in sk and "var secret" not in sk  # heading yes; script content excluded
+
+
+def test_audit_coverage_is_best_effort_none_without_key(monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    assert audit_coverage("buttons/links: ['Upload']", {"has_upload": False}) is None   # no key -> skip
+    assert audit_coverage("", {}) is None                                               # empty -> nothing to audit
 
 
 def test_looks_like_client_404_detects_spa_not_found_shell():

@@ -355,6 +355,25 @@ def main():
                   f"→ live only (not reproducible from source)")
         print()
 
+    # (h) COVERAGE AUDIT (LLM) — surface the fuzzer's discovery MISSED, per the LLM critic, aggregated into
+    # a fixable backlog (the AfroSecured-style incidents), plus page-state classification (placeholder/broken).
+    audited = [r for r in recs if r.get("coverage_audit")]
+    if audited:
+        misses = [(r["repo"], m) for r in audited for m in (r["coverage_audit"].get("missed") or [])]
+        states = Counter((r["coverage_audit"].get("page_state") or "?") for r in audited)
+        print(f"(h) COVERAGE AUDIT (LLM) — {len(audited)} apps audited · page states {dict(states)}")
+        if misses:
+            gap_apps = len({repo for repo, _ in misses})
+            print(f"    DISCOVERY GAPS — surface the fuzzer missed: {len(misses)} across {gap_apps} apps  "
+                  f"(by kind: {dict(Counter(m.get('kind') for _, m in misses))})")
+            for repo, m in misses[:15]:
+                print(f"      {repo.rsplit('/', 1)[-1][:26]:26} {(m.get('kind') or '?'):8} "
+                      f"{(m.get('label') or '')[:28]:28} — {(m.get('why') or '')[:50]}")
+            print(f"    → fix these in discovery, then re-grade; audit any probe: --audit <probe-id>")
+        else:
+            print("    DISCOVERY GAPS: none flagged — discovery covered the audited pages")
+        print()
+
 
 if __name__ == "__main__":
     main()

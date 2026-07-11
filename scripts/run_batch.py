@@ -161,6 +161,10 @@ def main():
     ap.add_argument("--no-browser", dest="browser", action="store_false",
                     help="skip the browser-rendered surface (faster; default is browser ON for grading — "
                          "the render finds SPA forms a static crawl misses, the #1 recall win)")
+    ap.add_argument("--audit-coverage", action="store_true", dest="audit_coverage",
+                    help="LLM audits discovery coverage per app — notes missed surface (AfroSecured-style) + "
+                         "placeholder pages onto each record. One cheap LLM call + light render per app; "
+                         "stats' (h) DISCOVERY GAPS aggregates them into a fixable backlog.")
     ap.add_argument("--attempts", type=int, default=3, help="deploy attempts per repo")
     ap.add_argument("--build-timeout", type=int, default=480, dest="build_timeout",
                     help="per-repo docker build timeout in seconds (default 480; lower = more throughput)")
@@ -228,6 +232,8 @@ def main():
                     "--checkpoint", str(ckpt)]
         if not args.browser:
             cmd += ["--no-browser"]
+        if args.audit_coverage:
+            cmd += ["--audit-coverage"]
         if args.model:
             cmd += ["--model", args.model]
         # own process group (start_new_session) so a wedge -> we SIGKILL the child + its chrome/docker

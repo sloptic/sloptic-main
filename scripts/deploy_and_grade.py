@@ -351,6 +351,74 @@ def plan_deploy(context: str, model: str, error: str = "", prev: dict = None, on
     return json.loads(m.group(0))
 
 
+# ---- 2b. LLM coverage auditor: catch surface the DETERMINISTIC discovery missed -------------------
+# The same LLM that plans deploys reads the live page and flags interactive surface our fuzzer's
+# discovery didn't capture (an AfroSecured-style upload behind an oddly-labelled button, a login the
+# regexes didn't classify) + placeholder/broken pages. Its findings are NOTED on the record so the
+# misses accumulate into a fixable backlog instead of silently under-grading. Best-effort: any failure
+# returns None and the grade proceeds — the audit never breaks a run.
+
+_AUDIT_SYSTEM = """You audit a black-box web fuzzer's DISCOVERY coverage. You get (1) a compact map of a
+web page's ACTUAL interactive surface, and (2) what the fuzzer's automated discovery OBSERVED. Find
+SURFACE THE FUZZER MISSED — controls a user can clearly use that the observed surface does NOT represent:
+a login/signup, a file UPLOAD (incl. drag-drop or an 'Add evidence'/'Attach'-style button), a search box,
+a key create/submit action, a form. Flag a miss ONLY when the page CLEARLY has it AND observed lacks it —
+never invent surface. Also classify the page state.
+Respond with ONLY a JSON object, no prose/markdown:
+{"missed": [{"kind": "login|signup|upload|search|form|action|other", "label": "the on-page label",
+  "why": "why discovery likely missed it"}],
+ "page_state": "working | placeholder | broken | login-wall | not-an-app",
+ "notes": "one short line"}
+Empty "missed": [] when the observed surface already covers the page."""
+
+
+def _surface_skeleton(dom: str) -> str:
+    """A compact map (~1-2KB) of a rendered page's interactive surface for the auditor: headings, button/
+    link labels, input types+names, form actions, and a visible-text snippet. Small enough to be cheap,
+    rich enough for the LLM to reason 'there's clearly an upload here that observed doesn't have'."""
+    def _t(h):
+        return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", h)).strip()
+    labels = []
+    for m in re.findall(r"<(?:button|a)\b[^>]*>(.*?)</(?:button|a)>", dom, re.S | re.I):
+        t = _t(m)[:40]
+        if t and t not in labels:
+            labels.append(t)
+    inputs = []
+    for tag in re.findall(r"<input\b[^>]*>|<textarea\b[^>]*>|<select\b[^>]*>", dom, re.I):
+        typ = (re.search(r'type=["\']?([a-zA-Z]+)', tag) or [None, "text"])[1]
+        nm = (re.search(r'(?:name|placeholder|aria-label)=["\']([^"\']+)', tag) or [None, ""])[1]
+        inputs.append(f"{typ}:{nm}".strip(":")[:40])
+    actions = re.findall(r'<form\b[^>]*action=["\']([^"\']+)', dom, re.I)
+    heads = [_t(h)[:60] for h in re.findall(r"<h[12]\b[^>]*>(.*?)</h[12]>", dom, re.S | re.I)]
+    return (f"headings: {heads[:6]}\nbuttons/links: {labels[:40]}\n"
+            f"inputs: {inputs[:20]}\nform_actions: {actions[:10]}\nvisible_text: {_visible_text(dom)[:280]}")
+
+
+def audit_coverage(skeleton: str, observed: dict, features=None, model: str = DEFAULT_MODEL):
+    """Ask the LLM what surface the page has that `observed` (the fuzzer's discovery) missed, + the page
+    state. Returns {missed, page_state, notes} or None (no key / any error — best-effort, never raises)."""
+    key = os.environ.get("OPENROUTER_API_KEY")
+    if not key or not skeleton.strip():
+        return None
+    user = (f"PAGE SURFACE (what a user sees):\n{skeleton}\n\n"
+            f"FUZZER OBSERVED (structured):\n{json.dumps(observed, default=str)[:1600]}")
+    if features:
+        user += f"\n\nSOURCE FEATURES (from the repo, if known):\n{json.dumps(features)[:800]}"
+    body = {"model": model, "temperature": 0.1,
+            "messages": [{"role": "system", "content": _AUDIT_SYSTEM}, {"role": "user", "content": user}]}
+    try:
+        r = httpx.post(OPENROUTER_URL, json=body, timeout=90,
+                       headers={"Authorization": "Bearer " + key,
+                                "HTTP-Referer": "https://hacklet.league", "X-Title": "hacklet-audit"})
+        if r.status_code != 200:
+            return None
+        content = r.json()["choices"][0]["message"]["content"]
+        m = re.search(r"\{.*\}", content, re.S)
+        return json.loads(m.group(0)) if m else None
+    except Exception:
+        return None   # best-effort: a failed audit must never break the grade
+
+
 # ---- 3. execute the plan --------------------------------------------------------------------------
 
 _DB_READY = {
@@ -584,6 +652,11 @@ def main():
                          "HTTP(S) with NO clone / LLM plan / Docker deploy (for Vercel/Railway/*.app "
                          "submissions with no gradeable repo). Enables the HTTPS-only probes.")
     ap.add_argument("--model", default=DEFAULT_MODEL, help="OpenRouter model id (default: %(default)s)")
+    ap.add_argument("--audit-coverage", action="store_true", dest="audit_coverage",
+                    help="after grading, have the LLM audit DISCOVERY coverage against the live page — note "
+                         "interactive surface the fuzzer missed (AfroSecured-style) + placeholder/broken "
+                         "pages onto the record (coverage_audit), so misses accrue into a fixable backlog. "
+                         "One cheap LLM call + a light render per app; works for repo AND url grades.")
     ap.add_argument("--no-web-search", dest="web_search", action="store_false",
                     help="don't let the LLM web-search on retries (default: retries CAN search OpenRouter's "
                          "web plugin for current dep versions / deploy config, ~$0.02/retry)")
@@ -740,6 +813,19 @@ def main():
             findings.append(f)
         result.update(slop_score=report.slop_score, axis_slop=report.axis_slop,
                       observed_surface=report.surface, coverage=report.coverage, findings=findings)
+        if args.audit_coverage:   # LLM coverage critic — note surface discovery missed (best-effort, never fatal)
+            with contextlib.suppress(Exception):
+                routes = ["/"] + [r for r in (report.surface.get("routes") or []) if isinstance(r, str)][:3]
+                doms = browser.render_routes(url, routes, interact=False) if args.browser else {}
+                skeleton = "\n\n".join(_surface_skeleton(d) for d in doms.values() if d)
+                audit = audit_coverage(skeleton, report.surface, result.get("features"), model=args.model)
+                if audit:
+                    result["coverage_audit"] = audit
+                    miss, ps = audit.get("missed") or [], audit.get("page_state")
+                    if miss or ps not in (None, "working"):
+                        print(f"  COVERAGE AUDIT: page={ps}  missed={len(miss)}"
+                              + ("  → " + ", ".join(f"{m.get('kind')}:{(m.get('label') or '')[:18]}"
+                                                    for m in miss[:4]) if miss else ""))
         print(f"\n  SLOP SCORE: {report.slop_score}   ({_axis_str(report.axis_slop)})")
         cov = report.coverage
         if cov.get("probes_total"):   # test coverage: how much of the battery applied vs went n/a (calibration)
