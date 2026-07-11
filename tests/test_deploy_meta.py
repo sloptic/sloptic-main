@@ -1,13 +1,40 @@
 """deploy_and_grade plumbing: a failed clone is a recordable signal (not a crash), and the LLM's
 identification (kind/stack/features) is copied onto the record. No network/LLM/Docker."""
+import http.server
 import pathlib
 import sys
+import threading
 
 import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
 from deploy_and_grade import (  # noqa: E402
-    CloneError, _inject_build_cache, _record_plan_meta, _trigger_str, clone)
+    CloneError, _dead_url_reason, _inject_build_cache, _record_plan_meta, _trigger_str, clone)
+
+
+class _LivenessHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/gone":
+            self.send_response(404); self.end_headers(); self.wfile.write(b"nope"); return
+        self.send_response(200); self.end_headers()
+        self.wfile.write(b"There isn't a GitHub Pages site here"
+                         if self.path == "/placeholder" else b"<h1>hello app</h1>")
+
+    def log_message(self, *a):
+        pass
+
+
+def test_dead_url_reason_classifies_live_404_and_placeholder():
+    # --url liveness gate: a real page is gradeable (None); a 404 entry or a 200 placeholder shell is dead
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _LivenessHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        assert _dead_url_reason(base + "/live") is None
+        assert _dead_url_reason(base + "/gone") == "HTTP 404"
+        assert _dead_url_reason(base + "/placeholder").startswith("host placeholder")
+    finally:
+        srv.shutdown()
 
 
 def test_trigger_str_surfaces_the_payload_but_not_config_checks():

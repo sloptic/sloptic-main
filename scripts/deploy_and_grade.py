@@ -499,6 +499,34 @@ def grade(url: str, use_browser: bool, timeout: int = 480, features=None):
     return payload
 
 
+# --url ingest hits real, often link-rotted deployments. Reject a DEAD one BEFORE grading its shell:
+# unreachable, a 4xx/5xx entry, or a known host placeholder (a Pages/Vercel/Netlify "no site here" page
+# that answers 200/404 but hosts no app — otherwise we'd grade the placeholder to meaningless garbage).
+_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+_DEAD_PAGE = re.compile(
+    r"There isn't a GitHub Pages site here|"                          # GitHub Pages: no site published
+    r"DEPLOYMENT_NOT_FOUND|The deployment could not be found|"        # Vercel
+    r"Site not found|Not Found - Request ID|"                         # Netlify
+    r"no such app|couldn't find that app|no application configured",  # generic PaaS not-found
+    re.I)
+
+
+def _dead_url_reason(url: str, timeout: float = 10.0):
+    """Returns a reason string if `url` is NOT a working deployment (unreachable / 4xx-5xx entry / host
+    placeholder shell), else None. A NOTE, not a grade — the record just says the URL didn't work, so a
+    dead demo link is counted honestly instead of grading a 404 page or crashing the batch child."""
+    try:
+        r = httpx.get(url, timeout=timeout, follow_redirects=True, verify=False,
+                      headers={"User-Agent": _UA})
+    except httpx.HTTPError as e:
+        return f"unreachable ({type(e).__name__})"
+    if r.status_code >= 400:
+        return f"HTTP {r.status_code}"
+    if _DEAD_PAGE.search(r.text[:6000]):
+        return "host placeholder / 404 shell (no app deployed)"
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser(description="LLM-assisted deploy + fuzz-grade of a hackathon repo.")
     ap.add_argument("repo", help="a git URL, a local path, or (with --url) a live app URL")
@@ -553,6 +581,12 @@ def main():
             url = args.repo
             result.update(url_ingest=True, app_kind="web-app", web_gradeable=True,
                           stack="live app (url-ingest)", stack_profile={"routing": "url-ingest"})
+            dead = _dead_url_reason(url)   # link-rot is common -> don't grade a dead deployment's 404 shell
+            if dead:
+                result["dead_url"] = True                         # counted as "url does not work" (deployed=False)
+                result["deploy_error"] = f"URL DEAD — {dead}"
+                print(f"\n  URL DEAD ({dead}) — not a working deployment; recorded, not graded.")
+                return
             print(f"\n=== url-ingest: grading live app (no clone/plan/deploy) → {url} ===")
         else:
             _t = time.monotonic()
@@ -620,6 +654,19 @@ def main():
             print(f"\n  GRADE TIMEOUT — {e}. Target too pathological to grade in budget; "
                   f"recorded, moving on.")
             return   # the finally writes the record (deployed=True, grade_timeout=True) + tears down
+        except Exception as e:   # grade worker died — an unreachable/5xx-only URL, or a real crash. Record
+            timings["grade_s"] = round(time.monotonic() - _t, 1)   # it cleanly; never traceback out of a child.
+            msg = str(e)
+            unreachable = any(s in msg for s in ("did not respond", "only 5xx", "unreachable", "has no IP"))
+            if args.url_ingest and unreachable:    # the live URL went down between the liveness check and grade
+                result["deployed"] = False         # -> it did NOT work (counted as a dead URL, not a grade bug)
+                result["dead_url"] = True
+                result["deploy_error"] = "URL DEAD — did not respond / 5xx only"
+                print(f"\n  URL DEAD — {msg[:160]}; recorded, moving on.")
+            else:
+                result["deploy_error"] = f"GRADE FAILED: {msg[:180]}"
+                print(f"\n  GRADE FAILED — {msg[:200]}; recorded, moving on.")
+            return
         timings["grade_s"] = round(time.monotonic() - _t, 1)
         slop = [o for o in report.outcomes if o.outcome == "slop_detected"]
         # Collapse fan-out to ONE finding per (probe, reason): a header probe fires once per asset (civ2:
