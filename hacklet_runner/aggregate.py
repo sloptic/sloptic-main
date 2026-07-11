@@ -83,6 +83,9 @@ def coverage_metrics(outcomes: list[Outcome]) -> dict:
         d["na" if status == "not_applicable" else "ran"] += 1
     ran_kinds = sorted(k for k, d in by_kind.items() if d["ran"])          # kind applied on ≥1 probe
     na_kinds = sorted(k for k, d in by_kind.items() if d["ran"] == 0)      # kind entirely n/a
+    # the exact probe_ids that APPLIED here (fired or clean). Aggregated across a batch, the catalog minus
+    # the union of these is the set of probes that were N/A on EVERY app — never reached their target.
+    applied = sorted(pid for pid, (status, _, _) in best.items() if status != "not_applicable")
     return {
         "probes_total": total,
         "probes_applicable": applicable,
@@ -91,4 +94,5 @@ def coverage_metrics(outcomes: list[Outcome]) -> dict:
         "ran_kinds": ran_kinds,
         "na_kinds": na_kinds,
         "by_kind": by_kind,
+        "applied": applied,
     }

@@ -64,6 +64,7 @@ def test_coverage_counts_applicable_vs_na_by_probe_and_kind():
     assert c["pct_applicable"] == 50                       # half the battery applied
     assert c["ran_kinds"] == ["security-headers", "xss"]   # kinds that ran (any probe applied)
     assert c["na_kinds"] == ["csrf", "sql-injection"]      # kinds entirely n/a — the calibration signal
+    assert c["applied"] == ["headers-1", "xss-1"]          # exact probe_ids that ran (batch union -> never-applied)
 
 
 def test_coverage_empty_outcomes():

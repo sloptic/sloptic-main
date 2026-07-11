@@ -254,27 +254,41 @@ def main():
         bar = "█" * round(n / (freq[0][1] or 1) * 30)
         print(f"      {pid:20} {n:>3} │ {bar}")
 
-    # (b2) NEVER FIRED — catalog probes that tripped ZERO of the graded apps. Either genuinely never
-    # present (real apps lack that flaw) OR silently never-applicable / broken. At scale, an unexpected
-    # entry here is the tell that a probe isn't reaching its target — audit it.
+    # (b2) NEVER APPLIED — probes that were N/A on EVERY graded app: the intersection of the n/a sets.
+    # They never reached a target — either the surface they need is absent from every app, or the probe is
+    # mis-gated / broken. This is DISTINCT from a probe that applied and found nothing (working, just rare);
+    # that split is shown for contrast. Exact per-probe when records carry coverage.applied; else the
+    # coarser kind-level intersection (older records predate the per-probe field).
     try:
-        all_probes = {p.id: p.bundle for p in load_catalog(str(_ROOT / "catalog"))}
+        cat = {p.id: p.bundle for p in load_catalog(str(_ROOT / "catalog"))}
     except Exception as e:                     # never let a catalog hiccup break the whole report
-        all_probes = {}
-        print(f"\n(b2) NEVER FIRED — (catalog load failed: {e})")
-    if all_probes:
-        never = sorted(pid for pid in all_probes if pid not in probe_apps)
-        print(f"\n(b2) NEVER FIRED across the {len(graded)} graded apps  "
-              f"({len(never)}/{len(all_probes)} probes tripped nothing):")
+        cat = {}
+        print(f"\n(b2) NEVER APPLIED — (catalog load failed: {e})")
+    cov = [r for r in graded if r.get("coverage")]
+    per_probe = [r for r in cov if r["coverage"].get("applied") is not None]
+    if cat and per_probe:                      # exact: probes n/a everywhere = catalog − union(applied)
+        applied = set().union(*(set(r["coverage"]["applied"]) for r in per_probe))
+        never = sorted(pid for pid in cat if pid not in applied)
+        ran_clean = sum(1 for pid in applied if pid in cat and pid not in probe_apps)
+        print(f"\n(b2) NEVER APPLIED across all {len(per_probe)} graded apps  "
+              f"({len(never)}/{len(cat)} probes never reached a target):")
         if never:
-            by_bundle = defaultdict(list)
+            grp = defaultdict(list)
             for pid in never:
-                by_bundle[all_probes[pid]].append(pid)
-            for b in sorted(by_bundle):
-                print(f"      [{b}]  " + ", ".join(sorted(by_bundle[b])))
-            print(f"      ↳ genuinely-rare vs never-applicable/broken: audit any that SHOULD have fired")
+                grp[cat[pid]].append(pid)
+            for b in sorted(grp):
+                print(f"      [{b}]  " + ", ".join(sorted(grp[b])))
+            print(f"      ↳ surface absent everywhere, OR the probe is mis-gated/broken — audit any that SHOULD apply")
         else:
-            print("      (every catalog probe fired on at least one app)")
+            print("      (every probe applied to at least one app)")
+        print(f"      (for contrast: {ran_clean} probes DID apply somewhere but never fired — working, just rare)")
+    elif cov:                                  # legacy records: only kind-level n/a survives
+        na = [set(r["coverage"].get("na_kinds", [])) for r in cov]
+        ran = [set(r["coverage"].get("ran_kinds", [])) for r in cov]
+        na_all = sorted(set.intersection(*na) - set().union(*ran)) if na else []
+        print(f"\n(b2) NEVER APPLIED across all {len(cov)} graded apps  (KIND-level — these records predate "
+              f"per-probe coverage; re-grade for probe granularity):")
+        print("      " + (", ".join(na_all) if na_all else "(every kind applied on ≥1 app)"))
 
     # (c)
     print(f"\n(c) WINNERS vs NON-WINNERS")
