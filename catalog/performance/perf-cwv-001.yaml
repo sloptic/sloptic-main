@@ -1,0 +1,14 @@
+id: perf-cwv-001
+bundle: performance
+category: web-vitals
+variant_group_id: perf-cwv   # same "slow user-facing render" flaw as perf-cwv-002 (full CWV); fire once
+pool: public
+evidence_model: oracle
+penalty: 22   # slow First Contentful Paint -> the 'app feels slow' signal for every visitor.
+              # Grouped w/ perf-cwv-002 (fuller CWV anchors the group at its higher value).
+applicability:
+  requires: [browser]
+probe:
+  predicate: slow_first_paint
+  target: /slow
+  threshold_ms: 1000

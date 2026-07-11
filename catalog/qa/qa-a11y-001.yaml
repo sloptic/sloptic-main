@@ -1,0 +1,15 @@
+id: qa-a11y-001
+bundle: qa
+category: accessibility
+variant_group_id: qa-a11y   # same flaw as qa-a11y-002 (static), two detection methods -> fire once
+pool: public
+evidence_model: oracle
+penalty: 26   # ~16% of people (1.3B, WHO 2023) are barred -> permanent, high-frequency-population
+              # harm; ADA web suits run >4,000/yr (UsableNet). Grouped w/ qa-a11y-002, fires once.
+applicability:
+  requires: [browser]   # needs a rendered DOM; N/A without --browser
+probe:
+  predicate: a11y_violations_present
+  target: /
+  threshold: 0   # fire on any axe-core WCAG 2 A/AA violation (~100 gold-standard rules: alt/label/lang/
+                 # contrast/ARIA/structure); axe's deterministic `violations` set, so intent-independent

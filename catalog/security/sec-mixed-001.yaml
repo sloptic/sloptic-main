@@ -1,0 +1,13 @@
+id: sec-mixed-001
+bundle: security
+category: mixed-content
+pool: public
+evidence_model: provable
+penalty: 20   # https page loads http:// subresources -> MITM can tamper; active mixed content is blocked
+applicability:
+  requires: [at_least_one_http_endpoint_exists]   # further self-gated to https pages by the predicate
+probe:
+  # on an https page, fire if any loaded subresource (<script>/<img>/<link rel=stylesheet>/...) is an
+  # absolute http:// URL. N/A over plain http (nothing to be "mixed"), like the HSTS probe.
+  predicate: mixed_content
+  target: /

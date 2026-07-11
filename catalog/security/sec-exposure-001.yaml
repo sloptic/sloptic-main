@@ -1,0 +1,12 @@
+id: sec-exposure-001
+bundle: security
+category: exposure
+pool: public
+evidence_model: provable
+penalty: 35   # a served .env hands DB credentials + secret keys to any anonymous visitor
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  target: /.env
+slop_if:
+  - response_is_dotenv

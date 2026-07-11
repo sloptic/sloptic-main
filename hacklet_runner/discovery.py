@@ -1,0 +1,444 @@
+"""Phase 1: discovery. Build a stack-agnostic surface map by crawling the live app over HTTP.
+
+A bounded, same-origin breadth-first crawl from the homepage: it records every reachable route and
+every HTML form (action, method, field names). Stays polite and bounded — page and depth caps, same
+origin only. Production adds browser-driven discovery (Playwright) for SPA routes this static crawl
+can't see (client-rendered forms), plus per-endpoint baselines for oracle differentials.
+"""
+from __future__ import annotations
+
+import re
+from urllib.parse import parse_qs, urljoin, urlparse
+
+import httpx
+
+from . import jsmine, openapi
+from .auth import is_password_change_form, login_form
+from .net import make_client
+from .schema import Endpoint, Form, Profile
+
+_LINK = re.compile(r'(?<![-\w])href=["\']([^"\']+)["\']', re.I)
+_SRC = re.compile(r'(?<![-\w])src=["\']([^"\']+)["\']', re.I)  # any tag: img / iframe / script / source / ...
+_FORM = re.compile(r"<form\b([^>]*)>(.*?)</form>", re.I | re.S)
+_ACTION = re.compile(r'(?<![-\w])action=["\']([^"\']*)["\']', re.I)
+_METHOD = re.compile(r'(?<![-\w])method=["\']([^"\']*)["\']', re.I)
+_ENCTYPE = re.compile(r'(?<![-\w])enctype=["\']([^"\']*)["\']', re.I)
+_FIELD = re.compile(r'<(?:input|textarea|select)\b[^>]*(?<![-\w])name=["\']([^"\']+)["\']', re.I)
+
+# Input parsing. We walk <label> and <input>/<textarea>/<select> in document order so each control can be
+# tied to its nearest preceding <label> — a name-less SPA input is often addressable only by its label.
+_LABEL_OR_INPUT = re.compile(r"<label\b[^>]*>(.*?)</label>|<(input|textarea|select)\b([^>]*?)>", re.I | re.S)
+_ATTR_NAME = re.compile(r'(?<![-\w])name=["\']([^"\']+)["\']', re.I)
+_ATTR_ID = re.compile(r'(?<![-\w])id=["\']([^"\']+)["\']', re.I)
+_ATTR_TYPE = re.compile(r'(?<![-\w])type=["\']?([a-zA-Z]+)', re.I)
+_ATTR_PLACEHOLDER = re.compile(r'(?<![-\w])placeholder=["\']([^"\']+)["\']', re.I)
+_ATTR_AUTOCOMPLETE = re.compile(r'(?<![-\w])autocomplete=["\']([^"\']+)["\']', re.I)
+_TAG = re.compile(r"<[^>]+>")            # strip any nested tags out of a <label>'s text before slugging
+_WORD = re.compile(r"[A-Za-z][A-Za-z0-9]*")
+# <input type=...> values that already name the field's purpose, so a name-less one is still addressable
+_SEMANTIC_TYPES = frozenset({"email", "password", "tel", "url", "search", "number"})
+# input types that carry no injectable free text (a submit button, a toggle, a color swatch, ...)
+_NONINJECTABLE_INPUT = frozenset({"submit", "button", "reset", "image", "hidden",
+                                  "checkbox", "radio", "range", "color"})
+# routes NOT worth browser-rendering for forms — static assets / JSON blobs, never an HTML page with a form
+_NON_HTML_EXT = re.compile(
+    r"\.(?:js|mjs|cjs|css|map|json|xml|svg|png|jpe?g|gif|webp|ico|bmp|woff2?|ttf|otf|eot|pdf|"
+    r"zip|gz|mp4|webm|mp3|wav|wasm|txt|csv)$", re.I)
+
+# Bundled third-party library paths — served BY the app but not its own surface. A 3D/mapping app
+# (Potree, three.js, Cesium) serves 60+ such files, padding the surface count without being real attack
+# surface, so they're excluded from surface_metrics' denominator (not from probing).
+_VENDOR_PATH = re.compile(
+    r"/(?:potree|node_modules|bower_components|vendor|libs?|three|cesium|draco|ammo|jquery|bootstrap|"
+    r"leaflet|mapbox|openlayers|d3|chartjs|plotly|ace|monaco|pdfjs|tesseract|opencv|wasm)(?:[/.\-]|$)",
+    re.I)
+
+MAX_PAGES = 25
+MAX_DEPTH = 2
+_BASELINE_CAP = 60   # cap the per-endpoint health baseline requests (a huge mined API shouldn't 10x the grade)
+# login / upload surfaces on a JSON API are ENDPOINTS, not <form>s — so has_login/has_upload (form-based)
+# would falsely read blind on an api-only app whose login/upload endpoint we DID discover. Recognize them.
+_LOGIN_EP = re.compile(r"/(?:login|log-?in|signin|sign-?in|auth|authenticate|session|token|oauth)(?:[/.\-]|$)", re.I)
+_UPLOAD_EP = re.compile(r"/(?:upload|files?|media|attachments?|import|ingest|documents?)(?:[/.\-]|$)", re.I)
+_BROWSER_ROUTE_CAP = 12  # max routes to browser-render for forms (one launch, but each goto has a cost)
+
+
+# A logout/sign-out link must never be crawled or probed: following it destroys the runner's own
+# authenticated session, silently de-authing the rest of an --header'd crawl (the classic auth-crawl
+# footgun — it's why an authed DVWA crawl kept dropping to the login page mid-run).
+_LOGOUT = re.compile(r"(?:^|[/_-])(?:logout|log-?out|log_?out|signout|sign-?out|sign_?out|logoff)\b", re.I)
+
+# Un-rendered client-side template syntax leaking into markup: `${x}` (JS template literal), `{{x}}`
+# (Angular/Vue/Handlebars/Jinja), or a stray backtick. A target that ships these in an href/name has a
+# rendering bug — they are never real server routes or params, so probing them chases ghost endpoints.
+# (`#{x}` Pug/Ruby needs no handling here: `#` is the URL-fragment delimiter, stripped before this check.)
+_TEMPLATE_ARTIFACT = re.compile(r"\$\{|\{\{|\}\}|`")
+
+
+def _same_origin_path(href: str, base_url: str, page_path: str) -> str | None:
+    """Resolve href against the current page; return its path if same-origin (and not a logout link),
+    else None."""
+    href = href.split("#")[0].strip()
+    if not href or href.startswith(("mailto:", "javascript:", "tel:", "data:")):
+        return None
+    base = urlparse(base_url)
+    page_abs = urljoin(f"{base.scheme}://{base.netloc}", page_path)
+    target = urlparse(urljoin(page_abs, href))
+    if target.netloc != base.netloc:
+        return None
+    path = target.path or "/"
+    if _LOGOUT.search(path):
+        return None  # crawling logout would destroy the authenticated session
+    if _TEMPLATE_ARTIFACT.search(path):
+        return None  # an un-rendered template literal in the href -> a ghost route, not a real endpoint
+    return path
+
+
+def _slug(text: str | None) -> str | None:
+    """First word of human text (a <label>/placeholder) as a lowercase id: 'Email address' -> 'email'."""
+    if not text:
+        return None
+    m = _WORD.search(_TAG.sub(" ", text))
+    return m.group(0).lower() if m else None
+
+
+def _infer_name(attrs: str, label: str | None) -> str | None:
+    """Best-effort field name for a NAME-less input from its semantic signals — a React-controlled input
+    frequently ships no name and no id, only a type / autocomplete / <label> / placeholder. Ordered by
+    reliability: standardized autocomplete token, then a self-naming input type (email/password/...), then
+    the label, then the placeholder, and a structural id only as a last resort. None when nothing is
+    addressable (a bare `type=text` with no other hint — we can't guess a server field name for it)."""
+    ac = _ATTR_AUTOCOMPLETE.search(attrs)
+    if ac:
+        tok = ac.group(1).strip().lower()
+        if tok and tok not in ("on", "off"):
+            return "password" if "password" in tok else tok   # current-password / new-password -> password
+    tm = _ATTR_TYPE.search(attrs)
+    if tm and tm.group(1).lower() in _SEMANTIC_TYPES:
+        return tm.group(1).lower()                             # type=email/password/tel/... names itself
+    if _slug(label):
+        return _slug(label)
+    ph = _ATTR_PLACEHOLDER.search(attrs)
+    if ph and _slug(ph.group(1)):
+        return _slug(ph.group(1))
+    idm = _ATTR_ID.search(attrs)
+    return idm.group(1) if idm else None                      # a structural id (kept verbatim, not slugged)
+
+
+def _scan_form_inputs(html: str, drop_named_noninjectable: bool = False):
+    """(fields, file_fields, has_password) for the interactive controls in an HTML fragment, in document
+    order. A NAMED control keeps its name for any type (a real <form> needs its hidden/CSRF fields to
+    submit faithfully); a NAME-less control gets an inferred name (_infer_name) so React inputs with no
+    name/id are still addressable. File inputs also appear in `fields` (a superset — lets the text-input
+    capability see a pure-upload surface). drop_named_noninjectable drops loose submit/hidden/checkbox
+    noise for formless synthesis, where a lone non-text control isn't a real input surface."""
+    fields: list[str] = []
+    file_fields: list[str] = []
+    has_password = False
+    label: str | None = None
+    for label_text, tag, attrs in _LABEL_OR_INPUT.findall(html):
+        if not tag:                                   # a <label> — remember it for the NEXT input
+            label = label_text
+            continue
+        this_label, label = label, None               # each label pairs with the one following input
+        tm = _ATTR_TYPE.search(attrs)
+        itype = tm.group(1).lower() if tm else "text"
+        is_input = tag.lower() == "input"
+        is_file = is_input and itype == "file"
+        noninjectable = is_input and itype in _NONINJECTABLE_INPUT
+        nm = _ATTR_NAME.search(attrs)
+        if is_file:
+            idm = _ATTR_ID.search(attrs)
+            name = nm.group(1) if nm else (idm.group(1) if idm else "file")
+        elif nm:
+            if noninjectable and drop_named_noninjectable:
+                continue
+            name = nm.group(1)
+        elif noninjectable:
+            continue                                  # a name-less button/checkbox/hidden — nothing to inject
+        else:
+            name = _infer_name(attrs, this_label)
+            if name is None:
+                continue
+        if _TEMPLATE_ARTIFACT.search(name):
+            continue                                  # a `${x}`/`{{x}}` artifact leaked into the identifier
+        if is_file and name not in file_fields:
+            file_fields.append(name)
+        if name not in fields:
+            fields.append(name)
+            has_password = has_password or itype == "password"
+    return fields, file_fields, has_password
+
+
+def _parse_forms(matches, base_url: str, page_path: str) -> list[Form]:
+    forms = []
+    for attrs, body in matches:
+        am, mm = _ACTION.search(attrs), _METHOD.search(attrs)
+        # a "#..."/empty action submits back to the CURRENT page (very common: DVWA, many CMS forms) —
+        # strip the fragment so it resolves to page_path instead of being dropped as un-resolvable.
+        raw_action = (am.group(1).strip() if am else "").split("#")[0]
+        action = _same_origin_path(raw_action, base_url, page_path) if raw_action else page_path
+        if action is None:  # cross-origin action — not our target
+            continue
+        method = mm.group(1).lower() if mm else "get"
+        em = _ENCTYPE.search(attrs)
+        fields, file_fields, _ = _scan_form_inputs(body)  # keeps hidden/CSRF fields for a faithful submit
+        forms.append(Form(
+            action=action,
+            method=method if method in ("get", "post") else "get",
+            fields=fields,
+            enctype=em.group(1).lower() if em else "",
+            file_fields=file_fields,
+        ))
+    return forms
+
+
+def _renderable_route(path: str) -> bool:
+    """A route worth browser-rendering for forms: an HTML page, not a static asset or JSON/API blob."""
+    return not _NON_HTML_EXT.search(path.split("?")[0])
+
+
+def _form_key(form: Form) -> tuple:
+    """Dedup identity for a discovered form (across the static crawl and every rendered route)."""
+    return (form.action, form.method, tuple(form.fields))
+
+
+def _formless_form(html: str, page_path: str) -> Form | None:
+    """Synthesize a Form from interactive inputs NOT wrapped in a <form> — the modern-SPA pattern
+    (React/Vue controlled inputs submitted via fetch(), e.g. phish-school's bare <input type=file> +
+    <button> with no <form>). The <form>-anchored parser structurally cannot see these, so on such apps
+    the entire login/upload/search surface is invisible and every injection/upload/auth probe reads N/A.
+
+    Best-effort by nature: the real submit endpoint lives in JS, so the action is the page itself —
+    correct for same-path server actions / Next.js API routes / PHP self-post, and a harmless no-op
+    elsewhere (a wrong target just returns the SPA shell, which yields no oracle differential, so this
+    can't manufacture a false positive). Field names come from _scan_form_inputs/_infer_name, which
+    handle the name-less React inputs these apps use. Returns None when the page has no such inputs."""
+    body = _FORM.sub(" ", html)   # drop real <form>s (handled by _parse_forms) -> only UNwrapped inputs
+    fields, file_fields, has_password = _scan_form_inputs(body, drop_named_noninjectable=True)
+    if not fields:
+        return None
+    return Form(
+        action=page_path,                                        # best-effort: the page's own path
+        method="post" if (file_fields or has_password) else "get",  # login/upload POST; search-ish GET
+        fields=fields,
+        enctype="multipart/form-data" if file_fields else "",
+        file_fields=file_fields,
+    )
+
+
+def _endpoints_from_features(features) -> list:
+    """Turn the deploy LLM's source-read feature inventory ([{name, kind, path, method}]) into Endpoints
+    so the catalog can fire on an api-only app whose JSON API has NO crawlable HTML — the #1 discovery
+    blind spot (Foodgrid: 7 endpoints in source, 0 found by crawling '/'). Best-effort: a hallucinated
+    path just 404s harmlessly. A search-kind endpoint gets common query params (the source rarely names
+    them) so injection has a target; a templated /x/{id}/ yields path_params for BOLA/traversal."""
+    out = []
+    for f in features or []:
+        raw = (f.get("path") or "").strip()
+        if not raw.startswith("/") or _TEMPLATE_ARTIFACT.search(raw):
+            continue
+        method = (f.get("method") or "get").lower()
+        if method not in ("get", "post", "put", "patch", "delete"):
+            method = "get"
+        path_params = re.findall(r"\{([^}]+)\}", raw)
+        concrete = re.sub(r"\{[^}]+\}", "1", raw)          # {id} -> 1 for fan-out fetches; injection uses raw
+        qp = ["q", "search", "query"] if f.get("kind") == "search" else []
+        out.append(Endpoint(path=concrete, method=method, query_params=qp,
+                            path_params=path_params, raw_path=raw, kind=f.get("kind") or ""))
+    return out
+
+
+def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: int = MAX_DEPTH,
+             headers=None, seed_features=None) -> Profile:
+    routes: dict[str, None] = {}      # insertion-ordered set
+    forms: list[Form] = []
+    seen_forms: set[tuple] = set()
+    visited: set[str] = set()
+    # Split a path-bearing --target into ORIGIN + entry path. The client and probes bind to the origin
+    # (a path-bearing base_url breaks httpx's relative-redirect resolution -> loops, and breaks the
+    # `base_url + "/probe/path"` construction probes rely on), while the crawl SEEDS at the entry path so
+    # a --target pointing at a specific page (e.g. bWAPP's /sqli_1.php, whose "/" only redirects to a
+    # login/portal the crawler can't navigate) gets THAT page discovered. A bare origin still starts at "/".
+    _parsed = urlparse(base_url)
+    start_path = _parsed.path or "/"
+    base_url = f"{_parsed.scheme}://{_parsed.netloc}" if _parsed.netloc else base_url
+    queue: list[tuple[str, int]] = [(start_path, 0)]
+    any_response = False
+    endpoints: list = []
+    js_urls: list[str] = []           # same-origin .js assets to mine for an SPA's API paths
+    link_params: dict[str, set] = {}  # path -> query-param NAMES seen in links (?page=, ?id=, ...)
+
+    with make_client(base_url, headers, timeout=5.0, follow_redirects=True) as c:
+        while queue and len(visited) < max_pages:
+            path, depth = queue.pop(0)
+            if path in visited:
+                continue
+            visited.add(path)
+            try:
+                resp = c.get(path)
+            except (httpx.HTTPError, httpx.InvalidURL):
+                continue  # InvalidURL isn't an HTTPError: a hostile target served a control-char path
+            any_response = True
+            routes[path] = None
+            if "html" not in resp.headers.get("content-type", "").lower():
+                continue
+            html = resp.text
+            for form in _parse_forms(_FORM.findall(html), base_url, path):
+                key = _form_key(form)
+                if key not in seen_forms:
+                    seen_forms.add(key)
+                    forms.append(form)
+                    routes.setdefault(form.action, None)
+            for src in _SRC.findall(html):  # tag srcs (img/iframe/script/...) are scan targets, not crawled
+                p = _same_origin_path(src, base_url, path)
+                if p:
+                    routes.setdefault(p, None)
+                    if p.split("?")[0].endswith(".js"):
+                        js_urls.append(p)
+            if depth < max_depth:
+                for href in _LINK.findall(html):
+                    p = _same_origin_path(href, base_url, path)
+                    if p:
+                        routes.setdefault(p, None)
+                        # capture query-param NAMES from the link (?page=, ?id=, ...) so a reflected /
+                        # includable GET param is testable — the crawl otherwise drops the query string
+                        if "?" in href:
+                            for name in parse_qs(href.split("?", 1)[1].split("#")[0], keep_blank_values=True):
+                                if not _TEMPLATE_ARTIFACT.search(name):  # skip a `${x}`/`{{x}}` param name
+                                    link_params.setdefault(p, set()).add(name)
+                        if p not in visited:
+                            queue.append((p, depth + 1))
+
+        # API surface from a served OpenAPI/Swagger spec, paths mined from an SPA's JS bundles, and the
+        # deploy LLM's source-read feature inventory (the last activates the catalog on an api-only app
+        # with no crawlable HTML — otherwise surface_size collapses to 1). Dedup by (method, raw_path).
+        endpoints = (openapi.ingest(base_url, c) + jsmine.ingest(c, js_urls)
+                     + _endpoints_from_features(seed_features))
+        endpoints += [Endpoint(path=p, method="get", query_params=sorted(params), raw_path=p)
+                      for p, params in link_params.items()]
+        seen_eps: set[tuple] = set()
+        endpoints = [e for e in endpoints
+                     if (e.method, e.raw_path) not in seen_eps and not seen_eps.add((e.method, e.raw_path))]
+        # Baseline each endpoint with a well-formed (read-only GET) request: an env-var-gated endpoint
+        # (dummy Supabase/API key) 500s on EVERYTHING, so a baseline 5xx marks it reached-but-DEAD. This
+        # separates "healthy-observed" surface (parity's real denominator) from merely "reached", and lets
+        # behavioral probes skip an endpoint that never works. GET-only stays side-effect-free (a POST-only
+        # endpoint answers 405 = alive; its POST deadness is handled by the crash probe's own baseline).
+        for ep in endpoints[:_BASELINE_CAP]:
+            try:
+                ep.baseline_status = c.get(ep.path).status_code
+            except (httpx.HTTPError, httpx.InvalidURL):
+                ep.baseline_status = None
+        for ep in endpoints:
+            routes.setdefault(ep.path, None)
+
+    browser_ok = False
+    if render is not None:
+        # Browser-render the discovered HTML routes and harvest their client-rendered forms AND formless
+        # inputs. A SPA paints its login/upload/search controls on their OWN routes (often with no <form>
+        # at all), so the old single-"/" render only ever saw a form-less landing page — and every
+        # injection/upload/auth probe went N/A for want of a target. Two phases so nav routes that only
+        # appear AFTER "/" renders still get rendered: (1) render the entry page and fold its
+        # client-rendered links into the route set; (2) render the rest of the now-fuller HTML route set
+        # in one reused browser session (bounded — each goto costs). render(base_url, paths, headers) ->
+        # {path: DOM} is browser.render_routes; None/{} when no browser launched (browser probes read N/A).
+        rendered = render(base_url, [start_path], headers=headers) or {}
+        if rendered:
+            browser_ok = True  # a real render returned HTML -> the browser actually launched/works
+            any_response = True
+            for dom in list(rendered.values()):     # phase 1: entry-page links -> route set
+                for ref in _SRC.findall(dom) + _LINK.findall(dom):
+                    p = _same_origin_path(ref, base_url, start_path)
+                    if p:
+                        routes.setdefault(p, None)
+            extra = [r for r in routes if r != start_path and _renderable_route(r)]
+            extra = list(dict.fromkeys(extra))[:_BROWSER_ROUTE_CAP]
+            if extra:                               # phase 2: render the rest of the HTML surface
+                rendered.update(render(base_url, extra, headers=headers) or {})
+            for path, dom in rendered.items():
+                candidates = _parse_forms(_FORM.findall(dom), base_url, path)
+                formless = _formless_form(dom, path)   # SPA inputs with no <form> wrapper
+                if formless is not None:
+                    candidates.append(formless)
+                for form in candidates:
+                    key = _form_key(form)
+                    if key not in seen_forms:
+                        seen_forms.add(key)
+                        forms.append(form)
+                        routes.setdefault(form.action, None)
+                for ref in _SRC.findall(dom) + _LINK.findall(dom):
+                    p = _same_origin_path(ref, base_url, path)
+                    if p:
+                        routes.setdefault(p, None)
+
+    # Withhold password-CHANGE forms from the whole surface (like logout links above): probes SUBMIT
+    # discovered forms (and fold GET forms into query-param injection targets), so a `password_new`/
+    # `password_conf` form would get posted with our own session cookie and reset — and lock out — the
+    # account we're grading. DVWA's /vulnerabilities/csrf/ is exactly this. They stay in `routes` (safe
+    # to have crawled); only their submittable form/param projection is dropped.
+    forms = [f for f in forms if not is_password_change_form(f)]
+
+    capabilities = {
+        "at_least_one_http_endpoint_exists": any_response,
+        # text-input surface = HTML form fields OR API query params / JSON body fields (so the
+        # injection probes become applicable on a form-less JSON API discovered via its spec).
+        "any_endpoint_accepts_text_input": (
+            any(f.fields for f in forms)
+            or any(ep.query_params or ep.body_fields for ep in endpoints)
+        ),
+        "any_form_has_password": any(
+            any("pass" in name.lower() for name in form.fields) for form in forms
+        ),
+        # gate on an ACTUAL successful render, not just --browser: if Playwright/Chrome can't launch,
+        # render returns None and browser probes must read N/A, not silently 'clean' (false negative).
+        "browser": browser_ok,
+        # HSTS and other transport-security headers are meaningless over plain HTTP -> gate on this so
+        # those probes read N/A (not a false positive) against an http:// target.
+        "served_over_https": base_url.lower().startswith("https"),
+    }
+    return Profile(base_url=base_url, routes=list(routes), forms=forms, capabilities=capabilities,
+                   endpoints=endpoints)
+
+
+def surface_metrics(profile: Profile) -> dict:
+    """A quantitative + categorical fingerprint of the surface discovery actually SAW. This is the
+    denominator that separates a low slop score that means 'clean' from one that means 'we were blind':
+    genuine cleanliness shows HIGH observed surface + few findings, blindness shows LOW observed surface
+    + few findings (and, at batch scale, CLUSTERS on a stack). The same quantity feeds surface-aware
+    scoring, so it's a first-class Report field, not a script-local calc. Categorical flags (has_login/
+    upload/api) enable TYPE parity — did we see the login form five login apps each expose? — not just a
+    coverage percentage."""
+    forms = profile.forms
+    inputs = sum(len(f.fields) for f in forms)
+    caps = profile.capabilities
+    # count APP routes, not bundled libraries: a Potree/three.js/etc. app serves 60+ vendor files
+    # (/potree/libs/...) that pad the denominator and flatter its slop-to-surface ratio. Strip them.
+    app_routes = [r for r in profile.routes if not _VENDOR_PATH.search(r)]
+    # HEALTHY endpoints only: an env-var-dead endpoint (baseline >=500) is reached but not testable — count
+    # it as unobserved so 'reached-but-half-dead' (sapling: ~95 reached, many 500) isn't scored well-covered.
+    eps = profile.endpoints
+    healthy_eps = [e for e in eps if (e.baseline_status or 0) < 500]
+    # login/upload can be an API ENDPOINT (feature kind auth/upload, or a login/upload-named path), not
+    # just an HTML form — count those too so an api-only app's login/upload isn't a false blind spot.
+    has_login = login_form(forms) is not None or any(
+        e.kind == "auth" or _LOGIN_EP.search(e.raw_path or e.path or "") for e in eps)
+    has_upload = any(f.file_fields for f in forms) or any(
+        e.kind == "upload" or _UPLOAD_EP.search(e.raw_path or e.path or "") for e in eps)
+    return {
+        "routes": len(app_routes),
+        "routes_all": len(profile.routes),           # incl. vendor assets, for reference
+        "forms": len(forms),
+        "inputs": inputs,
+        "endpoints": len(healthy_eps),               # healthy = responds to a baseline without a 5xx
+        "endpoints_reached": len(eps),               # incl. env-var-dead (reached but not testable)
+        "endpoints_dead": len(eps) - len(healthy_eps),
+        "has_login": has_login,                       # HTML login form OR an API login endpoint
+        "has_upload": has_upload,                     # multipart form OR an API upload endpoint
+        "has_api": bool(healthy_eps),
+        "browser_rendered": bool(caps.get("browser")),
+        "accepts_text_input": bool(caps.get("any_endpoint_accepts_text_input")),
+        "has_password_form": bool(caps.get("any_form_has_password")),
+        # composite "how much observable & HEALTHY APP surface we saw" — the parity denominator
+        "surface_size": len(app_routes) + inputs + len(healthy_eps),
+    }

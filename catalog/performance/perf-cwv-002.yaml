@@ -1,0 +1,17 @@
+id: perf-cwv-002
+bundle: performance
+category: web-vitals
+variant_group_id: perf-cwv   # same "slow user-facing render" flaw as perf-cwv-001 (FCP); fire once
+pool: public
+evidence_model: oracle
+penalty: 28   # poor Core Web Vitals (LCP/CLS/TBT): Google-ranked, and web.dev case studies
+              # tie LCP gains to +8-53% revenue -> every visitor. Anchors the perf-cwv group.
+applicability:
+  requires: [browser]   # needs a real render + PerformanceObserver; N/A without --browser
+probe:
+  predicate: slow_core_web_vitals
+  target: /
+  samples: 3            # sampled + scored off the player-favorable edge (best-of-N), so variance only helps
+  lcp_ms: 4000          # Google "poor" thresholds, set beyond the render-to-render variance band:
+  cls: 0.25             #   LCP > 4s (slow largest paint), CLS > 0.25 (layout jank),
+  tbt_ms: 600           #   TBT > 600ms (main thread blocked -> unresponsive to input)

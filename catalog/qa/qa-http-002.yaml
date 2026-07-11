@@ -1,0 +1,13 @@
+id: qa-http-002
+bundle: qa
+category: http-conformance   # distinct from qa-http-001 (soft-404 = wrong status); this = header/method RFC nits
+pool: public
+evidence_model: provable
+penalty: 8   # an HTML response with no declared charset: every response, but low severity
+             # (browsers usually guess correctly) -> the conformance floor.
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  # fire when a text/html response omits ; charset= (browser guesses encoding). N/A on a non-HTML homepage
+  predicate: http_conformance
+  target: /

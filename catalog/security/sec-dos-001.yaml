@@ -1,0 +1,12 @@
+id: sec-dos-001
+bundle: security
+category: dos-resistance
+pool: public
+evidence_model: provable
+penalty: 12   # decompresses gzip request bodies with no size cap -> a zip bomb exhausts memory (DoS)
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  # confirm the endpoint decompresses request bodies, then send a ~50MB-expanding (safe) bomb;
+  # fire unless it's rejected with 413 (a decompressed-size cap). Detects the missing defense, never OOMs.
+  predicate: decompression_bomb

@@ -1,0 +1,13 @@
+id: sec-exposure-002
+bundle: security
+category: exposure
+variant_group_id: exposed-git   # config + HEAD are the same exposed-.git flaw -> fire once
+pool: public
+evidence_model: provable
+penalty: 30
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  target: /.git/config
+slop_if:
+  - response_is_git_config

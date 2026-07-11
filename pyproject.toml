@@ -1,0 +1,20 @@
+[project]
+name = "hacklet-fuzz-runner"
+version = "0.0.1"
+description = "HackLet fuzz runner — deploys a submission, probes it over HTTP, emits a slop score."
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+    "pydantic>=2",
+    "pyyaml>=6",
+]
+
+[dependency-groups]
+browser = [
+    "playwright>=1.60.0",
+]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

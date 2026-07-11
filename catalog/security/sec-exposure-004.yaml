@@ -1,0 +1,12 @@
+id: sec-exposure-004
+bundle: security
+category: exposure
+pool: public
+evidence_model: provable
+penalty: 35
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  target: /.aws/credentials
+slop_if:
+  - response_is_aws_credentials

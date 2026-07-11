@@ -1,0 +1,13 @@
+id: sec-lfi-001
+bundle: security
+category: path-traversal
+pool: public
+evidence_model: provable
+penalty: 40   # arbitrary file read / local file inclusion -> source & secret disclosure, often RCE
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  # absolute / ../ / doubled / URL-encoded / null-byte / php:// payloads for /etc/passwd + win.ini;
+  # fires on the file's content signature (root:x:0:0 / [fonts]). One finding.
+  predicate: path_traversal
+  max_attempts: 200

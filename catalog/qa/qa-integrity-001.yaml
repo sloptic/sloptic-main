@@ -1,0 +1,11 @@
+id: qa-integrity-001
+bundle: qa
+category: data-integrity
+pool: public
+evidence_model: oracle
+penalty: 34   # silent data loss on every save -> terminal for user trust. The top qa/perf
+              # penalty, held just below the catastrophic-security per-instance ceiling (40).
+probe:
+  predicate: data_integrity_roundtrip
+  # POST-create an object, then GET it back by id. Fires when the create reports success (2xx + id) but
+  # the read-back 404s / 410s / 5xx's -> the write wasn't durable. N/A when no create+read pair exists.

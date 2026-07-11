@@ -1,0 +1,14 @@
+id: sec-backend-001
+bundle: security
+category: backend-exposure
+pool: public
+evidence_model: oracle
+penalty: 40   # catastrophic: the whole database is publicly readable — the signature vibe-coding leak
+              # (Supabase/Firebase shipped without row-level security). Same tier as SQLi/BOLA.
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  predicate: exposed_backend_readable
+  # Mine the client bundle for a Supabase/Firebase config + its public anon key, then read the DB with
+  # that key (host-restricted to *.supabase.co / *.firebaseio.com; read-only). Fires if real rows come
+  # back (RLS missing). N/A when no such config is embedded (firewalled Tier-A apps) or egress is blocked.

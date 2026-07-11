@@ -1,0 +1,12 @@
+id: qa-ctype-001
+bundle: qa
+category: content-type
+pool: public
+evidence_model: provable
+penalty: 12   # a wrong Content-Type breaks strict clients on every affected response;
+              # JSON-as-text/html is also a reflected-XSS vector -> moderate, recurring.
+probe:
+  predicate: content_type_mismatch
+  target: /
+  # Fetches the safe no-path-param GET endpoints (+ the homepage) and fires on an unambiguous body/type
+  # contradiction — above all a JSON body served as text/html. N/A when no body can be classified.

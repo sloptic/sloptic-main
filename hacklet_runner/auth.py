@@ -1,0 +1,324 @@
+"""Self-as-oracle: register the runner's own account so it can test the authenticated surface.
+
+Account creation is just an HTTP POST to a registration form — discover the form (a password field),
+fill it heuristically, submit, and hold the resulting session. Reusable by the auth-mechanics probes
+(cookie hygiene now; logout-invalidation, login rate-limit, two-account IDOR next).
+"""
+from __future__ import annotations
+
+import re
+import secrets
+from dataclasses import dataclass
+
+import httpx
+
+from .schema import Form, Profile
+
+_HIDDEN_INPUT = re.compile(r"<input\b[^>]*>", re.IGNORECASE)
+_INPUT_ATTR = re.compile(r'\b(name|value)\s*=\s*"([^"]*)"', re.IGNORECASE)
+
+
+def _csrf_token(html: str) -> str | None:
+    """Parse the first hidden input whose name looks like a CSRF token and return its value, so a
+    CSRF-protected form POST (Gitea, Django, Rails, ...) is accepted instead of silently rejected."""
+    for tag in _HIDDEN_INPUT.findall(html):
+        attrs = {k.lower(): v for k, v in _INPUT_ATTR.findall(tag)}
+        if "value" in attrs and is_csrf_field(attrs.get("name", "")):
+            return attrs["value"]
+    return None
+
+# Common session cookie names. Excludes CSRF tokens, which are intentionally readable by JS (not
+# HttpOnly) — flagging those would be a false positive.
+SESSION_COOKIE_NAMES = {
+    "session", "sessionid", "session_id", "sid", "connect.sid", "phpsessid",
+    "jsessionid", "_session", "auth", "auth_token", "access_token", "token", "jwt",
+}
+
+_REGISTER_HINTS = ("register", "signup", "sign-up", "sign_up", "join", "create-account")
+
+
+@dataclass
+class Account:
+    username: str
+    password: str
+    client: httpx.Client          # carries the session cookie jar (for later authed probes)
+    register_response: httpx.Response
+
+
+# A field that names a NEW / CURRENT / OLD password — the hallmark of a password-CHANGE form (as opposed
+# to a "confirm password" field, which also appears on registration). "password2"/"retype"/"confirm" are
+# deliberately NOT here: they're ambiguous (registration has them too).
+_PW_CHANGE_FIELD = re.compile(r"pass(?:word)?[_-]?(?:new|current|old)|(?:new|current|old)[_-]?pass(?:word)?",
+                              re.IGNORECASE)
+_IDENTITY_HINT = ("user", "email", "mail", "login", "phone", "handle", "account")
+
+
+def is_password_change_form(form: Form) -> bool:
+    """True when a form CHANGES the current session's own password rather than authenticating or
+    registering with one. Submitting it (any probe, with our real cookie) resets the account's password
+    and locks the grader — and the real user — out (DVWA's /vulnerabilities/csrf/ is exactly this). A
+    registration needs an IDENTITY field (username/email); a password-change is new/confirm passwords
+    with none, or an explicit new/current/old-password field."""
+    names = [n.lower() for n in form.fields]
+    if not any("pass" in n or "pwd" in n for n in names):
+        return False  # no password field at all -> not a credential form
+    if any(_PW_CHANGE_FIELD.search(n) for n in names):
+        return True   # an explicit new/current/old-password field -> a change form
+    return not any(any(h in n for h in _IDENTITY_HINT) for n in names)  # password(s) but no identity to register
+
+
+def _password_form(forms: list[Form]) -> Form | None:
+    pw = [f for f in forms
+          if any("pass" in name.lower() for name in f.fields) and not is_password_change_form(f)]
+    if not pw:
+        return None
+    return next((f for f in pw if any(h in f.action.lower() for h in _REGISTER_HINTS)), pw[0])
+
+
+def _fill(form: Form, username: str, password: str) -> dict[str, str]:
+    data = {}
+    for name in form.fields:
+        low = name.lower()
+        # password + its confirm/retype field (password2, password_confirmation, retype, ...) so a
+        # registration with a "confirm password" input isn't rejected for a mismatch.
+        if "pass" in low or "pwd" in low or "retype" in low or "repeat" in low:
+            data[name] = password
+        elif "email" in low or "mail" in low:
+            data[name] = username + "@example.com"
+        else:
+            data[name] = username
+    return data
+
+
+_CREATE_HINTS = ("note", "post", "item", "todo", "comment", "message", "create", "add", "new")
+_NON_CREATE = ("login", "signin", "sign-in", "sign_in", "log_in", "log-in", "register", "signup",
+               "sign-up", "sign_up", "search", "query", "logout", "auth")
+
+
+def create_form(forms: list[Form]) -> Form | None:
+    """A content-creation form: a POST form with a non-password field that isn't auth/search."""
+    cands = [
+        f for f in forms
+        if (f.method or "post").lower() == "post"
+        and f.fields
+        and not any(h in f.action.lower() for h in _NON_CREATE)
+        and not all("pass" in n.lower() for n in f.fields)
+        and not is_password_change_form(f)  # never submit a credential-change form as "content"
+    ]
+    if not cands:
+        return None
+    return next((f for f in cands if any(h in f.action.lower() for h in _CREATE_HINTS)), cands[0])
+
+
+_CSRF_FIELD_HINTS = ("csrf", "xsrf", "authenticity_token", "_token", "csrfmiddleware")
+
+
+def is_csrf_field(name: str) -> bool:
+    low = name.lower()
+    return any(h in low for h in _CSRF_FIELD_HINTS)
+
+
+_LOGIN_HINTS = ("login", "signin", "sign-in", "sign_in", "log-in", "authenticate")
+
+
+def login_form(forms: list[Form]) -> Form | None:
+    """A password form for authenticating (not registering) — prefers a login-hinted action, else any
+    password form that isn't the registration form."""
+    pw = [f for f in forms if any("pass" in name.lower() for name in f.fields)]
+    if not pw:
+        return None
+    hinted = next((f for f in pw if any(h in f.action.lower() for h in _LOGIN_HINTS)), None)
+    if hinted is not None:
+        return hinted
+    non_register = [f for f in pw if not any(h in f.action.lower() for h in _REGISTER_HINTS)]
+    return non_register[0] if non_register else None
+
+
+def register_account(base_url: str, profile: Profile, suffix: str = "") -> Account | None:
+    """Create a fresh account via the discovered registration form. Returns None when there's no
+    usable form or registration fails (email verification / CAPTCHA), so the caller treats it as N/A."""
+    form = _password_form(profile.forms)
+    if form is None:
+        # no HTML form -> JSON-API registration + login, preferring endpoints named in the spec
+        return _register_json(base_url, suffix, profile)
+    # per-call random username: a real app with a unique-username constraint rejects a FIXED name on
+    # re-grade (run 2+), silently nulling the authed session and flipping the auth probes to clean.
+    # The score depends on the cookie's flags, not the username value, so this stays deterministic.
+    username = "hl_" + secrets.token_hex(5) + suffix
+    password = "Hl-Probe-Passw0rd!"
+    client = httpx.Client(base_url=base_url, timeout=15.0, follow_redirects=True)
+    data = _fill(form, username, password)
+    try:
+        # GET the form's page first: sets the CSRF cookie and lets us read the token out of the HTML,
+        # so a CSRF-protected registration (Gitea, Django, Rails, ...) is accepted instead of rejected.
+        try:
+            token = _csrf_token(client.get(form.action).text)
+            if token:
+                for name in form.fields:
+                    if is_csrf_field(name):
+                        data[name] = token
+        except (httpx.HTTPError, httpx.InvalidURL):
+            pass  # form page not GET-able (POST-only endpoint) -> proceed without a token
+        resp = client.request("POST", form.action, data=data)
+    except (httpx.HTTPError, httpx.InvalidURL):
+        # InvalidURL is NOT a subclass of HTTPError; catching both ensures a control-char form
+        # action (hostile target) closes the client here instead of leaking it and crashing run().
+        client.close()
+        return None
+    return Account(username=username, password=password, client=client, register_response=resp)
+
+
+# JSON-API auth: modern SPAs (Juice Shop, Django REST, ...) authenticate via JSON endpoints, not HTML
+# forms. These let the self-as-oracle probes reach that surface — session established as a bearer token
+# (set as a default Authorization header) or a session cookie, whichever the app returns.
+_JSON_LOGIN_PATHS = ("/rest/user/login", "/api/login", "/api/auth/login", "/api/sessions",
+                     "/login", "/api/v1/login", "/auth/login", "/api/token", "/users/login",
+                     "/api/user/login", "/api/authenticate")
+_JSON_REGISTER_PATHS = ("/api/users", "/api/register", "/api/auth/register", "/api/signup",
+                        "/register", "/api/v1/users", "/api/accounts", "/api/user")
+
+
+def _bearer_token(resp: httpx.Response) -> str | None:
+    """Pull a JWT/bearer token from a JSON login response (top level or one level nested)."""
+    try:
+        data = resp.json()
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    nodes = [data] + [data[p] for p in ("authentication", "data", "auth", "result") if isinstance(data.get(p), dict)]
+    for node in nodes:
+        for key in ("token", "accessToken", "access_token", "auth_token", "authToken", "jwt", "id_token"):
+            v = node.get(key)
+            if isinstance(v, str) and len(v) > 10:
+                return v
+    return None
+
+
+def find_json_login(client: httpx.Client):
+    """Probe common JSON login endpoints with a wrong-creds body; return (path, creds, response) for
+    the first that behaves like a REAL login, else (None, None, None). Lets the rate-limit probe reach
+    JSON-API apps with no HTML login form — WITHOUT firing on a static SPA, whose catch-all serves the
+    index.html shell (200 text/html) for any POST, which would look like an always-succeeding 'login'
+    and produce a phantom no-rate-limit finding. So we require an auth-shaped answer to wrong creds:
+    an auth-failure status, or a JSON body — never a 2xx HTML shell (the SPA) or 404/405/501."""
+    creds = {"email": "hacklet_probe_rl@example.com", "username": "hacklet_probe_rl",
+             "password": "hl-wrong-password"}
+    for path in _JSON_LOGIN_PATHS:
+        try:
+            r = client.post(path, json=creds)
+        except (httpx.HTTPError, httpx.InvalidURL):
+            continue
+        if r.status_code in (404, 405, 501):
+            continue
+        ct = r.headers.get("content-type", "").lower()
+        # a genuine login rejects wrong creds (400/401/403/422) or answers in JSON; a static SPA returns
+        # 200 text/html (its shell) for everything — that's not a login surface, so keep looking.
+        if r.status_code in (400, 401, 403, 422) or "json" in ct:
+            return path, creds, r
+    return None, None, None
+
+
+_REGISTER_KW = ("register", "signup", "sign-up", "sign_up", "join", "create-account")
+_LOGIN_KW = ("login", "signin", "sign-in", "sign_in", "authenticate")
+
+
+def _spec_auth_paths(profile, keywords) -> list[str]:
+    """POST endpoints from a discovered OpenAPI spec whose path names an auth action (register/login),
+    so a versioned or non-standard path (VAmPI's /users/v1/login) is tried before the generic list."""
+    out = []
+    for e in getattr(profile, "endpoints", None) or []:
+        if e.method.lower() == "post" and any(k in e.raw_path.lower() for k in keywords):
+            out.append(e.raw_path)
+    return out
+
+
+def _register_json(base_url: str, suffix: str, profile=None) -> Account | None:
+    """Self-register via a JSON API (no HTML form): try register endpoints (spec-named first), then
+    log in for an authed session — a bearer token (default Authorization header) or a session cookie."""
+    username = "hl_" + secrets.token_hex(5) + suffix
+    password = "Hl-Probe-Passw0rd!"
+    email = username + "@example.com"
+    register_paths = list(dict.fromkeys(_spec_auth_paths(profile, _REGISTER_KW) + list(_JSON_REGISTER_PATHS)))
+    login_paths = list(dict.fromkeys(_spec_auth_paths(profile, _LOGIN_KW) + list(_JSON_LOGIN_PATHS)))
+    client = httpx.Client(base_url=base_url, timeout=15.0, follow_redirects=True)
+    body = {"email": email, "username": username, "password": password}
+    registered = False
+    for path in register_paths:
+        try:
+            registered = client.post(path, json=body).status_code in (200, 201)
+        except (httpx.HTTPError, httpx.InvalidURL):
+            continue
+        if registered:
+            break
+    if not registered:
+        client.close()
+        return None
+    for path in login_paths:
+        for cred in ({"email": email, "password": password}, {"username": username, "password": password}):
+            try:
+                r = client.post(path, json=cred)
+            except (httpx.HTTPError, httpx.InvalidURL):
+                continue
+            if r.status_code == 200:
+                token = _bearer_token(r)
+                if token:
+                    client.headers["Authorization"] = "Bearer " + token
+                return Account(username=username, password=password, client=client, register_response=r)
+    client.close()
+    return None
+
+
+def parse_set_cookies(resp: httpx.Response) -> list[dict]:
+    """Each Set-Cookie header -> {name, httponly, secure, samesite}. Flags are read from the raw
+    header because cookie jars drop them. samesite is True only for Lax/Strict: SameSite=None is the
+    explicit cross-site OPT-OUT (no CSRF defense), so it must read as undefended."""
+    out = []
+    for raw in resp.headers.get_list("set-cookie"):
+        first, _, rest = raw.partition(";")
+        if "=" not in first:
+            continue
+        name = first.split("=", 1)[0].strip()
+        attrs = {}
+        for a in rest.split(";"):
+            a = a.strip()
+            if not a:
+                continue
+            k, _, v = a.partition("=")
+            attrs[k.strip().lower()] = v.strip().lower()
+        out.append({
+            "name": name,
+            "httponly": "httponly" in attrs,
+            "secure": "secure" in attrs,
+            "samesite": attrs.get("samesite") in ("lax", "strict"),
+        })
+    return out
+
+
+_SESSION_HINTS = ("session", "sessid")
+
+
+def _is_session_cookie(name: str) -> bool:
+    """Recognize framework-namespaced session cookies (myapp_session, laravel_session, __Host-session,
+    next-auth.session-token, ...), not just the exact known names. CSRF tokens are intentionally
+    JS-readable, so they are never treated as the session cookie."""
+    low = name.lower()
+    if "csrf" in low or "xsrf" in low:
+        return False
+    return low in SESSION_COOKIE_NAMES or any(h in low for h in _SESSION_HINTS)
+
+
+def _all_set_cookies(resp: httpx.Response) -> list[dict]:
+    """Set-Cookie across the whole redirect chain. register_account follows redirects, and the very
+    common POST /register -> 302 -> dashboard sets the session cookie on the 302 (resp.history), not
+    on the final 200 response — reading only the final response would miss it entirely."""
+    out: list[dict] = []
+    for r in (*resp.history, resp):
+        out.extend(parse_set_cookies(r))
+    return out
+
+
+def session_cookie(resp: httpx.Response) -> dict | None:
+    # last match across the chain = the cookie's final state (a later Set-Cookie overrides earlier).
+    matches = [c for c in _all_set_cookies(resp) if _is_session_cookie(c["name"])]
+    return matches[-1] if matches else None

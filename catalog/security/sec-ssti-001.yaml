@@ -1,0 +1,13 @@
+id: sec-ssti-001
+bundle: security
+category: template-injection
+pool: public
+evidence_model: provable
+penalty: 40   # server-side template injection -> code execution (RCE), top-tier severity
+applicability:
+  requires: [any_endpoint_accepts_text_input]
+probe:
+  # <marker>{{7*7}} / ${7*7} / <%= 7*7 %> / {7*7} / @(7*7) ... ; fires on the evaluated "<marker>49"
+  # (a template engine computed it) -- reflecting the literal can't produce that. One finding.
+  predicate: ssti_injectable
+  max_attempts: 150

@@ -1,0 +1,14 @@
+id: perf-weight-001
+bundle: performance
+category: page-weight
+variant_group_id: perf-weight
+pool: public
+evidence_model: provable
+penalty: 12   # standardized-profile page weight (>2MB) -> heavy load for every visitor.
+              # Grouped w/ perf-weight-002 (the worse tier fires once).
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  predicate: perf_page_weight
+  tier: profile
+  target: /

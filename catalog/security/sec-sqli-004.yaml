@@ -1,0 +1,12 @@
+id: sec-sqli-004
+bundle: security
+category: sql-injection
+pool: public
+evidence_model: provable
+penalty: 40   # error-based SQLi in an API parameter -> data exfiltration / auth bypass
+applicability:
+  # the OpenAPI-discovered API surface counts as text input, so this applies to a form-less JSON API
+  requires: [any_endpoint_accepts_text_input]
+probe:
+  predicate: api_sqli
+  max_attempts: 150   # injectable slots to test (declared + common-param guesses) before stopping

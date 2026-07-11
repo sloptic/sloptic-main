@@ -1,0 +1,10 @@
+id: sec-redirect-001
+bundle: security
+category: open-redirect
+pool: public
+evidence_model: oracle
+penalty: 20
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  predicate: open_redirect   # discovered routes + common redirect endpoints, common redirect params

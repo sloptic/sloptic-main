@@ -1,0 +1,13 @@
+id: perf-ttfb-001
+bundle: performance
+category: speed
+pool: public
+evidence_model: provable
+penalty: 12   # slow TTFB (>1.0s) -> every request waits; the slow-server tax on all traffic.
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  method: GET
+  target: /heavy
+slop_if:
+  - ttfb_at_least: 1.0

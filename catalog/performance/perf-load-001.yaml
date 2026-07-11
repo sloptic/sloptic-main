@@ -1,0 +1,12 @@
+id: perf-load-001
+bundle: performance
+category: load-resilience
+pool: public
+evidence_model: oracle
+penalty: 28   # 5xx under a modest concurrent burst -> every user during a traffic spike
+              # hits the failure. High-frequency outage under exactly the load that matters.
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  predicate: load_resilience
+  target: /report

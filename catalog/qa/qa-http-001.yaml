@@ -1,0 +1,13 @@
+id: qa-http-001
+bundle: qa
+category: http-correctness
+pool: public
+evidence_model: provable
+penalty: 12   # soft-404: caches, crawlers and monitors treat phantom content as real ->
+              # recurring, moderate severity (corrupts SEO + observability).
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  # request a guaranteed-nonexistent typed static asset (/hlnope<rand>.js/.css/.png); a 2xx = soft-404.
+  # typed-asset path keeps it SPA-safe (the standard /route->200 index rewrite is intended, not flagged)
+  predicate: http_soft_404

@@ -1,0 +1,14 @@
+id: perf-ttfb-003
+bundle: performance
+category: speed
+variant_group_id: perf-ttfb
+pool: public
+evidence_model: provable
+penalty: 26   # ABSOLUTE ceiling (>3s to first byte) -> pathologically slow for every
+              # visitor on any hardware. Anchors the perf-ttfb group.
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  predicate: perf_ttfb
+  tier: ceiling
+  target: /

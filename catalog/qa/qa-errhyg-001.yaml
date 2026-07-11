@@ -1,0 +1,14 @@
+id: qa-errhyg-001
+bundle: qa
+category: error-hygiene
+pool: public
+evidence_model: provable
+penalty: 14   # a leaked stack trace fires only on error paths (lower frequency) and is a
+              # moderate info-leak -> priced modestly, below the every-user qa failures.
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  method: GET
+  target: /crash
+slop_if:
+  - response_leaks_stack_trace

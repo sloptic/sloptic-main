@@ -1,0 +1,10 @@
+id: sec-csrf-001
+bundle: security
+category: csrf
+pool: public
+evidence_model: oracle
+penalty: 25   # no CSRF defense (no token, no SameSite) — near-universal in vibe-coded apps
+applicability:
+  requires: [any_form_has_password]
+probe:
+  predicate: csrf_missing

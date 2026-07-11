@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Hidden-pool probes must NEVER be committed to this PUBLIC repo. The real boundary is a
+# separate PRIVATE fuzz-catalog repo (see FUZZ_RUNNER_SPEC.md); this is only a backstop.
+**/hidden/
+catalog-hidden/
+
+# Run artifacts — batch output (append-only parity/results logs) and scratch. These are DATA,
+# not source; regenerate them by running a batch. Keep them out of git so they never become a commit.
+*.jsonl
+terminal output*.md
+.raw-commitlog.tmp

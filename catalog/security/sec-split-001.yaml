@@ -1,0 +1,12 @@
+id: sec-split-001
+bundle: security
+category: response-splitting
+pool: public
+evidence_model: provable
+penalty: 20   # CRLF into a response header = header injection / response splitting (cache poisoning, XSS)
+applicability:
+  requires: [any_endpoint_accepts_text_input]
+probe:
+  # inject CRLF + a marker header into each field; fire if it comes back as a real response header.
+  # modern servers reject CRLF in headers, so a well-built app reads clean (this guards the ones that don't)
+  predicate: http_response_splitting

@@ -1,0 +1,15 @@
+id: perf-cache-001
+bundle: performance
+category: caching
+pool: public
+evidence_model: provable
+penalty: 16   # an uncacheable static asset is refetched on every page load -> bandwidth
+              # + latency on every repeat visit across the whole user base.
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  # fan across same-origin static assets (JS/CSS/image/font); fire on the first that is uncacheable:
+  # no validator/freshness, Cache-Control: no-store, or a validator the server won't honor with a 304
+  predicate: caching_ineffective
+  target: /
+  max_attempts: 20

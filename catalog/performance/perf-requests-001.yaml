@@ -1,0 +1,12 @@
+id: perf-requests-001
+bundle: performance
+category: request-count
+pool: public
+evidence_model: provable
+penalty: 10   # >50 round trips to render the homepage -> slower every load, and much
+              # worse on high-latency mobile connections.
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  predicate: perf_request_count
+  target: /

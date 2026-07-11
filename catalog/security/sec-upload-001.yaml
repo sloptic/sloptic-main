@@ -1,0 +1,12 @@
+id: sec-upload-001
+bundle: security
+category: file-upload
+pool: public
+evidence_model: provable
+penalty: 40   # a webshell that executes server-side is remote code execution
+applicability:
+  requires: [any_endpoint_accepts_text_input]
+probe:
+  # a PHP webshell in bypass shapes (bad ext / content-type spoof / double-ext / null-byte / magic-byte),
+  # located and fetched; fires only when it EXECUTES (arithmetic marker), not merely stored. One finding.
+  predicate: file_upload

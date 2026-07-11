@@ -1,0 +1,14 @@
+id: sec-cors-001
+bundle: security
+category: cors
+pool: public
+evidence_model: provable
+penalty: 25
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  target: /   # CORS is usually a global/middleware setting -> check once on the homepage
+  headers:
+    origin: https://hacklet-cors-probe.example   # a foreign origin; slop if reflected + credentialed
+slop_if:
+  - response_cors_misconfigured

@@ -1,0 +1,11 @@
+id: qa-race-001
+bundle: qa
+category: race-condition
+pool: public
+evidence_model: oracle
+penalty: 30   # data corruption / oversell / lost updates under concurrency -> high severity;
+              # frequency gated by concurrent load, so just under the crash/data-loss tier.
+applicability:
+  requires: [any_form_has_password]
+probe:
+  predicate: race_resource_ids

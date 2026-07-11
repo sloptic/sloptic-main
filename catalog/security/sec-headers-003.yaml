@@ -1,0 +1,12 @@
+id: sec-headers-003
+bundle: security
+category: security-headers
+pool: public
+evidence_model: provable
+penalty: 5
+applicability:
+  requires: [served_over_https]   # HSTS is meaningless over plain HTTP -> N/A unless the target is HTTPS
+probe:
+  target: /
+slop_if:
+  - response_missing_header: strict-transport-security

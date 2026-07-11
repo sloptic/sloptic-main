@@ -1,0 +1,14 @@
+id: sec-exposure-005
+bundle: security
+category: data-exposure
+variant_group_id: credential-exposure   # "this app returns credentials" = one finding, however many routes
+pool: public
+evidence_model: provable
+penalty: 35   # returning password material to a client is top-tier excessive-data-exposure (OWASP API3)
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  target: routes   # scan every discovered route/endpoint (incl. spec-derived) for leaked credentials
+  na_if_absent: true
+slop_if:
+  - response_leaks_credentials

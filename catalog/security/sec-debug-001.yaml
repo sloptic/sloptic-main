@@ -1,0 +1,11 @@
+id: sec-debug-001
+bundle: security
+category: debug-mode
+pool: public
+evidence_model: oracle
+penalty: 20   # debug UI in prod leaks source/settings/env; a Werkzeug console is an RCE surface
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  predicate: debug_mode_enabled
+  target: /crash   # the deliberate error route (references); the probe also checks for a live Werkzeug debugger

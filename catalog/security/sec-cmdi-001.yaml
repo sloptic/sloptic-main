@@ -1,0 +1,13 @@
+id: sec-cmdi-001
+bundle: security
+category: command-injection
+pool: public
+evidence_model: provable
+penalty: 40   # OS command injection -> remote code execution, top-tier severity
+applicability:
+  requires: [any_endpoint_accepts_text_input]
+probe:
+  # separators (; | || && newline) + command substitution ($(), backticks) + blind time-based;
+  # fires on the shell-evaluated arithmetic result (execution, not reflection). One finding.
+  predicate: command_injection
+  max_attempts: 120

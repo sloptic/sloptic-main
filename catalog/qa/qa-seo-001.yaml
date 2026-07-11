@@ -1,0 +1,14 @@
+id: qa-seo-001
+bundle: qa
+category: seo
+pool: public
+evidence_model: provable
+penalty: 12   # missing viewport/description hits ALL acquisition (very high frequency) but is
+              # growth-not-function -> survivable, so priced in the qa mid-band.
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  # presence check: fire if the homepage lacks <meta name=viewport> or <meta name=description>.
+  # canonical is deliberately NOT checked (correctly absent on single-URL pages -> would false-positive)
+  predicate: seo_meta_missing
+  target: /

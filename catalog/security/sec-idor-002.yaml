@@ -1,0 +1,11 @@
+id: sec-idor-002
+bundle: security
+category: access-control
+pool: public
+evidence_model: oracle
+penalty: 40   # BOLA / horizontal IDOR on an API object — OWASP API-Security #1
+applicability:
+  # the predicate self-decides: N/A unless there's a create+read API pair and two accounts register
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  predicate: api_bola

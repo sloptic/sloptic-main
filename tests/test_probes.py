@@ -1,0 +1,74 @@
+"""Detection-primitive unit tests. Focus: precision of the content matchers — they must catch real
+problems and must NOT flag benign content (a false positive wrongly penalizes).
+"""
+import httpx
+
+from hacklet_runner.probes import (
+    _csrf_candidates,
+    response_has_header,
+    response_is_dotenv,
+    response_is_git_config,
+    response_is_git_head,
+    response_leaks_secret,
+    response_missing_header,
+)
+from hacklet_runner.schema import Form, Profile
+
+
+def _resp(status, headers=None):
+    return httpx.Response(status, headers=headers or {}, request=httpx.Request("GET", "http://t/"))
+
+
+def test_header_policy_matchers_ignore_server_errors():
+    # a missing/leaked header on a 200 is a real config finding; on a 500 (env-var-dead endpoint's error
+    # page) it isn't the app's policy — counting it manufactures findings from a broken endpoint
+    assert response_missing_header(_resp(200, {}), "x-content-type-options") is True
+    assert response_missing_header(_resp(500, {}), "x-content-type-options") is False
+    assert response_missing_header(_resp(404, {}), "x-content-type-options") is True   # 4xx is still real
+    assert response_has_header(_resp(200, {"x-powered-by": "Express"}), "x-powered-by") is True
+    assert response_has_header(_resp(503, {"x-powered-by": "Express"}), "x-powered-by") is False
+
+
+def test_csrf_candidates_exclude_password_change_forms():
+    # a password-change form must never be a CSRF target — submitting it resets the grader's own session
+    prof = Profile(base_url="http://x", forms=[
+        Form(action="/vulnerabilities/csrf/", method="get", fields=["password_new", "password_conf", "Change"]),
+        Form(action="/guestbook", method="post", fields=["name", "message"]),   # a safe state-changer
+    ])
+    actions = [f.action for f in _csrf_candidates(prof)]
+    assert "/guestbook" in actions and "/vulnerabilities/csrf/" not in actions
+
+
+class _Resp:
+    def __init__(self, text: str, status: int = 200):
+        self.text = text
+        self.status_code = status
+
+
+def test_detects_real_secrets():
+    assert response_leaks_secret(_Resp("AKIAIOSFODNN7EXAMPLE"))                 # AWS key id
+    assert response_leaks_secret(_Resp('k="sk_live_abcdef0123456789ABCDEF"'))   # Stripe live secret
+    assert response_leaks_secret(_Resp("ghp_" + "a" * 36))                      # GitHub PAT
+    assert response_leaks_secret(_Resp("-----BEGIN PRIVATE KEY-----\nMIIE..."))  # private key block
+
+
+def test_ignores_public_by_design():
+    # Firebase web apiKey, Stripe publishable key, and plain JS are NOT secrets.
+    assert not response_leaks_secret(_Resp('apiKey: "AIzaSyD-EXAMPLE_firebase_public_key_x12345"'))
+    assert not response_leaks_secret(_Resp("pk_live_publishablekey1234567890"))
+    assert not response_leaks_secret(_Resp('const config = { api: "/api" };'))
+
+
+def test_detects_exposed_files():
+    assert response_is_dotenv(_Resp("DATABASE_URL=postgres://x\nSECRET_KEY=abc"))
+    assert response_is_dotenv(_Resp("export GITHUB_TOKEN=ghp_xyz\n"))   # export prefix + TOKEN key
+    assert response_is_dotenv(_Resp("  STRIPE_KEY=sk_live_xyz\n"))      # indented + bare *_KEY
+    assert response_is_git_config(_Resp("[core]\n\trepositoryformatversion = 0\n"))
+    assert response_is_git_head(_Resp("ref: refs/heads/main\n"))        # symbolic ref
+    assert response_is_git_head(_Resp("a" * 40 + "\n"))                 # detached HEAD (raw SHA)
+
+
+def test_exposure_needs_200_and_signature():
+    assert not response_is_dotenv(_Resp("DATABASE_URL=x", status=404))   # not actually served
+    assert not response_is_dotenv(_Resp("<html><body>hi</body></html>"))  # 200 but not a .env
+    assert not response_is_git_head(_Resp("<html>not found</html>"))     # 200, wrong content

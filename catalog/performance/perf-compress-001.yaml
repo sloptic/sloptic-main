@@ -1,0 +1,13 @@
+id: perf-compress-001
+bundle: performance
+category: compression
+pool: public
+evidence_model: provable
+penalty: 12   # sizeable text served uncompressed -> a heavier, slower load every time,
+              # worse on mobile. Perf is the highest-frequency harm axis.
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  target: /   # the homepage HTML — the representative sizeable text response
+slop_if:
+  - response_uncompressed: 512   # >512 bytes of text with no Content-Encoding -> should be gzipped

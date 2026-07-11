@@ -1,0 +1,12 @@
+id: sec-sqli-005
+bundle: security
+category: sql-injection
+variant_group_id: sqli-auth-bypass
+pool: public
+evidence_model: oracle
+penalty: 40
+applicability:
+  requires: [any_endpoint_accepts_text_input]
+probe:
+  predicate: sqli_auth_bypass
+  payload: "' OR '1'='1"

@@ -1,0 +1,10 @@
+id: sec-xxe-001
+bundle: security
+category: xxe
+pool: public
+evidence_model: provable
+penalty: 40   # XML external entity -> file read / SSRF / RCE
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  predicate: xxe   # POST an external-entity XML to POST endpoints; fire on the out-of-band callback

@@ -1,0 +1,12 @@
+id: sec-hosthdr-001
+bundle: security
+category: host-header
+pool: public
+evidence_model: provable
+penalty: 15   # a trusted Host/X-Forwarded-Host -> web-cache poisoning + password-reset-link poisoning
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  # inject a unique marker host via Host / X-Forwarded-Host across the homepage + likely reset/link
+  # routes; fire if it reflects into a redirect Location or the body
+  predicate: host_header_injection

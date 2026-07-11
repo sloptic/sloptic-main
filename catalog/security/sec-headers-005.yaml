@@ -1,0 +1,12 @@
+id: sec-headers-005
+bundle: security
+category: security-headers
+pool: public
+evidence_model: provable
+penalty: 2
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  target: /   # Referrer-Policy is a global response header -> check once on the homepage
+slop_if:
+  - response_missing_header: referrer-policy

@@ -1,0 +1,14 @@
+id: perf-weight-002
+bundle: performance
+category: page-weight
+variant_group_id: perf-weight
+pool: public
+evidence_model: provable
+penalty: 22   # ABSOLUTE ceiling (>10MB page) -> punishing on mobile/metered for every
+              # visitor. Anchors the perf-weight group.
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  predicate: perf_page_weight
+  tier: ceiling
+  target: /

@@ -1,0 +1,10 @@
+id: sec-ssrf-001
+bundle: security
+category: ssrf
+pool: public
+evidence_model: provable
+penalty: 35   # server-side request forgery -> internal network access / cloud-metadata theft
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  predicate: ssrf   # inject a collaborator URL into url-ish params; fire on the out-of-band callback

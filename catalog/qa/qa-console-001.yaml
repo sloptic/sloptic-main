@@ -1,0 +1,12 @@
+id: qa-console-001
+bundle: qa
+category: console-errors
+pool: public
+evidence_model: oracle
+penalty: 22   # an uncaught JS error on load breaks interactivity for every visitor ->
+              # high-frequency functional failure of a client-rendered app.
+applicability:
+  requires: [browser]   # needs a rendered page; N/A without --browser
+probe:
+  predicate: console_errors_present
+  target: /   # the homepage — a page that throws on load is broken regardless of intent

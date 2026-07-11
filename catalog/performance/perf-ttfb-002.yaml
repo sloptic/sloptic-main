@@ -1,0 +1,14 @@
+id: perf-ttfb-002
+bundle: performance
+category: speed
+variant_group_id: perf-ttfb        # profile + ceiling tiers are one flaw -> the worse tier fires once
+pool: public
+evidence_model: provable
+penalty: 14   # standardized-profile TTFB (>800ms backend on 1 vCPU) -> a slow-server tax
+              # on every request. Grouped w/ perf-ttfb-003 (the worse tier fires once).
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  predicate: perf_ttfb
+  tier: profile
+  target: /

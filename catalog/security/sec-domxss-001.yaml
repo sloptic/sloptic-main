@@ -1,0 +1,10 @@
+id: sec-domxss-001
+bundle: security
+category: dom-xss
+pool: public
+evidence_model: oracle
+penalty: 30   # XSS that executes in the DOM — the variant a source-only check can't see
+applicability:
+  requires: [browser]
+probe:
+  predicate: dom_xss

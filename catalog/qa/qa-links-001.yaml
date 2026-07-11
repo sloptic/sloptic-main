@@ -1,0 +1,15 @@
+id: qa-links-001
+bundle: qa
+category: broken-links
+pool: public
+evidence_model: provable
+penalty: 24   # a dead internal link breaks the journey for every user who clicks it ->
+              # near-existential navigation failure (the site can't be used as intended).
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  # fetch each same-origin <a href> on the homepage; fire on the first that lands on a 4xx.
+  # redirects are followed (a redirect that resolves is not broken); 5xx is left to crash-resistance
+  predicate: broken_links
+  target: /
+  max_attempts: 40

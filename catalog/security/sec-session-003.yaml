@@ -1,0 +1,11 @@
+id: sec-session-003
+bundle: security
+category: session
+pool: public
+evidence_model: oracle
+penalty: 15   # a session cookie without Secure can transit in cleartext (HTTP downgrade / interception)
+applicability:
+  requires: [any_form_has_password]
+probe:
+  predicate: session_cookie_missing_flag
+  flag: secure

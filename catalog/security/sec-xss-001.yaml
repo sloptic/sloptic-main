@@ -1,0 +1,14 @@
+id: sec-xss-001
+bundle: security
+category: xss
+pool: public
+evidence_model: provable
+penalty: 30
+applicability:
+  requires: [any_endpoint_accepts_text_input]
+probe:
+  # comprehensive reflected+stored XSS: each field gets every payload shape (script / img / svg /
+  # javascript-URI / attribute-breakout / script-breakout / case-varied); fires once on unescaped
+  # reflection of a unique marker. dom_xss (sec-domxss-001) covers execution in a rendered DOM.
+  predicate: xss_injectable
+  max_attempts: 150
