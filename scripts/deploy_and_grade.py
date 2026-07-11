@@ -813,19 +813,6 @@ def main():
             findings.append(f)
         result.update(slop_score=report.slop_score, axis_slop=report.axis_slop,
                       observed_surface=report.surface, coverage=report.coverage, findings=findings)
-        if args.audit_coverage:   # LLM coverage critic — note surface discovery missed (best-effort, never fatal)
-            with contextlib.suppress(Exception):
-                routes = ["/"] + [r for r in (report.surface.get("routes") or []) if isinstance(r, str)][:3]
-                doms = browser.render_routes(url, routes, interact=False) if args.browser else {}
-                skeleton = "\n\n".join(_surface_skeleton(d) for d in doms.values() if d)
-                audit = audit_coverage(skeleton, report.surface, result.get("features"), model=args.model)
-                if audit:
-                    result["coverage_audit"] = audit
-                    miss, ps = audit.get("missed") or [], audit.get("page_state")
-                    if miss or ps not in (None, "working"):
-                        print(f"  COVERAGE AUDIT: page={ps}  missed={len(miss)}"
-                              + ("  → " + ", ".join(f"{m.get('kind')}:{(m.get('label') or '')[:18]}"
-                                                    for m in miss[:4]) if miss else ""))
         print(f"\n  SLOP SCORE: {report.slop_score}   ({_axis_str(report.axis_slop)})")
         cov = report.coverage
         if cov.get("probes_total"):   # test coverage: how much of the battery applied vs went n/a (calibration)
@@ -855,6 +842,33 @@ def main():
                 trig = _trigger_str(o.evidence)          # show WHAT triggered it (payload/injection/field)
                 if trig:
                     print(f"        {'':22}↳ {trig}")
+        if args.audit_coverage:   # LLM coverage CRITIC — read the live page, ALWAYS print + record what
+            audit, why = None, ""  # discovery missed (like the deploy notes). Best-effort: never breaks a grade.
+            try:
+                # observed_surface carries route COUNTS, not the list, so audit the ENTRY page (interact ON
+                # so a click-gated login/upload on the landing lands in the skeleton the LLM reasons over).
+                doms = browser.render_routes(url, ["/"], interact=True) if args.browser else {}
+                skeleton = "\n\n".join(_surface_skeleton(d) for d in doms.values() if d)
+                if not skeleton:
+                    why = "no rendered page surface (browser off or render empty)"
+                else:
+                    audit = audit_coverage(skeleton, report.surface, result.get("features"), model=args.model)
+                    if audit is None:
+                        why = "LLM returned nothing (missing OPENROUTER_API_KEY or an API error)"
+            except Exception as e:
+                why = f"{type(e).__name__}: {e}"
+            if audit:
+                result["coverage_audit"] = audit
+                miss = audit.get("missed") or []
+                print(f"\n  LLM COVERAGE AUDIT — verdict: {audit.get('page_state') or '?'}   "
+                      + (f"{len(miss)} missed surface" if miss else "no gaps (discovery covered the page)"))
+                for m in miss:
+                    print(f"    ↳ MISSED {m.get('kind') or '?'}: {(m.get('label') or '').strip()}"
+                          + (f"  — {m.get('why').strip()}" if m.get('why') else ""))
+                for i, line in enumerate(textwrap.wrap((audit.get('notes') or '').strip(), width=100)[:4]):
+                    print(("    note: " if i == 0 else "          ") + line)
+            else:
+                print(f"\n  LLM COVERAGE AUDIT — skipped: {why}")
     except CloneError as e:   # clone failed/timed out BEFORE the deploy loop — record it, don't crash
         result["deploy_error"] = str(e)
         if "TIMEOUT" in str(e):
