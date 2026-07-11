@@ -9,7 +9,7 @@ import sys
 import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
-from run_batch import _done_repos, _hard_kill, _record_wedge  # noqa: E402
+from run_batch import _done_repos, _hard_kill, _load_urls, _record_wedge  # noqa: E402
 
 
 def test_done_repos_skips_graded_and_skipped_but_not_failed(tmp_path):
@@ -25,8 +25,33 @@ def test_done_repos_skips_graded_and_skipped_but_not_failed(tmp_path):
     assert _done_repos(str(f)) == {"gh/graded", "gh/skipped"}
 
 
+def test_done_repos_no_repeat_also_skips_failed(tmp_path):
+    # --no-repeat (include_failed): ANY prior record counts as done, so failed deploys aren't retried either
+    f = tmp_path / "r.jsonl"
+    f.write_text("\n".join(json.dumps(r) for r in [
+        {"repo": "gh/graded", "deployed": True, "slop_score": 40},
+        {"repo": "gh/build-failed", "deployed": False, "deploy_error": "BUILD FAILED:"},
+        {"repo": "gh/wedged", "deployed": False, "timeout": "wedge"},
+        {"nope": "no repo key -> ignored"},
+    ]))
+    assert _done_repos(str(f), include_failed=True) == {"gh/graded", "gh/build-failed", "gh/wedged"}
+
+
 def test_done_repos_empty_when_file_absent(tmp_path):
     assert _done_repos(str(tmp_path / "nope.jsonl")) == set()
+
+
+def test_load_urls_parses_url_project_winner_and_skips_comments(tmp_path):
+    f = tmp_path / "urls.txt"
+    f.write_text("# live apps with no gradeable repo\n"
+                 "https://cool.vercel.app\n"
+                 "\n"
+                 "https://api.example.railway.app , My API , winner\n")
+    recs = _load_urls(str(f), hackathon="hackharvard")
+    assert [r["repo"] for r in recs] == ["https://cool.vercel.app", "https://api.example.railway.app"]
+    assert recs[0]["project"] == "cool.vercel.app" and recs[0]["winner"] is False   # host fallback
+    assert recs[1]["project"] == "My API" and recs[1]["winner"] is True             # explicit project + winner
+    assert all(r["url_ingest"] and r["hackathon"] == "hackharvard" for r in recs)
 
 # a child that IGNORES SIGTERM (so only SIGKILL ends it) + spawns a 'chrome-like' descendant + CPU-spins
 _SPIN = (

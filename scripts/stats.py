@@ -114,9 +114,15 @@ def main():
         audit(recs, args.audit)
         return
 
-    deployed = [r for r in recs if r.get("deployed")]
-    graded = [r for r in deployed if "slop_score" in r]
-    ungraded = [r for r in deployed if "slop_score" not in r]   # came up but grading aborted (e.g. timeout)
+    # cohorts: REPO apps are cloned + deploy-tested from source (the reproducibility metric applies to
+    # them). URL-INGEST apps were already live and graded raw over HTTP(S) — NOT deployed by us, and graded
+    # with a different applicable-probe set (the HTTPS-only probes apply). Keep them distinct so neither the
+    # deploy-rate nor the score cohorts get silently conflated.
+    url_apps = [r for r in recs if r.get("url_ingest")]
+    repo_recs = [r for r in recs if not r.get("url_ingest")]
+    deployed = [r for r in repo_recs if r.get("deployed")]      # deploy-success is a REPO-only concept
+    graded = [r for r in recs if r.get("deployed") and "slop_score" in r]   # all graded (both cohorts)
+    ungraded = [r for r in deployed if "slop_score" not in r]   # repo app came up but grading aborted
     scores = [r["slop_score"] for r in graded]
     timed = [r for r in recs if r.get("timings")]               # per-phase wall-clock, as measurement
     _PHASES = [("clone_s", "clone"), ("plan_s", "plan(LLM)"), ("deploy_s", "deploy"),
@@ -126,8 +132,8 @@ def main():
         return [r["timings"][key] for r in timed if r["timings"].get(key)]
 
     # ---- (d) deploy-success rate (the hackathon-reproducibility finding) ----
-    skipped = [r for r in recs if r.get("skipped")]        # not a web app -> OUT OF SCOPE, not a failure
-    fails = [r for r in recs if not r.get("deployed") and not r.get("skipped")]
+    skipped = [r for r in repo_recs if r.get("skipped")]   # not a web app -> OUT OF SCOPE, not a failure
+    fails = [r for r in repo_recs if not r.get("deployed") and not r.get("skipped")]
     err_kinds = Counter((r.get("deploy_error") or "unknown")[:60] for r in fails)
     timeouts = Counter(r["timeout"] for r in recs if r.get("timeout"))   # 'took forever' — a signal itself
 
@@ -166,8 +172,9 @@ def main():
 
     if args.json:
         print(json.dumps({
-            "n_records": len(recs), "n_deployed": len(deployed), "n_graded": len(graded),
-            "deploy_rate": round(len(deployed) / len(recs), 3),
+            "n_records": len(recs), "n_repo": len(repo_recs), "n_url_ingest": len(url_apps),
+            "n_deployed": len(deployed), "n_graded": len(graded),
+            "deploy_rate": round(len(deployed) / ((len(repo_recs) - len(skipped)) or 1), 3),   # repo web apps
             "scores": {"avg": round(statistics.mean(scores), 1) if scores else None,
                        "median": round(statistics.median(scores), 1) if scores else None,
                        "stdev": round(sd, 1), "min": min(scores) if scores else None,
@@ -186,8 +193,8 @@ def main():
     print(f"\n═══ deploy_and_grade stats — {len(recs)} apps ═══")
 
     # (d)
-    print(f"\n(d) DEPLOY-SUCCESS RATE (hackathon reproducibility)")
-    n_try = len(recs) - len(skipped)   # rate is over web apps we actually tried, not out-of-scope skips
+    print(f"\n(d) DEPLOY-SUCCESS RATE (hackathon reproducibility — REPO apps only)")
+    n_try = len(repo_recs) - len(skipped)   # over REPO web apps we tried to deploy (not skips, not live URLs)
     print(f"    {len(deployed)}/{n_try} deployed  ({len(deployed)/(n_try or 1)*100:.0f}%)   "
           f"— {n_try - len(deployed)} failed to come up"
           + (f"   ({len(skipped)} skipped as non-web, excluded)" if skipped else ""))
@@ -204,10 +211,17 @@ def main():
     if timeouts:   # the 'took forever' signal — bloated build / broken grade / wedge
         print(f"    TOOK FOREVER (timeouts — a deployability/quality signal): "
               + ", ".join(f"{n}× {k}" for k, n in timeouts.most_common()))
+    if url_apps:   # graded directly from a live URL — never deploy-tested, so OUTSIDE the rate above
+        u_scored = [r for r in url_apps if "slop_score" in r]
+        print(f"    LIVE-URL COHORT: {len(url_apps)} app(s) graded directly (not deploy-tested) — "
+              f"{len(u_scored)} scored, {len(url_apps) - len(u_scored)} unreachable/ungraded")
 
     # (a)
-    print(f"\n(a) SLOP-SCORE DISTRIBUTION  (deployed+graded apps)")
+    print(f"\n(a) SLOP-SCORE DISTRIBUTION  (all graded apps)")
     print(f"    {_stat_line(scores)}")
+    if url_apps:   # don't conflate cohorts — live apps grade over HTTPS with a different applicable-probe set
+        print(f"      ├─ repo-deployed  {_stat_line([r['slop_score'] for r in graded if not r.get('url_ingest')])}")
+        print(f"      └─ live-URL       {_stat_line([r['slop_score'] for r in graded if r.get('url_ingest')])}")
     for line in _histogram(scores):
         print(line)
     print(f"\n    slop concentration by category (damped, summed across apps):")

@@ -501,7 +501,11 @@ def grade(url: str, use_browser: bool, timeout: int = 480, features=None):
 
 def main():
     ap = argparse.ArgumentParser(description="LLM-assisted deploy + fuzz-grade of a hackathon repo.")
-    ap.add_argument("repo", help="a git URL or a local path")
+    ap.add_argument("repo", help="a git URL, a local path, or (with --url) a live app URL")
+    ap.add_argument("--url", action="store_true", dest="url_ingest",
+                    help="treat the positional as a LIVE, already-deployed app URL: grade it directly over "
+                         "HTTP(S) with NO clone / LLM plan / Docker deploy (for Vercel/Railway/*.app "
+                         "submissions with no gradeable repo). Enables the HTTPS-only probes.")
     ap.add_argument("--model", default=DEFAULT_MODEL, help="OpenRouter model id (default: %(default)s)")
     ap.add_argument("--no-web-search", dest="web_search", action="store_false",
                     help="don't let the LLM web-search on retries (default: retries CAN search OpenRouter's "
@@ -542,62 +546,69 @@ def main():
     timings = {"clone_s": 0.0, "plan_s": 0.0, "deploy_s": 0.0, "grade_s": 0.0, "total_s": 0.0}
     t_app = time.monotonic()
     try:
-        _t = time.monotonic()
-        repo = clone(args.repo, timeout=args.clone_timeout)
-        timings["clone_s"] = round(time.monotonic() - _t, 1)
-        context = gather_context(repo)
-        for attempt in range(1, args.attempts + 1):
-            result["attempts_used"] = attempt
-            online = attempt >= 2 and args.web_search   # attempt 1 cheap/no-search; retries look up recent stacks
-            print(f"\n=== attempt {attempt}/{args.attempts}: planning deploy ({args.model}"
-                  f"{' + web search' if online else ''}) ===")
+        if args.url_ingest:   # a LIVE, already-deployed app -> skip clone/plan/deploy, grade the URL raw
+            url = args.repo
+            result.update(url_ingest=True, app_kind="web-app", web_gradeable=True,
+                          stack="live app (url-ingest)", stack_profile={"routing": "url-ingest"})
+            print(f"\n=== url-ingest: grading live app (no clone/plan/deploy) → {url} ===")
+        else:
             _t = time.monotonic()
-            plan = plan_deploy(context, args.model, error=error, prev=plan, online=online)
-            timings["plan_s"] += round(time.monotonic() - _t, 1)   # LLM planning, summed across attempts
-            _routing = (plan.get("stack_profile") or {}).get("routing", "?")
-            print(f"  stack: {plan.get('stack')} [{_routing}]  port: {plan.get('port')}  "
-                  f"db: {(plan.get('db') or {}).get('type')}")
-            notes = (plan.get("notes") or "").strip()
-            if notes:   # a few wrapped, hanging-indented lines (was one 200-char line cut mid-sentence)
-                for i, line in enumerate(textwrap.wrap(notes, width=100)[:6]):
-                    print(("  notes: " if i == 0 else "         ") + line)
-            if args.checkpoint and attempt == 1:   # persist the stack-ID BEFORE the risky deploy/grade, so
-                _ck = {}                            # a wedge-kill still yields a labelled record (deploy-parity)
-                _record_plan_meta(_ck, plan)
-                with contextlib.suppress(OSError):
-                    with open(args.checkpoint, "w") as _f:
-                        json.dump(_ck, _f)
-            if plan.get("web_gradeable") is False:   # not a runnable web service (mobile/CLI/notebook/...)
-                _record_plan_meta(result, plan)      # -> SKIP: no fabricated server, no meaningless score
-                result["skipped"] = True
-                result["skip_reason"] = f"not web-gradeable (app_kind={plan.get('app_kind') or '?'})"
-                print(f"\n  SKIP — {result['skip_reason']}; recorded, not graded (no fabricated deploy)")
-                return
-            _t = time.monotonic()
-            try:
-                url = execute(plan, repo, verbose=args.verbose, build_timeout=args.build_timeout)
-                timings["deploy_s"] += round(time.monotonic() - _t, 1)   # build + db + run + health
-                result.pop("deploy_error", None)   # a later attempt SUCCEEDED -> drop the earlier failure's
-                result.pop("timeout", None)        # error/timeout so a deployed app isn't tagged as failed
-                break
-            except DeployError as e:
-                timings["deploy_s"] += round(time.monotonic() - _t, 1)   # a failed attempt cost time too
-                error = str(e)
-                result["deploy_error"] = (error.strip().splitlines() or ["unknown"])[0][:200]
-                if "BUILD TIMEOUT" in result["deploy_error"]:
-                    result["timeout"] = "build"   # 'took forever to build' — a bloat/deployability signal
-                print(f"  deploy failed:\n{error[-800:]}")
-                _docker("rm", "-f", "-v", APP, DB)   # tear down this attempt's containers + volume
-        if plan:   # kind + stack + features + source-implied surface — recorded even on deploy FAILURE, so
-            _record_plan_meta(result, plan)          # the stack-distribution + parity ground-truth stay whole
-        if not url:
-            print("\nGAVE UP — could not deploy after all attempts.")
-            return   # result (deployed=False, deploy_error) is written in the finally
+            repo = clone(args.repo, timeout=args.clone_timeout)
+            timings["clone_s"] = round(time.monotonic() - _t, 1)
+            context = gather_context(repo)
+            for attempt in range(1, args.attempts + 1):
+                result["attempts_used"] = attempt
+                online = attempt >= 2 and args.web_search   # attempt 1 cheap/no-search; retries look up recent stacks
+                print(f"\n=== attempt {attempt}/{args.attempts}: planning deploy ({args.model}"
+                      f"{' + web search' if online else ''}) ===")
+                _t = time.monotonic()
+                plan = plan_deploy(context, args.model, error=error, prev=plan, online=online)
+                timings["plan_s"] += round(time.monotonic() - _t, 1)   # LLM planning, summed across attempts
+                _routing = (plan.get("stack_profile") or {}).get("routing", "?")
+                print(f"  stack: {plan.get('stack')} [{_routing}]  port: {plan.get('port')}  "
+                      f"db: {(plan.get('db') or {}).get('type')}")
+                notes = (plan.get("notes") or "").strip()
+                if notes:   # a few wrapped, hanging-indented lines (was one 200-char line cut mid-sentence)
+                    for i, line in enumerate(textwrap.wrap(notes, width=100)[:6]):
+                        print(("  notes: " if i == 0 else "         ") + line)
+                if args.checkpoint and attempt == 1:   # persist the stack-ID BEFORE the risky deploy/grade, so
+                    _ck = {}                            # a wedge-kill still yields a labelled record (deploy-parity)
+                    _record_plan_meta(_ck, plan)
+                    with contextlib.suppress(OSError):
+                        with open(args.checkpoint, "w") as _f:
+                            json.dump(_ck, _f)
+                if plan.get("web_gradeable") is False:   # not a runnable web service (mobile/CLI/notebook/...)
+                    _record_plan_meta(result, plan)      # -> SKIP: no fabricated server, no meaningless score
+                    result["skipped"] = True
+                    result["skip_reason"] = f"not web-gradeable (app_kind={plan.get('app_kind') or '?'})"
+                    print(f"\n  SKIP — {result['skip_reason']}; recorded, not graded (no fabricated deploy)")
+                    return
+                _t = time.monotonic()
+                try:
+                    url = execute(plan, repo, verbose=args.verbose, build_timeout=args.build_timeout)
+                    timings["deploy_s"] += round(time.monotonic() - _t, 1)   # build + db + run + health
+                    result.pop("deploy_error", None)   # a later attempt SUCCEEDED -> drop the earlier failure's
+                    result.pop("timeout", None)        # error/timeout so a deployed app isn't tagged as failed
+                    break
+                except DeployError as e:
+                    timings["deploy_s"] += round(time.monotonic() - _t, 1)   # a failed attempt cost time too
+                    error = str(e)
+                    result["deploy_error"] = (error.strip().splitlines() or ["unknown"])[0][:200]
+                    if "BUILD TIMEOUT" in result["deploy_error"]:
+                        result["timeout"] = "build"   # 'took forever to build' — a bloat/deployability signal
+                    print(f"  deploy failed:\n{error[-800:]}")
+                    _docker("rm", "-f", "-v", APP, DB)   # tear down this attempt's containers + volume
+            if plan:   # kind + stack + features + source-implied surface — recorded even on deploy FAILURE, so
+                _record_plan_meta(result, plan)          # the stack-distribution + parity ground-truth stay whole
+            if not url:
+                print("\nGAVE UP — could not deploy after all attempts.")
+                return   # result (deployed=False, deploy_error) is written in the finally
         result.update(deployed=True)
         print(f"\n=== grading {url} ===")
         _t = time.monotonic()
         try:
-            report = grade(url, args.browser, timeout=args.grade_timeout, features=plan.get("features"))
+            report = grade(url, args.browser, timeout=args.grade_timeout,
+                           features=(plan.get("features") if plan else None))   # url-ingest has no plan
         except GradeTimeout as e:
             timings["grade_s"] = round(time.monotonic() - _t, 1)
             result["grade_timeout"] = True         # deployed but ungradeable in budget (broken/pathological
@@ -672,11 +683,13 @@ def main():
             with open(args.record, "a") as f:
                 f.write(json.dumps(result) + "\n")
             print(f"  recorded -> {args.record}")
-        if args.keep:
+        if args.url_ingest:
+            pass                       # nothing was deployed — no containers/temp-clone to tear down
+        elif args.keep:
             print(f"\n(left running: docker rm -f {APP} {DB}; docker network rm {NET})")
         else:
             _teardown()
-        if str(repo).startswith(tempfile.gettempdir()):
+        if repo and str(repo).startswith(tempfile.gettempdir()):
             shutil.rmtree(repo.parent, ignore_errors=True)
 
 

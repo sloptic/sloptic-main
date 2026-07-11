@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from urllib.parse import urlparse
 
 _HERE = pathlib.Path(__file__).resolve().parent
 PY = [sys.executable]   # the uv-run venv interpreter (hacklet_runner importable)
@@ -41,10 +42,12 @@ def _cleanup_containers():
     subprocess.run(["docker", "rm", "-f", "-v", "hl-deploy-app", "hl-db"], capture_output=True)
 
 
-def _done_repos(results_path):
+def _done_repos(results_path, include_failed=False):
     """Repos already FINISHED in a prior run of this --results file: successfully graded (has a slop_score)
     OR skipped as non-web (out of scope). A re-run doesn't retest these — only untested (new) repos and
-    FAILED ones (deploy-failed / wedged / timed-out, i.e. no score and not skipped) run again."""
+    FAILED ones (deploy-failed / wedged / timed-out, i.e. no score and not skipped) run again. With
+    include_failed (--no-repeat), EVERY repo that has ANY record counts as done, so even failed deploys
+    are never retried — a re-run then touches only brand-new entries."""
     done = set()
     p = pathlib.Path(results_path)
     if not p.exists():
@@ -54,9 +57,30 @@ def _done_repos(results_path):
             continue
         with contextlib.suppress(json.JSONDecodeError):
             r = json.loads(line)
-            if r.get("slop_score") is not None or r.get("skipped"):
+            if r.get("repo") is None:
+                continue
+            if include_failed or r.get("slop_score") is not None or r.get("skipped"):
                 done.add(r.get("repo"))
     return done
+
+
+def _load_urls(path, hackathon=None):
+    """Parse a file of ALREADY-DEPLOYED app URLs to raw-fuzz (no clone/deploy). One entry per line:
+    `URL`, or `URL,project`, or `URL,project,winner`; blank lines and `#` comments skipped. Each becomes
+    a record shaped like a Devpost one but tagged url_ingest=True, so the batch routes it to
+    `deploy_and_grade --url` (grade the live app directly — enables the HTTPS-only probes)."""
+    recs = []
+    for line in pathlib.Path(path).read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [c.strip() for c in line.split(",")]
+        url = parts[0]
+        project = parts[1] if len(parts) > 1 and parts[1] else (urlparse(url).netloc or url)
+        winner = len(parts) > 2 and parts[2].lower() in ("1", "true", "yes", "winner", "y")
+        recs.append({"repo": url, "url_ingest": True, "project": project,
+                     "winner": winner, "hackathon": hackathon})
+    return recs
 
 
 def _record_wedge(results, rec, secs, extra=None):
@@ -79,9 +103,16 @@ def _record_wedge(results, rec, secs, extra=None):
 
 def main():
     ap = argparse.ArgumentParser(description="Devpost -> deploy + grade -> stats, in one run.")
-    mode = ap.add_mutually_exclusive_group(required=True)
+    mode = ap.add_mutually_exclusive_group(required=False)
     mode.add_argument("--hackathon", metavar="SLUG", help="one hackathon subdomain slug")
     mode.add_argument("--search", metavar="QUERY", help="auto-pick hackathons matching QUERY")
+    ap.add_argument("--urls", metavar="FILE", help="also grade a file of ALREADY-DEPLOYED app URLs (one "
+                    "per line, `URL[,project[,winner]]`) — raw-fuzz over HTTP(S), no clone/plan/deploy. "
+                    "For submissions that ship a live Vercel/Railway/*.app link but no gradeable repo. "
+                    "Combines with a Devpost source or stands alone.")
+    ap.add_argument("--no-repeat", action="store_true", help="on re-run, skip EVERY repo already in "
+                    "--results, INCLUDING failed deploys/wedges (default retries the failed ones). Use to "
+                    "grind through only brand-new entries across passes.")
     ap.add_argument("--hackathons", type=int, default=5, help="(--search) how many hackathons")
     ap.add_argument("--completed", action="store_true", help="(--search) only ended hackathons")
     ap.add_argument("--max-pages", type=int, default=25, dest="max_pages",
@@ -104,32 +135,42 @@ def main():
                          "runaway; deriving it means deploy time can't starve grading's budget")
     ap.add_argument("--model", metavar="ID", help="OpenRouter model (default: deploy_and_grade's)")
     args = ap.parse_args()
+    if not (args.hackathon or args.search or args.urls):
+        ap.error("need a source: --hackathon, --search, or --urls")
     if args.app_timeout is None:   # sum of the phase budgets (clone 300 + per-attempt build + grade) + margin
         args.app_timeout = 300 + args.attempts * (args.build_timeout + 90) + args.grade_timeout + 120
 
-    # 1) fetch repos (+ metadata) from Devpost
-    dp = PY + [str(_HERE / "devpost_repos.py"), "--json", "--limit", str(args.limit),
-               "--max-pages", str(args.max_pages)]
-    if args.hackathon:
-        dp += ["--hackathon", args.hackathon]
-    else:
-        dp += ["--search", args.search, "--hackathons", str(args.hackathons)]
-        if args.completed:
-            dp += ["--completed"]
-    print("== fetching repos from Devpost ==", flush=True)
-    got = subprocess.run(dp, capture_output=True, text=True)
-    sys.stderr.write(got.stderr)
-    records = json.loads(got.stdout or "[]")
+    # 1) gather work: Devpost repos (+ metadata) and/or a file of already-deployed app URLs
+    records = []
+    if args.hackathon or args.search:
+        dp = PY + [str(_HERE / "devpost_repos.py"), "--json", "--limit", str(args.limit),
+                   "--max-pages", str(args.max_pages)]
+        if args.hackathon:
+            dp += ["--hackathon", args.hackathon]
+        else:
+            dp += ["--search", args.search, "--hackathons", str(args.hackathons)]
+            if args.completed:
+                dp += ["--completed"]
+        print("== fetching repos from Devpost ==", flush=True)
+        got = subprocess.run(dp, capture_output=True, text=True)
+        sys.stderr.write(got.stderr)
+        records = json.loads(got.stdout or "[]")
+    if args.urls:   # already-deployed apps: grade raw over HTTP(S), no clone/deploy
+        url_recs = _load_urls(args.urls, args.hackathon)
+        print(f"== + {len(url_recs)} live-app URL(s) from {args.urls} (raw-fuzz, no deploy) ==", flush=True)
+        records += url_recs
     if not records:
-        sys.exit("no repos found")
-    # resume: skip repos already graded/skipped in this --results file; re-run only new + failed ones
-    done = _done_repos(args.results)
+        sys.exit("no repos or urls found")
+    # resume: skip repos already done in this --results file. Default: done = graded/skipped (failed ones
+    # re-run). --no-repeat: done = anything already attempted (failed deploys skipped too).
+    done = _done_repos(args.results, include_failed=args.no_repeat)
     to_run = [rec for rec in records if rec["repo"] not in done]
     if done:
-        print(f"== {len(records)} repos · {len(done)} already done (graded/skipped) → "
+        _what = "attempted" if args.no_repeat else "graded/skipped"
+        print(f"== {len(records)} entries · {len(done)} already {_what} → "
               f"{len(to_run)} to (re)run ==\n", flush=True)
     else:
-        print(f"== {len(to_run)} repos to deploy + grade ==\n", flush=True)
+        print(f"== {len(to_run)} entries to grade ==\n", flush=True)
 
     # 2) deploy + grade each, appending to --results (failures recorded, batch continues)
     for i, rec in enumerate(to_run, 1):
@@ -137,11 +178,14 @@ def main():
         ckpt = pathlib.Path(tempfile.gettempdir()) / "hl-deploy-ckpt.json"
         ckpt.unlink(missing_ok=True)   # stale from the previous app -> clear before this one writes its own
         cmd = PY + [str(_HERE / "deploy_and_grade.py"), rec["repo"], "--record", args.results,
-                    "--attempts", str(args.attempts), "--build-timeout", str(args.build_timeout),
-                    "--grade-timeout", str(args.grade_timeout), "--checkpoint", str(ckpt),
-                    "--meta", json.dumps(
+                    "--grade-timeout", str(args.grade_timeout), "--meta", json.dumps(
                         {"hackathon": rec.get("hackathon"), "project": rec.get("project"),
                          "winner": rec.get("winner")})]
+        if rec.get("url_ingest"):   # live app: grade raw, no clone/plan/Docker deploy
+            cmd += ["--url"]
+        else:
+            cmd += ["--attempts", str(args.attempts), "--build-timeout", str(args.build_timeout),
+                    "--checkpoint", str(ckpt)]
         if not args.browser:
             cmd += ["--no-browser"]
         if args.model:
