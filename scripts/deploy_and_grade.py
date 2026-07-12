@@ -41,6 +41,7 @@ _ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 
 from hacklet_runner import browser  # noqa: E402
+from hacklet_runner.scope import off_target  # noqa: E402
 from hacklet_runner.aggregate import CATEGORY_DECAY, _damped_total  # noqa: E402
 from hacklet_runner.catalog import load_catalog  # noqa: E402
 from hacklet_runner.deploy import RemoteDeployer  # noqa: E402
@@ -804,6 +805,12 @@ def main():
     try:
         if args.url_ingest:   # a LIVE, already-deployed app -> skip clone/plan/deploy, grade the URL raw
             url = args.repo
+            off = off_target(url)   # AIRTIGHT SCOPE GUARD: a third-party link (reddit/discord/github/...) that
+            if off:                 # slipped into the target list must NEVER be fetched or probed. Before any GET.
+                result.update(url_ingest=True, skipped=True, off_target=off, web_gradeable=False,
+                              app_kind="off-target", skip_reason=f"off-target host ({off}) — not the submission's app")
+                print(f"\n  OFF-TARGET ({off}) — a third-party link, not an app; recorded, NOT fetched or probed.")
+                return
             result.update(url_ingest=True, app_kind="web-app", web_gradeable=True,
                           stack="live app (url-ingest)", stack_profile={"routing": "url-ingest"})
             # link-rot is common -> don't grade a dead deployment's 404 shell. With the browser on, this

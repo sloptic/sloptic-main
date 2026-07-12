@@ -22,11 +22,15 @@ needs only httpx + a browser UA (no key, no Playwright). A project's real repo l
 """
 import argparse
 import json
+import pathlib
 import re
 import sys
 import time
 
 import httpx
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+from hacklet_runner.scope import off_target  # noqa: E402  (the ONE authoritative off-target deny-list)
 
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
 _HACK_API = "https://devpost.com/api/hackathons"
@@ -115,7 +119,7 @@ def links_for(client, project_url):
         m = _GH.match(h)
         if m and not _VENDOR_REPO.search(h):
             repo = repo or m.group(0).rstrip('.,);"\'')   # just github.com/user/repo, not any /tree/... suffix
-        elif not _NOT_LIVE.search(h):
+        elif not _NOT_LIVE.search(h) and not off_target(h):   # off_target = the authoritative safety deny-list
             url = url or h.rstrip('.,);"\'')               # the live "Try it out" demo (full URL)
     return repo, url
 
