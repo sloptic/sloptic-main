@@ -18,26 +18,27 @@ def _rec(repo, slop, findings, page_state=None):
     return r
 
 
-def test_flags_phantom_and_gating_fps_but_keeps_real_fires():
+def test_credits_the_dnf_gate_and_flags_only_residual_fps_on_scored_apps():
     recs = [
-        # broken app -> the WHOLE surface is hallucinated, so every finding is phantom (a gating gap)
+        # broken app -> DNF-class (gated), NOT a residual precision problem (the gate excludes it from scoring)
         _rec("gh/broken", 80, [_f("sec-sqli-004", 40), _f("qa-a11y-001", 26, "qa")], page_state="broken"),
-        # working catch-all (soft-404 probe fired) -> server-side fires suspect, header fire still real
+        # functional=False (deterministic gate already flagged it) -> also gated
+        {"repo": "gh/dnf", "slop_score": 50, "functional": False, "findings": [_f("sec-csrf-001", 25)]},
+        # working catch-all (soft-404 fired) -> a RESIDUAL FP on a scored app; the header fire stays real
         _rec("gh/catchall", 60, [_f("sec-csrf-001", 25), _f("qa-http-001", 8, "qa"), _f("sec-headers-002", 12)],
              page_state="working"),
-        # working, no catch-all -> nothing flagged (real fires left alone)
+        # working, no catch-all -> nothing flagged
         _rec("gh/clean", 30, [_f("sec-headers-002", 12), _f("qa-a11y-001", 26, "qa")], page_state="working"),
-        # XSS "reflection" into a Cloudflare anti-bot field -> the vendor's, not the app's
+        # XSS "reflection" into a Cloudflare anti-bot field on a working app -> residual FP
         _rec("gh/vendor", 30, [_f("sec-xss-001", 30, evidence={"field": "cf-turnstile-response"})], page_state="working"),
     ]
     a = analyze(recs)
+    assert {r["repo"] for r in a["gated"]} == {"gh/broken", "gh/dnf"}          # broken + functional=False -> gated
+    assert {r["repo"] for r in a["scored"]} == {"gh/catchall", "gh/clean", "gh/vendor"}   # only working apps scored
+    assert a["gated_slop"] == 130                                             # 80 + 50 kept OUT of the distribution
     flagged = {(repo, pid) for repo, pid, *_ in a["flagged"]}
-    assert ("gh/broken", "sec-sqli-004") in flagged and ("gh/broken", "qa-a11y-001") in flagged  # non-working -> ALL
-    assert ("gh/catchall", "sec-csrf-001") in flagged           # phantom-sensitive on a catch-all host
-    assert ("gh/catchall", "sec-headers-002") not in flagged    # a missing header is real even on a catch-all
-    assert ("gh/clean", "sec-headers-002") not in flagged and ("gh/clean", "qa-a11y-001") not in flagged  # clean untouched
-    assert ("gh/vendor", "sec-xss-001") in flagged              # vendor anti-bot field reflection
-    assert a["nonworking_apps"] == 1 and a["nonworking_slop"] == 80   # the 404 app's entire score is phantom
-    assert a["catchall_apps"] == 1
-    assert a["per_probe"]["sec-csrf-001"] == [1, 1]              # 1 fire, 1 suspect
-    assert a["per_probe"]["sec-headers-002"][1] == 0            # never suspect (real everywhere)
+    assert ("gh/catchall", "sec-csrf-001") in flagged                        # residual: phantom-sensitive on catch-all
+    assert ("gh/catchall", "sec-headers-002") not in flagged                 # a header is real even on a catch-all
+    assert ("gh/vendor", "sec-xss-001") in flagged                           # residual: vendor anti-bot field
+    assert not any(repo in ("gh/broken", "gh/dnf") for repo, *_ in a["flagged"])  # gated apps never counted as FP
+    assert ("gh/clean", "sec-headers-002") not in flagged

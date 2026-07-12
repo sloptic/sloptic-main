@@ -70,21 +70,24 @@ def load(path):
     return out
 
 
+def _gated(r):
+    """DNF-class: the gate already excludes it from scoring (functional=False, or the audit says broken/
+    not-an-app/placeholder). Its fires aren't residual FPs to chase — they never enter the distribution."""
+    return r.get("functional") is False or _page_state(r) in _NON_WORKING
+
+
 def analyze(recs):
-    scored = [r for r in recs if isinstance(r.get("slop_score"), (int, float))]
-    per_probe = defaultdict(lambda: [0, 0])          # pid -> [fires, suspect]
+    have_score = [r for r in recs if isinstance(r.get("slop_score"), (int, float))]
+    gated = [r for r in have_score if _gated(r)]          # correctly DNF'd by the gate -> not a precision problem
+    scored = [r for r in have_score if not _gated(r)]     # the apps that ACTUALLY count toward the score
+    per_probe = defaultdict(lambda: [0, 0])              # pid -> [fires, suspect]
     reasons = Counter()
-    flagged = []                                     # (repo, pid, penalty, reason)
-    nonworking_slop, nonworking_apps = 0, 0
+    flagged = []                                         # (repo, pid, penalty, count, reason)
     catchall_apps = 0
-    for r in scored:
+    for r in scored:                                     # measure precision ONLY on what's actually scored
         state = _page_state(r)
-        catch_all = _soft404(r)
-        if state in _NON_WORKING:
-            nonworking_apps += 1
-            nonworking_slop += r.get("slop_score") or 0
-        elif catch_all:
-            catchall_apps += 1
+        catch_all = _soft404(r) or bool((r.get("observed_surface") or {}).get("catch_all"))
+        catchall_apps += bool(catch_all)
         for f in r.get("findings", []):
             pid = f["probe_id"]
             per_probe[pid][0] += 1
@@ -93,8 +96,8 @@ def analyze(recs):
                 per_probe[pid][1] += 1
                 reasons[why.split(" —")[0].split(" (")[0]] += 1
                 flagged.append((r["repo"], pid, f.get("penalty", 0), f.get("count", 1), why))
-    return {"scored": scored, "per_probe": per_probe, "reasons": reasons, "flagged": flagged,
-            "nonworking_apps": nonworking_apps, "nonworking_slop": nonworking_slop, "catchall_apps": catchall_apps}
+    return {"scored": scored, "gated": gated, "gated_slop": sum(r.get("slop_score") or 0 for r in gated),
+            "per_probe": per_probe, "reasons": reasons, "flagged": flagged, "catchall_apps": catchall_apps}
 
 
 def main():
@@ -112,37 +115,40 @@ def main():
 
     if args.json:
         print(json.dumps({
-            "n_scored": len(scored), "total_fires": total_fires, "suspect_fires": total_suspect,
-            "suspect_apps": suspect_apps, "nonworking_apps": a["nonworking_apps"],
-            "nonworking_slop": a["nonworking_slop"], "catchall_apps": a["catchall_apps"],
+            "n_scored": len(scored), "n_gated_dnf": len(a["gated"]), "gated_slop": a["gated_slop"],
+            "scored_fires": total_fires, "suspect_fires": total_suspect, "suspect_apps": suspect_apps,
+            "catchall_apps": a["catchall_apps"],
             "per_probe_precision": {pid: {"fires": v[0], "suspect": v[1],
                                           "precision_pct": round((v[0] - v[1]) / v[0] * 100, 1) if v[0] else None}
                                     for pid, v in sorted(a["per_probe"].items())},
-            "reasons": dict(a["reasons"].most_common()),
+            "residual_reasons": dict(a["reasons"].most_common()),
         }, indent=2))
         return
 
-    print(f"\n═══ precision audit — {len(scored)} scored apps ═══")
-    print(f"    {total_suspect}/{total_fires} fires flagged as LIKELY FALSE POSITIVE  "
-          f"across {suspect_apps} apps  ({total_suspect/(total_fires or 1)*100:.0f}% of all fires)")
-    print(f"\n(1) NON-WORKING APPS SCORED ANYWAY — a gating gap, not just precision")
-    print(f"    {a['nonworking_apps']} apps the audit marked broken/placeholder/not-an-app were still scored, "
-          f"carrying {a['nonworking_slop']} slop that is ENTIRELY phantom (a 404 page has no real surface).")
-    print(f"    {a['catchall_apps']} more apps are catch-all/soft-404 hosts (server-side fires there are suspect).")
-    print(f"\n(2) WHY FIRES WERE FLAGGED")
-    for why, n in a["reasons"].most_common():
-        print(f"    {n:>4}  {why}")
-    print(f"\n(3) PER-PROBE PRECISION  (phantom-sensitive probes; precision = clean fires / all fires)")
+    print(f"\n═══ precision audit — {len(scored)} SCORED apps  ({len(a['gated'])} DNF'd by the gate, excluded) ═══")
+    print(f"\n(0) DNF GATE — {len(a['gated'])} apps flagged broken/not-an-app -> ranked DNF-class, EXCLUDED from "
+          f"scoring\n    ({a['gated_slop']} slop the gate correctly kept OUT of the distribution — not a precision gap).")
+    print(f"\n(1) RESIDUAL FALSE POSITIVES ON SCORED APPS — the real precision gap that's LEFT")
+    if a["reasons"]:
+        print(f"    {total_suspect}/{total_fires} fires on scored apps suspect  ({total_suspect/(total_fires or 1)*100:.0f}%), "
+              f"across {suspect_apps} apps:")
+        for why, n in a["reasons"].most_common():
+            print(f"      {n:>4}  {why}")
+    else:
+        print(f"    none — every fire on a scored app looks real (0/{total_fires}). Precision clean.")
+    print(f"\n(2) PER-PROBE PRECISION  (phantom-sensitive probes, SCORED apps only)")
     rows = [(pid, v[0], v[1]) for pid, v in a["per_probe"].items() if _phantom_sensitive(pid) and v[0]]
-    for pid, fires, susp in sorted(rows, key=lambda x: -x[2]):
+    for pid, fires, susp in sorted(rows, key=lambda x: -x[2]) or [(None, 0, 0)]:
+        if pid is None:
+            print("    (no phantom-sensitive probes fired on scored apps)")
+            break
         prec = (fires - susp) / fires * 100
-        bar = "█" * int(round(prec / 5))
-        print(f"    {pid:20} {fires:>4} fires · {susp:>4} suspect · precision {prec:5.0f}% {bar}")
-    print(f"\n(4) FLAGGED FINDINGS  (top {args.show} by penalty)")
-    for repo, pid, pen, cnt, why in sorted(a["flagged"], key=lambda x: -x[2])[:args.show]:
-        print(f"    {repo.rsplit('/', 1)[-1][:30]:30} {pid:18} pen={pen:>3}×{cnt:<2} — {why[:60]}")
-    print(f"\n    → the fix is a catch-all/liveness GATE in discovery (never score a phantom surface), then "
-          f"re-grade; this tool measures the gap.\n")
+        print(f"    {pid:20} {fires:>4} fires · {susp:>4} suspect · precision {prec:5.0f}% {'█' * int(round(prec / 5))}")
+    if a["flagged"]:
+        print(f"\n(3) FLAGGED FINDINGS  (top {args.show} by penalty)")
+        for repo, pid, pen, cnt, why in sorted(a["flagged"], key=lambda x: -x[2])[:args.show]:
+            print(f"    {repo.rsplit('/', 1)[-1][:30]:30} {pid:18} pen={pen:>3}×{cnt:<2} — {why[:58]}")
+    print()
 
 
 if __name__ == "__main__":
