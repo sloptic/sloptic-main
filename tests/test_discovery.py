@@ -359,6 +359,22 @@ def test_catch_all_host_drops_phantom_endpoints_and_forms():
         ca.shutdown(); real.shutdown()
 
 
+def test_login_signup_triggers_credit_has_login_without_a_form():
+    from hacklet_runner.discovery import _auth_triggers, surface_metrics
+    # button/link CTAs, not inline password forms — the case the audit kept flagging as has_login=false
+    assert _auth_triggers("<a href='/x'>Continue with Google</a><button>Sign up free</button>") == (True, True)
+    assert _auth_triggers("<button>Get Started</button>") == (False, True)          # 'Get started' = signup CTA
+    assert _auth_triggers("<button>Add to cart</button><a>Home</a>") == (False, False)   # no auth CTA -> no FP
+    assert _auth_triggers("<button>Sign out</button>") == (False, False)            # sign OUT is not sign in
+    # a Profile whose ONLY login/signup signal is the trigger cap (no form, no auth endpoint) -> credited
+    m = surface_metrics(Profile(base_url="http://t", routes=["/"], forms=[], capabilities={},
+                                endpoints=[]))
+    assert m["has_login"] is False and m["has_signup"] is False                     # nothing -> both false
+    m2 = surface_metrics(Profile(base_url="http://t", routes=["/"], forms=[], endpoints=[],
+                                 capabilities={"login_trigger": True, "signup_trigger": True}))
+    assert m2["has_login"] is True and m2["has_signup"] is True                     # CTA-only auth is now seen
+
+
 def test_surface_metrics_reports_llm_pointer_precision():
     from hacklet_runner.schema import Endpoint
     # build #2 telemetry (off-score): of the endpoints ONLY the LLM seeded (origin llm), how many are real

@@ -60,7 +60,21 @@ _BASELINE_CAP = 60   # cap the per-endpoint health baseline requests (a huge min
 # would falsely read blind on an api-only app whose login/upload endpoint we DID discover. Recognize them.
 _LOGIN_EP = re.compile(r"/(?:login|log-?in|signin|sign-?in|auth|authenticate|session|token|oauth)(?:[/.\-]|$)", re.I)
 _UPLOAD_EP = re.compile(r"/(?:upload|files?|media|attachments?|import|ingest|documents?)(?:[/.\-]|$)", re.I)
+# Login/signup presented as a BUTTON or LINK (not an inline password form): 'Sign in', 'Continue with
+# Google', 'Sign up', 'Start Free Trial'. The audit's #1 complaint was has_login=false on apps whose login
+# is a CTA button, not a <form> — so has_login must also credit these triggers, not just password forms.
+_LOGIN_TRIGGER = re.compile(r"\b(?:log ?in|sign ?in|log-in|sign-in)\b|continue with (?:google|github|apple|email)|\bsso\b", re.I)
+_SIGNUP_TRIGGER = re.compile(r"\bsign ?up\b|\bregister\b|create (?:an |my )?(?:account|profile)|"
+                             r"get started|start (?:your )?free|join (?:the )?(?:free|beta|waitlist)", re.I)
 _BROWSER_ROUTE_CAP = 12  # max routes to browser-render for forms (one launch, but each goto has a cost)
+
+
+def _auth_triggers(markup: str) -> tuple[bool, bool]:
+    """Scan a page's BUTTON/LINK labels (not arbitrary text -> low FP) for a login/signup trigger. Returns
+    (has_login_trigger, has_signup_trigger). Catches the button/link/CTA logins a password-form check misses."""
+    text = " ".join(re.sub(r"<[^>]+>", " ", m)
+                    for m in re.findall(r"<(?:button|a)\b[^>]*>(.*?)</(?:button|a)>", markup, re.S | re.I))
+    return bool(_LOGIN_TRIGGER.search(text)), bool(_SIGNUP_TRIGGER.search(text))
 
 
 # A logout/sign-out link must never be crawled or probed: following it destroys the runner's own
@@ -358,6 +372,7 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
     endpoints: list = []
     js_urls: list[str] = []           # same-origin .js assets to mine for an SPA's API paths
     link_params: dict[str, set] = {}  # path -> query-param NAMES seen in links (?page=, ?id=, ...)
+    auth = [False, False]             # [login_trigger, signup_trigger] seen as a button/link across the surface
 
     with make_client(base_url, headers, timeout=5.0, follow_redirects=True) as c:
         while queue and len(visited) < max_pages:
@@ -374,6 +389,9 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
             if "html" not in resp.headers.get("content-type", "").lower():
                 continue
             html = resp.text
+            _l, _s = _auth_triggers(html)   # login/signup as a button/link (a CTA a password-form check misses)
+            auth[0] |= _l
+            auth[1] |= _s
             for form in _parse_forms(_FORM.findall(html), base_url, path):
                 key = _form_key(form)
                 if key not in seen_forms:
@@ -445,6 +463,9 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
             if extra:                               # phase 2: render the rest of the HTML surface
                 rendered.update(render(base_url, extra, headers=headers) or {})
             for path, dom in rendered.items():
+                _l, _s = _auth_triggers(dom)   # a SPA paints 'Sign in'/'Sign up' client-side, so scan the DOM too
+                auth[0] |= _l
+                auth[1] |= _s
                 candidates = _parse_forms(_FORM.findall(dom), base_url, path)
                 formless = _formless_form(dom, path)   # SPA inputs with no <form> wrapper
                 if formless is not None:
@@ -490,6 +511,10 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
         "served_over_https": base_url.lower().startswith("https"),
         # host serves a 200 shell for every path -> phantom server-side surface was dropped (off-score signal)
         "catch_all": catch_all,
+        # login/signup presented as a BUTTON/LINK (not an inline password form) -> feeds has_login/has_signup
+        # so parity credits a CTA login (the audit's #1 has_login=false complaint), not only password forms
+        "login_trigger": auth[0],
+        "signup_trigger": auth[1],
     }
     return Profile(base_url=base_url, routes=list(routes), forms=forms, capabilities=capabilities,
                    endpoints=endpoints)
@@ -513,10 +538,14 @@ def surface_metrics(profile: Profile) -> dict:
     # it as unobserved so 'reached-but-half-dead' (sapling: ~95 reached, many 500) isn't scored well-covered.
     eps = profile.endpoints
     healthy_eps = [e for e in eps if (e.baseline_status or 0) < 500]
-    # login/upload can be an API ENDPOINT (feature kind auth/upload, or a login/upload-named path), not
-    # just an HTML form — count those too so an api-only app's login/upload isn't a false blind spot.
-    has_login = login_form(forms) is not None or any(
+    # login/upload can be an API ENDPOINT (feature kind auth/upload, or a login/upload-named path), a
+    # password FORM, or — the case the audit kept flagging — a login/signup BUTTON/LINK with no inline form.
+    # Credit all three so parity doesn't report a false has_login=false blind spot on CTA-style auth.
+    has_login = login_form(forms) is not None or bool(caps.get("login_trigger")) or any(
         e.kind == "auth" or _LOGIN_EP.search(e.raw_path or e.path or "") for e in eps)
+    has_signup = bool(caps.get("signup_trigger")) or any(
+        e.kind in ("auth", "signup") for e in eps) or any(
+        re.search(r"sign-?up|register", (f.action or ""), re.I) for f in forms)
     has_upload = any(f.file_fields for f in forms) or any(
         e.kind == "upload" or _UPLOAD_EP.search(e.raw_path or e.path or "") for e in eps)
     # LLM-POINTER precision (build #2 telemetry, OFF-SCORE): endpoints the LLM UNIQUELY seeded from source
@@ -541,7 +570,8 @@ def surface_metrics(profile: Profile) -> dict:
         "endpoints": len(healthy_eps),               # healthy = responds to a baseline without a 5xx
         "endpoints_reached": len(eps),               # incl. env-var-dead (reached but not testable)
         "endpoints_dead": len(eps) - len(healthy_eps),
-        "has_login": has_login,                       # HTML login form OR an API login endpoint
+        "has_login": has_login,                       # HTML login form, API login endpoint, OR a CTA login button
+        "has_signup": has_signup,                     # signup form/endpoint OR a 'Sign up'/'Get started' CTA
         "has_upload": has_upload,                     # multipart form OR an API upload endpoint
         "has_api": bool(healthy_eps),
         "browser_rendered": bool(caps.get("browser")),
