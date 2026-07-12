@@ -158,6 +158,73 @@ _active_lock = threading.Lock()
 _print_lock = threading.Lock()    # serialize a captured job's output block so concurrent logs don't garble
 
 
+# --- --tldr: one compact line per app instead of the full grading dump -----------------------------------
+class _Progress:
+    """Thread-safe batch progress for the ETA. Uses throughput = done / elapsed (self-corrects for whatever
+    concurrency is actually running); ETA = elapsed / done * remaining. Same shape as the manual estimate."""
+    def __init__(self, total):
+        self.total, self.done, self.t0 = total, 0, time.monotonic()
+        self.lock = threading.Lock()
+
+    def tick(self):
+        with self.lock:
+            self.done += 1
+            elapsed = time.monotonic() - self.t0
+            eta = elapsed / self.done * (self.total - self.done) if self.done else 0.0
+            return self.done, eta
+
+
+def _label(j):
+    """A short human tag for the app: the Devpost project slug if we have it, else owner/repo or the URL host."""
+    rec, target, source = j["rec"], j["target"], j["source"]
+    proj = rec.get("project") or ""
+    if "/software/" in proj:
+        return proj.rstrip("/").rsplit("/", 1)[-1][:30]
+    if source == "repo":
+        return "/".join(target.rstrip("/").split("/")[-2:])[:30]
+    return (urlparse(target).netloc or target)[:30]
+
+
+def _last_record_for(results_path, target):
+    """The most-recent result row for this target — the record the child just appended (latest wins, matching
+    stats' dedup). Read after the child exits, so the row is fully written; safe to read under concurrency."""
+    rec, p = None, pathlib.Path(results_path)
+    if not p.exists():
+        return None
+    for line in p.read_text().splitlines():
+        if line.strip():
+            with contextlib.suppress(json.JSONDecodeError):
+                r = json.loads(line)
+                if r.get("repo") == target:
+                    rec = r
+    return rec
+
+
+def _tldr_line(done, total, label, rec, secs, eta, tail):
+    """The compact per-app line: [i/N] label  <slop N | DNF | FAIL>  missed: kinds  · Ns ETA m:ss."""
+    prog = f"[{done}/{total}]"
+    eta_s = f"ETA {int(eta) // 60}:{int(eta) % 60:02d}" if eta else ""
+    if tail:                                    # wedged / job error — tail carries the reason
+        return f"{prog} {label:<30} ✗ {tail.strip().lstrip('!').strip()[:50]}  ·{secs:4.0f}s {eta_s}"
+    if rec is None:
+        return f"{prog} {label:<30} ? no record  ·{secs:4.0f}s {eta_s}"
+    audit = rec.get("coverage_audit") or {}
+    state = audit.get("page_state")
+    if rec.get("functional") is False or state in ("broken", "not-an-app", "placeholder"):
+        score = f"DNF ({state or 'non-functional'})"        # ranked last — never rescued to a low score
+    elif rec.get("slop_score") is not None:                 # a DNF app keeps its slop for reference; check DNF first
+        score = f"slop {rec['slop_score']}"
+    elif rec.get("deployed") is False:
+        score = "FAIL deploy"
+    elif rec.get("skipped"):
+        score = "skipped"
+    else:
+        score = "—"
+    missed = audit.get("missed") or []
+    miss = ("missed: " + ", ".join(dict.fromkeys(m.get("kind", "?") for m in missed))) if missed else ""
+    return f"{prog} {label:<30} {score:<20} {miss:<26} ·{secs:4.0f}s {eta_s}"
+
+
 def _build_cmd(j, args, ckpt):
     rec, target, source = j["rec"], j["target"], j["source"]
     cmd = PY + [str(_HERE / "deploy_and_grade.py"), target, "--record", args.results,
@@ -176,10 +243,12 @@ def _build_cmd(j, args, ckpt):
     return cmd
 
 
-def _run_job(j, idx, total, args, capture):
+def _run_job(j, idx, total, args, capture, progress=None):
     """Grade one job in a child process with a hard wall-clock kill. capture=True buffers the child's output
     and prints it as ONE block on completion (concurrent url jobs, so logs don't interleave); capture=False
-    streams live (serial repo jobs). A wedge or error is RECORDED, never fatal to the batch."""
+    streams live (serial repo jobs). Under --tldr the buffered dump is dropped and ONE compact line is printed
+    from the child's result record instead. A wedge or error is RECORDED, never fatal to the batch."""
+    t0 = time.monotonic()
     rec, target, source = j["rec"], j["target"], j["source"]
     ckpt = pathlib.Path(tempfile.gettempdir()) / "hl-deploy-ckpt.json"
     if source == "repo":           # only repo jobs plan+checkpoint; url jobs never touch it (safe concurrently)
@@ -220,7 +289,14 @@ def _run_job(j, idx, total, args, capture):
     finally:
         with _active_lock:
             _active.pop(proc.pid, None)
-    if capture:
+    secs = time.monotonic() - t0
+    if args.tldr:                          # terse: one line from the child's record, not its full dump
+        rec_out = _last_record_for(args.results, target)
+        done, eta = progress.tick() if progress else (idx, 0.0)
+        with _print_lock:
+            print(_tldr_line(done, progress.total if progress else total, _label(j),
+                             rec_out, secs, eta, tail), flush=True)
+    elif capture:
         with _print_lock:
             print(hdr + "\n" + (out or "").rstrip() + (("\n" + tail) if tail else ""), flush=True)
     elif tail:
@@ -293,6 +369,11 @@ def main():
                          "no Docker, so 6-10 is a big overnight speedup; the results append is lock-guarded so "
                          "concurrent writes won't corrupt it. REPO jobs always run serially (fixed Docker "
                          "container names can't coexist), regardless of this value.")
+    ap.add_argument("--tldr", action="store_true",
+                    help="terse progress: suppress each app's full grading dump; print ONE line per app "
+                         "(count · slop score / DNF / FAIL · what the coverage-audit says the fuzzer missed · "
+                         "elapsed + ETA). The full per-app record still lands in --results and the aggregate "
+                         "stats still print at the end. Pair with --audit-coverage for the 'missed' column.")
     args = ap.parse_args()
     if not (args.hackathon or args.search or args.urls):
         ap.error("need a source: --hackathon, --search, or --urls")
@@ -345,12 +426,14 @@ def main():
     if conc > 1:
         note = f" · url {conc}-wide" + (f", {len(repo_jobs)} repo serial" if repo_jobs else "")
         print(f"   concurrency: {conc}{note}", flush=True)
+    prog = _Progress(len(repo_jobs) + len(url_jobs)) if args.tldr else None
+    cap = args.tldr        # --tldr captures (suppresses) each child's dump; we print one line from its record
     try:
         for i, j in enumerate(repo_jobs, 1):                       # serial repo phase
-            _run_job(j, i, len(repo_jobs), args, capture=False)
+            _run_job(j, i, len(repo_jobs), args, capture=cap, progress=prog)
         if url_jobs and conc > 1:                                  # parallel url phase
             with concurrent.futures.ThreadPoolExecutor(max_workers=conc) as ex:
-                futs = [ex.submit(_run_job, j, i, len(url_jobs), args, True)
+                futs = [ex.submit(_run_job, j, i, len(url_jobs), args, True, prog)
                         for i, j in enumerate(url_jobs, 1)]
                 try:
                     for f in concurrent.futures.as_completed(futs):
@@ -360,7 +443,7 @@ def main():
                     raise
         else:
             for i, j in enumerate(url_jobs, 1):                    # serial url phase (concurrency 1)
-                _run_job(j, i, len(url_jobs), args, capture=False)
+                _run_job(j, i, len(url_jobs), args, capture=cap, progress=prog)
     except KeyboardInterrupt:
         _kill_all_active()
         _cleanup_containers()
