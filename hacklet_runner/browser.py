@@ -166,6 +166,102 @@ def render_routes(base_url: str, paths, headers=None, timeout: float = 12.0,
     return out
 
 
+# ---- dead / inert controls (qa-deadctrl-001) -----------------------------------------------------
+# The AI-shell tell: a control that RENDERS but is wired to nothing — no handler, or one that no-ops. The
+# interactive analogue of a broken link. Detected by OBSERVED BEHAVIOR, not static handler presence (event
+# delegation binds one listener at the document root, so "no handler on the node" != dead in React/Vue —
+# most of the corpus). Click a reveal-SAFE control and watch EVERY channel; a control that moves none is
+# inert. Bias is deliberately toward FALSE NEGATIVES (any observed motion clears a control), so a fired
+# finding is high-confidence and we never penalize a working app whose effect we merely failed to see.
+# Safety: only visible, non-disabled controls that are NOT form submitters and NOT real links (that's the
+# broken-link probe), and whose label is not on the _NO_CLICK denylist (never pay/delete/logout/checkout).
+_INERT_TAG_JS = r"""() => {
+  const vis = el => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+  const ok = el => {
+    if (!vis(el) || el.disabled) return false;
+    const t = el.tagName;
+    // a <button> defaults to type=submit even with no attribute, so gate on "submits a REAL form" (el.form),
+    // not the type alone — else every plain button (type=submit, but no form) would be wrongly excluded.
+    if (t === 'BUTTON') return !((el.type === 'submit' || el.type === 'reset') && el.form);
+    if (t === 'A') { const h = (el.getAttribute('href') || '').trim();        // a real link is the link probe's job;
+      return h === '' || h === '#' || h.toLowerCase().startsWith('javascript:'); }  // an <a> acting as a button IS ours
+    return (el.getAttribute('role') || '').toLowerCase() === 'button';        // role=button div/span
+  };
+  const els = [...document.querySelectorAll('button, a, [role=button]')].filter(ok);
+  els.forEach((el, i) => el.setAttribute('data-hl-btn', String(i)));
+  return els.map(el => (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 60));
+}"""
+# Re-installed on EVERY navigation (add_init_script): counts DOM mutations + app-initiated fetch/XHR. The
+# Playwright-side page.on hooks below add ALL network (img/beacon), dialogs, and uncaught errors as channels.
+_INERT_WATCH_JS = r"""(() => {
+  window.__hlw = {muts: 0, reqs: 0};
+  // this init script runs BEFORE <html> is parsed, so documentElement can be null here -> defer the
+  // observer to DOMContentLoaded (else observe(null) throws and NO DOM mutation is ever recorded).
+  const arm = () => { try { new MutationObserver(m => { window.__hlw.muts += m.length; })
+      .observe(document.documentElement, {subtree: true, childList: true, attributes: true, characterData: true}); } catch (e) {} };
+  if (document.documentElement) arm(); else document.addEventListener('DOMContentLoaded', arm);
+  const wrap = (o, k) => { const f = o[k]; if (f) o[k] = function () { window.__hlw.reqs++; return f.apply(this, arguments); }; };
+  wrap(window, 'fetch');
+  if (window.XMLHttpRequest) wrap(XMLHttpRequest.prototype, 'open');
+})()"""
+
+
+def inert_controls(url: str, headers=None, timeout: float = 12.0, max_controls: int = 10,
+                   per_wait_ms: int = 400, total_timeout: float = 40.0) -> list | None:
+    """Click each reveal-safe control on the page and return the labels of the ones that produced NO
+    observable effect on ANY channel (DOM mutation / network / navigation / dialog / uncaught error) —
+    inert ("dead") controls. None if no browser or the render fails; [] if every control did something.
+    Observed behavior, so event-delegated handlers (invisible to a static check) still clear a control;
+    a control whose only effect is slower than per_wait_ms, or off-channel (clipboard/print), reads as
+    live-or-skipped, never dead — the miss-don't-invent bias that keeps this safe to score."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return None
+    try:
+        with sync_playwright() as pw:
+            b = _launch(pw)
+            if b is None:
+                return None
+            try:
+                page = b.new_page()
+                net, dialogs, errs = {"n": 0}, {"n": 0}, {"n": 0}
+                page.on("request", lambda r: net.__setitem__("n", net["n"] + 1))         # ALL network (img/beacon too)
+                page.on("dialog", lambda d: (dialogs.__setitem__("n", dialogs["n"] + 1), d.dismiss()))
+                page.on("pageerror", lambda e: errs.__setitem__("n", errs["n"] + 1))
+                page.add_init_script(script=_INERT_WATCH_JS)   # re-installs the watcher on every navigation
+                _apply_auth(page, url, headers)
+                page.goto(url, timeout=timeout * 1000, wait_until="load")
+                page.wait_for_timeout(300)
+                labels = page.evaluate(_INERT_TAG_JS) or []
+                dead, deadline = [], time.monotonic() + total_timeout
+                for i, label in enumerate(labels):
+                    if i >= max_controls or time.monotonic() > deadline:
+                        break
+                    if _NO_CLICK.search(label or ""):
+                        continue   # never click a destructive-labeled control (pay/delete/logout/checkout/...)
+                    with contextlib.suppress(Exception):
+                        page.evaluate("() => { if (window.__hlw) { window.__hlw.muts = 0; window.__hlw.reqs = 0; } }")
+                        n0, d0, e0, url0 = net["n"], dialogs["n"], errs["n"], page.url
+                        page.click(f'[data-hl-btn="{i}"]', timeout=1500)
+                        page.wait_for_timeout(per_wait_ms)
+                        w = page.evaluate("() => window.__hlw || {muts: 0, reqs: 0}")
+                        navigated = page.url != url0
+                        moved = ((w.get("muts") or 0) or (w.get("reqs") or 0) or (net["n"] - n0)
+                                 or (dialogs["n"] - d0) or (errs["n"] - e0) or navigated)
+                        if not moved:
+                            dead.append(label or "(unlabeled)")
+                        if navigated:   # a live control that navigated away -> restore + re-tag to continue
+                            page.goto(url, timeout=timeout * 1000, wait_until="load")
+                            page.wait_for_timeout(200)
+                            page.evaluate(_INERT_TAG_JS)
+                return dead
+            finally:
+                b.close()
+    except Exception:
+        return None
+
+
 def first_contentful_paint(url: str, headers=None, timeout: float = 12.0) -> float | None:
     """Render url and return First Contentful Paint in milliseconds (the user-facing 'time to see
     something' metric). None if no browser, render fails, or nothing ever paints."""

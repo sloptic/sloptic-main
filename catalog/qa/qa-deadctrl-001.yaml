@@ -1,0 +1,16 @@
+id: qa-deadctrl-001
+bundle: qa
+category: dead-controls
+pool: public
+evidence_model: oracle
+penalty: 12   # a control wired to nothing is low-severity but every-user (the AI-shell tell): the UI
+              # advertises an action it doesn't deliver. Priced BELOW a broken link (24) — dead controls
+              # span a wide severity range (a dead primary CTA vs a decorative toggle) and we can't tell
+              # which; ONE finding regardless of count (the evidence carries the labels).
+applicability:
+  requires: [browser]   # must render + click to observe effect; N/A without --browser
+probe:
+  predicate: dead_controls_present
+  target: /              # the entry page's controls — where the primary actions live
+  max_controls: 10       # bound the clicks (safety + wall-clock); reveal-safe controls only (_NO_CLICK denylist)
+  threshold: 0           # any inert control fires

@@ -131,6 +131,45 @@ def test_interaction_is_bounded_to_first_n_routes():
         srv.shutdown()
 
 
+def test_inert_controls_flags_only_the_dead_button():
+    # observed-behavior dead-control detection: click each reveal-safe control, flag ONLY the ones that
+    # move no channel. Locks the FP guards — a delegated/DOM-mutating button, a network button, a disabled
+    # button, a real link, and a destructive-labeled ("Delete") button must all be cleared or never clicked.
+    import http.server
+    import threading
+
+    page = (
+        "<!doctype html><html><body>"
+        "<button id='dead'>Show details</button>"          # no handler -> DEAD
+        "<button id='live'>Toggle</button>"                # mutates the DOM -> live
+        "<button id='net'>Refresh</button>"               # fires a request -> live
+        "<button id='off' disabled>Frobnicate</button>"    # disabled -> excluded (not clicked)
+        "<a href='/elsewhere'>Home</a>"                    # a real link -> the broken-link probe's job, excluded
+        "<button id='del'>Delete account</button>"         # DEAD, but _NO_CLICK label -> never clicked, not flagged
+        "<div id='sink'></div><script>"
+        "document.getElementById('live').onclick=function(){var s=document.createElement('span');"
+        "s.textContent='x';document.getElementById('sink').appendChild(s);};"
+        "document.getElementById('net').onclick=function(){fetch('/ping').catch(function(){});};"
+        "</script></body></html>").encode("ascii")
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200); self.send_header("Content-Type", "text/html"); self.end_headers()
+            self.wfile.write(page)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        dead = browser.inert_controls(base)
+        assert dead == ["Show details"]      # only the genuinely inert, safe-to-click control
+    finally:
+        srv.shutdown()
+
+
 @pytest.fixture
 def serve():
     deployers = []

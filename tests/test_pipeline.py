@@ -118,6 +118,10 @@ def test_vulnerable_app_accrues_slop():
     # qa-console-001 / qa-a11y-001 are browser-only too -> N/A here (fired in test_browser):
     assert o["qa-console-001"] == "not_applicable"
     assert o["qa-a11y-001"] == "not_applicable"
+    # qa-deadctrl-001 (dead controls) is browser-gated too -> N/A here; fire/clean locked in test_browser:
+    assert o["qa-deadctrl-001"] == "not_applicable"
+    from hacklet_runner.probes import PREDICATES
+    assert "dead_controls_present" in PREDICATES   # its predicate is registered (offline registration lock)
     # sec-exposure-* find the served .env and .git files (.git config+HEAD share a variant group):
     exposure_hits = {x.target for x in report.outcomes
                      if x.probe_id.startswith("sec-exposure") and x.outcome == "slop_detected"}
@@ -186,6 +190,7 @@ def test_minimal_app_resolves_surface_probes_na():
     assert o["perf-cwv-002"] == "not_applicable"      # browser-gated
     assert o["qa-console-001"] == "not_applicable"    # browser-gated
     assert o["qa-a11y-001"] == "not_applicable"       # browser-gated
+    assert o["qa-deadctrl-001"] == "not_applicable"   # browser-gated
     assert report.slop_score == 0
 
 

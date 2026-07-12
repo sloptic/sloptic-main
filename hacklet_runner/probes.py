@@ -1517,6 +1517,20 @@ def a11y_violations_present(ctx, probe) -> bool:
     return len(viols) > probe.probe.get("threshold", 0)
 
 
+def dead_controls_present(ctx, probe) -> bool:
+    """Browser oracle: clickable controls wired to nothing — clicking moves no channel (DOM / network /
+    navigation / dialog / error). The AI-shell-app tell, the interactive analogue of a broken link.
+    Browser-gated. The helper under-reports rather than over-reports (any observed motion clears a
+    control), so a fired finding is high-confidence — we never penalize a working app whose effect we
+    merely failed to observe."""
+    url = ctx.base_url.rstrip("/") + probe.probe.get("target", "/")
+    dead = browser.inert_controls(url, headers=ctx.headers, max_controls=probe.probe.get("max_controls", 10))
+    if dead is None:
+        return False   # no browser / render failed -> inconclusive, not a false "clean"
+    ctx.evidence.update(dead_controls=len(dead), labels=dead[:8])
+    return len(dead) > probe.probe.get("threshold", 0)
+
+
 _REDIRECT_PARAMS = ("next", "url", "redirect", "return", "dest", "continue", "to", "r")
 _REDIRECT_PROBE_HOST = "hacklet-redirect-probe.example"
 _REDIRECT_ENDPOINTS = ("/redirect", "/login", "/logout", "/go", "/out", "/auth/callback", "/sso")
@@ -2314,6 +2328,7 @@ PREDICATES = {
     "slow_core_web_vitals": slow_core_web_vitals,
     "console_errors_present": console_errors_present,
     "a11y_violations_present": a11y_violations_present,
+    "dead_controls_present": dead_controls_present,
     "open_redirect": open_redirect,
     "host_header_injection": host_header_injection,
     "http_response_splitting": http_response_splitting,
@@ -2378,6 +2393,7 @@ _PREDICATE_REASONS = {
     "slow_core_web_vitals": "Core Web Vitals poor on the best of N throttled samples (slow LCP / layout shift / main-thread blocking)",
     "login_no_rate_limit": "repeated wrong-password logins were never throttled",
     "console_errors_present": "threw an uncaught JavaScript error on load",
+    "dead_controls_present": "clickable controls wired to nothing (no effect on click) — non-functional UI",
     "a11y_violations_present": "accessibility violations (missing alt / form label / lang / control name)",
     "open_redirect": "a user-controlled parameter redirects to an arbitrary external host",
     "host_header_injection": "a client-controlled Host / X-Forwarded-Host header reflects into a URL / redirect (cache + password-reset poisoning)",
