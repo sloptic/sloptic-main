@@ -227,12 +227,25 @@ def _formless_form(html: str, page_path: str) -> Form | None:
     )
 
 
+def _clean_names(v) -> list:
+    """Sanitize an LLM-provided list of param / body-field names: strings only, stripped, deduped, bounded
+    — the plan is untrusted input (it can carry non-strings, dupes, or a runaway list)."""
+    out: list[str] = []
+    for x in v if isinstance(v, list) else []:
+        if isinstance(x, str) and x.strip() and x.strip() not in out:
+            out.append(x.strip())
+    return out[:12]
+
+
 def _endpoints_from_features(features) -> list:
-    """Turn the deploy LLM's source-read feature inventory ([{name, kind, path, method}]) into Endpoints
-    so the catalog can fire on an api-only app whose JSON API has NO crawlable HTML — the #1 discovery
-    blind spot (Foodgrid: 7 endpoints in source, 0 found by crawling '/'). Best-effort: a hallucinated
-    path just 404s harmlessly. A search-kind endpoint gets common query params (the source rarely names
-    them) so injection has a target; a templated /x/{id}/ yields path_params for BOLA/traversal."""
+    """Turn the deploy LLM's source-read feature inventory into Endpoints so the catalog can fire on an
+    api-only app whose JSON API has NO crawlable HTML — the #1 discovery blind spot (Foodgrid: 7 endpoints
+    in source, 0 found by crawling '/'). Best-effort: a hallucinated path just 404s harmlessly. The LLM
+    also names each endpoint's ACTUAL query params + body fields (build #2), so injection points at the
+    real source-declared input surface a crawler can't see; a search endpoint the LLM left unparametrized
+    falls back to common query names, and a templated /x/{id}/ yields path_params for BOLA/traversal.
+    The LLM only WIDENS which targets get probed — the deterministic probe still decides fire vs clean, so
+    a hallucinated name simply no-ops (never a false finding)."""
     out = []
     for f in features or []:
         raw = (f.get("path") or "").strip()
@@ -243,8 +256,11 @@ def _endpoints_from_features(features) -> list:
             method = "get"
         path_params = re.findall(r"\{([^}]+)\}", raw)
         concrete = re.sub(r"\{[^}]+\}", "1", raw)          # {id} -> 1 for fan-out fetches; injection uses raw
-        qp = ["q", "search", "query"] if f.get("kind") == "search" else []
-        out.append(Endpoint(path=concrete, method=method, query_params=qp,
+        qp = _clean_names(f.get("params"))                  # source-declared query inputs (the build #2 win)
+        bf = _clean_names(f.get("body_fields"))             # source-declared request-body inputs
+        if not qp and not bf and f.get("kind") == "search":
+            qp = ["q", "search", "query"]                   # fallback only when the LLM named nothing
+        out.append(Endpoint(path=concrete, method=method, query_params=qp, body_fields=bf,
                             path_params=path_params, raw_path=raw, kind=f.get("kind") or ""))
     return out
 

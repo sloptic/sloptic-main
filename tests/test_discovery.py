@@ -250,6 +250,28 @@ def test_endpoints_from_features_seeds_api_surface():
     assert next(e for e in eps if e.raw_path == "/api/s/").query_params == ["q", "search", "query"]
 
 
+def test_endpoints_from_features_uses_source_declared_params_and_body_fields():
+    # build #2: the LLM names each endpoint's ACTUAL query params + body fields from the source, so
+    # injection points at the real input surface a crawler can't see — not a generic guess. Untrusted-plan
+    # sanitized, and the search fallback survives only when the LLM named nothing.
+    from hacklet_runner.probes import _sqli_slots
+    eps = _endpoints_from_features([
+        {"kind": "crud-create", "path": "/projects", "method": "post",
+         "body_fields": ["title", "description"]},                        # POST body -> SQLi body slots
+        {"kind": "crud-read", "path": "/download", "method": "get", "params": ["file"]},  # non-search GET param (LFI)
+        {"kind": "search", "path": "/api/search", "method": "get",
+         "params": ["q", "q", "  ", 7, "limit"]},                         # dupes/blank/non-str sanitized out
+        {"kind": "search", "path": "/api/s2", "method": "get"},           # search + no names -> fallback intact
+    ])
+    create = next(e for e in eps if e.raw_path == "/projects")
+    assert create.method == "post" and create.body_fields == ["title", "description"] and create.query_params == []
+    assert next(e for e in eps if e.raw_path == "/download").query_params == ["file"]   # the key win: a real, non-search target
+    assert next(e for e in eps if e.raw_path == "/api/search").query_params == ["q", "limit"]  # deduped, blank + int dropped
+    assert next(e for e in eps if e.raw_path == "/api/s2").query_params == ["q", "search", "query"]  # fallback preserved
+    # and it actually reaches the injection battery: the source-named body field becomes a real SQLi slot
+    assert ("body", "title") in _sqli_slots(create)
+
+
 def test_surface_metrics_recognizes_api_login_upload_endpoints():
     from hacklet_runner.schema import Endpoint
     # an api-only app's login/upload are ENDPOINTS (feature kind or a login/upload-named path), not forms —

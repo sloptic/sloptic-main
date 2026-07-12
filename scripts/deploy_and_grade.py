@@ -303,11 +303,18 @@ JSON schema (all keys required unless marked optional):
     "views": 5
   },
   "features": [   // the app's actual features/operations inferred FROM THE CODE — ground truth for fine-grained
-                  // parity. Each: {name, kind, path?, method?}. kind in: form|crud-create|crud-read|crud-update|
-                  // crud-delete|search|upload|auth|realtime|payment|other. [] if none/unsure. e.g.:
-    {"name": "create project", "kind": "crud-create", "path": "/projects", "method": "post"},
+                  // parity AND injection targeting. Each: {name, kind, path?, method?, params?, body_fields?}.
+                  // kind in: form|crud-create|crud-read|crud-update|crud-delete|search|upload|auth|realtime|payment|other.
+                  // params = the query-string input NAMES the endpoint reads; body_fields = the JSON/form
+                  // request-body property NAMES it reads. Take these VERBATIM from the source — ONLY names that
+                  // actually appear in the code (never invent one to "help"); [] when the endpoint takes none.
+                  // This is the input surface a crawler can't see; the deterministic security probes inject into
+                  // exactly these names, so precise names = real coverage, a wrong name just harmlessly no-ops.
+                  // [] features if none/unsure. e.g.:
+    {"name": "create project", "kind": "crud-create", "path": "/projects", "method": "post", "body_fields": ["title", "description"]},
     {"name": "delete project", "kind": "crud-delete", "path": "/projects/{id}", "method": "delete"},
-    {"name": "semantic search", "kind": "search", "path": "/api/search", "method": "get"}
+    {"name": "semantic search", "kind": "search", "path": "/api/search", "method": "get", "params": ["q", "limit"]},
+    {"name": "download report", "kind": "crud-read", "path": "/download", "method": "get", "params": ["file"]}
   ],
   "dockerfile": "the FULL Dockerfile text to write at the build_context root (may be \"\" if web_gradeable is false)",
   "files": { "relative/path": "full file contents to overwrite/create (repairs, e.g. a fixed requirements.txt)" },  // optional, may be {}
