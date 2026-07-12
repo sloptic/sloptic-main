@@ -286,6 +286,30 @@ def test_surface_metrics_recognizes_api_login_upload_endpoints():
                                    endpoints=e))["has_login"] is True
 
 
+def test_dedup_merges_llm_params_onto_crawler_found_endpoint():
+    from hacklet_runner.discovery import _dedup_merge_endpoints
+    from hacklet_runner.schema import Endpoint
+    # a crawler-found endpoint and an LLM feature for the SAME (method, raw_path): the LLM's source-named
+    # body/query params must MERGE on (not be dropped by keep-first dedup), and origin must downgrade to
+    # crawl (a crawl source found the path too -> not the pointer's UNIQUE contribution).
+    out = _dedup_merge_endpoints([
+        Endpoint(path="/api/x", raw_path="/api/x", method="get", query_params=["page"], origin="crawl"),
+        Endpoint(path="/api/x", raw_path="/api/x", method="get", query_params=["q"], body_fields=["title"],
+                 kind="search", origin="llm"),
+    ])
+    assert len(out) == 1
+    assert out[0].query_params == ["page", "q"] and out[0].body_fields == ["title"]  # unioned; LLM params kept
+    assert out[0].kind == "search" and out[0].origin == "crawl"                      # kind filled; not LLM-unique
+    # LLM seen FIRST, a crawl source merges later -> origin still downgrades to crawl (order-independent)
+    out2 = _dedup_merge_endpoints([
+        Endpoint(path="/y", raw_path="/y", query_params=["a"], origin="llm"),
+        Endpoint(path="/y", raw_path="/y", query_params=["b"], origin="crawl"),
+    ])
+    assert out2[0].origin == "crawl" and out2[0].query_params == ["a", "b"]
+    # an endpoint ONLY the LLM named keeps origin llm (the pointer's genuine unique find)
+    assert _dedup_merge_endpoints([Endpoint(path="/ghost", raw_path="/ghost", origin="llm")])[0].origin == "llm"
+
+
 def test_surface_metrics_reports_llm_pointer_precision():
     from hacklet_runner.schema import Endpoint
     # build #2 telemetry (off-score): of the endpoints ONLY the LLM seeded (origin llm), how many are real

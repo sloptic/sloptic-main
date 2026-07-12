@@ -265,6 +265,44 @@ def _endpoints_from_features(features) -> list:
     return out
 
 
+def _union(a: list, b: list) -> list:
+    """Order-preserving union of two name lists (deduped)."""
+    out = list(a)
+    for x in b:
+        if x not in out:
+            out.append(x)
+    return out
+
+
+def _merge_inputs(into: Endpoint, extra: Endpoint) -> None:
+    """Fold `extra`'s injectable input surface into `into` (the kept endpoint). Dedup keeps the first
+    occurrence's origin/baseline/path, but must not DROP a later source's params — e.g. the LLM's
+    source-named body fields on an endpoint the crawler independently found (the crawler found the PATH,
+    the LLM the request SHAPE). origin downgrades to "crawl" if EITHER contributor was crawled, so the
+    pointer telemetry only credits the LLM with endpoints it UNIQUELY found."""
+    into.query_params = _union(into.query_params, extra.query_params)
+    into.body_fields = _union(into.body_fields, extra.body_fields)
+    into.path_params = _union(into.path_params, extra.path_params)
+    if not into.kind and extra.kind:
+        into.kind = extra.kind
+    if extra.origin == "crawl":
+        into.origin = "crawl"
+
+
+def _dedup_merge_endpoints(endpoints: list) -> list:
+    """Dedup by (method, raw_path), MERGING each duplicate's injectable inputs into the first occurrence
+    rather than dropping it (keep-first would lose an LLM feature's source-named params on an endpoint the
+    crawler ALSO found). Insertion order preserved."""
+    merged: dict = {}
+    for e in endpoints:
+        key = (e.method, e.raw_path)
+        if key in merged:
+            _merge_inputs(merged[key], e)
+        else:
+            merged[key] = e
+    return list(merged.values())
+
+
 def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: int = MAX_DEPTH,
              headers=None, seed_features=None) -> Profile:
     routes: dict[str, None] = {}      # insertion-ordered set
@@ -333,9 +371,7 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
                      + _endpoints_from_features(seed_features))
         endpoints += [Endpoint(path=p, method="get", query_params=sorted(params), raw_path=p)
                       for p, params in link_params.items()]
-        seen_eps: set[tuple] = set()
-        endpoints = [e for e in endpoints
-                     if (e.method, e.raw_path) not in seen_eps and not seen_eps.add((e.method, e.raw_path))]
+        endpoints = _dedup_merge_endpoints(endpoints)   # MERGE inputs on collision (don't drop LLM params)
         # Baseline each endpoint with a well-formed (read-only GET) request: an env-var-gated endpoint
         # (dummy Supabase/API key) 500s on EVERYTHING, so a baseline 5xx marks it reached-but-DEAD. This
         # separates "healthy-observed" surface (parity's real denominator) from merely "reached", and lets
