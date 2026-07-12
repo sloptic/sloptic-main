@@ -6,7 +6,7 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
-from devpost_repos import links_for, repo_for  # noqa: E402
+from devpost_repos import IngestCache, links_for, page_projects, repo_for  # noqa: E402
 
 _VENDOR = '<script>d("https://github.com/newrelic/newrelic-browser-agent")</script>'   # on EVERY page
 
@@ -85,3 +85,56 @@ def test_vendor_url_inside_app_links_block_is_filtered():
 def test_multiclass_app_links_ul_still_matches():
     repo = _page('<ul class="grid app-links mt-2"><li><a href="https://github.com/bob/thing">gh</a></li></ul>')
     assert repo == "https://github.com/bob/thing"
+
+
+# ── ingest cache: a completed hackathon's fetches are memoized, so a re-run does ~zero network ──
+class _Counting:
+    """A client that counts real fetches and returns fixed 200 markup — proves the cache skips the network."""
+    def __init__(self, text):
+        self._text, self.n = text, 0
+
+    def get(self, url, **kw):
+        self.n += 1
+        return type("R", (), {"status_code": 200, "text": self._text})()
+
+
+def test_ingest_cache_memoizes_links_and_survives_reload(tmp_path):
+    # the core resumability claim: resolve once (1 fetch), re-resolve from cache (0), then a FRESH cache object
+    # reading the same file still hits (persisted to disk) — an interrupted scrape resumes without re-fetching.
+    c = _Counting('<ul class="app-links"><li><a href="https://github.com/a/b">gh</a></li></ul>')
+    cache = IngestCache(tmp_path / "ing.jsonl")
+    r1 = links_for(c, "https://devpost.com/software/x", cache)
+    r2 = links_for(c, "https://devpost.com/software/x", cache)
+    assert r1 == r2 == ("https://github.com/a/b", None)
+    assert c.n == 1                                        # second call served from memory -> no new fetch
+    reloaded = IngestCache(tmp_path / "ing.jsonl")         # simulate a subsequent process
+    assert links_for(c, "https://devpost.com/software/x", reloaded) == r1
+    assert c.n == 1                                        # still no new fetch: the entry persisted to the file
+
+
+def test_ingest_cache_never_memoizes_a_failed_fetch(tmp_path):
+    # no-poisoning claim: a transient failure must NOT be cached as an (empty) result — it retries next run.
+    class _Flaky:
+        def __init__(self):
+            self.n = 0
+
+        def get(self, url, **kw):
+            self.n += 1
+            ok = self.n > 1                               # first fetch fails (500), then recovers (200)
+            text = '<ul class="app-links"><li><a href="https://github.com/a/b">gh</a></li></ul>' if ok else ""
+            return type("R", (), {"status_code": 200 if ok else 500, "text": text})()
+
+    c, cache = _Flaky(), IngestCache(tmp_path / "ing.jsonl")
+    assert links_for(c, "https://devpost.com/software/x", cache) == (None, None)   # 500 -> uncached
+    assert links_for(c, "https://devpost.com/software/x", cache) == ("https://github.com/a/b", None)
+    assert c.n == 2                                        # it re-fetched rather than serving a poisoned blank
+
+
+def test_ingest_cache_memoizes_gallery_pages(tmp_path):
+    # the gallery-enumeration half caches too (and round-trips the (url, winner) tuple through JSON).
+    c = _Counting('<div class="gallery-item">https://devpost.com/software/proj-one winner</div>')
+    cache = IngestCache(tmp_path / "ing.jsonl")
+    p1 = page_projects(c, "hack", 1, cache)
+    p2 = page_projects(c, "hack", 1, cache)
+    assert p1 == p2 == [("https://devpost.com/software/proj-one", True)]
+    assert c.n == 1                                        # page 1 served from cache the second time

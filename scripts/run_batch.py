@@ -263,6 +263,11 @@ def main():
     ap.add_argument("--max-pages", type=int, default=25, dest="max_pages",
                     help="safety cap on gallery pages per hackathon (pages auto-fetched to fill --limit)")
     ap.add_argument("--limit", type=int, default=25, help="max repos to grade")
+    ap.add_argument("--ingest-cache", metavar="FILE", dest="ingest_cache", default=None,
+                    help="forward to devpost_repos: JSONL memo of Devpost fetches so a re-run of an already-"
+                         "scraped hackathon does ~zero network (default: $HL_CACHE_DIR/devpost-ingest.jsonl).")
+    ap.add_argument("--no-ingest-cache", action="store_true", dest="no_ingest_cache",
+                    help="forward to devpost_repos: disable the ingest cache (fetch every page/project fresh).")
     ap.add_argument("--results", required=True, metavar="FILE", help="JSONL to append results to")
     ap.add_argument("--no-browser", dest="browser", action="store_false",
                     help="skip the browser-rendered surface (faster; default is browser ON for grading — "
@@ -299,6 +304,10 @@ def main():
     if args.hackathon or args.search:
         dp = PY + [str(_HERE / "devpost_repos.py"), "--json", "--limit", str(args.limit),
                    "--max-pages", str(args.max_pages)]
+        if args.no_ingest_cache:
+            dp += ["--no-ingest-cache"]
+        elif args.ingest_cache:
+            dp += ["--ingest-cache", args.ingest_cache]
         if args.hackathon:
             dp += ["--hackathon", args.hackathon]
         else:
