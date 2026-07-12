@@ -19,6 +19,7 @@ grader still probes whatever comes up.
 """
 import argparse
 import contextlib
+import hashlib
 import json
 import multiprocessing as mp
 import os
@@ -329,7 +330,10 @@ def plan_deploy(context: str, model: str, error: str = "", prev: dict = None, on
     if error:
         user += (f"\n\nThe PREVIOUS plan FAILED. Previous plan:\n{json.dumps(prev)[:3000]}"
                  f"\n\nError output:\n{error[:4000]}\n\nReturn a corrected JSON plan.")
-    body = {"model": model, "temperature": 0.2,
+    # temperature 0: greedy decoding makes the source-read (deploy plan + feature SEED) as reproducible as an
+    # LLM gets — same repo -> near-same plan. Combined with the per-commit plan CACHE (see main), the LLM's
+    # contribution is frozen, so re-grading identical code can't yield a different score (the fairness bug).
+    body = {"model": model, "temperature": 0,
             "messages": [{"role": "system", "content": _SYSTEM}, {"role": "user", "content": user}]}
     if online:   # retries: let the model WEB-SEARCH for current dep versions / deploy config it may not know
         body["plugins"] = [{"id": "web", "max_results": 3, "search_prompt":
@@ -349,6 +353,52 @@ def plan_deploy(context: str, model: str, error: str = "", prev: dict = None, on
     if not m:
         sys.exit(f"LLM did not return JSON:\n{content[:400]}")
     return json.loads(m.group(0))
+
+
+# ---- 2a. per-commit plan cache: freeze the LLM's contribution for COMPUTATIONAL reproducibility ---
+# The LLM is a discovery/deploy POINTER, never a scorer — but at temp>0 it still drifts run-to-run, so
+# re-grading identical code could deploy differently or seed a different surface -> a different score. That
+# is a fairness violation (an appeal must re-grade to the same number). Fix: cache the SUCCESSFUL plan
+# (Dockerfile + features + stack) keyed by the immutable commit SHA. Same commit -> same frozen plan ->
+# same deploy + same discovery seed -> reproducible. (Freezing the browser crawl/interaction surface is the
+# next increment; this freezes the LLM, which is the drift the temperature bug actually caused.)
+_CACHE_DIR = pathlib.Path(os.environ.get("HL_CACHE_DIR", pathlib.Path.home() / ".cache" / "hacklet-plan"))
+
+
+def _git_sha(repo: pathlib.Path):
+    """The cloned repo's commit SHA — the immutable identity a cached plan is keyed to. None for a local
+    non-git path (no stable identity, so no caching — a local checkout can change under us)."""
+    with contextlib.suppress(Exception):
+        r = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    return None
+
+
+def _plan_cache_path(repo_url: str, sha: str) -> pathlib.Path:
+    return _CACHE_DIR / (hashlib.sha256(f"{repo_url}@{sha}".encode()).hexdigest()[:24] + ".json")
+
+
+def load_cached_plan(repo_url: str, sha):
+    """The frozen plan for this exact (repo, commit), or None. Reused verbatim so the deploy + discovery
+    seed are identical to the first grade — the source of computational reproducibility."""
+    if not sha:
+        return None
+    p = _plan_cache_path(repo_url, sha)
+    if p.exists():
+        with contextlib.suppress(Exception):
+            return json.loads(p.read_text())
+    return None
+
+
+def store_cached_plan(repo_url: str, sha, plan: dict) -> None:
+    """Freeze the plan that WORKED (deployed + graded) for this commit, so every later run reuses it."""
+    if not sha:
+        return
+    with contextlib.suppress(Exception):
+        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        _plan_cache_path(repo_url, sha).write_text(json.dumps(plan))
 
 
 # ---- 2b. LLM coverage auditor: catch surface the DETERMINISTIC discovery missed -------------------
@@ -404,7 +454,7 @@ def audit_coverage(skeleton: str, observed: dict, features=None, model: str = DE
             f"FUZZER OBSERVED (structured):\n{json.dumps(observed, default=str)[:1600]}")
     if features:
         user += f"\n\nSOURCE FEATURES (from the repo, if known):\n{json.dumps(features)[:800]}"
-    body = {"model": model, "temperature": 0.1,
+    body = {"model": model, "temperature": 0,   # greedy: the off-score audit stays as stable as an LLM gets
             "messages": [{"role": "system", "content": _AUDIT_SYSTEM}, {"role": "user", "content": user}]}
     try:
         r = httpx.post(OPENROUTER_URL, json=body, timeout=90,
@@ -660,6 +710,9 @@ def main():
     ap.add_argument("--no-web-search", dest="web_search", action="store_false",
                     help="don't let the LLM web-search on retries (default: retries CAN search OpenRouter's "
                          "web plugin for current dep versions / deploy config, ~$0.02/retry)")
+    ap.add_argument("--no-cache", action="store_true", help="don't reuse/store the per-commit deploy-plan "
+                    "cache — re-plan from scratch every run (default: a commit's SUCCESSFUL plan is frozen so "
+                    "re-grades are reproducible; the cache lives at HL_CACHE_DIR, default ~/.cache/hacklet-plan)")
     ap.add_argument("--attempts", type=int, default=3, help="max deploy attempts (LLM fixes errors between)")
     ap.add_argument("--build-timeout", type=int, default=480, dest="build_timeout",
                     help="kill a docker build after N seconds (default 480). Lower = better batch "
@@ -717,21 +770,32 @@ def main():
             repo = clone(args.repo, timeout=args.clone_timeout)
             timings["clone_s"] = round(time.monotonic() - _t, 1)
             context = gather_context(repo)
+            _sha = _git_sha(repo)   # immutable commit identity for the plan cache (None on a local path -> no cache)
+            cached_plan = None if args.no_cache else load_cached_plan(args.repo, _sha)
+            if cached_plan:
+                print(f"  ↺ reusing the cached deploy plan for commit {_sha[:8]} "
+                      f"— frozen for reproducibility (--no-cache to re-plan)")
             for attempt in range(1, args.attempts + 1):
                 result["attempts_used"] = attempt
-                online = attempt >= 2 and args.web_search   # attempt 1 cheap/no-search; retries look up recent stacks
-                print(f"\n=== attempt {attempt}/{args.attempts}: planning deploy ({args.model}"
-                      f"{' + web search' if online else ''}) ===")
-                _t = time.monotonic()
-                plan = plan_deploy(context, args.model, error=error, prev=plan, online=online)
-                timings["plan_s"] += round(time.monotonic() - _t, 1)   # LLM planning, summed across attempts
-                _routing = (plan.get("stack_profile") or {}).get("routing", "?")
-                print(f"  stack: {plan.get('stack')} [{_routing}]  port: {plan.get('port')}  "
-                      f"db: {(plan.get('db') or {}).get('type')}")
-                notes = (plan.get("notes") or "").strip()
-                if notes:   # a few wrapped, hanging-indented lines (was one 200-char line cut mid-sentence)
-                    for i, line in enumerate(textwrap.wrap(notes, width=100)[:6]):
-                        print(("  notes: " if i == 0 else "         ") + line)
+                if attempt == 1 and cached_plan:   # FROZEN: reuse the cached plan, skip the (stochastic) LLM
+                    plan = cached_plan
+                    _routing = (plan.get("stack_profile") or {}).get("routing", "?")
+                    print(f"  stack (frozen): {plan.get('stack')} [{_routing}]  port: {plan.get('port')}  "
+                          f"db: {(plan.get('db') or {}).get('type')}")
+                else:
+                    online = attempt >= 2 and args.web_search   # attempt 1 cheap/no-search; retries look up stacks
+                    print(f"\n=== attempt {attempt}/{args.attempts}: planning deploy ({args.model}"
+                          f"{' + web search' if online else ''}) ===")
+                    _t = time.monotonic()
+                    plan = plan_deploy(context, args.model, error=error, prev=plan, online=online)
+                    timings["plan_s"] += round(time.monotonic() - _t, 1)   # LLM planning, summed across attempts
+                    _routing = (plan.get("stack_profile") or {}).get("routing", "?")
+                    print(f"  stack: {plan.get('stack')} [{_routing}]  port: {plan.get('port')}  "
+                          f"db: {(plan.get('db') or {}).get('type')}")
+                    notes = (plan.get("notes") or "").strip()
+                    if notes:   # a few wrapped, hanging-indented lines (was one 200-char line cut mid-sentence)
+                        for i, line in enumerate(textwrap.wrap(notes, width=100)[:6]):
+                            print(("  notes: " if i == 0 else "         ") + line)
                 if args.checkpoint and attempt == 1:   # persist the stack-ID BEFORE the risky deploy/grade, so
                     _ck = {}                            # a wedge-kill still yields a labelled record (deploy-parity)
                     _record_plan_meta(_ck, plan)
@@ -748,6 +812,8 @@ def main():
                 try:
                     url = execute(plan, repo, verbose=args.verbose, build_timeout=args.build_timeout)
                     timings["deploy_s"] += round(time.monotonic() - _t, 1)   # build + db + run + health
+                    if _sha and not cached_plan and not args.no_cache:
+                        store_cached_plan(args.repo, _sha, plan)   # freeze the plan that WORKED for this commit
                     result.pop("deploy_error", None)   # a later attempt SUCCEEDED -> drop the earlier failure's
                     result.pop("timeout", None)        # error/timeout so a deployed app isn't tagged as failed
                     break

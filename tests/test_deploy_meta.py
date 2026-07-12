@@ -102,6 +102,29 @@ def test_inject_build_cache_handles_continuation_and_is_idempotent():
     assert _inject_build_cache(once) == once                                 # idempotent (guarded on --mount=)
 
 
+def test_plan_cache_roundtrip_keyed_by_commit(tmp_path, monkeypatch):
+    # computational reproducibility: a commit's SUCCESSFUL plan is frozen + reused verbatim, keyed by SHA
+    import subprocess
+
+    import deploy_and_grade as dg
+    monkeypatch.setattr(dg, "_CACHE_DIR", tmp_path / "cache")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for cmd in (["init", "-q"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
+        subprocess.run(["git", "-C", str(repo), *cmd], check=True)
+    (repo / "f").write_text("x")
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "init"], check=True)
+    sha = dg._git_sha(repo)
+    assert sha and len(sha) == 40
+    assert dg.load_cached_plan("gh/x", sha) is None                 # miss before store
+    plan = {"dockerfile": "FROM scratch", "features": [{"name": "login"}], "stack": "flask"}
+    dg.store_cached_plan("gh/x", sha, plan)
+    assert dg.load_cached_plan("gh/x", sha) == plan                 # frozen: same commit -> the same plan
+    assert dg.load_cached_plan("gh/x", "0" * 40) is None            # a different commit -> miss (keyed by SHA)
+    assert dg.load_cached_plan("gh/x", None) is None                # local non-git path -> no cache
+
+
 def test_clone_raises_cloneerror_instead_of_crashing():
     # a bad repo must raise CloneError (caught + recorded in main), not an uncaught TimeoutExpired/SystemExit
     with pytest.raises(CloneError):
