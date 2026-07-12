@@ -131,6 +131,45 @@ def test_interaction_is_bounded_to_first_n_routes():
         srv.shutdown()
 
 
+def test_interaction_clicks_create_openers_but_not_form_submitters():
+    # build #3: the broadened reveal set clicks generic create/new/add OPENERS ('New Board') to surface the
+    # create form discovery kept missing — while the submit-guard skips a 'Create' SUBMIT inside a <form>, so
+    # we open UI without POSTing it. ('New Board'/'Create' match neither the OLD reveal regex nor _NO_CLICK.)
+    import http.server
+    import threading
+
+    page = (
+        "<!doctype html><html><body><h1>Boards</h1>"
+        "<button id='nb'>New Board</button>"                        # opener, NOT in a form -> clicked
+        "<form onsubmit='return false'><button type='submit' id='cr'>Create</button></form>"  # submit -> guarded
+        "<div id='mount'></div><script>"
+        "function mk(n){var e=document.createElement('input');e.setAttribute('name',n);"
+        "document.getElementById('mount').appendChild(e);}"
+        "document.getElementById('nb').onclick=function(){mk('boardname');};"
+        "document.getElementById('cr').onclick=function(){mk('shouldnotappear');};"
+        "</script></body></html>").encode("ascii")
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200); self.send_header("Content-Type", "text/html"); self.end_headers()
+            self.wfile.write(page)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        dom = browser.render_routes(base, ["/"], interact=True)["/"]
+        # assert against the REVEALED section only (the <script> source names both inputs -> match attributes there)
+        revealed = dom.split("<!--revealed-controls-->", 1)[-1] if "<!--revealed-controls-->" in dom else ""
+        assert 'name="boardname"' in revealed        # 'New Board' opener clicked -> its create input captured
+        assert 'name="shouldnotappear"' not in revealed  # 'Create' is a form submitter -> guarded, never clicked
+    finally:
+        srv.shutdown()
+
+
 def test_inert_controls_flags_only_the_dead_button():
     # observed-behavior dead-control detection: click each reveal-safe control, flag ONLY the ones that
     # move no channel. Locks the FP guards — a delegated/DOM-mutating button, a network button, a disabled

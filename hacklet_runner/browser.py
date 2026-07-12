@@ -71,11 +71,14 @@ def _apply_auth(page, url: str, headers) -> None:
 _REVEAL = re.compile(
     r"log ?in|sign ?in|sign ?up|register|create account|get started|get access|"
     r"upload|attach|evidence|screenshot|choose file|select file|browse|drop|"
-    r"add (a |an )?(file|photo|image|evidence|attachment|document|screenshot|picture)|"
-    r"account|profile|menu|new (post|note|item|entry|report|upload)", re.I)
+    r"account|profile|menu|"
+    # generic create/new/add OPENERS — 'New Board', 'Add Card', 'Create Your First X', 'Start', '+' — the
+    # client-side action buttons the coverage audit kept flagging as missed (they open a create form/modal
+    # whose inputs we then capture). The submit-guard below keeps this from clicking a form's SUBMIT button.
+    r"\bnew\b|\badd\b|\bcreate\b|\bstart\b|\bbegin\b|\bcompose\b|\bwrite\b|\bpost\b|\+", re.I)
 _NO_CLICK = re.compile(
     r"log ?out|sign ?out|delete|remove|pay\b|buy\b|checkout|subscribe|purchase|confirm|"
-    r"download|share|tweet|facebook|instagram|external|https?://", re.I)
+    r"send\b|publish|invite|download|share|tweet|facebook|instagram|external|https?://", re.I)
 
 
 def _reveal_hidden_controls(page, max_clicks: int = 6, per_wait_ms: int = 350) -> str:
@@ -100,6 +103,12 @@ def _reveal_hidden_controls(page, max_clicks: int = 6, per_wait_ms: int = 350) -
         except Exception:
             continue
         if not label or not _REVEAL.search(label) or _NO_CLICK.search(label):
+            continue
+        is_submit = False   # a Create/Add/... SUBMIT button inside a <form> would POST it, not open UI —
+        with contextlib.suppress(Exception):   # reveal is open-ONLY, so skip real form submitters (the broadened
+            is_submit = el.evaluate(           # opener set now matches submit labels too; this keeps them safe)
+                "e => e.tagName==='BUTTON' && (e.type==='submit'||e.type==='reset') && !!e.form")
+        if is_submit:
             continue
         try:
             el.click(timeout=1500)
