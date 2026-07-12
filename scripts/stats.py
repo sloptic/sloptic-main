@@ -133,7 +133,10 @@ def main():
     url_apps = [r for r in recs if _source(r) == "url"]
     repo_recs = [r for r in recs if _source(r) == "repo"]
     deployed = [r for r in repo_recs if r.get("deployed")]      # deploy-success is a REPO-only concept
-    graded = [r for r in recs if r.get("deployed") and "slop_score" in r]   # all graded (both cohorts)
+    # non-functional = the audit judged it broken/not-an-app/placeholder -> DNF-CLASS: ranks below every
+    # working submission, so it's EXCLUDED from the score distribution (never rescued to a low slop score).
+    nonfunctional = [r for r in recs if r.get("functional") is False]
+    graded = [r for r in recs if r.get("deployed") and "slop_score" in r and r.get("functional") is not False]
     ungraded = [r for r in deployed if "slop_score" not in r]   # repo app came up but grading aborted
     scores = [r["slop_score"] for r in graded]
     # (g) pairing: a submission graded BOTH ways — keyed by project, the delta is the reproducibility signal
@@ -206,6 +209,7 @@ def main():
     if args.json:
         print(json.dumps({
             "n_records": len(recs), "n_repo": len(repo_recs), "n_url": len(url_apps),
+            "n_nonfunctional": len(nonfunctional),
             "n_paired": len(paired), "n_deployed": len(deployed), "n_graded": len(graded),
             "deploy_rate": round(len(deployed) / ((len(repo_recs) - len(skipped)) or 1), 3),   # repo web apps
             "scores": {"avg": round(statistics.mean(scores), 1) if scores else None,
@@ -250,9 +254,14 @@ def main():
         print(f"    TOOK FOREVER (timeouts — a deployability/quality signal): "
               + ", ".join(f"{n}× {k}" for k, n in timeouts.most_common()))
     if url_apps:   # graded directly from a live URL — never deploy-tested, so OUTSIDE the rate above
-        u_scored = [r for r in url_apps if "slop_score" in r]
+        u_scored = [r for r in url_apps if "slop_score" in r and r.get("functional") is not False]
+        u_broken = [r for r in url_apps if r.get("functional") is False]
+        u_dead = len(url_apps) - len(u_scored) - len(u_broken)
         print(f"    LIVE-URL COHORT: {len(url_apps)} app(s) graded directly (not deploy-tested) — "
-              f"{len(u_scored)} scored, {len(url_apps) - len(u_scored)} unreachable/ungraded")
+              f"{len(u_scored)} scored, {len(u_broken)} non-functional (DNF-class), {u_dead} unreachable/ungraded")
+    if nonfunctional:   # visible, not silently dropped: broken/not-an-app apps rank DNF, out of the distribution
+        print(f"    NON-FUNCTIONAL (audit): {len(nonfunctional)} app(s) broken/not-an-app/placeholder — ranked "
+              f"DNF-class, EXCLUDED from the score distribution below (not rescued to a low slop score)")
 
     # (a)
     print(f"\n(a) SLOP-SCORE DISTRIBUTION  (all graded apps)")
