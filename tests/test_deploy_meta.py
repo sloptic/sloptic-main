@@ -44,6 +44,8 @@ def test_dead_shell_reason_flags_placeholder_and_default_pages_but_not_a_real_ap
     assert _dead_shell_reason("<h1>Coming Soon</h1><p>we're building something great</p>").startswith("placeholder")
     assert _dead_shell_reason("<title>Welcome to nginx!</title><h1>Welcome to nginx!</h1>").startswith("placeholder")
     assert _dead_shell_reason("<div>404</div><p>Page Not Found</p>").startswith("client-side 404")
+    assert _dead_shell_reason("<h1>Application error</h1><p>a client-side exception occurred</p>") is not None
+    assert _dead_shell_reason("<div><h2>Something went wrong</h2></div>") is not None   # crashed error-boundary shell
     assert _dead_shell_reason("<h1>Receipts</h1><p>Welcome back — upload a receipt to get started</p>") is None
 
 

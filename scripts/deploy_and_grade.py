@@ -681,9 +681,11 @@ _DEAD_PAGE = re.compile(
 # a CLIENT-SIDE 404: the host answers 200 but the SPA ROUTER renders a 'page not found' at the entry (a
 # broken/missing root route). Only visible in the RENDERED dom — the static shell doesn't carry it. Match
 # the not-found message as the page's main content, tolerant of the exact wording (React/Vue/Angular defaults).
+_GHOST_PATH = "/__hacklet_nonexistent_probe_9z8x7q__"   # a path no real app serves -> reveals catch-all/404 behavior
 _CLIENT_404 = re.compile(
     r"page not ?found|could(n'?t| not) be found|this page (does ?n'?t|does not) exist|"
-    r"404\D{0,40}(not ?found|error|does ?n'?t exist)|nothing (to see )?here", re.I)
+    r"404\D{0,40}(not ?found|error|does ?n'?t exist)|nothing (to see )?here|"
+    r"application error|something went wrong", re.I)   # a crashed SPA / error-boundary shell is broken, not an app
 # a working-LOOKING but empty deployment: a coming-soon / maintenance / service-down splash, or a web
 # server's DEFAULT page (nginx/Apache) — the deploy 'succeeded' but hosts no real app. Placeholder, not app.
 _PLACEHOLDER = re.compile(
@@ -736,12 +738,20 @@ def _dead_url_reason(url: str, render=None, timeout: float = 10.0):
         return static_shell
     if render is not None:   # SPA client-side 404 / rendered placeholder: only the rendered entry shows it
         with contextlib.suppress(Exception):
-            doms = render(url, ["/"])
+            base = url.rstrip("/")
+            doms = render(base + "/", ["/"])
             dom = doms.get("/") or (next(iter(doms.values()), "") if doms else "")
             if dom:
                 rendered_shell = _dead_shell_reason(dom)
                 if rendered_shell:
                     return rendered_shell
+                # BROKEN CATCH-ALL: a guaranteed-nonexistent path renders a 404/error shell AND the entry
+                # renders the SAME thing -> the app serves that dead shell for EVERY route (nothing real is
+                # deployed; this is the world-of-vibecraft class that scored SQLi-40 on a 404 page). A working
+                # SPA whose entry differs from its 404 component is fine — that's good 404 UX, not a dead app.
+                ghost = next(iter((render(base + _GHOST_PATH, ["/"]) or {}).values()), "")
+                if ghost and _dead_shell_reason(ghost) and _visible_text(dom)[:800] == _visible_text(ghost)[:800]:
+                    return f"broken app — every route renders a {_dead_shell_reason(ghost)}"
     return None
 
 
@@ -995,6 +1005,14 @@ def main():
             timings["audit_s"] = round(time.monotonic() - _t, 1)   # only set on audit runs -> stats counts only these
             if audit:
                 result["coverage_audit"] = audit
+                if audit.get("page_state") in ("broken", "not-an-app", "placeholder"):
+                    # off-score STATUS backstop for what the deterministic dead-shell check missed: this isn't
+                    # a working app, so it ranks DNF-class (below every completed submission) — NOT a rescued
+                    # low slop score. The slop_score stays on the record for reference; `functional=False` is
+                    # the ranking signal (stats/precision exclude it; a scored league routes it to review).
+                    result["functional"] = False
+                    print(f"  ⚠ NON-FUNCTIONAL (audit page_state={audit['page_state']}) — ranks DNF-class, "
+                          f"not scored as a working app")
                 miss = audit.get("missed") or []
                 print(f"\n  LLM COVERAGE AUDIT — verdict: {audit.get('page_state') or '?'}   "
                       + (f"{len(miss)} missed surface" if miss else "no gaps (discovery covered the page)"))

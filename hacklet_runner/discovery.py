@@ -303,6 +303,42 @@ def _dedup_merge_endpoints(endpoints: list) -> list:
     return list(merged.values())
 
 
+_CATCHALL_PROBE = "/__hacklet_nonexistent_probe_9z8x7q__"
+
+
+def _body_sig(text: str) -> str:
+    """Whitespace-normalized, bounded body — for comparing whether two responses are the same shell."""
+    return re.sub(r"\s+", " ", text)[:4096]
+
+
+def _drop_phantom_surface(base_url, headers, endpoints, forms):
+    """Catch-all / phantom-surface suppression. A static-SPA or soft-404 host serves the SAME 200 shell for
+    EVERY path, so a discovered endpoint/form whose GET echoes that shell is NOT real server-side surface —
+    the injection / CSRF / rate-limit probes would fire on the shell (a submission once scored SQLi-40 on a
+    literal 404 page). Detect the shell (a deterministic nonexistent path's 200 body) and drop the targets
+    that echo it. PER-TARGET, not host-level: a mixed host — or the soft-404-having vulnerable reference —
+    keeps every REAL endpoint (only targets that literally return the shell are dropped; routes stay, so
+    headers/a11y/perf on the served shell remain real). Returns (catch_all, endpoints, forms)."""
+    try:
+        with make_client(base_url, headers, timeout=5.0, follow_redirects=True) as c:
+            probe = c.get(_CATCHALL_PROBE)
+            if probe.status_code != 200 or "html" not in probe.headers.get("content-type", "").lower():
+                return False, endpoints, forms          # a real 404 for a nonexistent path -> not a catch-all
+            shell = _body_sig(probe.text)
+
+            def echoes(path):
+                try:
+                    r = c.get(path)
+                    return r.status_code == 200 and _body_sig(r.text) == shell
+                except (httpx.HTTPError, httpx.InvalidURL):
+                    return False
+            return (True,
+                    [e for e in endpoints if not echoes(e.path)],
+                    [f for f in forms if not echoes(f.action)])
+    except (httpx.HTTPError, httpx.InvalidURL):
+        return False, endpoints, forms
+
+
 def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: int = MAX_DEPTH,
              headers=None, seed_features=None) -> Profile:
     routes: dict[str, None] = {}      # insertion-ordered set
@@ -431,6 +467,10 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
     # to have crawled); only their submittable form/param projection is dropped.
     forms = [f for f in forms if not is_password_change_form(f)]
 
+    # drop phantom server-side surface on a catch-all / soft-404 host (endpoints/forms that just echo the
+    # app shell) so injection/CSRF/rate-limit don't fire on a page that has no real backend (see the helper).
+    catch_all, endpoints, forms = _drop_phantom_surface(base_url, headers, endpoints, forms)
+
     capabilities = {
         "at_least_one_http_endpoint_exists": any_response,
         # text-input surface = HTML form fields OR API query params / JSON body fields (so the
@@ -448,6 +488,8 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
         # HSTS and other transport-security headers are meaningless over plain HTTP -> gate on this so
         # those probes read N/A (not a false positive) against an http:// target.
         "served_over_https": base_url.lower().startswith("https"),
+        # host serves a 200 shell for every path -> phantom server-side surface was dropped (off-score signal)
+        "catch_all": catch_all,
     }
     return Profile(base_url=base_url, routes=list(routes), forms=forms, capabilities=capabilities,
                    endpoints=endpoints)
@@ -508,4 +550,5 @@ def surface_metrics(profile: Profile) -> dict:
         # composite "how much observable & HEALTHY APP surface we saw" — the parity denominator
         "surface_size": len(app_routes) + inputs + len(healthy_eps),
         "pointer": pointer,                          # LLM-pointer precision telemetry (off-score, build #2)
+        "catch_all": bool(caps.get("catch_all")),    # phantom server-side surface was suppressed (soft-404/SPA)
     }

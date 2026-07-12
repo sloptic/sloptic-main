@@ -310,6 +310,55 @@ def test_dedup_merges_llm_params_onto_crawler_found_endpoint():
     assert _dedup_merge_endpoints([Endpoint(path="/ghost", raw_path="/ghost", origin="llm")])[0].origin == "llm"
 
 
+def test_catch_all_host_drops_phantom_endpoints_and_forms():
+    import http.server
+    import threading
+
+    from hacklet_runner.discovery import discover
+    _SHELL = (b"<html><body><h1>App</h1>"
+              b"<form action='/login'><input name='email'><input name='password' type='password'></form>"
+              b"<a href='/api/data?q=x'>data</a></body></html>")
+
+    class _CatchAll(http.server.BaseHTTPRequestHandler):   # every path -> the SAME 200 shell (SPA/soft-404)
+        def do_GET(self):
+            self.send_response(200); self.send_header("Content-Type", "text/html"); self.end_headers()
+            self.wfile.write(_SHELL)
+
+        def log_message(self, *a):
+            pass
+
+    class _Real(http.server.BaseHTTPRequestHandler):       # real 404 for nonexistent; a real JSON endpoint
+        def do_GET(self):
+            if self.path.startswith("/api/data"):
+                self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers()
+                self.wfile.write(b'{"items":[]}'); return
+            if self.path in ("/", "/login"):
+                self.send_response(200); self.send_header("Content-Type", "text/html"); self.end_headers()
+                self.wfile.write(_SHELL); return
+            self.send_response(404); self.end_headers(); self.wfile.write(b"not found")
+
+        def log_message(self, *a):
+            pass
+
+    def _serve(handler):
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        return srv
+
+    ca = _serve(_CatchAll)
+    real = _serve(_Real)
+    try:
+        p_ca = discover(f"http://127.0.0.1:{ca.server_address[1]}")
+        assert p_ca.capabilities["catch_all"] is True          # nonexistent path returned the shell -> catch-all
+        assert p_ca.endpoints == [] and p_ca.forms == []       # /api/data + /login echo the shell -> phantom, dropped
+        p_real = discover(f"http://127.0.0.1:{real.server_address[1]}")
+        assert p_real.capabilities["catch_all"] is False       # nonexistent path 404s -> real server
+        assert any("/api/data" in e.path for e in p_real.endpoints)   # a real endpoint (distinct JSON) is KEPT
+        assert any(f.action == "/login" for f in p_real.forms)        # and its real form
+    finally:
+        ca.shutdown(); real.shutdown()
+
+
 def test_surface_metrics_reports_llm_pointer_precision():
     from hacklet_runner.schema import Endpoint
     # build #2 telemetry (off-score): of the endpoints ONLY the LLM seeded (origin llm), how many are real
