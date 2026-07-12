@@ -30,7 +30,12 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from hacklet_runner.jsonl import append_jsonl  # noqa: E402  (lock-guarded results append, safe under concurrency)
 
 _HERE = pathlib.Path(__file__).resolve().parent
-PY = [sys.executable]   # the uv-run venv interpreter (hacklet_runner importable)
+# Launch children (deploy_and_grade / devpost_repos / stats / parity) with the PROJECT'S OWN venv python —
+# it has PyYAML + httpx + playwright + all deps. NOT sys.executable: a bare `python3 run_batch.py` (no
+# `uv run`) would otherwise spawn every child on a system interpreter missing yaml, and each grade dies at
+# `import yaml`. Fall back to sys.executable only if the venv is absent (e.g. a non-uv checkout).
+_VENV_PY = pathlib.Path(__file__).resolve().parent.parent / ".venv" / "bin" / "python"
+PY = [str(_VENV_PY)] if _VENV_PY.exists() else [sys.executable]
 
 
 def _hard_kill(proc):
