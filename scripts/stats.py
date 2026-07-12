@@ -144,7 +144,7 @@ def main():
     paired = {p: d for p, d in by_project.items() if "repo" in d and "url" in d}
     timed = [r for r in recs if r.get("timings")]               # per-phase wall-clock, as measurement
     _PHASES = [("clone_s", "clone"), ("plan_s", "plan(LLM)"), ("deploy_s", "deploy"),
-               ("grade_s", "grade"), ("total_s", "total")]
+               ("grade_s", "grade"), ("audit_s", "audit(LLM)"), ("total_s", "total")]
 
     def _phase(key):
         return [r["timings"][key] for r in timed if r["timings"].get(key)]
@@ -201,6 +201,8 @@ def main():
     ptr_judged = ptr_reach + ptr_halluc
     ptr_prec = round(ptr_reach / ptr_judged * 100, 1) if ptr_judged else None
 
+    models = Counter(r.get("model") for r in recs if r.get("model"))   # LLM(s) used (a file may mix runs)
+
     if args.json:
         print(json.dumps({
             "n_records": len(recs), "n_repo": len(repo_recs), "n_url": len(url_apps),
@@ -220,10 +222,13 @@ def main():
                                  "max": max(xs)} for key, label in _PHASES for xs in [_phase(key)] if xs},
             "pointer": {"apps": len(ptr_active), "endpoints_seeded": ptr_seeded, "reachable": ptr_reach,
                         "hallucinated": ptr_halluc, "params_seeded": ptr_params, "precision_pct": ptr_prec},
+            "models": dict(models.most_common()),
         }, indent=2))
         return
 
     print(f"\n═══ deploy_and_grade stats — {len(recs)} apps ═══")
+    if models:
+        print("    model(s): " + ", ".join(f"{m} ({n})" for m, n in models.most_common()))
 
     # (d)
     print(f"\n(d) DEPLOY-SUCCESS RATE (hackathon reproducibility — REPO apps only)")

@@ -793,7 +793,7 @@ def main():
     # reproducibility metric) vs "url" (their live deployment, real keys + full surface but their infra
     # headers). A submission can be graded BOTH ways; stats keep the two separate — never blended.
     result = {"repo": args.repo, "deployed": False, "attempts_used": 0, "browser": args.browser,
-              "source": "url" if args.url_ingest else "repo", "ts": time.time(), **meta}
+              "source": "url" if args.url_ingest else "repo", "model": args.model, "ts": time.time(), **meta}
 
     plan, url, error, repo = None, None, "", None
     _sha, cached_profile = None, None   # repo-commit identity + its frozen surface; stay None for --url
@@ -967,6 +967,7 @@ def main():
                     print(f"        {'':22}↳ {trig}")
         if args.audit_coverage:   # LLM coverage CRITIC — read the live page, ALWAYS print + record what
             audit, why = None, ""  # discovery missed (like the deploy notes). Best-effort: never breaks a grade.
+            _t = time.monotonic()  # the audit renders + calls the LLM -> its own timed phase (audit_s)
             try:
                 # audit the entry page + the head app sub-routes discovery found (routes_list), interact ON
                 # so a click-gated login/upload — on the landing OR a sub-route like /report — lands in the
@@ -983,6 +984,7 @@ def main():
                         why = "LLM returned nothing (missing OPENROUTER_API_KEY or an API error)"
             except Exception as e:
                 why = f"{type(e).__name__}: {e}"
+            timings["audit_s"] = round(time.monotonic() - _t, 1)   # only set on audit runs -> stats counts only these
             if audit:
                 result["coverage_audit"] = audit
                 miss = audit.get("missed") or []
@@ -1003,9 +1005,11 @@ def main():
     finally:
         timings["total_s"] = round(time.monotonic() - t_app, 1)
         result["timings"] = timings
+        _audit_s = timings.get("audit_s")   # present only when --audit-coverage ran
         print(f"  timing: clone {timings['clone_s']:.0f}s · plan {timings['plan_s']:.0f}s · "
               f"deploy {timings['deploy_s']:.0f}s · grade {timings['grade_s']:.0f}s · "
-              f"total {timings['total_s']:.0f}s")
+              + (f"audit {_audit_s:.0f}s · " if _audit_s else "")
+              + f"total {timings['total_s']:.0f}s   ·   model {args.model}")
         if args.record:
             with open(args.record, "a") as f:
                 f.write(json.dumps(result) + "\n")
