@@ -67,6 +67,13 @@ _LOGIN_TRIGGER = re.compile(r"\b(?:log ?in|sign ?in|log-in|sign-in)\b|continue w
 _SIGNUP_TRIGGER = re.compile(r"\bsign ?up\b|\bregister\b|create (?:an |my )?(?:account|profile)|"
                              r"get started|start (?:your )?free|join (?:the )?(?:free|beta|waitlist)", re.I)
 _BROWSER_ROUTE_CAP = 12  # max routes to browser-render for forms (one launch, but each goto has a cost)
+# conventional auth routes a CTA login/signup navigates to via the JS router (no crawlable href) — rendered
+# explicitly ONLY when a login/signup trigger was seen but no password form captured, so the auth self-oracle
+# probes get a registerable form (Part 2). Skips OAuth (can't appear in self-contained apps).
+_AUTH_ROUTES = ["/login", "/signin", "/sign-in", "/signup", "/sign-up", "/register", "/auth"]
+# anti-bot widget tokens (Cloudflare Turnstile / reCAPTCHA / hCaptcha / ASP.NET AV) — NOT app-controlled
+# fields; injecting into them produced XSS false positives (the reflection is the vendor's, not the app's).
+_VENDOR_FIELD = re.compile(r"turnstile|recaptcha|h-?captcha|__requestverification|g-recaptcha", re.I)
 
 
 def _auth_triggers(markup: str) -> tuple[bool, bool]:
@@ -176,6 +183,9 @@ def _scan_form_inputs(html: str, drop_named_noninjectable: bool = False):
                 continue
         if _TEMPLATE_ARTIFACT.search(name):
             continue                                  # a `${x}`/`{{x}}` artifact leaked into the identifier
+        if _VENDOR_FIELD.search(name):
+            continue                                  # a captcha/anti-bot widget token — not app-controlled;
+            #     injecting into it produced XSS false positives (its reflection is the vendor's, not the app's)
         if is_file and name not in file_fields:
             file_fields.append(name)
         if name not in fields:
@@ -460,6 +470,10 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
                         routes.setdefault(p, None)
             extra = [r for r in routes if r != start_path and _renderable_route(r)]
             extra = list(dict.fromkeys(extra))[:_BROWSER_ROUTE_CAP]
+            # a login/signup CTA was seen but no password form captured -> the form is likely on a conventional
+            # auth route the CTA navigates to (JS router push, no href to crawl). Render those to find it (Part 2).
+            if (auth[0] or auth[1]) and not any(any("pass" in n.lower() for n in f.fields) for f in forms):
+                extra += [p for p in _AUTH_ROUTES if p not in extra and p not in visited]
             if extra:                               # phase 2: render the rest of the HTML surface
                 rendered.update(render(base_url, extra, headers=headers) or {})
             for path, dom in rendered.items():

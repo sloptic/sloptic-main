@@ -170,6 +170,39 @@ def test_interaction_clicks_create_openers_but_not_form_submitters():
         srv.shutdown()
 
 
+def test_auth_route_probing_captures_login_form_behind_a_cta():
+    # Part 2: a login CTA with NO crawlable href + no inline form -> discovery must probe conventional auth
+    # routes (/login) to find the password form, so the auth self-oracle probes get a registerable form.
+    import http.server
+    import threading
+
+    from hacklet_runner.discovery import discover
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path.startswith("/login"):
+                body = b"<html><body><form><input name='email'><input name='password' type='password'></form></body></html>"
+            elif self.path == "/":
+                body = b"<html><body><h1>App</h1><button>Sign in</button></body></html>"   # CTA, no href, no form
+            else:
+                self.send_response(404); self.end_headers(); self.wfile.write(b"nope"); return   # real 404 (not catch-all)
+            self.send_response(200); self.send_header("Content-Type", "text/html"); self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        p = discover(f"http://127.0.0.1:{srv.server_address[1]}", render=browser.render_routes)
+        assert p.capabilities["login_trigger"] is True             # the 'Sign in' CTA was detected
+        assert p.capabilities["any_form_has_password"] is True      # /login was probed -> password form captured
+        assert any(f.action == "/login" and "password" in f.fields for f in p.forms)
+    finally:
+        srv.shutdown()
+
+
 def test_inert_controls_flags_only_the_dead_button():
     # observed-behavior dead-control detection: click each reveal-safe control, flag ONLY the ones that
     # move no channel. Locks the FP guards — a delegated/DOM-mutating button, a network button, a disabled

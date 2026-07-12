@@ -359,6 +359,15 @@ def test_catch_all_host_drops_phantom_endpoints_and_forms():
         ca.shutdown(); real.shutdown()
 
 
+def test_vendor_antibot_fields_excluded_from_injectable_surface():
+    from hacklet_runner.discovery import _scan_form_inputs
+    fields, _files, _pw = _scan_form_inputs(
+        "<input name='email'><input name='cf-turnstile-response' type='hidden'>"
+        "<input name='g-recaptcha-response'><input name='password' type='password'>")
+    assert "email" in fields and "password" in fields                                      # real inputs kept
+    assert "cf-turnstile-response" not in fields and "g-recaptcha-response" not in fields   # widget tokens dropped
+
+
 def test_login_signup_triggers_credit_has_login_without_a_form():
     from hacklet_runner.discovery import _auth_triggers, surface_metrics
     # button/link CTAs, not inline password forms — the case the audit kept flagging as has_login=false

@@ -53,8 +53,7 @@ def _suspect(r, f, catch_all, state):
         return f"reflection is a vendor anti-bot field ({ev.get('field')}), not app-controlled XSS"
     if _phantom_sensitive(pid) and catch_all:
         return "catch-all / soft-404 host — the targeted endpoint likely doesn't exist server-side"
-    if state == "login-wall" and _phantom_sensitive(pid):
-        return "login-wall — the app is gated; the tested surface is the wall shell, not the app"
+    # NOTE: a login-wall is NOT flagged — its login form + rate-limiting ARE real, testable surface.
     return None
 
 
