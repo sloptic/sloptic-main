@@ -79,6 +79,14 @@ def _plan_jobs(records):
     return jobs
 
 
+def _only(jobs, only):
+    """Restrict to a single cohort (--repo-only / --url-only). `only` is 'repo' | 'url' | None (both). The
+    repo cohort is the permanent, reproducible one (fires #2 + the pointer telemetry); the url cohort is
+    cheap (no clone/plan/Docker deploy). Splitting them lets a concluded hackathon whose URLs have rotted be
+    graded repo-only, or a quick live-app pass be run url-only."""
+    return [j for j in jobs if only is None or j["source"] == only]
+
+
 def _pending(jobs, results_path, mode):
     """Jobs still needing to run under resume `mode`:
       "default"        every job not yet SUCCESSFULLY done — retries failed repos+urls, AND catches a
@@ -152,6 +160,13 @@ def main():
     resume.add_argument("--no-repeat-whatsoever", action="store_true", help="on re-run, skip any job whose "
                         "PROJECT already has a record — only brand-new submissions run (don't even chase a "
                         "missing url on an already-touched submission).")
+    cohort = ap.add_mutually_exclusive_group()
+    cohort.add_argument("--repo-only", dest="only", action="store_const", const="repo",
+                        help="grade ONLY repo jobs (skip live URLs) — the permanent, reproducible cohort that "
+                             "fires #2 + pointer telemetry; use for a concluded hackathon whose URLs have rotted.")
+    cohort.add_argument("--url-only", dest="only", action="store_const", const="url",
+                        help="grade ONLY live-URL jobs (skip repos) — cheap + fast (no clone/plan/Docker deploy); "
+                             "a quick dead-controls / coverage-audit / HTTPS pass over live apps.")
     ap.add_argument("--hackathons", type=int, default=5, help="(--search) how many hackathons")
     ap.add_argument("--completed", action="store_true", help="(--search) only ended hackathons")
     ap.add_argument("--max-pages", type=int, default=25, dest="max_pages",
@@ -207,11 +222,12 @@ def main():
     # expand submissions into repo+url grade jobs, then resume-filter them by mode (see _pending)
     mode = ("whatsoever" if args.no_repeat_whatsoever else
             "no_repeat_repo" if args.no_repeat_repo else "default")
-    jobs = _plan_jobs(records)
+    jobs = _only(_plan_jobs(records), args.only)   # --repo-only / --url-only cohort filter (None = both)
     to_run = _pending(jobs, args.results, mode)
     n_repo = sum(j["source"] == "repo" for j in to_run)
     done_n = len(jobs) - len(to_run)
-    print(f"== {len(records)} submissions → {len(jobs)} grade jobs · "
+    only_tag = f" [{args.only}-only]" if args.only else ""
+    print(f"== {len(records)} submissions → {len(jobs)} grade jobs{only_tag} · "
           + (f"{done_n} already done [{mode}] → " if done_n else "")
           + f"{len(to_run)} to run ({n_repo} repo, {len(to_run) - n_repo} url) ==\n", flush=True)
 

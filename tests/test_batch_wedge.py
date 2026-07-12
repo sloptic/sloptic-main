@@ -9,7 +9,7 @@ import sys
 import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
-from run_batch import _hard_kill, _load_urls, _pending, _plan_jobs, _record_wedge  # noqa: E402
+from run_batch import _hard_kill, _load_urls, _only, _pending, _plan_jobs, _record_wedge  # noqa: E402
 
 
 def _runset(jobs, path, mode):
@@ -24,6 +24,17 @@ def test_plan_jobs_expands_a_submission_into_repo_and_url_jobs():
     ])
     assert [(j["target"], j["source"]) for j in jobs] == [
         ("gh/a", "repo"), ("https://a.app", "url"), ("gh/b", "repo"), ("https://c.app", "url")]
+
+
+def test_only_filters_jobs_to_a_single_cohort():
+    jobs = _plan_jobs([
+        {"repo": "gh/a", "url": "https://a.app", "project": "p/a"},
+        {"repo": "gh/b", "project": "p/b"},
+        {"url": "https://c.app", "project": "p/c"},
+    ])
+    assert [j["target"] for j in _only(jobs, "repo")] == ["gh/a", "gh/b"]                  # --repo-only
+    assert [j["target"] for j in _only(jobs, "url")] == ["https://a.app", "https://c.app"]  # --url-only
+    assert _only(jobs, None) == jobs                                                        # neither flag -> both
 
 
 def test_pending_default_retries_failed_and_catches_missing_url(tmp_path):
