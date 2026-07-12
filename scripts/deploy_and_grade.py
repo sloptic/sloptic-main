@@ -45,6 +45,7 @@ from hacklet_runner.aggregate import CATEGORY_DECAY, _damped_total  # noqa: E402
 from hacklet_runner.catalog import load_catalog  # noqa: E402
 from hacklet_runner.deploy import RemoteDeployer  # noqa: E402
 from hacklet_runner.pipeline import run  # noqa: E402
+from hacklet_runner.schema import profile_from_dict, profile_to_dict  # noqa: E402
 
 
 def _axis_str(axis: dict) -> str:
@@ -360,8 +361,8 @@ def plan_deploy(context: str, model: str, error: str = "", prev: dict = None, on
 # re-grading identical code could deploy differently or seed a different surface -> a different score. That
 # is a fairness violation (an appeal must re-grade to the same number). Fix: cache the SUCCESSFUL plan
 # (Dockerfile + features + stack) keyed by the immutable commit SHA. Same commit -> same frozen plan ->
-# same deploy + same discovery seed -> reproducible. (Freezing the browser crawl/interaction surface is the
-# next increment; this freezes the LLM, which is the drift the temperature bug actually caused.)
+# same deploy + same discovery seed -> reproducible. Freezing the LLM is only HALF, though: the browser
+# crawl + interaction clicking add their OWN timing non-determinism (2b caches the discovered SURFACE too).
 _CACHE_DIR = pathlib.Path(os.environ.get("HL_CACHE_DIR", pathlib.Path.home() / ".cache" / "hacklet-plan"))
 
 
@@ -399,6 +400,41 @@ def store_cached_plan(repo_url: str, sha, plan: dict) -> None:
     with contextlib.suppress(Exception):
         _CACHE_DIR.mkdir(parents=True, exist_ok=True)
         _plan_cache_path(repo_url, sha).write_text(json.dumps(plan))
+
+
+# ---- 2b. per-commit SURFACE cache: freeze the DISCOVERED surface (crawl + interaction) too ---------
+# The plan cache froze the LLM; this freezes the browser. discover() renders + clicks reveal-triggers, and
+# that carries timing non-determinism a modal that loads slowly on one run, not the next => a different
+# surface => a different score on IDENTICAL code. So on the FIRST grade we mint the canonical surface and
+# freeze it (keyed by the same commit SHA); every re-grade reuses it verbatim and skips the crawl entirely
+# (relative paths transplant onto the fresh deployment; only base_url re-binds). Repo/zip only — a --url is
+# inherently point-in-time (the live site drifts), so it always re-discovers and the record IS the capture.
+def _profile_cache_path(repo_url: str, sha: str) -> pathlib.Path:
+    return _CACHE_DIR / (hashlib.sha256(f"{repo_url}@{sha}".encode()).hexdigest()[:24] + ".surface.json")
+
+
+def load_cached_profile(repo_url: str, sha):
+    """The frozen discovered surface for this exact (repo, commit) as a Profile, or None on miss/no-sha/
+    parse error (best-effort — a miss just re-crawls). Companion to load_cached_plan; a commit can have a
+    frozen plan but no surface yet (deployed, but its first grade hasn't finished discovery)."""
+    if not sha:
+        return None
+    p = _profile_cache_path(repo_url, sha)
+    if p.exists():
+        with contextlib.suppress(Exception):
+            return profile_from_dict(json.loads(p.read_text()))
+    return None
+
+
+def store_cached_profile(repo_url: str, sha, profile) -> None:
+    """Freeze the canonical surface discovered on this commit's first grade (called from the grade worker
+    the instant discovery completes, before probing — the surface is a complete artifact regardless of
+    whether probing later times out)."""
+    if not sha:
+        return
+    with contextlib.suppress(Exception):
+        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        _profile_cache_path(repo_url, sha).write_text(json.dumps(profile_to_dict(profile)))
 
 
 # ---- 2b. LLM coverage auditor: catch surface the DETERMINISTIC discovery missed -------------------
@@ -575,18 +611,23 @@ def _grade_heartbeat(done, total, probe, outcomes):
         sys.stderr.flush()
 
 
-def _grade_worker(url, use_browser, features, q):
+def _grade_worker(url, use_browser, features, q, cached_profile=None, cache_key=None, repo_url=None):
     os.setsid()   # own process group so the parent can SIGKILL this child AND its headless chrome together
     try:
         render = browser.render_routes if use_browser else None
+        # cache_key set (a repo commit SHA, not --no-cache) -> freeze the surface discovery mints. Writes to
+        # disk from the child; the file survives the fork. cached_profile set -> reuse it, skip the crawl.
+        on_profile = (lambda p: store_cached_profile(repo_url, cache_key, p)) if cache_key else None
         report = run(RemoteDeployer(url, health_timeout=20), load_catalog(str(_ROOT / "catalog")),
-                     render=render, on_progress=_grade_heartbeat, seed_features=features)
+                     render=render, on_progress=_grade_heartbeat, seed_features=features,
+                     cached_profile=cached_profile, on_profile=on_profile)
         q.put(("ok", report))
     except BaseException as e:   # report ANY failure back to the parent instead of dying silently
         q.put(("err", f"{type(e).__name__}: {e}"))
 
 
-def grade(url: str, use_browser: bool, timeout: int = 480, features=None):
+def grade(url: str, use_browser: bool, timeout: int = 480, features=None,
+          cached_profile=None, cache_key=None, repo_url=None):
     """Grade the running app in a CHILD PROCESS with its OWN hard wall-clock budget. Why a subprocess and
     not an in-process SIGALRM: a signal can't interrupt a Playwright CPU-spin (the browser probes), so an
     in-process cap silently overruns — but an EXTERNAL SIGKILL of the child + its chrome always works. And
@@ -594,7 +635,8 @@ def grade(url: str, use_browser: bool, timeout: int = 480, features=None):
     used to starve grading). Raises GradeTimeout on expiry. `features` seeds discovery for api-only apps."""
     ctx = mp.get_context("fork")
     q = ctx.Queue()
-    p = ctx.Process(target=_grade_worker, args=(url, use_browser, features, q))
+    p = ctx.Process(target=_grade_worker,
+                    args=(url, use_browser, features, q, cached_profile, cache_key, repo_url))
     p.start()
     try:
         result = q.get(timeout=timeout)              # up to `timeout` for the report to arrive
@@ -747,6 +789,7 @@ def main():
               "source": "url" if args.url_ingest else "repo", "ts": time.time(), **meta}
 
     plan, url, error, repo = None, None, "", None
+    _sha, cached_profile = None, None   # repo-commit identity + its frozen surface; stay None for --url
     # wall-clock per phase, as MEASUREMENT not just gates — which stacks are expensive to deploy vs grade,
     # and how that correlates with slop/coverage. Accumulated across retries; partial on an early return.
     timings = {"clone_s": 0.0, "plan_s": 0.0, "deploy_s": 0.0, "grade_s": 0.0, "total_s": 0.0}
@@ -770,8 +813,9 @@ def main():
             repo = clone(args.repo, timeout=args.clone_timeout)
             timings["clone_s"] = round(time.monotonic() - _t, 1)
             context = gather_context(repo)
-            _sha = _git_sha(repo)   # immutable commit identity for the plan cache (None on a local path -> no cache)
+            _sha = _git_sha(repo)   # immutable commit identity for the caches (None on a local path -> no cache)
             cached_plan = None if args.no_cache else load_cached_plan(args.repo, _sha)
+            cached_profile = None if args.no_cache else load_cached_profile(args.repo, _sha)
             if cached_plan:
                 print(f"  ↺ reusing the cached deploy plan for commit {_sha[:8]} "
                       f"— frozen for reproducibility (--no-cache to re-plan)")
@@ -832,10 +876,16 @@ def main():
                 return   # result (deployed=False, deploy_error) is written in the finally
         result.update(deployed=True)
         print(f"\n=== grading {url} ===")
+        if cached_profile is not None:   # frozen crawl -> no browser/interaction this run (deterministic + fast)
+            print(f"  ↺ reusing the cached discovery surface for commit {_sha[:8]} "
+                  f"({len(cached_profile.routes)} routes, {len(cached_profile.forms)} forms, "
+                  f"{len(cached_profile.endpoints)} endpoints) — frozen, skipping the crawl")
         _t = time.monotonic()
         try:
             report = grade(url, args.browser, timeout=args.grade_timeout,
-                           features=(plan.get("features") if plan else None))   # url-ingest has no plan
+                           features=(plan.get("features") if plan else None),   # url-ingest has no plan
+                           cached_profile=cached_profile,
+                           cache_key=(None if args.no_cache else _sha), repo_url=args.repo)
         except GradeTimeout as e:
             timings["grade_s"] = round(time.monotonic() - _t, 1)
             result["grade_timeout"] = True         # deployed but ungradeable in budget (broken/pathological

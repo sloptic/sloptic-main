@@ -189,6 +189,25 @@ def test_minimal_app_resolves_surface_probes_na():
     assert report.slop_score == 0
 
 
+def test_cached_profile_freezes_surface_and_reproduces_score(monkeypatch):
+    # build 1b (per-commit surface cache): the FIRST grade mints + hands back the discovered surface; a
+    # re-grade REUSES it verbatim, skipping the crawl entirely, and reproduces the EXACT score. The
+    # deployment's port differs between runs, so this also exercises the base_url re-bind (paths are relative).
+    catalog = load_catalog(CATALOG)
+    minted = []
+    r1 = run(SubprocessDeployer(str(REFS / "vulnerable" / "app.py")), catalog, on_profile=minted.append)
+    assert len(minted) == 1 and r1.slop_score == 642          # cache MISS -> discovered once + handed back
+
+    import hacklet_runner.pipeline as pipeline_mod            # PROVE the crawl is skipped on a cache HIT:
+    monkeypatch.setattr(pipeline_mod, "discover",             # discover() must never be called with a cached profile
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("discover ran on a cache hit")))
+    seen = []
+    r2 = run(SubprocessDeployer(str(REFS / "vulnerable" / "app.py")), catalog,
+             cached_profile=minted[0], on_profile=seen.append)
+    assert r2.slop_score == 642 and seen == []                # HIT -> same score, no re-crawl, no re-mint
+    assert r2.axis_slop == r1.axis_slop                       # identical per-axis decomposition too
+
+
 def test_progress_callback_fires_per_probe():
     events = []
     run(SubprocessDeployer(str(REFS / "minimal" / "app.py")), load_catalog(CATALOG),

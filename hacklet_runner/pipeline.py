@@ -7,7 +7,7 @@ so multiple vulnerable endpoints cost more than one but less than linearly.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import httpx
 
@@ -142,12 +142,25 @@ def _run_probe(probe: Probe, ctx: _Ctx, client: httpx.Client, profile: Profile) 
 
 
 def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_progress=None,
-        source_dir=None, seed_features=None) -> Report:
+        source_dir=None, seed_features=None, cached_profile=None, on_profile=None) -> Report:
     """on_progress(done, total, probe, outcomes): called twice per probe — before it runs with
-    outcomes=None (so a caller can show what's currently testing), and after with its outcomes."""
+    outcomes=None (so a caller can show what's currently testing), and after with its outcomes.
+
+    cached_profile: a FROZEN discovered surface (the per-commit cache, build 1b) reused VERBATIM instead
+    of crawling — only its base_url is re-bound to this deployment. on_profile(profile): called once with
+    a freshly-discovered surface (cache MISS) so the caller can persist it. Mutually exclusive: a HIT
+    skips discovery entirely (no crawl, no browser, no on_profile); a MISS discovers then hands it back."""
     try:
         handle = deployer.deploy()  # inside try so teardown runs even if deploy/health fails
-        profile = discover(handle.base_url, render=render, headers=headers, seed_features=seed_features)
+        if cached_profile is not None:
+            # FROZEN surface: reuse the cached crawl, re-pointing only the origin at THIS deployment's
+            # ephemeral URL (routes/forms/endpoints are relative paths; base_url is the sole absolute).
+            # Skips the crawl + interaction clicking entirely -> their timing non-determinism leaves the score.
+            profile = replace(cached_profile, base_url=handle.base_url)
+        else:
+            profile = discover(handle.base_url, render=render, headers=headers, seed_features=seed_features)
+            if on_profile is not None:
+                on_profile(profile)   # cache MISS -> hand the freshly-minted canonical surface to the caller
         outcomes: list[Outcome] = []
         total = len(catalog)
         # bind the client + probes to the ORIGIN (a --target may carry an entry path; discover() crawls

@@ -125,6 +125,36 @@ def test_plan_cache_roundtrip_keyed_by_commit(tmp_path, monkeypatch):
     assert dg.load_cached_plan("gh/x", None) is None                # local non-git path -> no cache
 
 
+def test_profile_cache_roundtrip_keyed_by_commit(tmp_path, monkeypatch):
+    # build 1b: a commit's discovered SURFACE is frozen + reconstructed as a Profile, keyed by SHA, and
+    # lives in a DISTINCT file from the plan cache (so both coexist for the same commit)
+    import subprocess
+
+    import deploy_and_grade as dg
+    from hacklet_runner.schema import Endpoint, Form, Profile
+    monkeypatch.setattr(dg, "_CACHE_DIR", tmp_path / "cache")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for cmd in (["init", "-q"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
+        subprocess.run(["git", "-C", str(repo), *cmd], check=True)
+    (repo / "f").write_text("x")
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "init"], check=True)
+    sha = dg._git_sha(repo)
+    assert dg.load_cached_profile("gh/x", sha) is None              # miss before store
+    prof = Profile(base_url="http://x", routes=["/", "/login"],
+                   forms=[Form(action="/login", method="post", fields=["u", "p"])],
+                   capabilities={"has_forms": True},
+                   endpoints=[Endpoint(path="/api/1", raw_path="/api/{id}", baseline_status=200, kind="search")])
+    dg.store_cached_profile("gh/x", sha, prof)
+    assert dg.load_cached_profile("gh/x", sha) == prof             # frozen: same commit -> the same surface
+    assert dg.load_cached_profile("gh/x", "0" * 40) is None        # a different commit -> miss (keyed by SHA)
+    assert dg.load_cached_profile("gh/x", None) is None            # local non-git path -> no cache
+    dg.store_cached_plan("gh/x", sha, {"stack": "flask"})          # the plan + surface caches share a commit
+    assert dg.load_cached_plan("gh/x", sha) == {"stack": "flask"}  # but are DISTINCT files (.json vs
+    assert dg.load_cached_profile("gh/x", sha) == prof             # .surface.json) -> neither clobbers the other
+
+
 def test_clone_raises_cloneerror_instead_of_crashing():
     # a bad repo must raise CloneError (caught + recorded in main), not an uncaught TimeoutExpired/SystemExit
     with pytest.raises(CloneError):

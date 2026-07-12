@@ -2,7 +2,7 @@
 to what the vertical slice exercises)."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -65,6 +65,37 @@ class Profile:
     @property
     def form_endpoints(self) -> list[str]:  # back-compat for predicates that target form actions
         return [f.action for f in self.forms]
+
+
+_FORM_FIELDS = {f.name for f in fields(Form)}
+_ENDPOINT_FIELDS = {f.name for f in fields(Endpoint)}
+
+
+def profile_to_dict(profile: Profile) -> dict:
+    """Serialize a discovered Profile to a JSON-safe dict for the per-commit SURFACE cache (build 1b).
+    Freezes the whole discovered surface — routes/forms/endpoints (incl. each endpoint's frozen
+    baseline_status) + capabilities — so a re-grade of the same commit reuses it verbatim instead of
+    re-crawling. That removes the browser crawl + interaction clicking's OWN timing non-determinism from
+    the score (temp-0 + the plan cache only froze the LLM). base_url is stored for reference but re-bound
+    to the fresh deployment on reuse: the surface paths are all relative (base_url is the sole absolute)."""
+    return {
+        "base_url": profile.base_url,
+        "routes": list(profile.routes),
+        "forms": [asdict(f) for f in profile.forms],
+        "capabilities": dict(profile.capabilities),
+        "endpoints": [asdict(e) for e in profile.endpoints],
+    }
+
+
+def profile_from_dict(d: dict) -> Profile:
+    """Reconstruct a Profile from profile_to_dict output. Field-tolerant (unknown keys dropped, missing
+    ones defaulted) so an older cache file still loads after a benign schema addition — a grader-logic
+    change that alters the surface's MEANING is handled out-of-band (bump the cache dir / --no-cache)."""
+    forms = [Form(**{k: v for k, v in f.items() if k in _FORM_FIELDS}) for f in d.get("forms") or []]
+    endpoints = [Endpoint(**{k: v for k, v in e.items() if k in _ENDPOINT_FIELDS})
+                 for e in d.get("endpoints") or []]
+    return Profile(base_url=d.get("base_url", ""), routes=list(d.get("routes") or []), forms=forms,
+                   capabilities=dict(d.get("capabilities") or {}), endpoints=endpoints)
 
 
 @dataclass
