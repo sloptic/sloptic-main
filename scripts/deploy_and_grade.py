@@ -41,6 +41,7 @@ _ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 
 from hacklet_runner import browser  # noqa: E402
+from hacklet_runner.jsonl import append_jsonl  # noqa: E402
 from hacklet_runner.scope import off_target  # noqa: E402
 from hacklet_runner.aggregate import CATEGORY_DECAY, _damped_total  # noqa: E402
 from hacklet_runner.catalog import load_catalog  # noqa: E402
@@ -1018,8 +1019,7 @@ def main():
               + (f"audit {_audit_s:.0f}s · " if _audit_s else "")
               + f"total {timings['total_s']:.0f}s   ·   model {args.model}")
         if args.record:
-            with open(args.record, "a") as f:
-                f.write(json.dumps(result) + "\n")
+            append_jsonl(args.record, result)   # lock-guarded: safe under parallel url grading (run_batch --concurrency)
             print(f"  recorded -> {args.record}")
         if args.url_ingest:
             pass                       # nothing was deployed — no containers/temp-clone to tear down

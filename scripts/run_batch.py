@@ -13,6 +13,7 @@ batch (they're recorded as deployed=False for the reproducibility stat). Re-runn
 --results appends; stats dedupes by repo (latest wins).
 """
 import argparse
+import concurrent.futures
 import contextlib
 import json
 import os
@@ -21,8 +22,12 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from urllib.parse import urlparse
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+from hacklet_runner.jsonl import append_jsonl  # noqa: E402  (lock-guarded results append, safe under concurrency)
 
 _HERE = pathlib.Path(__file__).resolve().parent
 PY = [sys.executable]   # the uv-run venv interpreter (hacklet_runner importable)
@@ -139,8 +144,89 @@ def _record_wedge(results, rec, secs, target, source, extra=None):
     }
     for k, v in (extra or {}).items():
         row.setdefault(k, v)   # recovered stack_profile / app_kind / features / expected_surface
-    with open(results, "a") as f:
-        f.write(json.dumps(row) + "\n")
+    append_jsonl(results, row)   # lock-guarded (a parent-thread wedge record races the concurrent url graders)
+
+
+# --- job execution (extracted so url jobs can fan out through a bounded thread pool; see main) -----------
+_active: dict = {}                # pid -> Popen, so a KeyboardInterrupt can SIGKILL every in-flight child
+_active_lock = threading.Lock()
+_print_lock = threading.Lock()    # serialize a captured job's output block so concurrent logs don't garble
+
+
+def _build_cmd(j, args, ckpt):
+    rec, target, source = j["rec"], j["target"], j["source"]
+    cmd = PY + [str(_HERE / "deploy_and_grade.py"), target, "--record", args.results,
+                "--grade-timeout", str(args.grade_timeout), "--meta", json.dumps(
+                    {"hackathon": rec.get("hackathon"), "project": rec.get("project"), "winner": rec.get("winner")})]
+    if source == "url":            # live app: grade raw, no clone/plan/Docker deploy
+        cmd += ["--url"]
+    else:
+        cmd += ["--attempts", str(args.attempts), "--build-timeout", str(args.build_timeout), "--checkpoint", str(ckpt)]
+    if not args.browser:
+        cmd += ["--no-browser"]
+    if args.audit_coverage:
+        cmd += ["--audit-coverage"]
+    if args.model:
+        cmd += ["--model", args.model]
+    return cmd
+
+
+def _run_job(j, idx, total, args, capture):
+    """Grade one job in a child process with a hard wall-clock kill. capture=True buffers the child's output
+    and prints it as ONE block on completion (concurrent url jobs, so logs don't interleave); capture=False
+    streams live (serial repo jobs). A wedge or error is RECORDED, never fatal to the batch."""
+    rec, target, source = j["rec"], j["target"], j["source"]
+    ckpt = pathlib.Path(tempfile.gettempdir()) / "hl-deploy-ckpt.json"
+    if source == "repo":           # only repo jobs plan+checkpoint; url jobs never touch it (safe concurrently)
+        ckpt.unlink(missing_ok=True)
+    hdr = f"\n{'#' * 60}\n[{idx}/{total}] {target}  [{source}]\n{'#' * 60}"
+    if not capture:
+        print(hdr, flush=True)
+    kw = {"start_new_session": True}   # own process group -> a wedge SIGKILLs the child + its chrome/docker kids
+    if capture:
+        kw.update(stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    proc = subprocess.Popen(_build_cmd(j, args, ckpt), **kw)
+    with _active_lock:
+        _active[proc.pid] = proc
+    out, tail = "", ""
+    try:
+        if capture:
+            out, _ = proc.communicate(timeout=args.app_timeout)   # reads the pipe (else it fills + deadlocks)
+        else:
+            proc.wait(timeout=args.app_timeout)   # non-zero exit doesn't stop the batch; a WEDGE gets killed
+    except subprocess.TimeoutExpired:
+        _hard_kill(proc)
+        if source == "repo":
+            _cleanup_containers()
+        if capture:
+            with contextlib.suppress(Exception):
+                out, _ = proc.communicate(timeout=5)
+        stack = {}                                # recover the stack-ID the child checkpointed before wedging
+        if source == "repo" and ckpt.exists():
+            with contextlib.suppress(Exception):
+                stack = json.loads(ckpt.read_text())
+        _record_wedge(args.results, rec, args.app_timeout, target=target, source=source, extra=stack)
+        tail = (f"  !! WEDGED — killed after {args.app_timeout}s (hung past its internal caps); "
+                f"recorded{' (stack recovered)' if stack else ''}, moving on")
+    except Exception as e:                        # a single job's failure must never kill an overnight batch
+        with contextlib.suppress(Exception):
+            _hard_kill(proc)
+        tail = f"  !! job error: {type(e).__name__}: {e}; moving on"
+    finally:
+        with _active_lock:
+            _active.pop(proc.pid, None)
+    if capture:
+        with _print_lock:
+            print(hdr + "\n" + (out or "").rstrip() + (("\n" + tail) if tail else ""), flush=True)
+    elif tail:
+        print(tail, flush=True)
+
+
+def _kill_all_active():
+    with _active_lock:
+        for p in list(_active.values()):
+            with contextlib.suppress(Exception):
+                _hard_kill(p)
 
 
 def main():
@@ -192,6 +278,11 @@ def main():
                          "now (grade in its own killable subprocess), so this only fires on a whole-child "
                          "runaway; deriving it means deploy time can't starve grading's budget")
     ap.add_argument("--model", metavar="ID", help="OpenRouter model (default: deploy_and_grade's)")
+    ap.add_argument("--concurrency", type=int, default=1, metavar="N",
+                    help="grade N URL jobs in parallel (default 1). URL grading is network/render-bound with "
+                         "no Docker, so 6-10 is a big overnight speedup; the results append is lock-guarded so "
+                         "concurrent writes won't corrupt it. REPO jobs always run serially (fixed Docker "
+                         "container names can't coexist), regardless of this value.")
     args = ap.parse_args()
     if not (args.hackathon or args.search or args.urls):
         ap.error("need a source: --hackathon, --search, or --urls")
@@ -231,47 +322,35 @@ def main():
           + (f"{done_n} already done [{mode}] → " if done_n else "")
           + f"{len(to_run)} to run ({n_repo} repo, {len(to_run) - n_repo} url) ==\n", flush=True)
 
-    # 2) run each job (repo deploy-grade or url raw-grade), appending to --results (failures recorded)
-    for i, j in enumerate(to_run, 1):
-        rec, target, source = j["rec"], j["target"], j["source"]
-        print(f"\n{'#' * 60}\n[{i}/{len(to_run)}] {target}  [{source}]\n{'#' * 60}", flush=True)
-        ckpt = pathlib.Path(tempfile.gettempdir()) / "hl-deploy-ckpt.json"
-        ckpt.unlink(missing_ok=True)   # stale from the previous app -> clear before this one writes its own
-        cmd = PY + [str(_HERE / "deploy_and_grade.py"), target, "--record", args.results,
-                    "--grade-timeout", str(args.grade_timeout), "--meta", json.dumps(
-                        {"hackathon": rec.get("hackathon"), "project": rec.get("project"),
-                         "winner": rec.get("winner")})]
-        if source == "url":   # live app: grade raw, no clone/plan/Docker deploy
-            cmd += ["--url"]
+    # 2) run each job (repo deploy-grade or url raw-grade), appending to --results (failures recorded).
+    # REPO jobs run SERIALLY (fixed Docker container names hl-deploy-app/hl-db can't coexist); URL jobs fan
+    # out N-wide (no Docker — network/render-bound). The lock-guarded append keeps --results intact.
+    repo_jobs = [j for j in to_run if j["source"] == "repo"]
+    url_jobs = [j for j in to_run if j["source"] == "url"]
+    conc = max(1, args.concurrency)
+    if conc > 1:
+        note = f" · url {conc}-wide" + (f", {len(repo_jobs)} repo serial" if repo_jobs else "")
+        print(f"   concurrency: {conc}{note}", flush=True)
+    try:
+        for i, j in enumerate(repo_jobs, 1):                       # serial repo phase
+            _run_job(j, i, len(repo_jobs), args, capture=False)
+        if url_jobs and conc > 1:                                  # parallel url phase
+            with concurrent.futures.ThreadPoolExecutor(max_workers=conc) as ex:
+                futs = [ex.submit(_run_job, j, i, len(url_jobs), args, True)
+                        for i, j in enumerate(url_jobs, 1)]
+                try:
+                    for f in concurrent.futures.as_completed(futs):
+                        f.result()                                # _run_job self-contains errors; surfaces only KI
+                except KeyboardInterrupt:
+                    _kill_all_active()                            # unblock the workers so the pool can shut down
+                    raise
         else:
-            cmd += ["--attempts", str(args.attempts), "--build-timeout", str(args.build_timeout),
-                    "--checkpoint", str(ckpt)]
-        if not args.browser:
-            cmd += ["--no-browser"]
-        if args.audit_coverage:
-            cmd += ["--audit-coverage"]
-        if args.model:
-            cmd += ["--model", args.model]
-        # own process group (start_new_session) so a wedge -> we SIGKILL the child + its chrome/docker
-        # descendants. Live output inherits our stdio.
-        proc = subprocess.Popen(cmd, start_new_session=True)
-        try:
-            proc.wait(timeout=args.app_timeout)   # non-zero exit doesn't stop the batch; a WEDGE does get killed
-        except subprocess.TimeoutExpired:
-            _hard_kill(proc)
-            _cleanup_containers()
-            stack = {}                            # recover the stack-ID the child checkpointed before wedging
-            if source == "repo" and ckpt.exists():   # url jobs never plan, so never checkpoint
-                with contextlib.suppress(Exception):
-                    stack = json.loads(ckpt.read_text())
-            _record_wedge(args.results, rec, args.app_timeout, target=target, source=source, extra=stack)
-            print(f"\n  !! WEDGED — killed after {args.app_timeout}s (hung past its internal caps); "
-                  f"recorded{' (stack recovered)' if stack else ''}, moving on", flush=True)
-        except KeyboardInterrupt:
-            _hard_kill(proc)
-            _cleanup_containers()
-            print("\ninterrupted — running stats on what we have so far ...")
-            break
+            for i, j in enumerate(url_jobs, 1):                    # serial url phase (concurrency 1)
+                _run_job(j, i, len(url_jobs), args, capture=False)
+    except KeyboardInterrupt:
+        _kill_all_active()
+        _cleanup_containers()
+        print("\ninterrupted — running stats on what we have so far ...")
 
     # 3) aggregate: slop distribution/anomalies, then the cross-stack parity (blind-spot calibration)
     print(f"\n\n{'=' * 60}\nAGGREGATE STATISTICS\n{'=' * 60}", flush=True)
