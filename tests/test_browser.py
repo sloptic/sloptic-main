@@ -96,6 +96,41 @@ def test_interaction_reveals_click_gated_login_and_upload():
         srv.shutdown()
 
 
+def test_interaction_is_bounded_to_first_n_routes():
+    # reveal-clicking EVERY route on a big SPA is what pushed AfroSecured past the grade budget -> interaction
+    # is capped to the first `interact_routes` rendered routes. With cap=1, route 0 is interacted (its gated
+    # login form surfaces) but route 1 is only RENDERED (the identical gated control stays hidden).
+    import http.server
+    import threading
+
+    from hacklet_runner.discovery import _scan_form_inputs
+    page = (
+        "<!doctype html><html><body><h1>SPA</h1><button id='lb'>Log in</button><div id='lm'></div><script>"
+        "document.getElementById('lb').onclick=function(){var f=document.createElement('form');"
+        "f.setAttribute('action','/login');var e=document.createElement('input');e.setAttribute('name','email');"
+        "var p=document.createElement('input');p.setAttribute('name','password');p.setAttribute('type','password');"
+        "f.appendChild(e);f.appendChild(p);document.getElementById('lm').appendChild(f);};"
+        "</script></body></html>").encode("ascii")
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200); self.send_header("Content-Type", "text/html"); self.end_headers()
+            self.wfile.write(page)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        out = browser.render_routes(base, ["/", "/two"], interact=True, interact_routes=1)
+        assert _scan_form_inputs(out["/"])[2] is True        # route 0 interacted -> the click-gated login surfaces
+        assert _scan_form_inputs(out["/two"])[2] is False     # route 1 only rendered -> the gated control stays hidden
+    finally:
+        srv.shutdown()
+
+
 @pytest.fixture
 def serve():
     deployers = []

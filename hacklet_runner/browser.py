@@ -120,14 +120,20 @@ def _reveal_hidden_controls(page, max_clicks: int = 6, per_wait_ms: int = 350) -
 
 
 def render_routes(base_url: str, paths, headers=None, timeout: float = 12.0,
-                  total_timeout: float = 60.0, interact: bool = True) -> dict[str, str]:
+                  total_timeout: float = 60.0, interact: bool = True,
+                  interact_routes: int = 6) -> dict[str, str]:
     """Render each same-origin path in ONE reused browser session and return {path: rendered_DOM}.
     Paths that fail to load are omitted; {} if no browser is available. A single launch is amortized
     across all routes — a launch-per-route helper would relaunch (and re-warm) the browser each time.
     Bounded by total_timeout so a slow-loris route can't stall the whole crawl (like dom_xss_executes).
     Used by discovery to harvest the client-rendered forms/inputs a SPA paints on routes OTHER than "/"
     (login, upload, search) — the interactive surface a single "/" render misses. Pass ["/"] for just
-    the entry page."""
+    the entry page.
+
+    interact_routes bounds HOW MANY routes get the (expensive) reveal-click pass: every route is still
+    rendered, but only the first `interact_routes` are interacted with. Reveal-clicking EVERY route on a
+    big SPA is what pushed AfroSecured past the grade budget, and the gated surface (login/upload) lives
+    on the entry + top nav routes anyway — deep routes almost never gate NEW controls."""
     out: dict[str, str] = {}
     try:
         from playwright.sync_api import sync_playwright
@@ -142,7 +148,7 @@ def render_routes(base_url: str, paths, headers=None, timeout: float = 12.0,
                 page = b.new_page()
                 _apply_auth(page, base_url, headers)  # cookies/headers persist for the origin across gotos
                 deadline = time.monotonic() + total_timeout
-                for path in paths:
+                for idx, path in enumerate(paths):
                     if time.monotonic() > deadline:
                         break
                     url = base_url.rstrip("/") + path
@@ -150,8 +156,8 @@ def render_routes(base_url: str, paths, headers=None, timeout: float = 12.0,
                         page.goto(url, timeout=timeout * 1000, wait_until="load")
                         page.wait_for_timeout(300)  # let client JS paint the route's forms/inputs
                         dom = page.content()
-                        if interact:                # + surface interaction-gated login/upload controls
-                            dom += _reveal_hidden_controls(page)
+                        if interact and idx < interact_routes:  # bound: reveal-clicking every route on a big
+                            dom += _reveal_hidden_controls(page)  # SPA is the grade-timeout — cap to the first N
                         out[path] = dom
             finally:
                 b.close()
