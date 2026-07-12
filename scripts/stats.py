@@ -188,6 +188,19 @@ def main():
     thin = [r for r in graded if r["slop_score"] > 0 and len(r.get("findings", [])) < 2]
     highs = [r for r in graded if sd > 0 and r["slop_score"] > hi_cut]
 
+    # ---- LLM-pointer precision (build #2, OFF-SCORE): of the endpoints the LLM UNIQUELY seeded from source
+    # (the crawler missed them), how many were REAL vs hallucinated 404s. Measures the pointer, never scores it.
+    def _ptr(r):
+        s = r.get("observed_surface")
+        return s.get("pointer") if isinstance(s, dict) and isinstance(s.get("pointer"), dict) else None
+    ptr_active = [p for r in recs for p in [_ptr(r)] if p and p.get("endpoints_seeded")]
+    ptr_seeded = sum(p["endpoints_seeded"] for p in ptr_active)
+    ptr_reach = sum(p.get("endpoints_reachable", 0) for p in ptr_active)
+    ptr_halluc = sum(p.get("endpoints_hallucinated", 0) for p in ptr_active)
+    ptr_params = sum(p.get("params_seeded", 0) for p in ptr_active)
+    ptr_judged = ptr_reach + ptr_halluc
+    ptr_prec = round(ptr_reach / ptr_judged * 100, 1) if ptr_judged else None
+
     if args.json:
         print(json.dumps({
             "n_records": len(recs), "n_repo": len(repo_recs), "n_url": len(url_apps),
@@ -205,6 +218,8 @@ def main():
                           "high_outliers": [(r["repo"], r["slop_score"]) for r in highs]},
             "timing_s": {label: {"avg": round(statistics.mean(xs), 1), "median": round(statistics.median(xs), 1),
                                  "max": max(xs)} for key, label in _PHASES for xs in [_phase(key)] if xs},
+            "pointer": {"apps": len(ptr_active), "endpoints_seeded": ptr_seeded, "reachable": ptr_reach,
+                        "hallucinated": ptr_halluc, "params_seeded": ptr_params, "precision_pct": ptr_prec},
         }, indent=2))
         return
 
@@ -375,6 +390,27 @@ def main():
             print(f"    → fix these in discovery, then re-grade; audit any probe: --audit <probe-id>")
         else:
             print("    DISCOVERY GAPS: none flagged — discovery covered the audited pages")
+        print()
+
+    # (i) LLM-POINTER PRECISION (build #2, off-score) — of the endpoints the LLM UNIQUELY seeded from source
+    # (the crawler missed them), how many were REAL on the deployed app vs hallucinated 404s. Measures the
+    # pointer's accuracy without EVER letting it touch the score — the pointer/never-judge separation, quantified.
+    if ptr_active:
+        print(f"(i) LLM-POINTER PRECISION (build #2, off-score) — {len(ptr_active)} apps where the LLM seeded "
+              f"endpoints the crawler missed")
+        print(f"    {ptr_seeded} endpoints seeded · {ptr_reach} reachable · {ptr_halluc} hallucinated (404) · "
+              f"{ptr_params} injection params added")
+        if ptr_judged:
+            print(f"    precision {ptr_prec:.0f}%  (reachable / {ptr_judged} judged)   "
+                  f"— high = the pointer names real paths; low = it invents ghost endpoints")
+        worst = sorted((r for r in recs if (_ptr(r) or {}).get("endpoints_hallucinated")),
+                       key=lambda r: -_ptr(r)["endpoints_hallucinated"])[:6]
+        if worst:
+            print("    most hallucinated paths (pointer misfires — inspect the plan):")
+            for r in worst:
+                pp = _ptr(r)
+                print(f"      {r['repo'].rsplit('/', 1)[-1][:30]:30} {pp['endpoints_hallucinated']} ghost "
+                      f"/ {pp['endpoints_seeded']} seeded")
         print()
 
 

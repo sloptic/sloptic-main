@@ -261,7 +261,7 @@ def _endpoints_from_features(features) -> list:
         if not qp and not bf and f.get("kind") == "search":
             qp = ["q", "search", "query"]                   # fallback only when the LLM named nothing
         out.append(Endpoint(path=concrete, method=method, query_params=qp, body_fields=bf,
-                            path_params=path_params, raw_path=raw, kind=f.get("kind") or ""))
+                            path_params=path_params, raw_path=raw, kind=f.get("kind") or "", origin="llm"))
     return out
 
 
@@ -441,6 +441,18 @@ def surface_metrics(profile: Profile) -> dict:
         e.kind == "auth" or _LOGIN_EP.search(e.raw_path or e.path or "") for e in eps)
     has_upload = any(f.file_fields for f in forms) or any(
         e.kind == "upload" or _UPLOAD_EP.search(e.raw_path or e.path or "") for e in eps)
+    # LLM-POINTER precision (build #2 telemetry, OFF-SCORE): endpoints the LLM UNIQUELY seeded from source
+    # (origin "llm" — survived dedup, so the crawler never found them = coverage the pointer added) and
+    # whether they turned out REAL on the deployed app. reachable = the path exists (baseline not 404);
+    # hallucinated = 404 (the LLM named a path that isn't there); the rest were beyond the baseline cap
+    # (unjudged). This MEASURES the pointer without ever letting it score — pointer/never-judge, quantified.
+    llm_eps = [e for e in eps if getattr(e, "origin", "crawl") == "llm"]
+    pointer = {
+        "endpoints_seeded": len(llm_eps),                                                 # coverage the pointer added
+        "endpoints_reachable": sum(e.baseline_status not in (None, 404) for e in llm_eps),  # path exists -> LLM right
+        "endpoints_hallucinated": sum(e.baseline_status == 404 for e in llm_eps),         # 404 -> LLM named a ghost path
+        "params_seeded": sum(len(e.query_params) + len(e.body_fields) for e in llm_eps),  # injection targets it added
+    }
     return {
         "routes": len(app_routes),
         "routes_all": len(profile.routes),           # incl. vendor assets, for reference
@@ -459,4 +471,5 @@ def surface_metrics(profile: Profile) -> dict:
         "has_password_form": bool(caps.get("any_form_has_password")),
         # composite "how much observable & HEALTHY APP surface we saw" — the parity denominator
         "surface_size": len(app_routes) + inputs + len(healthy_eps),
+        "pointer": pointer,                          # LLM-pointer precision telemetry (off-score, build #2)
     }

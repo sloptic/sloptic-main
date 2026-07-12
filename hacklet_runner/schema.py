@@ -51,6 +51,8 @@ class Endpoint:
     baseline_status: int | None = None                     # status of a well-formed baseline request;
     #                                    >=500 => env-var-dead (dummy key), so it's reached-but-not-healthy
     kind: str = ""                                          # feature kind if seeded (auth/upload/search/...)
+    origin: str = "crawl"                                   # "crawl" (openapi/js-mine/link) | "llm" (source-read
+    #                                    feature seed) — off-score pointer-precision telemetry, never scored
 
 
 @dataclass

@@ -286,6 +286,25 @@ def test_surface_metrics_recognizes_api_login_upload_endpoints():
                                    endpoints=e))["has_login"] is True
 
 
+def test_surface_metrics_reports_llm_pointer_precision():
+    from hacklet_runner.schema import Endpoint
+    # build #2 telemetry (off-score): of the endpoints ONLY the LLM seeded (origin llm), how many are real
+    # (path exists) vs hallucinated (404). Crawler endpoints are excluded — this measures the POINTER.
+    eps = [
+        Endpoint(path="/api/search", raw_path="/api/search", query_params=["q"], baseline_status=200, origin="llm"),
+        Endpoint(path="/download", raw_path="/download", query_params=["file"], baseline_status=401, origin="llm"),  # auth -> exists
+        Endpoint(path="/ghost", raw_path="/ghost", baseline_status=404, origin="llm"),                            # 404 -> hallucinated
+        Endpoint(path="/projects", raw_path="/projects", method="post", body_fields=["title", "body"],
+                 baseline_status=200, origin="llm"),
+        Endpoint(path="/crawled", raw_path="/crawled", query_params=["x"], baseline_status=200),                  # origin crawl -> excluded
+    ]
+    ptr = surface_metrics(Profile(base_url="http://t", routes=["/"], forms=[], capabilities={}, endpoints=eps))["pointer"]
+    assert ptr["endpoints_seeded"] == 4              # 4 llm-origin (the crawled endpoint is not the pointer's)
+    assert ptr["endpoints_reachable"] == 3           # 200 / 401 / 200 — the path exists (LLM was right)
+    assert ptr["endpoints_hallucinated"] == 1        # /ghost 404 — a path that isn't there
+    assert ptr["params_seeded"] == 4                 # q + file + (title, body); the ghost added none
+
+
 def test_surface_metrics_counts_only_healthy_endpoints():
     from hacklet_runner.schema import Endpoint
     eps = [Endpoint(path="/api/a", raw_path="/api/a", baseline_status=200),   # healthy
