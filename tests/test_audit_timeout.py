@@ -76,3 +76,18 @@ def test_perceive_surface_hard_caps_and_never_raises(monkeypatch):
 def test_perceive_surface_none_without_key(monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     assert dg.perceive_surface("buttons: ['x']", {}) is None                # no key -> deterministic crawl is the floor
+
+
+def test_print_perceived_shows_the_targets(capsys):
+    dg._print_perceived({"forms": [{"kind": "login", "action": "/api/login", "method": "post",
+                                     "fields": ["email", "password"]}],
+                         "endpoints": [{"kind": "create", "path": "/api/boards", "method": "post",
+                                        "body_fields": ["title"]}]})
+    out = capsys.readouterr().out
+    assert "/api/login" in out and "email, password" in out                 # the login the crawl missed, with fields
+    assert "/api/boards" in out and "title" in out                          # the action endpoint + its body field
+
+
+def test_print_perceived_silent_when_nothing_added(capsys):
+    dg._print_perceived({"forms": [], "endpoints": []})
+    assert capsys.readouterr().out == ""

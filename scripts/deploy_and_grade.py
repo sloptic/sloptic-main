@@ -578,6 +578,26 @@ def perceive_surface(skeleton: str, observed: dict, model: str = DEFAULT_MODEL, 
     return _llm_json(_PERCEIVE_SYSTEM, user, model, timeout)
 
 
+def _print_perceived(perceived: dict) -> None:
+    """Show what the perception LLM handed the fuzzer to probe (proactive discovery) — printed as it happens,
+    DURING discovery before the probes run, so a --proactive run is legible: you see the LLM point, then the
+    deterministic probes fire on those targets. Silent when perception added nothing."""
+    forms = perceived.get("forms") or []
+    eps = perceived.get("endpoints") or []
+    if not forms and not eps:
+        return
+    print(f"\n  🔮 PROACTIVE PERCEPTION — the LLM found {len(forms)} form(s) + {len(eps)} endpoint(s) the crawl "
+          f"missed, feeding them to the probes:")
+    for f in forms:
+        names = ", ".join([*(f.get("fields") or []), *(f.get("file_fields") or [])])
+        print(f"    ↳ FORM {(f.get('method') or '?').upper():4} {f.get('action') or '?'}  [{f.get('kind') or '?'}]"
+              + (f"  fields: {names}" if names else ""))
+    for e in eps:
+        names = ", ".join([*(e.get("params") or []), *(e.get("body_fields") or [])])
+        print(f"    ↳ API  {(e.get('method') or '?').upper():4} {e.get('path') or '?'}  [{e.get('kind') or '?'}]"
+              + (f"  inputs: {names}" if names else ""))
+
+
 # ---- 3. execute the plan --------------------------------------------------------------------------
 
 _DB_READY = {
@@ -699,7 +719,11 @@ def _grade_worker(url, use_browser, features, q, cached_profile=None, cache_key=
         if proactive:
             def perceive(doms, observed):
                 skeleton = "\n\n".join(_surface_skeleton(d) for d in doms.values() if d)
-                return perceive_surface(skeleton, observed, model=model) if skeleton.strip() else None
+                if not skeleton.strip():
+                    return None
+                p = perceive_surface(skeleton, observed, model=model)
+                _print_perceived(p or {})   # show what the LLM handed the fuzzer, before the probes run
+                return p
         report = run(RemoteDeployer(url, health_timeout=20), load_catalog(str(_ROOT / "catalog")),
                      render=render, on_progress=_grade_heartbeat, seed_features=features,
                      cached_profile=cached_profile, on_profile=on_profile, perceive=perceive)
