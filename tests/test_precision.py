@@ -42,3 +42,18 @@ def test_credits_the_dnf_gate_and_flags_only_residual_fps_on_scored_apps():
     assert ("gh/vendor", "sec-xss-001") in flagged                           # residual: vendor anti-bot field
     assert not any(repo in ("gh/broken", "gh/dnf") for repo, *_ in a["flagged"])  # gated apps never counted as FP
     assert ("gh/clean", "sec-headers-002") not in flagged
+
+
+def test_disputed_broken_is_scored_not_gated_and_fires_not_auto_flagged():
+    # the veto: LLM said broken but discovery KEPT real surface -> deploy_and_grade set disputed_broken and did
+    # NOT set functional=False. precision must SCORE it (page_state alone no longer gates) and judge fires normally.
+    recs = [
+        {"repo": "gh/disputed", "slop_score": 70, "disputed_broken": "broken",
+         "coverage_audit": {"page_state": "broken"},
+         "findings": [_f("sec-headers-002", 12), _f("qa-a11y-001", 26, "qa")]},
+        _rec("gh/broken", 80, [_f("sec-headers-002", 12)], page_state="broken"),   # plain broken -> still gated
+    ]
+    a = analyze(recs)
+    assert {r["repo"] for r in a["scored"]} == {"gh/disputed"}
+    assert {r["repo"] for r in a["gated"]} == {"gh/broken"}
+    assert not any(repo == "gh/disputed" for repo, *_ in a["flagged"])   # its real fires aren't flagged as FPs

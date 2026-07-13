@@ -43,12 +43,12 @@ def _soft404(r):
     return any(f.get("probe_id") == "qa-http-001" for f in r.get("findings", []))
 
 
-def _suspect(r, f, catch_all, state):
-    """Return a (reason) string if finding f on record r is a likely false positive, else None."""
+def _suspect(f, catch_all):
+    """Return a reason string if finding f is a likely false positive, else None. Called ONLY on scored apps —
+    non-working apps are gated out and a disputed-broken app has real captured surface, so page_state is no
+    longer a suspicion signal here; what remains is vendor-reflection XSS and catch-all phantom fires."""
     pid = f.get("probe_id", "")
     ev = f.get("evidence") or {}
-    if state in _NON_WORKING:
-        return f"non-working app (page_state={state}) — discovered surface is hallucinated"
     if pid.startswith("sec-xss") and (ev.get("field") or "").lower() in _VENDOR_FIELDS:
         return f"reflection is a vendor anti-bot field ({ev.get('field')}), not app-controlled XSS"
     if _phantom_sensitive(pid) and catch_all:
@@ -70,8 +70,12 @@ def load(path):
 
 
 def _gated(r):
-    """DNF-class: the gate already excludes it from scoring (functional=False, or the audit says broken/
-    not-an-app/placeholder). Its fires aren't residual FPs to chase — they never enter the distribution."""
+    """DNF-class: excluded from scoring. functional=False is the grader's authoritative verdict (set with
+    corroboration — a deterministic broken signal, or no real surface); the page_state fallback covers records
+    graded before the veto. A `disputed_broken` record is the veto's product — the LLM called it broken but
+    real surface was captured, so it's SCORED, never gated (and its fires ARE audited like any scored app)."""
+    if r.get("disputed_broken"):
+        return False
     return r.get("functional") is False or _page_state(r) in _NON_WORKING
 
 
@@ -84,13 +88,12 @@ def analyze(recs):
     flagged = []                                         # (repo, pid, penalty, count, reason)
     catchall_apps = 0
     for r in scored:                                     # measure precision ONLY on what's actually scored
-        state = _page_state(r)
         catch_all = _soft404(r) or bool((r.get("observed_surface") or {}).get("catch_all"))
         catchall_apps += bool(catch_all)
         for f in r.get("findings", []):
             pid = f["probe_id"]
             per_probe[pid][0] += 1
-            why = _suspect(r, f, catch_all, state)
+            why = _suspect(f, catch_all)
             if why:
                 per_probe[pid][1] += 1
                 reasons[why.split(" —")[0].split(" (")[0]] += 1

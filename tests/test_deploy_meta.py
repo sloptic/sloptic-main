@@ -9,8 +9,9 @@ import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
 from deploy_and_grade import (  # noqa: E402
-    CloneError, _dead_shell_reason, _dead_url_reason, _inject_build_cache, _looks_like_client_404,
-    _record_plan_meta, _surface_skeleton, _trigger_str, audit_coverage, clone)
+    CloneError, _broken_verdict, _dead_shell_reason, _dead_url_reason, _inject_build_cache,
+    _looks_like_client_404, _looks_like_source_dump, _record_plan_meta, _surface_skeleton, _trigger_str,
+    audit_coverage, clone)
 
 
 def test_surface_skeleton_extracts_interactive_surface_not_scripts():
@@ -46,6 +47,58 @@ def test_dead_shell_reason_flags_placeholder_and_default_pages_but_not_a_real_ap
     assert _dead_shell_reason("<div>404</div><p>Page Not Found</p>").startswith("client-side 404")
     assert _dead_shell_reason("<h1>Application error</h1><p>a client-side exception occurred</p>") is not None
     assert _dead_shell_reason("<div><h2>Something went wrong</h2></div>") is not None   # crashed error-boundary shell
+
+
+_CSS_DUMP = (
+    ":root { --primary: #3b82f6; --bg: #ffffff; --radius: 8px; } "
+    "body { margin: 0; font-family: sans-serif; } "
+    ".container { max-width: 1200px; padding: 24px; } "
+    "@media (max-width: 768px) { .container { padding: 12px; } } "
+    ".btn { background: var(--primary); color: #fff; border-radius: var(--radius); } "
+    ".card { box-shadow: 0 1px 3px rgba(0,0,0,0.1); font-size: 14px; } "
+    "h1 { font-size: 32px; } .grid { display: grid; gap: 16px; }")
+
+
+def test_source_dump_detects_a_bundle_painted_as_page_text():
+    # the dominant Bolt/Netlify break: HTTP 200, no '404' words, body is raw CSS -> deterministically broken
+    # (a status check can't see this; it's the signal the LLM page_state was carrying alone)
+    assert _looks_like_source_dump(f"<html><body>{_CSS_DUMP}</body></html>") is True
+    assert _dead_shell_reason(f"<body>{_CSS_DUMP}</body>").startswith("raw source dump")
+
+
+def test_source_dump_spares_a_real_app_and_short_pages():
+    app = ("<html><body><h1>TaskFlow</h1><p>Organize your team's work in one place. Sign up free and "
+           "start collaborating with your whole team today, across projects, boards, and calendars. "
+           "Thousands of teams plan their week here every Monday morning without any friction.</p>"
+           "<button>Get Started</button><form action='/signup'><input name='email'></form></body></html>")
+    assert _looks_like_source_dump(app) is False
+    assert _dead_shell_reason(app) is None
+    assert _looks_like_source_dump("<body>Hi</body>") is False          # too short to judge
+
+
+def test_source_dump_spares_a_code_snippet_diluted_by_prose():
+    # a legit tutorial: one small snippet in a sea of prose -> markers fall below the density floor, spared
+    prose = "Styling your buttons is easy and there are many approaches to consider for your design. " * 20
+    page = f"<body>{prose} For example: .btn {{ color: #fff; padding: 8px; }}</body>"
+    assert _looks_like_source_dump(page) is False
+
+
+def test_broken_verdict_dnf_on_deterministic_signal_or_no_surface():
+    # the veto DNFs (max penalty) only WITH corroboration:
+    assert _broken_verdict({"forms": 0}, f"<body>{_CSS_DUMP}</body>")[0] is True   # source-dump entry
+    dnf, why = _broken_verdict({"catch_all": True, "forms": 2}, "<body><h1>Hello there</h1></body>")
+    assert dnf is True and "catch-all" in why                                       # catch-all beats phantom forms
+    dnf, why = _broken_verdict({"forms": 0, "endpoints": 0}, "<body><h1>Buy this domain</h1></body>")
+    assert dnf is True and "no real surface" in why                                 # parked domain: nothing to test
+
+
+def test_broken_verdict_disputes_a_mixed_state_app_with_real_surface():
+    # LLM said broken, but a real form was captured and the entry isn't a dead-shell -> DISPUTED, not floored
+    dnf, why = _broken_verdict(
+        {"forms": 1, "endpoints": 3, "catch_all": False},
+        "<body><h1>Weather</h1><form><input name='city'></form>"
+        "<p>Enter your city to see this week's forecast at a glance.</p></body>")
+    assert dnf is False and "disputed" in why.lower()
     assert _dead_shell_reason("<h1>Receipts</h1><p>Welcome back — upload a receipt to get started</p>") is None
 
 

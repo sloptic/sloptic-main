@@ -712,6 +712,13 @@ _PLACEHOLDER = re.compile(
     r"we'?ll be back (soon|shortly)|temporarily (unavailable|down)|service (temporarily )?unavailable|"
     r"site is (down|offline)|parked (domain|free)|future home of|default (web )?page|"
     r"welcome to nginx|apache2? (ubuntu )?default page|\bit works!", re.I)
+# A broken build/route serving the JS/CSS BUNDLE as the page body — the browser paints raw source as visible
+# text (the dominant Bolt/Netlify break: ~28 of bolt3's 42 DNFs). HTTP 200, so a status check misses it, and
+# it often carries no 'not found' words. These markers are dense in source and ~absent in real UI copy.
+_SOURCE_MARK = re.compile(
+    r"var\(--|--[a-z][\w-]*\s*:|@media\b|@keyframes\b|@font-face\b|!important|"          # CSS
+    r"[.#][a-zA-Z][\w-]*\s*\{|:\s*#[0-9a-fA-F]{3,8}\b|\b\d+(?:px|rem|vh|vw)\b|"           # CSS rules / units
+    r"function\s*\(|=>|\bconst\s|\blet\s|module\.exports|\bimport\s.+?\bfrom\b", re.I)   # JS
 
 
 def _visible_text(html: str) -> str:
@@ -726,15 +733,31 @@ def _looks_like_client_404(dom: str) -> bool:
     return bool(_CLIENT_404.search(_visible_text(dom)[:1500]))
 
 
+def _looks_like_source_dump(html: str) -> bool:
+    """True if the visible text is raw CSS/JS SOURCE rather than UI copy — the dominant Bolt/Netlify break
+    (the bundle painted as the page body). Deterministic backing for a 'broken' verdict that a status check
+    misses (it's HTTP 200) — the signal the LLM audit was carrying alone. PRECISION-biased: fires only when
+    source markers DOMINATE a substantial body, so a page with real prose/UI — including a legit code-display
+    app, whose markers are diluted by copy — is spared (density falls below threshold)."""
+    vis = _visible_text(html)
+    if len(vis) < 300:                                   # too little text to judge confidently
+        return False
+    sample = vis[:4000]
+    hits = len(_SOURCE_MARK.findall(sample))
+    return hits >= 12 and hits / (len(sample) / 1000) >= 4   # >=12 markers AND >=4/KB -> body is source, not copy
+
+
 def _dead_shell_reason(html: str):
-    """A dead/placeholder SHELL (served OR rendered markup): a client-side 404, or a coming-soon /
-    maintenance / server-default splash. Only the PROMINENT top of the visible text is checked (low FP —
-    a real app that merely mentions 'coming soon' for a future feature isn't flagged)."""
+    """A dead/placeholder SHELL (served OR rendered markup): a client-side 404, a coming-soon / maintenance /
+    server-default splash, or a raw source dump. The text patterns check only the PROMINENT top of the visible
+    text (low FP — a real app that merely mentions 'coming soon' for a future feature isn't flagged)."""
     vis = _visible_text(html)[:1500]
     if _CLIENT_404.search(vis):
         return "client-side 404 (renders 'not found' at HTTP 200)"
     if _PLACEHOLDER.search(vis):
         return "placeholder page (coming-soon / maintenance / server default)"
+    if _looks_like_source_dump(html):
+        return "raw source dump (CSS/JS painted as page text — broken build/route)"
     return None
 
 
@@ -772,6 +795,22 @@ def _dead_url_reason(url: str, render=None, timeout: float = 10.0):
                 if ghost and _dead_shell_reason(ghost) and _visible_text(dom)[:800] == _visible_text(ghost)[:800]:
                     return f"broken app — every route renders a {_dead_shell_reason(ghost)}"
     return None
+
+
+def _broken_verdict(surf: dict, entry_dom: str):
+    """For a page the LLM audit flagged broken/placeholder/not-an-app, decide DNF vs DISPUTED. DNF is the MAX
+    penalty (ranked below every working submission), so it needs CORROBORATION: a DETERMINISTIC broken signal
+    (dead-shell / source-dump on the rendered entry, or a suppressed catch-all) OR the genuine ABSENCE of real
+    captured surface. Else it's DISPUTED — real forms/endpoints captured AND nothing deterministic agrees, so
+    scoring it (high slop ranks it near the bottom) beats flooring a demonstrably-working app on the model's
+    say-so. Returns (dnf: bool, reason: str)."""
+    surf = surf or {}
+    shell = _dead_shell_reason(entry_dom) if entry_dom else None
+    det_broken = bool(surf.get("catch_all")) or bool(shell)
+    real_surface = not surf.get("catch_all") and bool(surf.get("forms") or surf.get("endpoints"))
+    if det_broken or not real_surface:
+        return True, shell or ("catch-all (phantom surface)" if surf.get("catch_all") else "no real surface captured")
+    return False, "disputed — real surface captured, no deterministic broken signal"
 
 
 def main():
@@ -1003,7 +1042,7 @@ def main():
                 if trig:
                     print(f"        {'':22}↳ {trig}")
         if args.audit_coverage:   # LLM coverage CRITIC — read the live page, ALWAYS print + record what
-            audit, why = None, ""  # discovery missed (like the deploy notes). Best-effort: never breaks a grade.
+            audit, why, doms = None, "", {}  # discovery missed (like deploy notes). Best-effort: never breaks a grade.
             _t = time.monotonic()  # the audit renders + calls the LLM -> its own timed phase (audit_s)
             try:
                 # audit the entry page + the head app sub-routes discovery found (routes_list), interact ON
@@ -1025,13 +1064,20 @@ def main():
             if audit:
                 result["coverage_audit"] = audit
                 if audit.get("page_state") in ("broken", "not-an-app", "placeholder"):
-                    # off-score STATUS backstop for what the deterministic dead-shell check missed: this isn't
-                    # a working app, so it ranks DNF-class (below every completed submission) — NOT a rescued
-                    # low slop score. The slop_score stays on the record for reference; `functional=False` is
-                    # the ranking signal (stats/precision exclude it; a scored league routes it to review).
-                    result["functional"] = False
-                    print(f"  ⚠ NON-FUNCTIONAL (audit page_state={audit['page_state']}) — ranks DNF-class, "
-                          f"not scored as a working app")
+                    # DNF is the MAX penalty, so the LLM's holistic 'broken' can't impose it ALONE — see
+                    # _broken_verdict: it needs a deterministic broken signal OR no real captured surface, else
+                    # the app is DISPUTED (scored high-slop + flagged for review, not floored on a model's say-so).
+                    entry_dom = doms.get("/") or next((d for d in doms.values() if d), "")
+                    dnf, why_dnf = _broken_verdict(report.surface, entry_dom)
+                    if dnf:
+                        result["functional"] = False
+                        print(f"  ⚠ NON-FUNCTIONAL (page_state={audit['page_state']}; {why_dnf}) — ranks "
+                              f"DNF-class, not scored as a working app")
+                    else:
+                        result["disputed_broken"] = audit["page_state"]
+                        print(f"  ⚠ DISPUTED BROKEN (page_state={audit['page_state']}, but discovery captured "
+                              f"real surface + no deterministic signal) — SCORED, not DNF'd on the LLM alone; "
+                              f"flagged for review")
                 miss = audit.get("missed") or []
                 print(f"\n  LLM COVERAGE AUDIT — verdict: {audit.get('page_state') or '?'}   "
                       + (f"{len(miss)} missed surface" if miss else "no gaps (discovery covered the page)"))

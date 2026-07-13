@@ -136,6 +136,7 @@ def main():
     # non-functional = the audit judged it broken/not-an-app/placeholder -> DNF-CLASS: ranks below every
     # working submission, so it's EXCLUDED from the score distribution (never rescued to a low slop score).
     nonfunctional = [r for r in recs if r.get("functional") is False]
+    disputed = [r for r in recs if r.get("disputed_broken") and r.get("functional") is not False]  # veto: scored, flagged
     graded = [r for r in recs if r.get("deployed") and "slop_score" in r and r.get("functional") is not False]
     ungraded = [r for r in deployed if "slop_score" not in r]   # repo app came up but grading aborted
     scores = [r["slop_score"] for r in graded]
@@ -210,6 +211,7 @@ def main():
         print(json.dumps({
             "n_records": len(recs), "n_repo": len(repo_recs), "n_url": len(url_apps),
             "n_nonfunctional": len(nonfunctional),
+            "n_disputed": len(disputed),
             "n_paired": len(paired), "n_deployed": len(deployed), "n_graded": len(graded),
             "deploy_rate": round(len(deployed) / ((len(repo_recs) - len(skipped)) or 1), 3),   # repo web apps
             "scores": {"avg": round(statistics.mean(scores), 1) if scores else None,
@@ -262,6 +264,9 @@ def main():
     if nonfunctional:   # visible, not silently dropped: broken/not-an-app apps rank DNF, out of the distribution
         print(f"    NON-FUNCTIONAL (audit): {len(nonfunctional)} app(s) broken/not-an-app/placeholder — ranked "
               f"DNF-class, EXCLUDED from the score distribution below (not rescued to a low slop score)")
+    if disputed:   # veto: LLM called it broken but discovery kept real surface + no deterministic signal agreed
+        print(f"    DISPUTED-BROKEN (veto): {len(disputed)} app(s) the audit called broken but that KEPT real "
+              f"surface — SCORED (not DNF'd on the LLM alone), FLAGGED for human review")
 
     # (a)
     print(f"\n(a) SLOP-SCORE DISTRIBUTION  (all graded apps)")
