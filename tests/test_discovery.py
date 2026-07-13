@@ -504,4 +504,6 @@ def test_surface_metrics_reports_the_perception_pointer():
     assert ptr["perceived_forms_seeded"] == 1 and ptr["perceived_form_actions"] == ["/login"]
     assert ptr["perceived_endpoints_seeded"] == 2
     assert ptr["perceived_endpoints_reachable"] == 1 and ptr["perceived_endpoints_hallucinated"] == 1
+    assert set(ptr["perceived_endpoint_paths"]) == {"/api/real", "/api/ghost"}   # the paths it added (not the llm one)
+    assert ptr["perceived_ghost_paths"] == ["/api/ghost"]                        # only the 404 -> the invented path
     assert ptr["endpoints_seeded"] == 1        # the origin='llm' source-seed stays SEPARATE from perceived

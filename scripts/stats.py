@@ -458,6 +458,11 @@ def main():
         if pcv_judged:
             print(f"    endpoint precision {pcv_prec:.0f}%  (reachable / {pcv_judged} judged)   "
                   f"— how much of the RENDERED-page surface perception added was real (forms show up as woken probes)")
+        ghosts = [(r.get("repo", ""), p) for r in recs for p in ((_ptr(r) or {}).get("perceived_ghost_paths") or [])]
+        if ghosts:
+            print(f"    ghost paths perception INVENTED (404 — eyeball these when endpoint precision dips):")
+            for repo, path in ghosts[:8]:
+                print(f"      {repo.rsplit('/', 1)[-1][:30]:30} {path}")
         print()
 
 

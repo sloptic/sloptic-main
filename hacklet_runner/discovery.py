@@ -645,6 +645,9 @@ def surface_metrics(profile: Profile) -> dict:
         "perceived_endpoints_seeded": len(perceived_eps),
         "perceived_endpoints_reachable": sum(e.baseline_status not in (None, 404) for e in perceived_eps),
         "perceived_endpoints_hallucinated": sum(e.baseline_status == 404 for e in perceived_eps),
+        "perceived_endpoint_paths": [(e.raw_path or e.path) for e in perceived_eps][:8],   # which paths it added
+        "perceived_ghost_paths": [(e.raw_path or e.path) for e in perceived_eps            # the 404s = what it INVENTED
+                                  if e.baseline_status == 404][:8],                        # (per-app hallucination audit)
         "perceived_forms_seeded": len(perceived_forms),
         "perceived_form_actions": [f.action for f in perceived_forms][:8],
     }
