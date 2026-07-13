@@ -1,0 +1,12 @@
+id: sec-idor-004
+bundle: security
+category: access-control
+pool: public
+evidence_model: oracle
+penalty: 40   # broken per-user Row-Level Security on the app's managed backend (Supabase) — horizontal IDOR
+              # on the developer's OWN authz config (OWASP #1). Tests only the app's observed endpoints/key,
+              # read-only, as a second registered user — never the vendor's platform.
+applicability:
+  requires: [has_auth_entrypoint]
+probe:
+  predicate: bola_managed_backend

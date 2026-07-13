@@ -292,7 +292,7 @@ def register_in_browser(base_url: str, headers=None, timeout: float = 12.0, tota
     import secrets
     uname = "hl_" + secrets.token_hex(5)
     creds = {"email": uname + "@example.com", "username": uname, "password": "Hl-Probe-Passw0rd!"}
-    captured, seen_bearer, out = {}, {}, None
+    captured, seen_bearer, reads, out = {}, {}, [], None
     try:
         with sync_playwright() as pw:
             b = _launch(pw)
@@ -309,6 +309,13 @@ def register_in_browser(base_url: str, headers=None, timeout: float = 12.0, tota
                         authz = req.headers.get("authorization", "")
                         if authz[:7].lower() == "bearer " and len(authz) > 27:
                             seen_bearer["token"] = authz[7:]   # the token the app sends to its own authed API
+                        # a Supabase PostgREST DATA read the app's OWN client makes (has the app's public apikey):
+                        # recorded so the managed-backend IDOR probe can replay THIS read as a second user. Only
+                        # the app's own endpoints/project/key — never anything the app doesn't itself request.
+                        apikey = req.headers.get("apikey")
+                        if req.method == "GET" and apikey and "/rest/v1/" in req.url and len(reads) < 10:
+                            if not any(r["url"] == req.url for r in reads):
+                                reads.append({"url": req.url, "apikey": apikey})
                 page.on("request", _on_request)
 
                 if not _reach_and_submit_signup(page, base_url, creds, timeout):
@@ -329,7 +336,8 @@ def register_in_browser(base_url: str, headers=None, timeout: float = 12.0, tota
                 if not jar and not bearer:
                     return None   # no cookie AND no token -> registration didn't take (email-verify/CAPTCHA) -> N/A
                 out = {"creds": creds, "cookies": jar, "request": captured or None,
-                       "bearer": bearer, "storage_exposed": bool(stored.get("token"))}
+                       "bearer": bearer, "storage_exposed": bool(stored.get("token")),
+                       "backend_reads": reads}
             finally:
                 b.close()
     except Exception:

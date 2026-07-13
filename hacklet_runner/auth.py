@@ -9,7 +9,7 @@ from __future__ import annotations
 import contextlib
 import re
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import httpx
 
@@ -46,6 +46,8 @@ class Account:
     register_response: httpx.Response
     storage_exposed: bool = False  # session token was persisted in localStorage (XSS-reachable) -> sec-session-005
     provided: bool = False         # a caller-supplied --header session (ONE identity), not a fresh self-registration
+    backend_reads: list = field(default_factory=list)  # managed-backend (Supabase /rest/v1) reads the app's own
+    #     client made during registration {url, apikey} — replayed as a second user by the managed-backend IDOR probe
 
 
 # A field that names a NEW / CURRENT / OLD password — the hallmark of a password-CHANGE form (as opposed
@@ -448,4 +450,5 @@ def _register_via_browser(base_url: str, browser_register) -> Account | None:
     creds = result.get("creds") or {}
     return Account(username=creds.get("username", "hl_browser"), password=creds.get("password", ""),
                    client=client, register_response=_synthesize_response(base_url, cookies),
-                   storage_exposed=bool(result.get("storage_exposed")))
+                   storage_exposed=bool(result.get("storage_exposed")),
+                   backend_reads=result.get("backend_reads") or [])

@@ -1025,6 +1025,65 @@ def idor_user_record(ctx, probe) -> bool | None:
         b.client.close()
 
 
+_BACKEND_READ_CAP = 8
+
+
+def bola_managed_backend(ctx, probe) -> bool | None:
+    """Horizontal IDOR / broken Row-Level-Security on the app's MANAGED backend (Supabase). A bolt/Supabase app
+    talks straight to <project>.supabase.co, so its data authorization IS the developer's RLS config — part of
+    the submission, not the vendor's platform. We test ONLY that config, never Supabase itself: replay the app's
+    OWN observed /rest/v1 reads (captured during A's registration), as a SECOND registered user B, using the
+    app's OWN public apikey. Read-only, only the endpoints/project/key the app already uses.
+
+    Fire when a read that returns A's record for A — and is NOT anon/world-readable (apikey alone; that's the
+    separate sec-exposure finding) — ALSO returns A's record for B: a second user reads A's private row -> RLS
+    is per-user broken. A's unique registration username is the oracle. N/A when no backend reads were observed
+    (no --browser-auth, or a same-origin/cookie app) or two distinct accounts can't be established."""
+    a = ctx.register(suffix="_a")
+    b = ctx.register(suffix="_b")
+    if a is None or b is None:
+        for acct in (a, b):
+            if acct:
+                acct.client.close()
+        return None
+    if a.provided:   # one --header identity can't be both A and B
+        a.client.close()
+        b.client.close()
+        return None
+    try:
+        canary = a.username
+        a_auth = a.client.headers.get("Authorization")
+        b_auth = b.client.headers.get("Authorization")
+        reads = getattr(a, "backend_reads", None) or []
+        if not reads or not canary or not a_auth or not b_auth:
+            return None
+        tested = False
+        with httpx.Client(timeout=10.0, follow_redirects=True) as c:
+            for r in reads[:_BACKEND_READ_CAP]:
+                url, apikey = r.get("url"), r.get("apikey")
+                if not url:
+                    continue
+                base = {"apikey": apikey} if apikey else {}
+                try:
+                    as_a = c.get(url, headers={**base, "Authorization": a_auth})
+                    if as_a.status_code != 200 or canary not in as_a.text:
+                        continue   # this read doesn't return A's own record -> nothing to cross-check
+                    if canary in c.get(url, headers=base).text:
+                        continue   # readable with the apikey ALONE -> world-readable (sec-exposure), not per-user IDOR
+                    tested = True
+                    as_b = c.get(url, headers={**base, "Authorization": b_auth})
+                except (httpx.HTTPError, httpx.InvalidURL):
+                    continue
+                if as_b.status_code == 200 and canary in as_b.text:
+                    ctx.evidence.update(cross_read=True, endpoint=url.split("?")[0])
+                    return True   # B read A's private backend record -> broken per-user RLS
+        ctx.evidence.update(cross_read=False, reads_tested=len(reads))
+        return False if tested else None
+    finally:
+        a.client.close()
+        b.client.close()
+
+
 def data_integrity_roundtrip(ctx, probe) -> bool | None:
     """Persistence correctness: POST-create an object, then read it back by id and confirm the write was
     durable. Fire when a create reports success (2xx with an id) but the object then can't be read back
@@ -2399,6 +2458,7 @@ PREDICATES = {
     "csrf_missing": csrf_missing,
     "idor_horizontal": idor_horizontal,
     "idor_user_record": idor_user_record,
+    "bola_managed_backend": bola_managed_backend,
     "dom_xss": dom_xss,
     "race_resource_ids": race_resource_ids,
     "load_resilience": load_resilience,
@@ -2466,6 +2526,7 @@ _PREDICATE_REASONS = {
     "csrf_missing": "state-changing POST accepted cross-site with no token / SameSite",
     "idor_horizontal": "another account's object was readable by id (broken access control)",
     "idor_user_record": "one account's private user record was readable by another account by id (horizontal IDOR / broken object-level auth)",
+    "bola_managed_backend": "the managed backend (Supabase) let one account read another's private row -> per-user Row-Level Security is broken (the app's own RLS config)",
     "dom_xss": "an injected payload executed in the DOM",
     "race_resource_ids": "concurrent creates collided on one id (non-atomic allocation)",
     "load_resilience": "endpoint 5xx'd under a concurrent burst",
