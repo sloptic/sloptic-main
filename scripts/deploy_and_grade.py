@@ -32,6 +32,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 from collections import defaultdict
 
@@ -73,6 +74,7 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 # web-search on retries (see plan_deploy `online`), so the base model needn't be bleeding-edge. Override
 # with OPENROUTER_MODEL (e.g. qwen/qwen3.7-max for even lower hallucination, openai/gpt-5-mini for OpenAI).
 DEFAULT_MODEL = os.environ.get("OPENROUTER_MODEL", "qwen/qwen3.7-plus")
+AUDIT_TIMEOUT_S = 180   # HARD wall-clock cap on ONE coverage-audit LLM call (p75 was 43s; a hang once hit 1486s)
 NET = "hl-deploy-net"
 APP = "hl-deploy-app"
 DB = "hl-db"
@@ -489,9 +491,14 @@ def _surface_skeleton(dom: str) -> str:
             f"inputs: {inputs[:20]}\nform_actions: {actions[:10]}\nvisible_text: {_visible_text(dom)[:280]}")
 
 
-def audit_coverage(skeleton: str, observed: dict, features=None, model: str = DEFAULT_MODEL):
+def audit_coverage(skeleton: str, observed: dict, features=None, model: str = DEFAULT_MODEL,
+                   timeout: float = AUDIT_TIMEOUT_S):
     """Ask the LLM what surface the page has that `observed` (the fuzzer's discovery) missed, + the page
-    state. Returns {missed, page_state, notes} or None (no key / any error — best-effort, never raises)."""
+    state. Returns {missed, page_state, notes} or None (no key / any error — best-effort, never raises).
+    HARD-capped at `timeout`s of wall-clock: the POST runs on a DAEMON thread we join() with a deadline, so a
+    hung/slow OpenRouter response can never eat the grade budget (a scalar httpx timeout is only PER-PHASE —
+    one call trickled keepalive for 1486s, never tripping the 90s read timeout). On the cap we abandon the
+    call and return None; the daemon dies with the process."""
     key = os.environ.get("OPENROUTER_API_KEY")
     if not key or not skeleton.strip():
         return None
@@ -501,17 +508,29 @@ def audit_coverage(skeleton: str, observed: dict, features=None, model: str = DE
         user += f"\n\nSOURCE FEATURES (from the repo, if known):\n{json.dumps(features)[:800]}"
     body = {"model": model, "temperature": 0,   # greedy: the off-score audit stays as stable as an LLM gets
             "messages": [{"role": "system", "content": _AUDIT_SYSTEM}, {"role": "user", "content": user}]}
+    out = {}
+
+    def _call():
+        try:
+            r = httpx.post(OPENROUTER_URL, json=body, timeout=httpx.Timeout(timeout, connect=10.0),
+                           headers={"Authorization": "Bearer " + key,
+                                    "HTTP-Referer": "https://hacklet.league", "X-Title": "hacklet-audit"})
+            if r.status_code == 200:
+                out["content"] = r.json()["choices"][0]["message"]["content"]
+        except Exception:
+            pass                       # best-effort: a failed audit must never break the grade
+
+    t = threading.Thread(target=_call, daemon=True)
+    t.start()
+    t.join(timeout)                    # HARD wall-clock cap — take control back after `timeout`s no matter what
+    content = out.get("content")
+    if not content:
+        return None                    # timed out, errored, or non-200
     try:
-        r = httpx.post(OPENROUTER_URL, json=body, timeout=90,
-                       headers={"Authorization": "Bearer " + key,
-                                "HTTP-Referer": "https://hacklet.league", "X-Title": "hacklet-audit"})
-        if r.status_code != 200:
-            return None
-        content = r.json()["choices"][0]["message"]["content"]
         m = re.search(r"\{.*\}", content, re.S)
         return json.loads(m.group(0)) if m else None
     except Exception:
-        return None   # best-effort: a failed audit must never break the grade
+        return None
 
 
 # ---- 3. execute the plan --------------------------------------------------------------------------
