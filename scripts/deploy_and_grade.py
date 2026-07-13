@@ -710,8 +710,21 @@ def _grade_heartbeat(done, total, probe, outcomes):
         sys.stderr.flush()
 
 
+def _parse_headers(items) -> dict | None:
+    """--header 'Name: Value' (repeatable) -> {Name: Value}; None when none supplied (the common path). The
+    Option-B provided session — sent on the whole run so the authed-surface probes reach the logged-in surface."""
+    if not items:
+        return None
+    out = {}
+    for it in items:
+        name, sep, val = it.partition(":")
+        if sep and name.strip():
+            out[name.strip()] = val.strip()
+    return out or None
+
+
 def _grade_worker(url, use_browser, features, q, cached_profile=None, cache_key=None, repo_url=None,
-                  proactive=False, model=DEFAULT_MODEL, browser_auth=False):
+                  proactive=False, model=DEFAULT_MODEL, browser_auth=False, session_headers=None):
     os.setsid()   # own process group so the parent can SIGKILL this child AND its headless chrome together
     try:
         render = browser.render_routes if use_browser else None
@@ -739,7 +752,7 @@ def _grade_worker(url, use_browser, features, q, cached_profile=None, cache_key=
             _kinds = "crawl" + (" + browser-render" if use_browser else "") + (" + LLM perception" if proactive else "")
             print(f"  discovering surface ({_kinds}) — this runs before the first probe ...", flush=True)
         report = run(RemoteDeployer(url, health_timeout=20), load_catalog(str(_ROOT / "catalog")),
-                     render=render, on_progress=_grade_heartbeat, seed_features=features,
+                     render=render, on_progress=_grade_heartbeat, seed_features=features, headers=session_headers,
                      cached_profile=cached_profile, on_profile=on_profile, perceive=perceive,
                      browser_register=browser_register)
         q.put(("ok", report))
@@ -759,7 +772,7 @@ def _hard_kill_group(p) -> None:
 
 def grade(url: str, use_browser: bool, timeout=None, features=None,
           cached_profile=None, cache_key=None, repo_url=None, proactive=False, model=DEFAULT_MODEL,
-          browser_auth=False):
+          browser_auth=False, session_headers=None):
     """Grade the running app in a CHILD PROCESS. A subprocess (not an in-process SIGALRM) because a signal
     can't interrupt a Playwright CPU-spin (the browser probes), but an EXTERNAL SIGKILL of the child + its
     chrome always works. `timeout` is the grading phase's OWN wall-clock budget (independent of deploy time,
@@ -770,7 +783,7 @@ def grade(url: str, use_browser: bool, timeout=None, features=None,
     q = ctx.Queue()
     p = ctx.Process(target=_grade_worker,
                     args=(url, use_browser, features, q, cached_profile, cache_key, repo_url, proactive, model,
-                          browser_auth))
+                          browser_auth, session_headers))
     p.start()
     try:
         result = q.get(timeout=timeout)              # timeout=None (direct run) blocks until the child reports
@@ -947,6 +960,13 @@ def main():
                          "to fill + submit the signup so the app's OWN JS registers, and use the session cookie "
                          "it sets — waking the session/idor probes on self-hosted SPAs. Opt-in (an extra browser "
                          "launch per auth app); best-effort, N/A on captcha / email-verify / SSO / third-party auth.")
+    ap.add_argument("--header", action="append", dest="headers", metavar="'Name: Value'",
+                    help="a request header sent on the WHOLE run (repeatable) — the Option-B auth fallback for apps "
+                         "we can't self-register (captcha / email-verify / SSO). Provide a live session and the "
+                         "authed-surface probes reach the logged-in surface as that identity: a COOKIE app -> "
+                         "--header 'Cookie: sessionid=…'; a bolt/Supabase/Firebase (token) app -> --header "
+                         "'Authorization: Bearer eyJ…' (from DevTools -> Network -> an authed request). A single "
+                         "provided session is ONE identity, so the cross-user IDOR/BOLA probes stay N/A (no false pos).")
     ap.add_argument("--no-web-search", dest="web_search", action="store_false",
                     help="don't let the LLM web-search on retries (default: retries CAN search OpenRouter's "
                          "web plugin for current dep versions / deploy config, ~$0.02/retry)")
@@ -1092,7 +1112,8 @@ def main():
                            features=(plan.get("features") if plan else None),   # url-ingest has no plan
                            cached_profile=cached_profile,
                            cache_key=(None if args.no_cache else _sha), repo_url=args.repo,
-                           proactive=args.proactive, model=args.model, browser_auth=args.browser_auth)
+                           proactive=args.proactive, model=args.model, browser_auth=args.browser_auth,
+                           session_headers=_parse_headers(args.headers))
         except GradeTimeout as e:
             timings["grade_s"] = round(time.monotonic() - _t, 1)
             result["grade_timeout"] = True         # deployed but ungradeable in budget (broken/pathological

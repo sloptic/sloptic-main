@@ -202,6 +202,22 @@ def test_data_integrity_na_when_no_create_read_pair(jsonapi):
     assert data_integrity_roundtrip(ctx, _Probe()) is None
 
 
+def test_api_bola_na_with_a_single_provided_session():
+    # Option B guard: a --header session is ONE identity, so A and B are the SAME user — B "reading A's object"
+    # would be a false BOLA. The pair is valid (secret field), so N/A here can only come from the provided guard.
+    from hacklet_runner.probes import api_bola
+    from hacklet_runner.auth import Account
+
+    def _provided(suffix=""):
+        return Account(username="p", password="", client=httpx.Client(base_url="http://x"),
+                       register_response=httpx.Response(200, request=httpx.Request("GET", "http://x")),
+                       provided=True)
+    ctx = type("C", (), {"base_url": "http://x", "headers": None, "evidence": {},
+                         "profile": Profile(base_url="http://x", endpoints=_orders_pair()),
+                         "register": lambda self, suffix="": _provided(suffix)})()
+    assert api_bola(ctx, _Probe()) is None
+
+
 def test_data_integrity_probe_fires_end_to_end():
     report = run(SubprocessDeployer(str(REFS / "jsonapi" / "app.py")), load_catalog(CATALOG))
     assert report.by_id["qa-integrity-001"] == "slop_detected"

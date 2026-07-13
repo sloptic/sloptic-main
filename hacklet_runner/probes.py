@@ -932,6 +932,10 @@ def api_bola(ctx, probe) -> bool | None:
             if acct:
                 acct.client.close()
         return None  # couldn't establish two accounts (no JSON register) -> couldn't test
+    if a.provided:   # a single --header session is ONE identity -> B re-reading A's own object isn't BOLA (false pos)
+        a.client.close()
+        b.client.close()
+        return None
     tested = False
     try:
         with make_client(ctx.base_url, ctx.headers, timeout=10.0, follow_redirects=True) as anon:
@@ -1238,6 +1242,8 @@ def session_token_in_local_storage(ctx, probe) -> bool | None:
     if account is None:
         return None  # couldn't self-register -> couldn't test
     try:
+        if account.provided:
+            return None  # a --header session reveals nothing about how the app STORES its token -> can't assess
         if not auth._has_session(account):
             return None  # no session established (email-verify/CAPTCHA/SSO, or httpx-only run) -> couldn't test
         exposed = bool(account.storage_exposed)
@@ -1593,19 +1599,27 @@ def idor_horizontal(ctx, probe) -> bool | None:
             if acct:
                 acct.client.close()
         return None
+    if a.provided:   # a single --header session is ONE identity -> B re-reading A's own resource isn't IDOR
+        a.client.close()
+        b.client.close()
+        return None
     # extract each session cookie (jar iteration avoids CookieConflict) and re-send it plainly, so an
     # authed create/read isn't dropped over http when the app sets a Secure cookie (that's tested by
-    # sec-session-003, separately). Same approach race_resource_ids already uses.
+    # sec-session-003, separately). Same approach race_resource_ids already uses. Carry the Authorization
+    # header too — the bolt/Supabase/Firebase cohort authenticates by Bearer token, not a cookie, so a
+    # cookie-only re-send would run the create/read anonymously and read a false N/A.
     a_cookies = {c.name: c.value for c in a.client.cookies.jar}
     b_cookies = {c.name: c.value for c in b.client.cookies.jar}
+    a_auth = {k: v for k, v in a.client.headers.items() if k.lower() == "authorization"}
+    b_auth = {k: v for k, v in b.client.headers.items() if k.lower() == "authorization"}
     try:
         marker = "hl-idor-7a3f9c"
         with httpx.Client(base_url=ctx.base_url, timeout=10.0, follow_redirects=True,
-                          cookies=a_cookies) as ac:
+                          cookies=a_cookies, headers=a_auth) as ac:
             resource = ac.post(form.action, data={n: marker for n in form.fields}).url.path
         if not resource or resource == form.action:  # no distinct resource created -> couldn't test
             return None
-        with httpx.Client(base_url=ctx.base_url, timeout=10.0, cookies=b_cookies) as bc:
+        with httpx.Client(base_url=ctx.base_url, timeout=10.0, cookies=b_cookies, headers=b_auth) as bc:
             leaked = bc.get(resource)
         cross = leaked.status_code == 200 and marker in leaked.text
         ctx.evidence.update(cross_read=cross, resource=resource)

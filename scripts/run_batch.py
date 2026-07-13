@@ -242,6 +242,8 @@ def _build_cmd(j, args, ckpt):
         cmd += ["--proactive"]
     if args.browser_auth:
         cmd += ["--browser-auth"]
+    for h in (args.headers or []):
+        cmd += ["--header", h]
     if args.model:
         cmd += ["--model", args.model]
     return cmd
@@ -366,7 +368,11 @@ def main():
     ap.add_argument("--browser-auth", action="store_true", dest="browser_auth",
                     help="forward to deploy_and_grade: SPA auth — when httpx self-registration gets no session, "
                          "drive the browser to fill+submit the signup so the app's JS registers, and use the "
-                         "cookie it sets (wakes session/idor on self-hosted SPAs; opt-in, extra browser launch).")
+                         "cookie/token it sets (wakes session/idor on self-hosted SPAs; opt-in, extra browser launch).")
+    ap.add_argument("--header", action="append", dest="headers", metavar="'Name: Value'",
+                    help="forward to deploy_and_grade (repeatable): a request header sent on the whole run — the "
+                         "Option-B auth fallback (--header 'Cookie: …' or --header 'Authorization: Bearer …') so "
+                         "the authed-surface probes reach the logged-in surface when self-registration can't.")
     ap.add_argument("--attempts", type=int, default=3, help="deploy attempts per repo")
     ap.add_argument("--build-timeout", type=int, default=480, dest="build_timeout",
                     help="per-repo docker build timeout in seconds (default 480; lower = more throughput)")

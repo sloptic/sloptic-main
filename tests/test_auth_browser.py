@@ -57,3 +57,13 @@ def test_register_account_authenticates_by_bearer_when_the_app_sets_no_cookie():
     assert acct is not None and _has_session(acct)                        # a Bearer IS a session (cookieless SPA)
     assert acct.client.headers.get("Authorization", "").startswith("Bearer eyJ")  # authed client for IDOR reuse
     assert acct.storage_exposed is True                                   # persisted in localStorage -> exposure finding
+
+
+def test_provided_header_session_short_circuits_registration():
+    # Option B: a caller-supplied --header session is used directly (no self-registration), marked provided so
+    # the cross-user IDOR/BOLA probes stay N/A (one identity can't be both A and B). No dead host is contacted.
+    for hdr in ({"Authorization": "Bearer eyJ.tok.sig"}, {"Cookie": "sessionid=abc"}):
+        acct = register_account("http://127.0.0.1:1", _signup_profile(), headers=hdr)
+        assert acct is not None and acct.provided is True       # the contract the two-account guard reads
+        sent = acct.client.headers                              # the provided header rides on every authed request
+        assert any(sent.get(k) == v for k, v in hdr.items())

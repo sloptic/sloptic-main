@@ -45,6 +45,7 @@ class Account:
     client: httpx.Client          # carries the session (cookie jar and/or Authorization: Bearer) for authed probes
     register_response: httpx.Response
     storage_exposed: bool = False  # session token was persisted in localStorage (XSS-reachable) -> sec-session-005
+    provided: bool = False         # a caller-supplied --header session (ONE identity), not a fresh self-registration
 
 
 # A field that names a NEW / CURRENT / OLD password — the hallmark of a password-CHANGE form (as opposed
@@ -136,12 +137,31 @@ def login_form(forms: list[Form]) -> Form | None:
     return non_register[0] if non_register else None
 
 
-def register_account(base_url: str, profile: Profile, suffix: str = "", browser_register=None) -> Account | None:
+def _provided_session(headers) -> bool:
+    """A caller supplied a live session via --header (a Cookie or an Authorization/Bearer) — the Option-B path
+    for apps we can't self-register (CAPTCHA / email-verify / SSO)."""
+    return bool(headers) and any(k.lower() in ("cookie", "authorization") for k in headers)
+
+
+def _account_from_headers(base_url: str, headers) -> Account:
+    """Wrap a caller-supplied session (--header) as an Account: an httpx client that carries those headers on
+    every request, so the authed-surface probes reach the authenticated surface as the provided identity. No
+    Set-Cookie is available (a client-side Cookie header has no flags), so the cookie-flag probes read N/A."""
+    client = httpx.Client(base_url=base_url, timeout=15.0, follow_redirects=True, headers=dict(headers))
+    return Account(username="hl_provided", password="", client=client,
+                   register_response=httpx.Response(200, request=httpx.Request("GET", base_url)), provided=True)
+
+
+def register_account(base_url: str, profile: Profile, suffix: str = "", browser_register=None,
+                     headers=None) -> Account | None:
     """Create a fresh account (self-as-oracle) for the authed-surface probes. httpx registration first (HTML
     form POST, else JSON-API); if that establishes NO session — the SPA case, where the form's action is a
     placeholder and the real registration is a JS fetch — and a `browser_register` callback is supplied, drive
-    the BROWSER to register (its own JS makes the real request) and use the session cookie it sets. Returns None
-    when nothing establishes a session (email-verify / CAPTCHA / SSO / third-party auth) -> caller reads N/A."""
+    the BROWSER to register (its own JS makes the real request) and use the session cookie/token it establishes.
+    Returns None when nothing establishes a session (email-verify / CAPTCHA / SSO / third-party auth) -> caller
+    reads N/A. If the caller supplied a session via --header (Option B), that is used directly (single identity)."""
+    if _provided_session(headers):
+        return _account_from_headers(base_url, headers)
     acct = _register_httpx(base_url, profile, suffix)
     if _has_session(acct) or browser_register is None:
         return acct

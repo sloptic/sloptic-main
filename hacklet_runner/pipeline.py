@@ -51,8 +51,10 @@ class _Ctx:
 
     def register(self, suffix: str = ""):
         """Self-register (self-as-oracle) for the authed-surface probes, with the browser fallback threaded in:
-        a client-rendered SPA (form action = placeholder, real POST = a JS fetch) still yields a session cookie."""
-        return auth.register_account(self.base_url, self.profile, suffix=suffix, browser_register=self.browser_register)
+        a client-rendered SPA (form action = placeholder, real POST = a JS fetch) still yields a session token.
+        A caller-supplied --header session (Option B) is used directly instead of self-registering."""
+        return auth.register_account(self.base_url, self.profile, suffix=suffix,
+                                     browser_register=self.browser_register, headers=self.headers)
 
 
 def _applicable(probe: Probe, profile: Profile) -> bool:
