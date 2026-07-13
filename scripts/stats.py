@@ -8,9 +8,9 @@ Input is the JSONL that `deploy_and_grade.py --record FILE` appends (one line pe
     uv run python scripts/stats.py results.jsonl --audit sec-sqli-004   # every app + evidence for one probe
     uv run python scripts/stats.py results.jsonl --json                 # machine-readable summary
 
-Reports: (a) slop-score distribution + histogram + category concentration + most-frequent findings,
-(b) per-probe fire-frequency, (c) winners vs non-winners, (d) deploy-success rate (hackathon
-reproducibility), (e) anomalies flagged for hand-verification (the surprising 0s and the surprising
+Reports: (a) deploy-success rate (hackathon reproducibility), (b) slop-score distribution + histogram
++ category concentration + most-frequent findings, (c) per-probe fire-frequency, (d) winners vs
+non-winners, (e) anomalies flagged for hand-verification (the surprising 0s and the surprising
 outliers — where fuzzer bugs and genuinely interesting apps both hide).
 """
 import argparse
@@ -153,7 +153,7 @@ def main():
     def _phase(key):
         return [r["timings"][key] for r in timed if r["timings"].get(key)]
 
-    # ---- (d) deploy-success rate (the hackathon-reproducibility finding) ----
+    # ---- (a) deploy-success rate (the hackathon-reproducibility finding) ----
     skipped = [r for r in repo_recs if r.get("skipped")]   # not a web app -> OUT OF SCOPE, not a failure
     fails = [r for r in repo_recs if not r.get("deployed") and not r.get("skipped")]
     err_kinds = Counter((r.get("deploy_error") or "unknown")[:60] for r in fails)
@@ -167,7 +167,7 @@ def main():
             cat_total[f"{bundle}/{cat}"] += v
     all_slop = sum(cat_total.values()) or 1.0
 
-    # ---- (b) per-probe fire frequency (app-level) + most-frequent findings ----
+    # ---- (c) per-probe fire frequency (app-level) + most-frequent findings ----
     probe_apps = defaultdict(set)        # probe_id -> {repos}
     probe_meta = {}                      # probe_id -> (bundle, category)
     for r in graded:
@@ -176,7 +176,7 @@ def main():
             probe_meta[f["probe_id"]] = (f["bundle"], f["category"])
     freq = sorted(((pid, len(apps)) for pid, apps in probe_apps.items()), key=lambda x: -x[1])
 
-    # ---- (c) winners vs non-winners ----
+    # ---- (d) winners vs non-winners ----
     def split(pred):
         return [r for r in recs if r.get("winner") is True and pred(r)], \
                [r for r in recs if r.get("winner") is False and pred(r)]
@@ -251,8 +251,8 @@ def main():
     if models:
         print("    model(s): " + ", ".join(f"{m} ({n})" for m, n in models.most_common()))
 
-    # (d)
-    print(f"\n(d) DEPLOY-SUCCESS RATE (hackathon reproducibility — REPO apps only)")
+    # (a)
+    print(f"\n(a) DEPLOY-SUCCESS RATE (hackathon reproducibility — REPO apps only)")
     n_try = len(repo_recs) - len(skipped)   # over REPO web apps we tried to deploy (not skips, not live URLs)
     print(f"    {len(deployed)}/{n_try} deployed  ({len(deployed)/(n_try or 1)*100:.0f}%)   "
           f"— {n_try - len(deployed)} failed to come up"
@@ -283,8 +283,8 @@ def main():
         print(f"    DISPUTED-BROKEN (veto): {len(disputed)} app(s) the audit called broken but that KEPT real "
               f"surface — SCORED (not DNF'd on the LLM alone), FLAGGED for human review")
 
-    # (a)
-    print(f"\n(a) SLOP-SCORE DISTRIBUTION  (all graded apps)")
+    # (b)
+    print(f"\n(b) SLOP-SCORE DISTRIBUTION  (all graded apps)")
     print(f"    {_stat_line(scores)}")
     if url_apps:   # don't conflate cohorts — live apps grade over HTTPS with a different applicable-probe set
         print(f"      ├─ repo-deployed  {_stat_line([r['slop_score'] for r in graded if _source(r) == 'repo'])}")
@@ -299,14 +299,14 @@ def main():
         b, c = probe_meta[pid]
         print(f"      {pid:20} {n:>3}/{len(graded)} apps   {b}/{c}")
 
-    # (b)
-    print(f"\n(b) PER-PROBE FIRE-FREQUENCY  (# of the {len(graded)} graded apps each probe fired on)")
+    # (c)
+    print(f"\n(c) PER-PROBE FIRE-FREQUENCY  (# of the {len(graded)} graded apps each probe fired on)")
     for pid, n in freq:
         b, c = probe_meta[pid]
         bar = "█" * round(n / (freq[0][1] or 1) * 30)
         print(f"      {pid:20} {n:>3} │ {bar}")
 
-    # (b2) NEVER APPLIED — probes that were N/A on EVERY graded app: the intersection of the n/a sets.
+    # (c2) NEVER APPLIED — probes that were N/A on EVERY graded app: the intersection of the n/a sets.
     # They never reached a target — either the surface they need is absent from every app, or the probe is
     # mis-gated / broken. This is DISTINCT from a probe that applied and found nothing (working, just rare);
     # that split is shown for contrast. Exact per-probe when records carry coverage.applied; else the
@@ -315,14 +315,14 @@ def main():
         cat = {p.id: p.bundle for p in load_catalog(str(_ROOT / "catalog"))}
     except Exception as e:                     # never let a catalog hiccup break the whole report
         cat = {}
-        print(f"\n(b2) NEVER APPLIED — (catalog load failed: {e})")
+        print(f"\n(c2) NEVER APPLIED — (catalog load failed: {e})")
     cov = [r for r in graded if r.get("coverage")]
     per_probe = [r for r in cov if r["coverage"].get("applied") is not None]
     if cat and per_probe:                      # exact: probes n/a everywhere = catalog − union(applied)
         applied = set().union(*(set(r["coverage"]["applied"]) for r in per_probe))
         never = sorted(pid for pid in cat if pid not in applied)
         ran_clean = sum(1 for pid in applied if pid in cat and pid not in probe_apps)
-        print(f"\n(b2) NEVER APPLIED across all {len(per_probe)} graded apps  "
+        print(f"\n(c2) NEVER APPLIED across all {len(per_probe)} graded apps  "
               f"({len(never)}/{len(cat)} probes never reached a target):")
         if never:
             grp = defaultdict(list)
@@ -338,12 +338,12 @@ def main():
         na = [set(r["coverage"].get("na_kinds", [])) for r in cov]
         ran = [set(r["coverage"].get("ran_kinds", [])) for r in cov]
         na_all = sorted(set.intersection(*na) - set().union(*ran)) if na else []
-        print(f"\n(b2) NEVER APPLIED across all {len(cov)} graded apps  (KIND-level — these records predate "
+        print(f"\n(c2) NEVER APPLIED across all {len(cov)} graded apps  (KIND-level — these records predate "
               f"per-probe coverage; re-grade for probe granularity):")
         print("      " + (", ".join(na_all) if na_all else "(every kind applied on ≥1 app)"))
 
-    # (c)
-    print(f"\n(c) WINNERS vs NON-WINNERS")
+    # (d)
+    print(f"\n(d) WINNERS vs NON-WINNERS")
     if not win_all and not non_all:
         print("    (no winner labels in the records — pass winner status via deploy_and_grade --meta)")
     else:
