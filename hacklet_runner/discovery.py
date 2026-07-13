@@ -583,6 +583,7 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
     # app shell) so injection/CSRF/rate-limit don't fire on a page that has no real backend (see the helper).
     catch_all, endpoints, forms = _drop_phantom_surface(base_url, headers, endpoints, forms)
 
+    has_pw = any(any("pass" in name.lower() for name in form.fields) for form in forms)
     capabilities = {
         "at_least_one_http_endpoint_exists": any_response,
         # text-input surface = HTML form fields OR API query params / JSON body fields (so the
@@ -591,9 +592,7 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
             any(f.fields for f in forms)
             or any(ep.query_params or ep.body_fields for ep in endpoints)
         ),
-        "any_form_has_password": any(
-            any("pass" in name.lower() for name in form.fields) for form in forms
-        ),
+        "any_form_has_password": has_pw,
         # gate on an ACTUAL successful render, not just --browser: if Playwright/Chrome can't launch,
         # render returns None and browser probes must read N/A, not silently 'clean' (false negative).
         "browser": browser_ok,
@@ -606,6 +605,11 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
         # so parity credits a CTA login (the audit's #1 has_login=false complaint), not only password forms
         "login_trigger": auth[0],
         "signup_trigger": auth[1],
+        # any auth DOOR — an inline password form OR a login/signup CTA (button/link to a separate route). The
+        # auth self-oracle (httpx form-POST, else the browser register) can ATTEMPT registration wherever one
+        # exists; the predicate self-gates to N/A when it can't establish a session, so widening here never
+        # false-fires — it just lets the auth-probe cluster reach the CTA-login SPAs a password-form check missed.
+        "has_auth_entrypoint": has_pw or auth[0] or auth[1],
     }
     return Profile(base_url=base_url, routes=list(routes), forms=forms, capabilities=capabilities,
                    endpoints=endpoints)

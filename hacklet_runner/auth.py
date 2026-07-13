@@ -42,8 +42,9 @@ _REGISTER_HINTS = ("register", "signup", "sign-up", "sign_up", "join", "create-a
 class Account:
     username: str
     password: str
-    client: httpx.Client          # carries the session cookie jar (for later authed probes)
+    client: httpx.Client          # carries the session (cookie jar and/or Authorization: Bearer) for authed probes
     register_response: httpx.Response
+    storage_exposed: bool = False  # session token was persisted in localStorage (XSS-reachable) -> sec-session-005
 
 
 # A field that names a NEW / CURRENT / OLD password — the hallmark of a password-CHANGE form (as opposed
@@ -372,19 +373,27 @@ def _synthesize_response(base_url: str, cookies: list[dict]) -> httpx.Response:
 
 def _register_via_browser(base_url: str, browser_register) -> Account | None:
     """SPA registration through the browser: the injected browser_register(base_url) drives Playwright to fill +
-    submit the signup so the app's OWN JS makes the real request, returning the session cookie it sets. Build an
-    Account whose httpx client carries those cookies (for the authed IDOR / etc. probes) + a synthetic
-    register_response for the flag-reading probes. None when the browser established no SESSION cookie."""
+    submit the signup so the app's OWN JS makes the real request, returning the session it establishes — a cookie
+    AND/OR a Bearer token (the bolt/Supabase/Firebase cohort authenticates by JWT, not cookie). Build an Account
+    whose httpx client carries both (cookie jar + Authorization header) for the authed IDOR / etc. probes, plus a
+    synthetic register_response for the cookie-flag probes. None when the browser established NEITHER."""
     try:
         result = browser_register(base_url)
     except Exception:
         return None
-    if not result or not any(_is_session_cookie(c["name"]) for c in (result.get("cookies") or [])):
-        return None   # no session cookie set (localStorage/JWT app, or registration didn't take) -> N/A
+    if not result:
+        return None
+    cookies = result.get("cookies") or []
+    bearer = result.get("bearer")
+    if not any(_is_session_cookie(c["name"]) for c in cookies) and not bearer:
+        return None   # neither a session cookie nor a token (email-verify / CAPTCHA / SSO) -> nothing to test -> N/A
     client = httpx.Client(base_url=base_url, timeout=15.0, follow_redirects=True)
-    for c in result["cookies"]:
+    for c in cookies:
         with contextlib.suppress(Exception):
             client.cookies.set(c["name"], c.get("value", ""))
+    if bearer:
+        client.headers["Authorization"] = "Bearer " + bearer   # authenticate the client the IDOR probes reuse
     creds = result.get("creds") or {}
     return Account(username=creds.get("username", "hl_browser"), password=creds.get("password", ""),
-                   client=client, register_response=_synthesize_response(base_url, result["cookies"]))
+                   client=client, register_response=_synthesize_response(base_url, cookies),
+                   storage_exposed=bool(result.get("storage_exposed")))

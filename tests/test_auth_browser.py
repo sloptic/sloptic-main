@@ -46,3 +46,14 @@ def test_browser_fallback_ignored_when_only_a_non_session_cookie_is_set():
                              "httponly": False, "secure": False, "samesite": False}]}
     acct = register_account(_dead_url(), _signup_profile(), browser_register=only_csrf)
     assert not _has_session(acct)   # cookies set but none is a SESSION cookie -> nothing to test -> N/A
+
+
+def test_register_account_authenticates_by_bearer_when_the_app_sets_no_cookie():
+    # the bolt/Supabase/Firebase shape: registration yields a JWT (localStorage + Authorization: Bearer), no cookie
+    def token_only(url):
+        return {"creds": {"username": "u", "password": "p"}, "cookies": [],
+                "bearer": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig", "storage_exposed": True}
+    acct = register_account(_dead_url(), _signup_profile(), browser_register=token_only)
+    assert acct is not None and _has_session(acct)                        # a Bearer IS a session (cookieless SPA)
+    assert acct.client.headers.get("Authorization", "").startswith("Bearer eyJ")  # authed client for IDOR reuse
+    assert acct.storage_exposed is True                                   # persisted in localStorage -> exposure finding
