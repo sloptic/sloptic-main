@@ -556,6 +556,19 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
                     _prof = Profile(base_url=base_url, forms=forms, endpoints=endpoints)
                     merge_perceived(_prof, perceive(rendered, observed))
                     forms, endpoints = _prof.forms, _prof.endpoints
+                    # Baseline the endpoints perception just added: the crawl's baseline loop already ran and
+                    # closed its client, so a perceived endpoint would otherwise stay unjudged (no baseline) —
+                    # its reachable/hallucinated telemetry AND the injection probes' health gate need it. A GET
+                    # is side-effect-free; a POST-only route answers 405 (reachable), a ghost path answers 404.
+                    fresh = [e for e in endpoints
+                             if getattr(e, "origin", "") == "perceived" and e.baseline_status is None]
+                    if fresh:
+                        with make_client(base_url, headers, timeout=5.0, follow_redirects=True) as pc:
+                            for e in fresh[:_BASELINE_CAP]:
+                                try:
+                                    e.baseline_status = pc.get(e.path).status_code
+                                except (httpx.HTTPError, httpx.InvalidURL):
+                                    e.baseline_status = None
                 except Exception:
                     pass   # perception NEVER breaks discovery — the crawl is the floor
 

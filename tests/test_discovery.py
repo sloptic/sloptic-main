@@ -474,7 +474,8 @@ def test_discover_wires_perceive_into_the_profile(serve):
                                "body_fields": ["title"]}], "page_state": "working"}
     prof = discover(base, render=_stub_render, perceive=_perceive)
     assert any(f.action == "/__perceived_login" and f.origin == "perceived" for f in prof.forms)
-    assert any(e.raw_path == "/__perceived_api" and e.origin == "perceived" for e in prof.endpoints)
+    pe = [e for e in prof.endpoints if e.raw_path == "/__perceived_api" and e.origin == "perceived"]
+    assert pe and pe[0].baseline_status is not None   # perceived endpoint is now BASELINED (was always None -> unjudged)
 
 
 def test_discover_perceive_failure_degrades_to_the_deterministic_floor(serve):
