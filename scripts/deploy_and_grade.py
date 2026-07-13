@@ -684,23 +684,32 @@ def _grade_heartbeat(done, total, probe, outcomes):
         sys.stderr.flush()
 
 
-def _grade_worker(url, use_browser, features, q, cached_profile=None, cache_key=None, repo_url=None):
+def _grade_worker(url, use_browser, features, q, cached_profile=None, cache_key=None, repo_url=None,
+                  proactive=False, model=DEFAULT_MODEL):
     os.setsid()   # own process group so the parent can SIGKILL this child AND its headless chrome together
     try:
         render = browser.render_routes if use_browser else None
         # cache_key set (a repo commit SHA, not --no-cache) -> freeze the surface discovery mints. Writes to
         # disk from the child; the file survives the fork. cached_profile set -> reuse it, skip the crawl.
         on_profile = (lambda p: store_cached_profile(repo_url, cache_key, p)) if cache_key else None
+        # PROACTIVE discovery: an LLM perceives the rendered pages for surface the crawl missed. Built HERE, in
+        # the forked child, so the closure never crosses a process boundary; module-level perceive_surface /
+        # _surface_skeleton are in scope. None -> the deterministic crawl stays the floor.
+        perceive = None
+        if proactive:
+            def perceive(doms, observed):
+                skeleton = "\n\n".join(_surface_skeleton(d) for d in doms.values() if d)
+                return perceive_surface(skeleton, observed, model=model) if skeleton.strip() else None
         report = run(RemoteDeployer(url, health_timeout=20), load_catalog(str(_ROOT / "catalog")),
                      render=render, on_progress=_grade_heartbeat, seed_features=features,
-                     cached_profile=cached_profile, on_profile=on_profile)
+                     cached_profile=cached_profile, on_profile=on_profile, perceive=perceive)
         q.put(("ok", report))
     except BaseException as e:   # report ANY failure back to the parent instead of dying silently
         q.put(("err", f"{type(e).__name__}: {e}"))
 
 
 def grade(url: str, use_browser: bool, timeout: int = 480, features=None,
-          cached_profile=None, cache_key=None, repo_url=None):
+          cached_profile=None, cache_key=None, repo_url=None, proactive=False, model=DEFAULT_MODEL):
     """Grade the running app in a CHILD PROCESS with its OWN hard wall-clock budget. Why a subprocess and
     not an in-process SIGALRM: a signal can't interrupt a Playwright CPU-spin (the browser probes), so an
     in-process cap silently overruns — but an EXTERNAL SIGKILL of the child + its chrome always works. And
@@ -709,7 +718,7 @@ def grade(url: str, use_browser: bool, timeout: int = 480, features=None,
     ctx = mp.get_context("fork")
     q = ctx.Queue()
     p = ctx.Process(target=_grade_worker,
-                    args=(url, use_browser, features, q, cached_profile, cache_key, repo_url))
+                    args=(url, use_browser, features, q, cached_profile, cache_key, repo_url, proactive, model))
     p.start()
     try:
         result = q.get(timeout=timeout)              # up to `timeout` for the report to arrive
@@ -871,6 +880,13 @@ def main():
                          "interactive surface the fuzzer missed (AfroSecured-style) + placeholder/broken "
                          "pages onto the record (coverage_audit), so misses accrue into a fixable backlog. "
                          "One cheap LLM call + a light render per app; works for repo AND url grades.")
+    ap.add_argument("--proactive", action="store_true",
+                    help="PROACTIVE discovery: during discovery an LLM perceives the RENDERED pages and feeds "
+                         "the probeable surface the crawl MISSED (client-rendered logins / uploads / action "
+                         "buttons) INTO the fuzzer's forms/endpoints, so the probes actually test it. The LLM "
+                         "only WIDENS targets; each probe self-gates (N/A on a hallucination) so it never "
+                         "touches the score, and a model outage degrades to today's deterministic crawl (the "
+                         "floor). Opt-in; repo grades freeze the augmented surface in the per-commit cache.")
     ap.add_argument("--no-web-search", dest="web_search", action="store_false",
                     help="don't let the LLM web-search on retries (default: retries CAN search OpenRouter's "
                          "web plugin for current dep versions / deploy config, ~$0.02/retry)")
@@ -1013,7 +1029,8 @@ def main():
             report = grade(url, args.browser, timeout=args.grade_timeout,
                            features=(plan.get("features") if plan else None),   # url-ingest has no plan
                            cached_profile=cached_profile,
-                           cache_key=(None if args.no_cache else _sha), repo_url=args.repo)
+                           cache_key=(None if args.no_cache else _sha), repo_url=args.repo,
+                           proactive=args.proactive, model=args.model)
         except GradeTimeout as e:
             timings["grade_s"] = round(time.monotonic() - _t, 1)
             result["grade_timeout"] = True         # deployed but ungradeable in budget (broken/pathological

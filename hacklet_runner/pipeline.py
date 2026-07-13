@@ -142,7 +142,7 @@ def _run_probe(probe: Probe, ctx: _Ctx, client: httpx.Client, profile: Profile) 
 
 
 def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_progress=None,
-        source_dir=None, seed_features=None, cached_profile=None, on_profile=None) -> Report:
+        source_dir=None, seed_features=None, cached_profile=None, on_profile=None, perceive=None) -> Report:
     """on_progress(done, total, probe, outcomes): called twice per probe — before it runs with
     outcomes=None (so a caller can show what's currently testing), and after with its outcomes.
 
@@ -158,7 +158,8 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
             # Skips the crawl + interaction clicking entirely -> their timing non-determinism leaves the score.
             profile = replace(cached_profile, base_url=handle.base_url)
         else:
-            profile = discover(handle.base_url, render=render, headers=headers, seed_features=seed_features)
+            profile = discover(handle.base_url, render=render, headers=headers, seed_features=seed_features,
+                               perceive=perceive)
             if on_profile is not None:
                 on_profile(profile)   # cache MISS -> hand the freshly-minted canonical surface to the caller
         outcomes: list[Outcome] = []

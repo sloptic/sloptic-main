@@ -455,3 +455,35 @@ def test_merge_perceived_rejects_third_party_and_fieldless_forms():
         {"action": "/empty", "fields": [], "file_fields": []},    # no inputs -> not a probe target
     ], "endpoints": []})
     assert prof.forms == []
+
+
+def _stub_render(base_url, paths, headers=None):
+    return {p: "<html><body><h1>App</h1><button>Sign in</button></body></html>" for p in paths}
+
+
+def test_discover_wires_perceive_into_the_profile(serve):
+    # end-to-end wiring: discover() runs the injected perceive callback on the rendered pages and merges its
+    # structured surface into the Profile (the crawl never sees /__perceived_* — only perception does).
+    base = serve("vulnerable")
+
+    def _perceive(doms, observed):
+        assert doms and "routes" in observed             # got the rendered DOMs + what the crawl observed
+        return {"forms": [{"kind": "login", "action": "/__perceived_login", "method": "post",
+                           "fields": ["email", "password"]}],
+                "endpoints": [{"kind": "create", "path": "/__perceived_api", "method": "post",
+                               "body_fields": ["title"]}], "page_state": "working"}
+    prof = discover(base, render=_stub_render, perceive=_perceive)
+    assert any(f.action == "/__perceived_login" and f.origin == "llm" for f in prof.forms)
+    assert any(e.raw_path == "/__perceived_api" and e.origin == "llm" for e in prof.endpoints)
+
+
+def test_discover_perceive_failure_degrades_to_the_deterministic_floor(serve):
+    # graceful degradation: a perceive callback that raises (model down / bad output) must NOT break discovery
+    base = serve("vulnerable")
+    baseline = discover(base, render=_stub_render)                          # no perception
+
+    def _boom(doms, observed):
+        raise RuntimeError("model down")
+    degraded = discover(base, render=_stub_render, perceive=_boom)          # perception raises -> swallowed
+    assert [f.action for f in degraded.forms] == [f.action for f in baseline.forms]
+    assert len(degraded.endpoints) == len(baseline.endpoints)              # identical to the pure crawl (the floor)

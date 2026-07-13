@@ -238,6 +238,8 @@ def _build_cmd(j, args, ckpt):
         cmd += ["--no-browser"]
     if args.audit_coverage:
         cmd += ["--audit-coverage"]
+    if args.proactive:
+        cmd += ["--proactive"]
     if args.model:
         cmd += ["--model", args.model]
     return cmd
@@ -352,6 +354,11 @@ def main():
                     help="LLM audits discovery coverage per app — notes missed surface (AfroSecured-style) + "
                          "placeholder pages onto each record. One cheap LLM call + light render per app; "
                          "stats' (h) DISCOVERY GAPS aggregates them into a fixable backlog.")
+    ap.add_argument("--proactive", action="store_true",
+                    help="forward to deploy_and_grade: PROACTIVE discovery — an LLM perceives the rendered "
+                         "pages and feeds the probeable surface the crawl missed INTO forms/endpoints (opt-in; "
+                         "probes self-gate, so it only widens targets, never touches the score). Pair with "
+                         "--audit-coverage to watch the DISCOVERY GAPS shrink as it closes them.")
     ap.add_argument("--attempts", type=int, default=3, help="deploy attempts per repo")
     ap.add_argument("--build-timeout", type=int, default=480, dest="build_timeout",
                     help="per-repo docker build timeout in seconds (default 480; lower = more throughput)")

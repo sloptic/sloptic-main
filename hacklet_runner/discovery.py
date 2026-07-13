@@ -407,7 +407,11 @@ def _drop_phantom_surface(base_url, headers, endpoints, forms):
 
 
 def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: int = MAX_DEPTH,
-             headers=None, seed_features=None) -> Profile:
+             headers=None, seed_features=None, perceive=None) -> Profile:
+    """`perceive(rendered_doms, observed)` (optional) — PROACTIVE discovery: an injected LLM reads the rendered
+    pages and returns the probeable surface the crawl missed (perceive_surface output), merged in below via
+    merge_perceived. LLM-agnostic here: the callback owns the model call; a None/failing one degrades to the
+    pure deterministic crawl (the FLOOR)."""
     routes: dict[str, None] = {}      # insertion-ordered set
     forms: list[Form] = []
     seen_forms: set[tuple] = set()
@@ -537,6 +541,21 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
                     p = _same_origin_path(ref, base_url, path)
                     if p:
                         routes.setdefault(p, None)
+
+            # PROACTIVE discovery: the injected LLM perceives the RENDERED pages and returns the probeable
+            # surface the crawl MISSED (client-rendered logins / uploads / action buttons a static crawl can't
+            # see). Merge BEFORE the password-change filter + phantom-suppression below, so perceived surface is
+            # held / dropped by the same guards; a hallucinated target then self-gates to N/A at probe time. Any
+            # failure is swallowed and a None result is a no-op -> the deterministic crawl stays the FLOOR.
+            if perceive is not None:
+                try:
+                    observed = {"routes": list(routes)[:30], "form_actions": [f.action for f in forms][:20],
+                                "endpoints": [e.raw_path or e.path for e in endpoints][:20]}
+                    _prof = Profile(base_url=base_url, forms=forms, endpoints=endpoints)
+                    merge_perceived(_prof, perceive(rendered, observed))
+                    forms, endpoints = _prof.forms, _prof.endpoints
+                except Exception:
+                    pass   # perception NEVER breaks discovery — the crawl is the floor
 
     # Withhold password-CHANGE forms from the whole surface (like logout links above): probes SUBMIT
     # discovered forms (and fold GET forms into query-param injection targets), so a `password_new`/
