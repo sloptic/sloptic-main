@@ -374,6 +374,38 @@ def _has_session(acct: Account | None) -> bool:
     return any(_is_session_cookie(c.name) for c in acct.client.cookies.jar)
 
 
+def _jwt_claims(token: str) -> dict | None:
+    """Decode a JWT's payload (middle segment) without verifying the signature — we only read the app's OWN
+    claims about the account WE just registered (its `sub` = the user id the app keys records on). No secret
+    needed, no trust decision; None on any malformed token."""
+    import base64
+    import json
+    parts = token.split(".")
+    if len(parts) < 2:
+        return None
+    try:
+        seg = parts[1] + "=" * (-len(parts[1]) % 4)   # pad base64url to a multiple of 4
+        claims = json.loads(base64.urlsafe_b64decode(seg))
+        return claims if isinstance(claims, dict) else None
+    except Exception:
+        return None
+
+
+def session_subject(acct: Account | None) -> str | None:
+    """The account's OWN user id as the app assigns it — the value its per-user records are keyed on — read
+    from the session JWT's `sub` claim (the Supabase/Firebase/JWT cohort). This is what the user-record IDOR
+    probe addresses A's record by. None for a cookie session with no JWT (that probe then can't address A)."""
+    if acct is None:
+        return None
+    auth_hdr = acct.client.headers.get("Authorization", "")
+    if auth_hdr[:7].lower() == "bearer ":
+        claims = _jwt_claims(auth_hdr[7:])
+        sub = claims.get("sub") if claims else None
+        if isinstance(sub, str) and sub:
+            return sub
+    return None
+
+
 def _synthesize_response(base_url: str, cookies: list[dict]) -> httpx.Response:
     """Re-encode browser cookies (name + httponly/secure/samesite) as Set-Cookie headers on an httpx.Response,
     so the session probes read the flags through session_cookie()/parse_set_cookies() UNCHANGED — the browser

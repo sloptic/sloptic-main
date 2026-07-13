@@ -971,6 +971,60 @@ def api_bola(ctx, probe) -> bool | None:
         b.client.close()
 
 
+def idor_user_record(ctx, probe) -> bool | None:
+    """Horizontal IDOR on a USER/ACCOUNT record — the canonical '/user/123 -> /user/124' case, read-only.
+    Register two accounts A and B, then check whether B can read A's OWN account record by id. A's record id is
+    A's session subject (the JWT `sub` the app itself assigned — how it keys per-user rows); A's registration
+    username is the unambiguous canary (unique to A, stored in its record). Fire only when (1) the id-addressed
+    read returns A's canary AS A [it really is A's private record], (2) an anonymous client CANNOT read it [it's
+    access-gated, not public], and (3) the SAME read returns A's canary AS B [a second logged-in user reads it
+    -> broken object-level authorization]. N/A when two distinct accounts can't be established, A has no
+    addressable id (cookie session with no JWT), or no id-addressed endpoint returns A's own record."""
+    a = ctx.register(suffix="_a")
+    b = ctx.register(suffix="_b")
+    if a is None or b is None:
+        for acct in (a, b):
+            if acct:
+                acct.client.close()
+        return None
+    if a.provided:   # a single --header session is ONE identity -> B == A -> not a cross-user read
+        a.client.close()
+        b.client.close()
+        return None
+    try:
+        a_id = auth.session_subject(a)
+        canary = a.username                        # unique per-registration token, stored in A's own record
+        if not a_id or not canary:
+            return None                            # no addressable user id (cookie session) -> couldn't test
+        reads = [(e, e.path_params[0]) for e in ctx.profile.endpoints
+                 if e.method.lower() == "get" and len(e.path_params) == 1
+                 and e.raw_path.endswith("/{" + e.path_params[0] + "}")]
+        if not reads:
+            return None
+        tested = False
+        with make_client(ctx.base_url, ctx.headers, timeout=10.0, follow_redirects=True) as anon:
+            for e, param in reads:
+                path = e.raw_path.replace("{" + param + "}", urllib.parse.quote(a_id, safe=""))
+                try:
+                    as_a = a.client.get(path)
+                    if as_a.status_code != 200 or canary not in as_a.text:
+                        continue                   # id isn't a user id at this endpoint -> not A's record here
+                    if anon.get(path).status_code not in (401, 403):
+                        continue                   # readable anonymously -> a public record, not IDOR
+                    tested = True
+                    as_b = b.client.get(path)
+                except (httpx.HTTPError, httpx.InvalidURL):
+                    continue
+                if as_b.status_code == 200 and canary in as_b.text:
+                    ctx.evidence.update(cross_read=True, endpoint=path)
+                    return True                    # B read A's own account record -> horizontal IDOR
+        ctx.evidence.update(cross_read=False, reads_tested=len(reads))
+        return False if tested else None
+    finally:
+        a.client.close()
+        b.client.close()
+
+
 def data_integrity_roundtrip(ctx, probe) -> bool | None:
     """Persistence correctness: POST-create an object, then read it back by id and confirm the write was
     durable. Fire when a create reports success (2xx with an id) but the object then can't be read back
@@ -2344,6 +2398,7 @@ PREDICATES = {
     "login_no_rate_limit": login_no_rate_limit,
     "csrf_missing": csrf_missing,
     "idor_horizontal": idor_horizontal,
+    "idor_user_record": idor_user_record,
     "dom_xss": dom_xss,
     "race_resource_ids": race_resource_ids,
     "load_resilience": load_resilience,
@@ -2410,6 +2465,7 @@ _PREDICATE_REASONS = {
     "session_token_in_local_storage": "session token persisted in localStorage (readable by any XSS on the origin — unlike an HttpOnly cookie)",
     "csrf_missing": "state-changing POST accepted cross-site with no token / SameSite",
     "idor_horizontal": "another account's object was readable by id (broken access control)",
+    "idor_user_record": "one account's private user record was readable by another account by id (horizontal IDOR / broken object-level auth)",
     "dom_xss": "an injected payload executed in the DOM",
     "race_resource_ids": "concurrent creates collided on one id (non-atomic allocation)",
     "load_resilience": "endpoint 5xx'd under a concurrent burst",

@@ -1,0 +1,11 @@
+id: sec-idor-003
+bundle: security
+category: access-control
+pool: public
+evidence_model: oracle
+penalty: 40   # horizontal IDOR on a USER/ACCOUNT record (the canonical /user/124 case) — broken access
+              # control is OWASP #1; read-only, proven by A's unique registration identity leaking to B
+applicability:
+  requires: [has_auth_entrypoint]
+probe:
+  predicate: idor_user_record
