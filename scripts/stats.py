@@ -451,13 +451,32 @@ def main():
     # RENDERED page (the client-side logins/uploads/actions the crawl missed), how much turned out REAL. The
     # recall counterpart to (h) DISCOVERY GAPS: (h) says what's still missed, this says how good the fix is.
     if pcv_active:
+        pcv_pw = sum(p.get("perceived_password_forms", 0) for p in pcv_active)   # perceived forms w/ a password field
+        pcv_unjudged = pcv_eps - pcv_judged                                      # seeded but no baseline (not 200/404)
         print(f"(i2) PERCEPTION POINTER (proactive discovery, off-score) — {len(pcv_active)} apps where the LLM "
               f"perceived surface the crawl missed")
-        print(f"    {pcv_forms} forms + {pcv_eps} endpoints perceived (survived suppression) · "
-              f"{pcv_reach} endpoints reachable · {pcv_halluc} hallucinated (404)")
+        pw = f" ({pcv_pw} w/ a password field -> auth self-oracle surface)" if pcv_pw else ""
+        print(f"    {pcv_forms} forms{pw} + {pcv_eps} endpoints perceived (survived suppression) · "
+              f"{pcv_reach} reachable · {pcv_halluc} hallucinated (404)"
+              + (f" · {pcv_unjudged} unjudged (no baseline)" if pcv_unjudged else ""))
         if pcv_judged:
-            print(f"    endpoint precision {pcv_prec:.0f}%  (reachable / {pcv_judged} judged)   "
-                  f"— how much of the RENDERED-page surface perception added was real (forms show up as woken probes)")
+            print(f"    endpoint precision {pcv_prec:.0f}%  (reachable / {pcv_judged} judged) — how much of the "
+                  f"perceived ENDPOINT surface was real (forms show up as woken probes / a fuller has_login)")
+        rows = [r for r in recs if (_ptr(r) or {}).get("perceived_forms_seeded")
+                or (_ptr(r) or {}).get("perceived_endpoints_seeded")]
+        if rows:
+            print(f"    per app — what perception ADDED (cross-check against (h) DISCOVERY GAPS above):")
+            for r in rows[:15]:
+                p = _ptr(r)
+                bits = []
+                if p.get("perceived_form_actions"):
+                    bits.append(f"forms {p['perceived_form_actions']}")
+                if p.get("perceived_endpoint_paths"):
+                    bits.append(f"endpoints {p['perceived_endpoint_paths']}")
+                label = (r.get("repo") or "").rstrip("/").rsplit("/", 1)[-1][:28] or "?"   # trailing '/' -> host, not ''
+                print(f"      {label:28} {' · '.join(bits)}")
+            if len(rows) > 15:
+                print(f"      ... and {len(rows) - 15} more (jq the per-app records for the rest)")
         ghosts = [(r.get("repo", ""), p) for r in recs for p in ((_ptr(r) or {}).get("perceived_ghost_paths") or [])]
         if ghosts:
             print(f"    ghost paths perception INVENTED (404 — eyeball these when endpoint precision dips):")

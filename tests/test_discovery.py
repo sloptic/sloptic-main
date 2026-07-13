@@ -502,6 +502,7 @@ def test_surface_metrics_reports_the_perception_pointer():
                        Endpoint(path="/api/src", raw_path="/api/src", baseline_status=200, origin="llm")])
     ptr = surface_metrics(prof)["pointer"]
     assert ptr["perceived_forms_seeded"] == 1 and ptr["perceived_form_actions"] == ["/login"]
+    assert ptr["perceived_password_forms"] == 1        # the login carries a password field -> auth self-oracle surface
     assert ptr["perceived_endpoints_seeded"] == 2
     assert ptr["perceived_endpoints_reachable"] == 1 and ptr["perceived_endpoints_hallucinated"] == 1
     assert set(ptr["perceived_endpoint_paths"]) == {"/api/real", "/api/ghost"}   # the paths it added (not the llm one)

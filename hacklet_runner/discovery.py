@@ -649,6 +649,7 @@ def surface_metrics(profile: Profile) -> dict:
         "perceived_ghost_paths": [(e.raw_path or e.path) for e in perceived_eps            # the 404s = what it INVENTED
                                   if e.baseline_status == 404][:8],                        # (per-app hallucination audit)
         "perceived_forms_seeded": len(perceived_forms),
+        "perceived_password_forms": sum(any("pass" in n.lower() for n in f.fields) for f in perceived_forms),
         "perceived_form_actions": [f.action for f in perceived_forms][:8],
     }
     return {
