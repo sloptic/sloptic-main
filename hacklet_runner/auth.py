@@ -6,6 +6,7 @@ fill it heuristically, submit, and hold the resulting session. Reusable by the a
 """
 from __future__ import annotations
 
+import contextlib
 import re
 import secrets
 from dataclasses import dataclass
@@ -134,9 +135,24 @@ def login_form(forms: list[Form]) -> Form | None:
     return non_register[0] if non_register else None
 
 
-def register_account(base_url: str, profile: Profile, suffix: str = "") -> Account | None:
-    """Create a fresh account via the discovered registration form. Returns None when there's no
-    usable form or registration fails (email verification / CAPTCHA), so the caller treats it as N/A."""
+def register_account(base_url: str, profile: Profile, suffix: str = "", browser_register=None) -> Account | None:
+    """Create a fresh account (self-as-oracle) for the authed-surface probes. httpx registration first (HTML
+    form POST, else JSON-API); if that establishes NO session — the SPA case, where the form's action is a
+    placeholder and the real registration is a JS fetch — and a `browser_register` callback is supplied, drive
+    the BROWSER to register (its own JS makes the real request) and use the session cookie it sets. Returns None
+    when nothing establishes a session (email-verify / CAPTCHA / SSO / third-party auth) -> caller reads N/A."""
+    acct = _register_httpx(base_url, profile, suffix)
+    if _has_session(acct) or browser_register is None:
+        return acct
+    caps = profile.capabilities
+    if _password_form(profile.forms) is None and not (caps.get("login_trigger") or caps.get("signup_trigger")):
+        return acct   # no auth surface at all -> don't spend a browser launch
+    return _register_via_browser(base_url, browser_register) or acct
+
+
+def _register_httpx(base_url: str, profile: Profile, suffix: str = "") -> Account | None:
+    """Register via the discovered HTML form (POST its action) or a JSON API. Returns None on a transport error;
+    an Account even when no session cookie came back (the caller checks _has_session; the probes then read N/A)."""
     form = _password_form(profile.forms)
     if form is None:
         # no HTML form -> JSON-API registration + login, preferring endpoints named in the spec
@@ -322,3 +338,53 @@ def session_cookie(resp: httpx.Response) -> dict | None:
     # last match across the chain = the cookie's final state (a later Set-Cookie overrides earlier).
     matches = [c for c in _all_set_cookies(resp) if _is_session_cookie(c["name"])]
     return matches[-1] if matches else None
+
+
+def _has_session(acct: Account | None) -> bool:
+    """Did registration actually establish an authenticated session? A bearer token (Authorization header) OR a
+    session COOKIE (in the register response, or the client's jar after redirects). If neither, an SPA's
+    placeholder-action POST just hit the shell — nothing to test — so the caller can try the browser path."""
+    if acct is None:
+        return False
+    if acct.client.headers.get("Authorization"):
+        return True
+    if session_cookie(acct.register_response) is not None:
+        return True
+    return any(_is_session_cookie(c.name) for c in acct.client.cookies.jar)
+
+
+def _synthesize_response(base_url: str, cookies: list[dict]) -> httpx.Response:
+    """Re-encode browser cookies (name + httponly/secure/samesite) as Set-Cookie headers on an httpx.Response,
+    so the session probes read the flags through session_cookie()/parse_set_cookies() UNCHANGED — the browser
+    handed us the flags directly; this just puts them in the exact shape the probes already parse."""
+    setc = []
+    for c in cookies:
+        parts = [f"{c['name']}={c.get('value', '')}"]
+        if c.get("httponly"):
+            parts.append("HttpOnly")
+        if c.get("secure"):
+            parts.append("Secure")
+        if c.get("samesite"):
+            parts.append("SameSite=Lax")   # samesite True = Lax/Strict was set (a real cross-site defense)
+        setc.append(("set-cookie", "; ".join(parts)))
+    return httpx.Response(200, headers=setc, request=httpx.Request("POST", base_url))
+
+
+def _register_via_browser(base_url: str, browser_register) -> Account | None:
+    """SPA registration through the browser: the injected browser_register(base_url) drives Playwright to fill +
+    submit the signup so the app's OWN JS makes the real request, returning the session cookie it sets. Build an
+    Account whose httpx client carries those cookies (for the authed IDOR / etc. probes) + a synthetic
+    register_response for the flag-reading probes. None when the browser established no SESSION cookie."""
+    try:
+        result = browser_register(base_url)
+    except Exception:
+        return None
+    if not result or not any(_is_session_cookie(c["name"]) for c in (result.get("cookies") or [])):
+        return None   # no session cookie set (localStorage/JWT app, or registration didn't take) -> N/A
+    client = httpx.Client(base_url=base_url, timeout=15.0, follow_redirects=True)
+    for c in result["cookies"]:
+        with contextlib.suppress(Exception):
+            client.cookies.set(c["name"], c.get("value", ""))
+    creds = result.get("creds") or {}
+    return Account(username=creds.get("username", "hl_browser"), password=creds.get("password", ""),
+                   client=client, register_response=_synthesize_response(base_url, result["cookies"]))
