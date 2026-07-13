@@ -5,6 +5,6 @@ pool: public
 evidence_model: oracle
 penalty: 40   # horizontal IDOR — broken access control is the #1 real-world slop class
 applicability:
-  requires: [any_form_has_password]
+  requires: [has_auth_entrypoint]
 probe:
   predicate: idor_horizontal

@@ -1227,6 +1227,26 @@ def session_cookie_missing_flag(ctx, probe) -> bool | None:
         account.client.close()
 
 
+def session_token_in_local_storage(ctx, probe) -> bool | None:
+    """Self-as-oracle: register, then report whether the app PERSISTED its session token in localStorage. A JWT in
+    localStorage is readable by any XSS on the origin (unlike an HttpOnly cookie) — the token-auth analog of a
+    session cookie missing HttpOnly, and the bolt/Supabase/Firebase cohort's default session model. Slop when a
+    persisted token was found; clean when a session was established WITHOUT one (a cookie, or an in-memory bearer);
+    N/A when no session could be established — reading localStorage needs the browser register (httpx alone can't),
+    so this is inherently N/A without --browser-auth, never a false 'clean'."""
+    account = ctx.register()
+    if account is None:
+        return None  # couldn't self-register -> couldn't test
+    try:
+        if not auth._has_session(account):
+            return None  # no session established (email-verify/CAPTCHA/SSO, or httpx-only run) -> couldn't test
+        exposed = bool(account.storage_exposed)
+        ctx.evidence.update(session_in_local_storage=exposed)
+        return exposed  # True = token sits in localStorage (XSS-exfiltratable); False = session held elsewhere
+    finally:
+        account.client.close()
+
+
 def login_no_rate_limit(ctx, probe) -> bool | None:
     """Self-as-oracle: fire N wrong-password logins at the login form; slop if NONE is throttled
     (HTTP 429/423). With no brute-force protection every attempt returns the same auth-failure status,
@@ -2306,6 +2326,7 @@ PREDICATES = {
     "debug_mode_enabled": debug_mode_enabled,
     "exposed_backend_readable": exposed_backend_readable,
     "session_cookie_missing_flag": session_cookie_missing_flag,
+    "session_token_in_local_storage": session_token_in_local_storage,
     "login_no_rate_limit": login_no_rate_limit,
     "csrf_missing": csrf_missing,
     "idor_horizontal": idor_horizontal,
@@ -2372,6 +2393,7 @@ _PREDICATE_REASONS = {
     "debug_mode_enabled": "framework debug mode is on in production (interactive debugger / DEBUG page -> source, settings, env and an RCE console exposed)",
     "exposed_backend_readable": "the app's managed backend (Supabase/Firebase) is world-readable with its own public key -> the whole database is exposed (missing row-level security)",
     "session_cookie_missing_flag": "session cookie missing the {flag} flag",
+    "session_token_in_local_storage": "session token persisted in localStorage (readable by any XSS on the origin — unlike an HttpOnly cookie)",
     "csrf_missing": "state-changing POST accepted cross-site with no token / SameSite",
     "idor_horizontal": "another account's object was readable by id (broken access control)",
     "dom_xss": "an injected payload executed in the DOM",

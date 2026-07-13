@@ -1,0 +1,11 @@
+id: sec-session-005
+bundle: security
+category: session
+pool: public
+evidence_model: oracle
+penalty: 15   # a session JWT in localStorage is XSS-exfiltratable (no HttpOnly equivalent) — the token-auth
+              # analog of sec-session-001; priced below it because it's a common, deliberate SPA-SDK default
+applicability:
+  requires: [has_auth_entrypoint]
+probe:
+  predicate: session_token_in_local_storage

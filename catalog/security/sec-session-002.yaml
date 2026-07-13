@@ -5,7 +5,7 @@ pool: public
 evidence_model: oracle
 penalty: 15   # a session cookie without SameSite is sendable cross-site (CSRF surface)
 applicability:
-  requires: [any_form_has_password]
+  requires: [has_auth_entrypoint]
 probe:
   predicate: session_cookie_missing_flag
   flag: samesite

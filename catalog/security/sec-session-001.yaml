@@ -5,7 +5,7 @@ pool: public
 evidence_model: oracle
 penalty: 20   # a session cookie without HttpOnly is stealable by any XSS
 applicability:
-  requires: [any_form_has_password]
+  requires: [has_auth_entrypoint]
 probe:
   predicate: session_cookie_missing_flag
   flag: httponly
