@@ -731,6 +731,9 @@ def _grade_worker(url, use_browser, features, q, cached_profile=None, cache_key=
                 p = perceive_surface(skeleton, observed, model=model)
                 _print_perceived(p)   # None -> call failed; empty -> nothing to add; else -> the targets
                 return p
+        if cached_profile is None:   # a cache HIT reuses the frozen surface -> no discovery, no delay to explain
+            _kinds = "crawl" + (" + browser-render" if use_browser else "") + (" + LLM perception" if proactive else "")
+            print(f"  discovering surface ({_kinds}) — this runs before the first probe ...", flush=True)
         report = run(RemoteDeployer(url, health_timeout=20), load_catalog(str(_ROOT / "catalog")),
                      render=render, on_progress=_grade_heartbeat, seed_features=features,
                      cached_profile=cached_profile, on_profile=on_profile, perceive=perceive)
@@ -739,31 +742,41 @@ def _grade_worker(url, use_browser, features, q, cached_profile=None, cache_key=
         q.put(("err", f"{type(e).__name__}: {e}"))
 
 
-def grade(url: str, use_browser: bool, timeout: int = 480, features=None,
+def _hard_kill_group(p) -> None:
+    """SIGKILL the grade child AND its process group (its chrome/etc.), then reap it — on a timeout or Ctrl-C,
+    so nothing is orphaned. p.pid IS the child's pgid after its own setsid()."""
+    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+        os.killpg(p.pid, signal.SIGKILL)
+    with contextlib.suppress(Exception):
+        p.kill()
+    p.join(5)
+
+
+def grade(url: str, use_browser: bool, timeout=None, features=None,
           cached_profile=None, cache_key=None, repo_url=None, proactive=False, model=DEFAULT_MODEL):
-    """Grade the running app in a CHILD PROCESS with its OWN hard wall-clock budget. Why a subprocess and
-    not an in-process SIGALRM: a signal can't interrupt a Playwright CPU-spin (the browser probes), so an
-    in-process cap silently overruns — but an EXTERNAL SIGKILL of the child + its chrome always works. And
-    because it's the grade's own budget, it's independent of how long deploy took (the shared per-app total
-    used to starve grading). Raises GradeTimeout on expiry. `features` seeds discovery for api-only apps."""
+    """Grade the running app in a CHILD PROCESS. A subprocess (not an in-process SIGALRM) because a signal
+    can't interrupt a Playwright CPU-spin (the browser probes), but an EXTERNAL SIGKILL of the child + its
+    chrome always works. `timeout` is the grading phase's OWN wall-clock budget (independent of deploy time,
+    which used to starve grading): a number BOUNDS it (raises GradeTimeout on expiry — batches pass one so a
+    pathological app can't stall the run); None = NO cap (a direct run you're watching — Ctrl-C kills the
+    child cleanly). `features` seeds discovery for api-only apps."""
     ctx = mp.get_context("fork")
     q = ctx.Queue()
     p = ctx.Process(target=_grade_worker,
                     args=(url, use_browser, features, q, cached_profile, cache_key, repo_url, proactive, model))
     p.start()
     try:
-        result = q.get(timeout=timeout)              # up to `timeout` for the report to arrive
-    except queue.Empty:
+        result = q.get(timeout=timeout)              # timeout=None (direct run) blocks until the child reports
+    except queue.Empty:                              # a SET timeout (batch) elapsed -> None -> hard-kill below
         result = None
+    except KeyboardInterrupt:                         # Ctrl-C on an uncapped run -> take the child + its chrome down
+        _hard_kill_group(p)
+        raise
     finally:
         sys.stderr.write("\r" + " " * 44 + "\r")     # wipe the heartbeat line
         sys.stderr.flush()
     if result is None:                               # timed out (or the child vanished) -> hard-kill the group
-        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-            os.killpg(p.pid, signal.SIGKILL)         # p.pid IS the child's pgid after its setsid() (+ chrome)
-        with contextlib.suppress(Exception):
-            p.kill()
-        p.join(5)
+        _hard_kill_group(p)
         raise GradeTimeout(f"grading exceeded {timeout}s")
     p.join(5)
     kind, payload = result
@@ -931,10 +944,12 @@ def main():
     ap.add_argument("--build-timeout", type=int, default=480, dest="build_timeout",
                     help="kill a docker build after N seconds (default 480). Lower = better batch "
                          "throughput but risks false-killing a genuinely heavy build; 300 is aggressive")
-    ap.add_argument("--grade-timeout", type=int, default=480, dest="grade_timeout",
-                    help="hard wall-clock cap (seconds) on the grading phase (default 480), enforced by an "
-                         "external kill of a grade subprocess — so grading gets its OWN budget independent "
-                         "of deploy time, and even a Playwright CPU-spin (which a signal can't touch) is bounded")
+    ap.add_argument("--grade-timeout", type=int, default=None, dest="grade_timeout",
+                    help="wall-clock cap (seconds) on the grading phase, externally enforced by killing the "
+                         "grade subprocess (even a Playwright CPU-spin, which a signal can't touch). Default "
+                         "NONE for a DIRECT run — you're watching it, so it runs to completion; Ctrl-C kills "
+                         "the child + its chrome cleanly. run_batch ALWAYS passes an explicit value, so a "
+                         "BATCH stays bounded — one pathological app can't stall an overnight run.")
     ap.add_argument("--clone-timeout", type=int, default=300, dest="clone_timeout",
                     help="git clone timeout in seconds (default 300; a timeout is recorded, not a crash)")
     ap.add_argument("--checkpoint", metavar="FILE", help="write the stack-ID here right after planning, so "
