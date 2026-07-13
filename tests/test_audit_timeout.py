@@ -88,6 +88,12 @@ def test_print_perceived_shows_the_targets(capsys):
     assert "/api/boards" in out and "title" in out                          # the action endpoint + its body field
 
 
-def test_print_perceived_silent_when_nothing_added(capsys):
+def test_print_perceived_reports_when_nothing_to_add(capsys):
     dg._print_perceived({"forms": [], "endpoints": []})
-    assert capsys.readouterr().out == ""
+    out = capsys.readouterr().out
+    assert "ran" in out and "nothing to add" in out    # a well-crawled page: perception ran, found no gap (not silent)
+
+
+def test_print_perceived_reports_a_failed_call(capsys):
+    dg._print_perceived(None)
+    assert "failed" in capsys.readouterr().out         # distinguishable from 'ran, nothing to add'

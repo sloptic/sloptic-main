@@ -578,13 +578,19 @@ def perceive_surface(skeleton: str, observed: dict, model: str = DEFAULT_MODEL, 
     return _llm_json(_PERCEIVE_SYSTEM, user, model, timeout)
 
 
-def _print_perceived(perceived: dict) -> None:
-    """Show what the perception LLM handed the fuzzer to probe (proactive discovery) — printed as it happens,
-    DURING discovery before the probes run, so a --proactive run is legible: you see the LLM point, then the
-    deterministic probes fire on those targets. Silent when perception added nothing."""
+def _print_perceived(perceived) -> None:
+    """Announce what the perception LLM did (proactive discovery), DURING discovery before the probes run, so a
+    --proactive run is always legible: you see the LLM point, then the deterministic probes fire on those
+    targets. ALWAYS prints a status (found targets / nothing to add / call failed) — silence used to look
+    identical to 'didn't run', which was confusing on a well-crawled app that has no missed surface."""
+    if perceived is None:
+        print("\n  🔮 PROACTIVE PERCEPTION — the perception call failed / timed out; no surface added "
+              "(the deterministic crawl is the floor)")
+        return
     forms = perceived.get("forms") or []
     eps = perceived.get("endpoints") or []
     if not forms and not eps:
+        print("\n  🔮 PROACTIVE PERCEPTION — ran; the crawl already covered the page, nothing to add")
         return
     print(f"\n  🔮 PROACTIVE PERCEPTION — the LLM found {len(forms)} form(s) + {len(eps)} endpoint(s) the crawl "
           f"missed, feeding them to the probes:")
@@ -720,9 +726,10 @@ def _grade_worker(url, use_browser, features, q, cached_profile=None, cache_key=
             def perceive(doms, observed):
                 skeleton = "\n\n".join(_surface_skeleton(d) for d in doms.values() if d)
                 if not skeleton.strip():
+                    print("\n  🔮 PROACTIVE PERCEPTION — skipped: the render returned no page surface to read")
                     return None
                 p = perceive_surface(skeleton, observed, model=model)
-                _print_perceived(p or {})   # show what the LLM handed the fuzzer, before the probes run
+                _print_perceived(p)   # None -> call failed; empty -> nothing to add; else -> the targets
                 return p
         report = run(RemoteDeployer(url, health_timeout=20), load_catalog(str(_ROOT / "catalog")),
                      render=render, on_progress=_grade_heartbeat, seed_features=features,
