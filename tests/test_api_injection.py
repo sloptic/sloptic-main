@@ -37,6 +37,10 @@ class _Ctx:
         self.client = None
         self.evidence = {}
 
+    def register(self, suffix=""):   # mirrors pipeline._Ctx.register (browser fallback off in unit tests)
+        from hacklet_runner import auth
+        return auth.register_account(self.base_url, self.profile, suffix=suffix)
+
 
 class _Probe:
     probe = {"max_attempts": 80, "time_delay": 1}   # short delay keeps the time-based test fast
