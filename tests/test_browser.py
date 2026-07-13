@@ -380,3 +380,48 @@ def test_cwv_clean_on_fast_page():
         assert ctx.evidence["failed"] == []
     finally:
         srv.shutdown()
+
+
+def test_register_in_browser_fills_a_signup_and_captures_the_session_cookie():
+    # a realistic client-rendered signup: JS reads the inputs and fetch()es /register; the server sets an
+    # HttpOnly session cookie on that response. register_in_browser must fill + submit + extract that cookie —
+    # the whole point, since an httpx form-POST to the placeholder action would never get it.
+    import http.server
+    import threading
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("content-type", "text/html")
+            self.end_headers()
+            self.wfile.write(b"""<html><body><h1>Join</h1>
+              <form onsubmit="reg(event)">
+                <input type="email" name="email" placeholder="Email">
+                <input type="password" name="password" placeholder="Password">
+                <button type="submit">Sign up</button>
+              </form>
+              <script>async function reg(e){e.preventDefault();
+                await fetch('/register',{method:'POST',body:JSON.stringify({
+                  email:document.querySelector('[name=email]').value,
+                  password:document.querySelector('[name=password]').value})});}
+              </script></body></html>""")
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("content-length", 0)))
+            self.send_response(200)
+            self.send_header("set-cookie", "session=s3cr3t; HttpOnly; SameSite=Lax; Path=/")
+            self.end_headers()
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        out = browser.register_in_browser("http://127.0.0.1:%d" % srv.server_address[1], total_timeout=30)
+        assert out is not None
+        sess = [c for c in out["cookies"] if c["name"] == "session"]
+        assert sess and sess[0]["httponly"] is True and sess[0]["samesite"] is True   # extracted with flags
+        assert out["request"] and "/register" in out["request"]["url"]                # captured the real endpoint
+    finally:
+        srv.shutdown()

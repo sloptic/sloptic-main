@@ -175,6 +175,103 @@ def render_routes(base_url: str, paths, headers=None, timeout: float = 12.0,
     return out
 
 
+# ---- browser-driven SPA registration (auth self-oracle, client-rendered path) --------------------
+_SIGNUP_SUBMIT = re.compile(r"sign ?up|register|create account|create your account|get started|join now|"
+                            r"\bjoin\b|continue|submit|create", re.I)
+
+
+def _fill_and_submit_signup(page, creds) -> bool:
+    """Fill the visible signup inputs (email / username / password + confirm, tick any terms box) and submit,
+    so the app's OWN JS runs the real registration. True iff a password field was found and a submit issued.
+    Best-effort field matching by type/name/placeholder/id; targets a SIGNUP (a password field must be present)."""
+    filled_pw = False
+    with contextlib.suppress(Exception):
+        for el in page.query_selector_all("input"):
+            with contextlib.suppress(Exception):
+                if not el.is_visible():
+                    continue
+                typ = (el.get_attribute("type") or "text").lower()
+                hint = ((el.get_attribute("name") or "") + " " + (el.get_attribute("placeholder") or "") + " "
+                        + (el.get_attribute("aria-label") or "") + " " + (el.get_attribute("id") or "")).lower()
+                if typ == "password" or "pass" in hint or "pwd" in hint:
+                    el.fill(creds["password"]); filled_pw = True
+                elif typ == "email" or "email" in hint or "mail" in hint:
+                    el.fill(creds["email"])
+                elif typ == "checkbox":
+                    el.check()                                       # terms / agree
+                elif typ in ("text", "") and any(h in hint for h in ("user", "name", "handle", "login")):
+                    el.fill(creds["username"])
+    if not filled_pw:
+        return False   # no fillable password field -> not a signup form we can register through
+    with contextlib.suppress(Exception):                             # prefer a signup-labeled submit button
+        for btn in page.query_selector_all("button, input[type=submit], [role=button]"):
+            lbl = ((btn.inner_text() or "") + " " + (btn.get_attribute("value") or "") + " "
+                   + (btn.get_attribute("aria-label") or "")).strip().lower()[:60]
+            if _SIGNUP_SUBMIT.search(lbl) and not _NO_CLICK.search(lbl) and btn.is_visible():
+                btn.click(timeout=2500)
+                return True
+    with contextlib.suppress(Exception):
+        page.keyboard.press("Enter")                                 # fallback: submit the focused field's form
+        return True
+    return False
+
+
+def register_in_browser(base_url: str, headers=None, timeout: float = 12.0, total_timeout: float = 45.0):
+    """SPA self-registration THROUGH the browser (the auth self-oracle's client-rendered path): open the signup
+    form, fill throwaway creds, submit so the app's OWN JS makes the real registration request, and return the
+    session cookie the server sets IN THE BROWSER — the thing an httpx form-POST can't get on an SPA (the form's
+    action is a placeholder; the real POST lives in the JS). Returns {creds, cookies:[{name,value,httponly,
+    secure,samesite}], request:{url,method,body}|None} or None (no browser / no fillable signup / no cookie set).
+    Best-effort + side-effecting: creates ONE throwaway account, like the httpx register; targets a SIGNUP form
+    only (a password field), never login/pay/delete (the reveal + _NO_CLICK guards). Caller (auth) decides which
+    cookie is the session and whether registration succeeded."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return None
+    import secrets
+    uname = "hl_" + secrets.token_hex(5)
+    creds = {"email": uname + "@example.com", "username": uname, "password": "Hl-Probe-Passw0rd!"}
+    captured, out = {}, None
+    try:
+        with sync_playwright() as pw:
+            b = _launch(pw)
+            if b is None:
+                return None
+            try:
+                page = b.new_page()
+                _apply_auth(page, base_url, headers)
+
+                def _on_request(req):   # the REAL registration request (endpoint + body the JS posts)
+                    with contextlib.suppress(Exception):
+                        if req.method in ("POST", "PUT") and creds["password"] in (req.post_data or ""):
+                            captured.update(url=req.url, method=req.method, body=req.post_data)
+                page.on("request", _on_request)
+                page.goto(base_url.rstrip("/") + "/", timeout=timeout * 1000, wait_until="load")
+                page.wait_for_timeout(300)
+                _reveal_hidden_controls(page)                        # open an interaction-gated signup modal/tab
+                if not _fill_and_submit_signup(page, creds):
+                    return None
+                with contextlib.suppress(Exception):                 # let the registration fetch + Set-Cookie land
+                    page.wait_for_load_state("networkidle", timeout=8000)
+                page.wait_for_timeout(500)
+                cookies = []
+                with contextlib.suppress(Exception):
+                    cookies = page.context.cookies()
+                jar = [{"name": c["name"], "value": c.get("value", ""),
+                        "httponly": bool(c.get("httpOnly")), "secure": bool(c.get("secure")),
+                        "samesite": (c.get("sameSite") or "").lower() in ("lax", "strict")}
+                       for c in cookies]
+                if not jar:
+                    return None
+                out = {"creds": creds, "cookies": jar, "request": captured or None}
+            finally:
+                b.close()
+    except Exception:
+        return None
+    return out
+
+
 # ---- dead / inert controls (qa-deadctrl-001) -----------------------------------------------------
 # The AI-shell tell: a control that RENDERS but is wired to nothing — no handler, or one that no-ops. The
 # interactive analogue of a broken link. Detected by OBSERVED BEHAVIOR, not static handler presence (event
