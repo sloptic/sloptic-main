@@ -491,34 +491,30 @@ def _surface_skeleton(dom: str) -> str:
             f"inputs: {inputs[:20]}\nform_actions: {actions[:10]}\nvisible_text: {_visible_text(dom)[:280]}")
 
 
-def audit_coverage(skeleton: str, observed: dict, features=None, model: str = DEFAULT_MODEL,
-                   timeout: float = AUDIT_TIMEOUT_S):
-    """Ask the LLM what surface the page has that `observed` (the fuzzer's discovery) missed, + the page
-    state. Returns {missed, page_state, notes} or None (no key / any error — best-effort, never raises).
-    HARD-capped at `timeout`s of wall-clock: the POST runs on a DAEMON thread we join() with a deadline, so a
-    hung/slow OpenRouter response can never eat the grade budget (a scalar httpx timeout is only PER-PHASE —
-    one call trickled keepalive for 1486s, never tripping the 90s read timeout). On the cap we abandon the
-    call and return None; the daemon dies with the process."""
+def _llm_json(system: str, user: str, model: str = DEFAULT_MODEL, timeout: float = AUDIT_TIMEOUT_S):
+    """One temp-0 OpenRouter chat call -> the first JSON object in the reply, or None (no key / API error /
+    non-JSON / timeout). Never raises. HARD-capped at `timeout`s via a DAEMON thread we join(): a hung/slow
+    response can never eat the grade budget (a scalar httpx timeout is only PER-PHASE — one call trickled
+    keepalive for 1486s, never tripping the 90s read timeout); on the cap we abandon it and the daemon dies
+    with the process. Shared by the off-score coverage audit and the in-discovery perception pass — both
+    temp-0, with determinism coming from caching the frozen result per-commit upstream (the cache, not temp-0,
+    is the real guarantee: OpenRouter can route temp-0 to different backends)."""
     key = os.environ.get("OPENROUTER_API_KEY")
-    if not key or not skeleton.strip():
+    if not key:
         return None
-    user = (f"PAGE SURFACE (what a user sees):\n{skeleton}\n\n"
-            f"FUZZER OBSERVED (structured):\n{json.dumps(observed, default=str)[:1600]}")
-    if features:
-        user += f"\n\nSOURCE FEATURES (from the repo, if known):\n{json.dumps(features)[:800]}"
-    body = {"model": model, "temperature": 0,   # greedy: the off-score audit stays as stable as an LLM gets
-            "messages": [{"role": "system", "content": _AUDIT_SYSTEM}, {"role": "user", "content": user}]}
+    body = {"model": model, "temperature": 0,   # greedy: as stable as an LLM gets; the per-commit cache is the guarantee
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
     out = {}
 
     def _call():
         try:
             r = httpx.post(OPENROUTER_URL, json=body, timeout=httpx.Timeout(timeout, connect=10.0),
                            headers={"Authorization": "Bearer " + key,
-                                    "HTTP-Referer": "https://hacklet.league", "X-Title": "hacklet-audit"})
+                                    "HTTP-Referer": "https://hacklet.league", "X-Title": "hacklet-fuzz"})
             if r.status_code == 200:
                 out["content"] = r.json()["choices"][0]["message"]["content"]
         except Exception:
-            pass                       # best-effort: a failed audit must never break the grade
+            pass                       # best-effort: a failed call must never break the grade
 
     t = threading.Thread(target=_call, daemon=True)
     t.start()
@@ -531,6 +527,55 @@ def audit_coverage(skeleton: str, observed: dict, features=None, model: str = DE
         return json.loads(m.group(0)) if m else None
     except Exception:
         return None
+
+
+def audit_coverage(skeleton: str, observed: dict, features=None, model: str = DEFAULT_MODEL,
+                   timeout: float = AUDIT_TIMEOUT_S):
+    """OFF-SCORE coverage critic: ask the LLM what surface `observed` (the fuzzer's discovery) missed + the
+    page state. Returns {missed, page_state, notes} or None (best-effort, never raises). A FLAG only — never
+    in the slop number (that's the perception pass's job to feed as probeable surface; this reports the gap)."""
+    if not skeleton.strip():
+        return None
+    user = (f"PAGE SURFACE (what a user sees):\n{skeleton}\n\n"
+            f"FUZZER OBSERVED (structured):\n{json.dumps(observed, default=str)[:1600]}")
+    if features:
+        user += f"\n\nSOURCE FEATURES (from the repo, if known):\n{json.dumps(features)[:800]}"
+    return _llm_json(_AUDIT_SYSTEM, user, model, timeout)
+
+
+_PERCEIVE_SYSTEM = """You perceive a web page's INTERACTIVE SURFACE for a black-box fuzzer, so it can TEST
+controls its automated crawl missed (client-rendered logins, upload widgets, action buttons a static crawl
+can't see). You get (1) a compact map of the page's ACTUAL rendered surface and (2) what the fuzzer's crawl
+OBSERVED. Emit the PROBEABLE surface the crawl MISSED — concrete targets, not prose:
+- forms: a login / signup / upload / search / contact / create form the crawl lacks. Give action (the submit
+  path, RELATIVE — your best evidence-based guess), method, fields (input names), file_fields (upload inputs).
+- endpoints: an API operation behind a button/action (e.g. a 'New Board' button POSTing to /api/boards). Give
+  path (relative), method, params (query names), body_fields (JSON/form body names).
+RULES: emit ONLY surface the page CLEARLY has AND observed lacks — NEVER invent. Prefer relative paths. If a
+path or field isn't evidenced, OMIT that item rather than guess (a hallucinated target wastes a probe). Also
+classify the page state. Respond with ONLY a JSON object, no prose/markdown:
+{"forms": [{"kind": "login|signup|upload|search|contact|create|other", "action": "/path", "method": "post",
+  "fields": ["email","password"], "file_fields": [], "label": "Sign in"}],
+ "endpoints": [{"kind": "create|search|read|update|delete|other", "path": "/path", "method": "post",
+  "params": [], "body_fields": ["title"], "label": "New Board"}],
+ "page_state": "working|placeholder|broken|login-wall|not-an-app"}
+Empty "forms"/"endpoints" when the crawl already covers the page."""
+
+
+def perceive_surface(skeleton: str, observed: dict, model: str = DEFAULT_MODEL, timeout: float = AUDIT_TIMEOUT_S):
+    """PROACTIVE discovery: read the RENDERED page + what the crawl observed, and return the PROBEABLE surface
+    the crawl MISSED as STRUCTURED targets — {forms:[{kind,action,method,fields,file_fields,label}],
+    endpoints:[{kind,path,method,params,body_fields,label}], page_state} — for the fuzzer to MERGE into its
+    Profile and probe DETERMINISTICALLY. The INVARIANT (same as the source-read #2 pointer, now applied to the
+    rendered surface): the LLM only WIDENS which targets get probed; each probe self-gates (fires on real slop,
+    N/A on a hallucinated target), so a wrong guess just no-ops and the LLM never touches the score. Returns
+    None on no-key / error / timeout, so the deterministic crawl stays the FLOOR (graceful degradation). Hard-
+    capped via _llm_json; feed it a cached skeleton per-commit upstream for reproducibility."""
+    if not skeleton.strip():
+        return None
+    user = (f"PAGE SURFACE (rendered — what a user sees):\n{skeleton}\n\n"
+            f"FUZZER CRAWL OBSERVED:\n{json.dumps(observed, default=str)[:1600]}")
+    return _llm_json(_PERCEIVE_SYSTEM, user, model, timeout)
 
 
 # ---- 3. execute the plan --------------------------------------------------------------------------

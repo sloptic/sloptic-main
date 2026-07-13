@@ -43,3 +43,36 @@ def test_audit_never_raises_on_malformed_json(monkeypatch):
 def test_audit_none_without_key(monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     assert dg.audit_coverage("headings: [Login]", {"routes": []}) is None
+
+
+# ── perceive_surface (proactive discovery): structured probeable targets, same hard-cap + never-raises ──
+def test_perceive_surface_returns_structured_targets(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "x")
+    payload = {"forms": [{"kind": "login", "action": "/api/login", "method": "post",
+                          "fields": ["email", "password"], "file_fields": [], "label": "Sign in"}],
+               "endpoints": [{"kind": "create", "path": "/api/boards", "method": "post",
+                              "params": [], "body_fields": ["title"], "label": "New Board"}],
+               "page_state": "working"}
+    monkeypatch.setattr(dg.httpx, "post", lambda *a, **k: _resp(200, json.dumps(payload)))
+    out = dg.perceive_surface("buttons/links: ['Sign in', 'New Board']", {"forms": 0}, timeout=5)
+    assert out == payload
+    assert out["forms"][0]["action"] == "/api/login" and out["endpoints"][0]["path"] == "/api/boards"
+
+
+def test_perceive_surface_hard_caps_and_never_raises(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "x")
+
+    def _slow(*a, **k):
+        time.sleep(3)
+        return _resp(200, "{}")
+    monkeypatch.setattr(dg.httpx, "post", _slow)
+    t0 = time.monotonic()
+    assert dg.perceive_surface("buttons: ['x']", {}, timeout=0.2) is None   # abandoned at the deadline
+    assert time.monotonic() - t0 < 2.0
+    monkeypatch.setattr(dg.httpx, "post", lambda *a, **k: _resp(200, "not json at all"))
+    assert dg.perceive_surface("buttons: ['x']", {}, timeout=5) is None     # malformed -> None, no raise
+
+
+def test_perceive_surface_none_without_key(monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    assert dg.perceive_surface("buttons: ['x']", {}) is None                # no key -> deterministic crawl is the floor
