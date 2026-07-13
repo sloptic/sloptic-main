@@ -83,6 +83,21 @@ def test_source_dump_spares_a_code_snippet_diluted_by_prose():
     assert _looks_like_source_dump(page) is False
 
 
+def test_source_dump_ignores_inlined_critical_css_in_a_style_block():
+    # a live site that inlines its critical CSS in <style> is NOT a dump — <style> content isn't visible page
+    # text (regression: insightaco.org, a real 200 site, was false-flagged URL DEAD because _visible_text kept it)
+    page = ("<html><head><style>:root { --green: #3b7c4f; --ink: #1a1a18; --bg: #ffffff; --line: #eeece6; } "
+            "*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; } "
+            ".btn { background: var(--green); font-size: 16px; padding: 12px 24px; border-radius: 8px; } "
+            "@media (max-width: 768px) { .btn { padding: 8px; } } "
+            ".card { box-shadow: 0 1px 3px rgba(0,0,0,0.1); } h1 { font-size: 48px; }</style></head>"
+            "<body><h1>Insighta — Research that moves people</h1>"
+            "<p>We run studies that change how organizations understand the people they serve.</p>"
+            "<button>Get started</button><a href='/login'>Sign in</a></body></html>")
+    assert _looks_like_source_dump(page) is False       # the CSS is in <style> -> not visible text -> not a dump
+    assert _dead_shell_reason(page) is None
+
+
 def test_broken_verdict_dnf_on_deterministic_signal_or_no_surface():
     # the veto DNFs (max penalty) only WITH corroboration:
     assert _broken_verdict({"forms": 0}, f"<body>{_CSS_DUMP}</body>")[0] is True   # source-dump entry

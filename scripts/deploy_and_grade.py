@@ -807,9 +807,12 @@ _SOURCE_MARK = re.compile(
 
 
 def _visible_text(html: str) -> str:
-    """Served/rendered markup -> visible text, scripts stripped (inline JS carries route/handler-name
-    strings that would false-match the dead-shell patterns)."""
-    t = re.sub(r"<script\b[^>]*>.*?</script>", " ", html, flags=re.S | re.I)
+    """Served/rendered markup -> visible text, with <script> AND <style> stripped: neither renders as page
+    text, and their contents would false-match the dead-shell / source-dump patterns — inline JS carries
+    route/handler-name strings, and inline CSS carries design tokens / @media / hex colors. <style> especially:
+    a real site that inlines its critical CSS (Tailwind / Next / design tokens) would otherwise read as a 'raw
+    CSS dump' and be false-flagged URL DEAD — insightaco.org, a live site, was."""
+    t = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", " ", html, flags=re.S | re.I)
     return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", t)).strip()
 
 
