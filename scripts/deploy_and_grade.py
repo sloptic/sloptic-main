@@ -711,7 +711,7 @@ def _grade_heartbeat(done, total, probe, outcomes):
 
 
 def _grade_worker(url, use_browser, features, q, cached_profile=None, cache_key=None, repo_url=None,
-                  proactive=False, model=DEFAULT_MODEL):
+                  proactive=False, model=DEFAULT_MODEL, browser_auth=False):
     os.setsid()   # own process group so the parent can SIGKILL this child AND its headless chrome together
     try:
         render = browser.render_routes if use_browser else None
@@ -731,12 +731,17 @@ def _grade_worker(url, use_browser, features, q, cached_profile=None, cache_key=
                 p = perceive_surface(skeleton, observed, model=model)
                 _print_perceived(p)   # None -> call failed; empty -> nothing to add; else -> the targets
                 return p
+        # SPA AUTH: browser-driven self-registration for the session/idor probes (an SPA's form action is a
+        # placeholder; the real POST is a JS fetch). register_in_browser is module-level -> safe in the fork.
+        # None -> the auth self-oracle uses only its httpx paths (which already work on server-rendered apps).
+        browser_register = browser.register_in_browser if (browser_auth and use_browser) else None
         if cached_profile is None:   # a cache HIT reuses the frozen surface -> no discovery, no delay to explain
             _kinds = "crawl" + (" + browser-render" if use_browser else "") + (" + LLM perception" if proactive else "")
             print(f"  discovering surface ({_kinds}) — this runs before the first probe ...", flush=True)
         report = run(RemoteDeployer(url, health_timeout=20), load_catalog(str(_ROOT / "catalog")),
                      render=render, on_progress=_grade_heartbeat, seed_features=features,
-                     cached_profile=cached_profile, on_profile=on_profile, perceive=perceive)
+                     cached_profile=cached_profile, on_profile=on_profile, perceive=perceive,
+                     browser_register=browser_register)
         q.put(("ok", report))
     except BaseException as e:   # report ANY failure back to the parent instead of dying silently
         q.put(("err", f"{type(e).__name__}: {e}"))
@@ -753,7 +758,8 @@ def _hard_kill_group(p) -> None:
 
 
 def grade(url: str, use_browser: bool, timeout=None, features=None,
-          cached_profile=None, cache_key=None, repo_url=None, proactive=False, model=DEFAULT_MODEL):
+          cached_profile=None, cache_key=None, repo_url=None, proactive=False, model=DEFAULT_MODEL,
+          browser_auth=False):
     """Grade the running app in a CHILD PROCESS. A subprocess (not an in-process SIGALRM) because a signal
     can't interrupt a Playwright CPU-spin (the browser probes), but an EXTERNAL SIGKILL of the child + its
     chrome always works. `timeout` is the grading phase's OWN wall-clock budget (independent of deploy time,
@@ -763,7 +769,8 @@ def grade(url: str, use_browser: bool, timeout=None, features=None,
     ctx = mp.get_context("fork")
     q = ctx.Queue()
     p = ctx.Process(target=_grade_worker,
-                    args=(url, use_browser, features, q, cached_profile, cache_key, repo_url, proactive, model))
+                    args=(url, use_browser, features, q, cached_profile, cache_key, repo_url, proactive, model,
+                          browser_auth))
     p.start()
     try:
         result = q.get(timeout=timeout)              # timeout=None (direct run) blocks until the child reports
@@ -934,6 +941,12 @@ def main():
                          "only WIDENS targets; each probe self-gates (N/A on a hallucination) so it never "
                          "touches the score, and a model outage degrades to today's deterministic crawl (the "
                          "floor). Opt-in; repo grades freeze the augmented surface in the per-commit cache.")
+    ap.add_argument("--browser-auth", action="store_true", dest="browser_auth",
+                    help="SPA auth: when httpx self-registration gets no session (a client-rendered app whose "
+                         "signup form action is a placeholder — the real POST is a JS fetch), drive the browser "
+                         "to fill + submit the signup so the app's OWN JS registers, and use the session cookie "
+                         "it sets — waking the session/idor probes on self-hosted SPAs. Opt-in (an extra browser "
+                         "launch per auth app); best-effort, N/A on captcha / email-verify / SSO / third-party auth.")
     ap.add_argument("--no-web-search", dest="web_search", action="store_false",
                     help="don't let the LLM web-search on retries (default: retries CAN search OpenRouter's "
                          "web plugin for current dep versions / deploy config, ~$0.02/retry)")
@@ -1079,7 +1092,7 @@ def main():
                            features=(plan.get("features") if plan else None),   # url-ingest has no plan
                            cached_profile=cached_profile,
                            cache_key=(None if args.no_cache else _sha), repo_url=args.repo,
-                           proactive=args.proactive, model=args.model)
+                           proactive=args.proactive, model=args.model, browser_auth=args.browser_auth)
         except GradeTimeout as e:
             timings["grade_s"] = round(time.monotonic() - _t, 1)
             result["grade_timeout"] = True         # deployed but ungradeable in budget (broken/pathological

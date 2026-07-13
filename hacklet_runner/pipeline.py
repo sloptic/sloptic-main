@@ -11,7 +11,7 @@ from dataclasses import dataclass, field, replace
 
 import httpx
 
-from . import secretscan
+from . import auth, secretscan
 from .aggregate import compute_axis_slop, compute_slop_score, coverage_metrics
 from .deploy import Deployer
 from .discovery import discover, surface_metrics
@@ -45,8 +45,14 @@ class _Ctx:
     client: httpx.Client
     profile: Profile
     headers: dict | None = None
+    browser_register: object = None   # optional callback: browser-driven SPA registration for the auth self-oracle
     evidence: dict = field(default_factory=dict)  # a predicate may record measured values here; the
     #     executor snapshots it onto the outcome and resets it before the next probe (probes run serially)
+
+    def register(self, suffix: str = ""):
+        """Self-register (self-as-oracle) for the authed-surface probes, with the browser fallback threaded in:
+        a client-rendered SPA (form action = placeholder, real POST = a JS fetch) still yields a session cookie."""
+        return auth.register_account(self.base_url, self.profile, suffix=suffix, browser_register=self.browser_register)
 
 
 def _applicable(probe: Probe, profile: Profile) -> bool:
@@ -142,7 +148,8 @@ def _run_probe(probe: Probe, ctx: _Ctx, client: httpx.Client, profile: Profile) 
 
 
 def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_progress=None,
-        source_dir=None, seed_features=None, cached_profile=None, on_profile=None, perceive=None) -> Report:
+        source_dir=None, seed_features=None, cached_profile=None, on_profile=None, perceive=None,
+        browser_register=None) -> Report:
     """on_progress(done, total, probe, outcomes): called twice per probe — before it runs with
     outcomes=None (so a caller can show what's currently testing), and after with its outcomes.
 
@@ -169,7 +176,7 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
         # is already normalized to the origin by discover().
         origin = profile.base_url or handle.base_url
         with make_client(origin, headers, timeout=15.0, follow_redirects=True) as client:
-            ctx = _Ctx(origin, client, profile, headers)
+            ctx = _Ctx(origin, client, profile, headers, browser_register=browser_register)
             for i, probe in enumerate(catalog):
                 if on_progress:
                     on_progress(i, total, probe, None)              # starting probe i (0-indexed)

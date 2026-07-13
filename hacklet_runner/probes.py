@@ -925,8 +925,8 @@ def api_bola(ctx, probe) -> bool | None:
              if any(_SENSITIVE_FIELD.search(f) for f in c.body_fields)]
     if not pairs:
         return None  # no create+read pair with a private field to exercise -> couldn't test
-    a = auth.register_account(ctx.base_url, ctx.profile, suffix="_a")
-    b = auth.register_account(ctx.base_url, ctx.profile, suffix="_b")
+    a = ctx.register(suffix="_a")
+    b = ctx.register(suffix="_b")
     if a is None or b is None:
         for acct in (a, b):
             if acct:
@@ -976,7 +976,7 @@ def data_integrity_roundtrip(ctx, probe) -> bool | None:
     pairs = _bola_pairs(ctx.profile.endpoints)
     if not pairs:
         return None
-    account = auth.register_account(ctx.base_url, ctx.profile)   # some creates are auth-gated
+    account = ctx.register()   # some creates are auth-gated
     client = (account.client if account
               else make_client(ctx.base_url, ctx.headers, timeout=10.0, follow_redirects=True))
     tested = False
@@ -1214,7 +1214,7 @@ def session_cookie_missing_flag(ctx, probe) -> bool | None:
     self-registration couldn't establish a session (CSRF/JSON-API app) — a false 'clean' would be a
     missed finding, not a pass."""
     flag = probe.probe.get("flag", "httponly")
-    account = auth.register_account(ctx.base_url, ctx.profile)
+    account = ctx.register()
     if account is None:
         return None  # couldn't self-register -> couldn't test
     try:
@@ -1331,7 +1331,7 @@ def csrf_missing(ctx, probe) -> bool | None:
     if ctx.headers:                                   # grade the authenticated surface as the given user
         client = make_client(ctx.base_url, ctx.headers, timeout=10.0, follow_redirects=False)
     else:                                             # open-registration app: be our own user
-        account = auth.register_account(ctx.base_url, ctx.profile, suffix="_csrf")
+        account = ctx.register(suffix="_csrf")
         if account is None:
             return None
         cookie = auth.session_cookie(account.register_response)
@@ -1566,8 +1566,8 @@ def idor_horizontal(ctx, probe) -> bool | None:
     form = auth.create_form(ctx.profile.forms)
     if form is None:
         return None
-    a = auth.register_account(ctx.base_url, ctx.profile, suffix="_a")
-    b = auth.register_account(ctx.base_url, ctx.profile, suffix="_b")
+    a = ctx.register(suffix="_a")
+    b = ctx.register(suffix="_b")
     if a is None or b is None:
         for acct in (a, b):
             if acct:
@@ -1622,7 +1622,7 @@ def race_resource_ids(ctx, probe) -> bool | None:
     form = auth.create_form(ctx.profile.forms)
     if form is None:
         return None
-    account = auth.register_account(ctx.base_url, ctx.profile, suffix="_race")
+    account = ctx.register(suffix="_race")
     if account is None:
         return None
     try:
