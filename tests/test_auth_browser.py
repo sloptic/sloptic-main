@@ -48,6 +48,30 @@ def test_browser_fallback_ignored_when_only_a_non_session_cookie_is_set():
     assert not _has_session(acct)   # cookies set but none is a SESSION cookie -> nothing to test -> N/A
 
 
+def test_ctx_register_memoizes_the_browser_registration_per_identity():
+    # the efficiency fix: the ~8 authed-surface probes that register the SAME identity share ONE browser
+    # registration (browser reg is 20-40s); distinct suffixes stay distinct identities.
+    from hacklet_runner.net import make_client
+    from hacklet_runner.pipeline import _Ctx
+    calls = {"n": 0}
+
+    def counting_browser_register(url):
+        calls["n"] += 1
+        return {"creds": {"username": f"u{calls['n']}", "password": "p"}, "cookies": [],
+                "bearer": f"eyJ.tok{calls['n']}.sig", "storage_exposed": False}
+
+    with make_client("http://127.0.0.1:1", None) as client:
+        ctx = _Ctx("http://127.0.0.1:1", client, _signup_profile(), None,
+                   browser_register=counting_browser_register)
+        a1 = ctx.register("_a")
+        a2 = ctx.register("_a")                       # same identity -> reused, NOT a second browser launch
+        assert calls["n"] == 1 and a1.username == a2.username == "u1"
+        b = ctx.register("_b")                        # distinct identity -> its own registration
+        assert calls["n"] == 2 and b.username == "u2"
+        for acct in (a1, a2, b):
+            acct.client.close()
+
+
 def test_register_account_authenticates_by_bearer_when_the_app_sets_no_cookie():
     # the bolt/Supabase/Firebase shape: registration yields a JWT (localStorage + Authorization: Bearer), no cookie
     def token_only(url):

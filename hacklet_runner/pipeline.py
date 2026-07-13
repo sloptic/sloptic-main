@@ -48,13 +48,28 @@ class _Ctx:
     browser_register: object = None   # optional callback: browser-driven SPA registration for the auth self-oracle
     evidence: dict = field(default_factory=dict)  # a predicate may record measured values here; the
     #     executor snapshots it onto the outcome and resets it before the next probe (probes run serially)
+    _browser_cache: dict = field(default_factory=dict)  # per-suffix browser-registration RESULT (see register)
 
     def register(self, suffix: str = ""):
         """Self-register (self-as-oracle) for the authed-surface probes, with the browser fallback threaded in:
         a client-rendered SPA (form action = placeholder, real POST = a JS fetch) still yields a session token.
-        A caller-supplied --header session (Option B) is used directly instead of self-registering."""
+        A caller-supplied --header session (Option B) is used directly instead of self-registering.
+
+        The BROWSER registration (20-40s: launch + fill + submit) is MEMOIZED per suffix: the ~8 authed-surface
+        probes that each register the SAME identity would otherwise each launch a fresh browser (and wedge-risk
+        at concurrency). The first probe for an identity pays it; the rest reuse the captured
+        cookies/bearer/backend_reads. A fresh httpx client is still built PER CALL, so per-probe close semantics
+        are unchanged (no shared-lifecycle risk); distinct suffixes (idor's "_a"/"_b") stay distinct identities."""
+        cached = real = self.browser_register
+        if real is not None:
+            store = self._browser_cache
+
+            def cached(base_url, _s=suffix, _real=real):
+                if _s not in store:
+                    store[_s] = _real(base_url)   # ONE browser registration per identity, reused across probes
+                return store[_s]
         return auth.register_account(self.base_url, self.profile, suffix=suffix,
-                                     browser_register=self.browser_register, headers=self.headers)
+                                     browser_register=cached, headers=self.headers)
 
 
 def _applicable(probe: Probe, profile: Profile) -> bool:
