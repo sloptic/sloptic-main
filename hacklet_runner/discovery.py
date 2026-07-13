@@ -327,6 +327,49 @@ def _dedup_merge_endpoints(endpoints: list) -> list:
     return list(merged.values())
 
 
+def _forms_from_perceived(perceived_forms) -> list:
+    """Perceived forms (the LLM's read of the RENDERED page) -> Form objects for the login/signup/upload/
+    CSRF/injection probes. Sanitized like the endpoint seed; RELATIVE same-origin actions only (never post to
+    a third party). A hallucinated action just returns the app shell -> no oracle differential -> no false
+    finding, same invariant as _endpoints_from_features. origin='llm' for the (off-score) pointer telemetry."""
+    out = []
+    for pf in perceived_forms or []:
+        action = (pf.get("action") or "").strip()
+        if not action.startswith("/"):                     # relative same-origin only (off_target posts never)
+            continue
+        fields = _clean_names(pf.get("fields"))
+        file_fields = _clean_names(pf.get("file_fields"))
+        if not fields and not file_fields:                 # nothing submittable/injectable -> not a probe target
+            continue
+        method = (pf.get("method") or ("post" if file_fields else "get")).lower()
+        if method not in ("get", "post", "put", "patch", "delete"):
+            method = "get"
+        out.append(Form(action=action, method=method, fields=fields, file_fields=file_fields,
+                        enctype="multipart/form-data" if file_fields else "", origin="llm"))
+    return out
+
+
+def merge_perceived(profile: Profile, perceived: dict) -> Profile:
+    """Fold an LLM perception of the RENDERED surface (perceive_surface output) into a discovered Profile —
+    the forms + endpoints the crawl MISSED (client-side logins / uploads / action buttons a static crawl can't
+    see). Endpoints reuse the exact source-seed rails (_endpoints_from_features -> _dedup_merge_endpoints, so a
+    perceived endpoint the crawler ALSO found merges its inputs rather than duplicating); forms dedup by
+    _form_key. Mutates + returns `profile`. The deterministic surface is NEVER removed — perception only
+    WIDENS it, and a hallucinated target self-gates to N/A at probe time. None/empty perception is a no-op, so
+    the crawl stays the FLOOR. Callers run this BEFORE _drop_phantom_surface so perceived phantoms on a
+    catch-all host get suppressed too."""
+    if not perceived:
+        return profile
+    profile.endpoints = _dedup_merge_endpoints(
+        profile.endpoints + _endpoints_from_features(perceived.get("endpoints")))
+    seen = {_form_key(f) for f in profile.forms}
+    for f in _forms_from_perceived(perceived.get("forms")):
+        if _form_key(f) not in seen:
+            seen.add(_form_key(f))
+            profile.forms.append(f)
+    return profile
+
+
 _CATCHALL_PROBE = "/__hacklet_nonexistent_probe_9z8x7q__"
 
 

@@ -35,6 +35,7 @@ class Form:
     fields: list[str] = field(default_factory=list)
     enctype: str = ""                                     # e.g. multipart/form-data (file uploads)
     file_fields: list[str] = field(default_factory=list)  # names of <input type=file> controls
+    origin: str = "crawl"                                  # "crawl" | "llm" (perceived) — pointer telemetry, never scored
 
 
 @dataclass

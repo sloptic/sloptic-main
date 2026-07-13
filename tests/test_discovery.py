@@ -7,7 +7,7 @@ import pytest
 
 from hacklet_runner.deploy import SubprocessDeployer
 from hacklet_runner.discovery import (
-    _ACTION, _FIELD, _FORM, _LINK, _SRC, _parse_forms, _same_origin_path, discover,
+    _ACTION, _FIELD, _FORM, _LINK, _SRC, _parse_forms, _same_origin_path, discover, merge_perceived,
 )
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -235,7 +235,7 @@ def test_surface_metrics_low_on_a_form_less_landing_page(serve):
 
 # --- api-only feature seeding + vendor-path stripping -------------------------------------------
 from hacklet_runner.discovery import _VENDOR_PATH, _endpoints_from_features  # noqa: E402
-from hacklet_runner.schema import Profile  # noqa: E402
+from hacklet_runner.schema import Form, Profile  # noqa: E402
 
 
 def test_endpoints_from_features_seeds_api_surface():
@@ -421,3 +421,37 @@ def test_surface_metrics_excludes_bundled_vendor_paths():
     s = surface_metrics(p)
     assert s["routes"] == 2 and s["routes_all"] == 4 and s["surface_size"] == 2
     assert bool(_VENDOR_PATH.search("/libs/d3.min.js")) and not _VENDOR_PATH.search("/api/v1/tracts/")
+
+
+# --- proactive discovery: merge an LLM perception of the rendered surface into the Profile ---------
+def test_merge_perceived_adds_missed_forms_and_endpoints_tagged_llm():
+    prof = Profile(base_url="http://x", forms=[Form(action="/", method="get", fields=["q"])], endpoints=[])
+    perceived = {
+        "forms": [{"kind": "login", "action": "/api/login", "method": "post",
+                   "fields": ["email", "password"], "file_fields": [], "label": "Sign in"}],
+        "endpoints": [{"kind": "create", "path": "/api/boards", "method": "post",
+                       "params": [], "body_fields": ["title"], "label": "New Board"}],
+        "page_state": "working"}
+    out = merge_perceived(prof, perceived)
+    login = [f for f in out.forms if f.action == "/api/login"]
+    assert login and login[0].fields == ["email", "password"] and login[0].origin == "llm"   # wakes auth probes
+    assert any(e.raw_path == "/api/boards" and e.body_fields == ["title"] and e.origin == "llm"
+               for e in out.endpoints)                                                        # injection target
+    assert out.forms[0].action == "/"                             # the crawled form is untouched (floor preserved)
+
+
+def test_merge_perceived_dedups_and_noops_on_empty():
+    prof = Profile(base_url="http://x", forms=[Form(action="/login", method="post", fields=["email", "password"])])
+    merge_perceived(prof, {"forms": [{"action": "/login", "method": "post",   # same form perceived again
+                                      "fields": ["email", "password"]}], "endpoints": []})
+    assert len(prof.forms) == 1                                   # deduped by (action, method, fields)
+    assert merge_perceived(prof, None).forms == prof.forms        # None -> no-op: the crawl stays the floor
+
+
+def test_merge_perceived_rejects_third_party_and_fieldless_forms():
+    prof = Profile(base_url="http://x")
+    merge_perceived(prof, {"forms": [
+        {"action": "https://evil.com/x", "fields": ["a"]},        # not relative -> never post to a third party
+        {"action": "/empty", "fields": [], "file_fields": []},    # no inputs -> not a probe target
+    ], "endpoints": []})
+    assert prof.forms == []
