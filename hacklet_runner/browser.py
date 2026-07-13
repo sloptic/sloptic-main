@@ -216,15 +216,75 @@ def _fill_and_submit_signup(page, creds) -> bool:
     return False
 
 
+# Conventional signup routes a 'Get Started' / 'Sign up' CTA navigates to via the JS router (QuizForge's
+# /register et al.) — an <a> LINK the button-only reveal can't open. Tried in order when the homepage has no
+# fillable signup, so a separate-route signup (the common SPA shape) is still reached.
+_SIGNUP_ROUTES = ("/register", "/signup", "/sign-up", "/join", "/auth/register", "/auth/signup",
+                  "/create-account", "/get-started")
+
+
+def _reach_and_submit_signup(page, base_url, creds, timeout) -> bool:
+    """Get to a fillable signup and submit it. The homepage (reveal an inline modal) first; if the signup lives
+    on its OWN route — a 'Get Started' <a> link the reveal can't open — walk conventional signup paths and try
+    each. True once a signup form was filled + submitted (the app's own JS then makes the real request)."""
+    with contextlib.suppress(Exception):
+        page.goto(base_url.rstrip("/") + "/", timeout=timeout * 1000, wait_until="load")
+        page.wait_for_timeout(300)
+        _reveal_hidden_controls(page)
+        if _fill_and_submit_signup(page, creds):
+            return True
+    for route in _SIGNUP_ROUTES:
+        with contextlib.suppress(Exception):
+            page.goto(base_url.rstrip("/") + route, timeout=timeout * 1000, wait_until="load")
+            page.wait_for_timeout(400)
+            _reveal_hidden_controls(page)
+            if _fill_and_submit_signup(page, creds):
+                return True
+    return False
+
+
+# A session token PERSISTED in localStorage (Supabase 'sb-<ref>-auth-token', Firebase authUser, or a bare JWT)
+# is reachable by ANY XSS on the origin — unlike an HttpOnly cookie — so its presence is the token-auth analog
+# of a session cookie missing HttpOnly (sec-session-005). The same token doubles as the Bearer for our authed
+# client when the app sets no cookie (the bolt/Supabase cohort's whole session model).
+_STORAGE_TOKEN_JS = r"""() => {
+  for (let i = 0; i < localStorage.length; i++) {
+    const k = localStorage.key(i), v = localStorage.getItem(k) || "";
+    let tok = null;
+    let s = v;
+    if (s.slice(0, 7) === "base64-") { try { s = atob(s.slice(7)); } catch (e) {} }  // @supabase/ssr wrapping
+    if (s.slice(0, 3) === "eyJ") tok = s;                          // a raw JWT stored directly
+    else if (s.indexOf("access_token") >= 0 || s.indexOf("accessToken") >= 0 || s.indexOf("idToken") >= 0) {
+      try { const j = JSON.parse(s);
+        tok = j.access_token || j.accessToken || j.token || j.idToken
+           || (j.currentSession && j.currentSession.access_token)
+           || (j.stsTokenManager && j.stsTokenManager.accessToken) || null;
+      } catch (e) {}
+    }
+    if (tok && String(tok).length > 20) return { token: String(tok), key: k };
+  }
+  return {};
+}"""
+
+
+def _extract_storage_token(page) -> dict:
+    """A persisted session token out of localStorage -> {token, key} or {} (the exposure finding + the Bearer)."""
+    with contextlib.suppress(Exception):
+        return page.evaluate(_STORAGE_TOKEN_JS) or {}
+    return {}
+
+
 def register_in_browser(base_url: str, headers=None, timeout: float = 12.0, total_timeout: float = 45.0):
     """SPA self-registration THROUGH the browser (the auth self-oracle's client-rendered path): open the signup
     form, fill throwaway creds, submit so the app's OWN JS makes the real registration request, and return the
     session cookie the server sets IN THE BROWSER — the thing an httpx form-POST can't get on an SPA (the form's
-    action is a placeholder; the real POST lives in the JS). Returns {creds, cookies:[{name,value,httponly,
-    secure,samesite}], request:{url,method,body}|None} or None (no browser / no fillable signup / no cookie set).
-    Best-effort + side-effecting: creates ONE throwaway account, like the httpx register; targets a SIGNUP form
-    only (a password field), never login/pay/delete (the reveal + _NO_CLICK guards). Caller (auth) decides which
-    cookie is the session and whether registration succeeded."""
+    action is a placeholder; the real POST lives in the JS). On the bolt/Supabase/Firebase cohort the session is
+    NOT a cookie but a JWT (localStorage + Authorization: Bearer), so this ALSO returns that token. Returns
+    {creds, cookies:[{name,value,httponly,secure,samesite}], request:{url,method,body}|None, bearer:str|None,
+    storage_exposed:bool} or None (no browser / no fillable signup / NEITHER a cookie nor a token — email-verify /
+    CAPTCHA / SSO). Best-effort + side-effecting: creates ONE throwaway account, like the httpx register; targets a
+    SIGNUP form only (a password field), never login/pay/delete (the reveal + _NO_CLICK guards). Caller (auth)
+    decides which cookie/token is the session and whether registration succeeded."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -232,7 +292,7 @@ def register_in_browser(base_url: str, headers=None, timeout: float = 12.0, tota
     import secrets
     uname = "hl_" + secrets.token_hex(5)
     creds = {"email": uname + "@example.com", "username": uname, "password": "Hl-Probe-Passw0rd!"}
-    captured, out = {}, None
+    captured, seen_bearer, out = {}, {}, None
     try:
         with sync_playwright() as pw:
             b = _launch(pw)
@@ -242,17 +302,18 @@ def register_in_browser(base_url: str, headers=None, timeout: float = 12.0, tota
                 page = b.new_page()
                 _apply_auth(page, base_url, headers)
 
-                def _on_request(req):   # the REAL registration request (endpoint + body the JS posts)
+                def _on_request(req):   # the REAL registration request + a Bearer the app's JS attaches post-auth
                     with contextlib.suppress(Exception):
                         if req.method in ("POST", "PUT") and creds["password"] in (req.post_data or ""):
                             captured.update(url=req.url, method=req.method, body=req.post_data)
+                        authz = req.headers.get("authorization", "")
+                        if authz[:7].lower() == "bearer " and len(authz) > 27:
+                            seen_bearer["token"] = authz[7:]   # the token the app sends to its own authed API
                 page.on("request", _on_request)
-                page.goto(base_url.rstrip("/") + "/", timeout=timeout * 1000, wait_until="load")
-                page.wait_for_timeout(300)
-                _reveal_hidden_controls(page)                        # open an interaction-gated signup modal/tab
-                if not _fill_and_submit_signup(page, creds):
+
+                if not _reach_and_submit_signup(page, base_url, creds, timeout):
                     return None
-                with contextlib.suppress(Exception):                 # let the registration fetch + Set-Cookie land
+                with contextlib.suppress(Exception):                 # let the registration fetch + Set-Cookie/token land
                     page.wait_for_load_state("networkidle", timeout=8000)
                 page.wait_for_timeout(500)
                 cookies = []
@@ -262,9 +323,13 @@ def register_in_browser(base_url: str, headers=None, timeout: float = 12.0, tota
                         "httponly": bool(c.get("httpOnly")), "secure": bool(c.get("secure")),
                         "samesite": (c.get("sameSite") or "").lower() in ("lax", "strict")}
                        for c in cookies]
-                if not jar:
-                    return None
-                out = {"creds": creds, "cookies": jar, "request": captured or None}
+                stored = _extract_storage_token(page)                # a session JWT persisted in localStorage
+                # the session for our authed client: a persisted localStorage token, else a Bearer the app sent
+                bearer = stored.get("token") or seen_bearer.get("token")
+                if not jar and not bearer:
+                    return None   # no cookie AND no token -> registration didn't take (email-verify/CAPTCHA) -> N/A
+                out = {"creds": creds, "cookies": jar, "request": captured or None,
+                       "bearer": bearer, "storage_exposed": bool(stored.get("token"))}
             finally:
                 b.close()
     except Exception:
