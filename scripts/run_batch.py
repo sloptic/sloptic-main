@@ -315,7 +315,9 @@ def _kill_all_active():
 def main():
     ap = argparse.ArgumentParser(description="Devpost -> deploy + grade -> stats, in one run.")
     mode = ap.add_mutually_exclusive_group(required=False)
-    mode.add_argument("--hackathon", metavar="SLUG", help="one hackathon subdomain slug")
+    mode.add_argument("--hackathon", metavar="SLUG", nargs="+",
+                      help="one or more hackathon subdomain slugs (space-separated), pooled into one run — "
+                           "the --limit is balanced across them for a diverse corpus")
     mode.add_argument("--search", metavar="QUERY", help="auto-pick hackathons matching QUERY")
     ap.add_argument("--urls", metavar="FILE", help="also grade a file of ALREADY-DEPLOYED app URLs (one "
                     "per line, `URL[,project[,winner]]`) — raw-fuzz over HTTP(S), no clone/plan/deploy. "
@@ -397,7 +399,7 @@ def main():
         elif args.ingest_cache:
             dp += ["--ingest-cache", args.ingest_cache]
         if args.hackathon:
-            dp += ["--hackathon", args.hackathon]
+            dp += ["--hackathon", *args.hackathon]
         else:
             dp += ["--search", args.search, "--hackathons", str(args.hackathons)]
             if args.completed:
@@ -407,7 +409,7 @@ def main():
         sys.stderr.write(got.stderr)
         records = json.loads(got.stdout or "[]")
     if args.urls:   # already-deployed apps: grade raw over HTTP(S), no clone/deploy
-        url_recs = _load_urls(args.urls, args.hackathon)
+        url_recs = _load_urls(args.urls, ",".join(args.hackathon) if args.hackathon else None)
         print(f"== + {len(url_recs)} live-app URL(s) from {args.urls} (raw-fuzz, no deploy) ==", flush=True)
         records += url_recs
     if not records:

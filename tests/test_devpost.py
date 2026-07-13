@@ -138,3 +138,11 @@ def test_ingest_cache_memoizes_gallery_pages(tmp_path):
     p2 = page_projects(c, "hack", 1, cache)
     assert p1 == p2 == [("https://devpost.com/software/proj-one", True)]
     assert c.n == 1                                        # page 1 served from cache the second time
+
+
+def test_per_slug_budget_balances_a_multi_hackathon_pull():
+    from devpost_repos import _per_slug_budget
+    assert _per_slug_budget(30, 1) == 30       # single slug -> whole budget (unchanged behavior)
+    assert _per_slug_budget(30, 3) == 10       # 3 slugs -> 10 each, balanced for diversity (not 30/0/0)
+    assert _per_slug_budget(25, 5) == 5        # --search's default shape, now balanced too
+    assert _per_slug_budget(10, 3) == 4        # ceil so the total still reaches ~the limit (4*3=12 >= 10)

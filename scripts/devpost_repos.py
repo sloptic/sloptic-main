@@ -200,10 +200,18 @@ def repo_for(client, project_url):
     return links_for(client, project_url)[0]
 
 
+def _per_slug_budget(limit: int, n_slugs: int) -> int:
+    """Spread --limit across N slugs so a MULTI-hackathon pull is BALANCED (the diversity goal), not front-
+    loaded onto the first slug. Ceil-divide so the total still reaches ~limit; a single slug keeps the whole
+    budget (and --search's auto-picked set gets balanced too, which beats the old take-all-from-slug-1)."""
+    return limit if n_slugs <= 1 else -(-limit // n_slugs)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Grab hackathon project GitHub repos from Devpost.")
     mode = ap.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--hackathon", metavar="SLUG", help="one hackathon subdomain slug")
+    mode.add_argument("--hackathon", metavar="SLUG", nargs="+",
+                      help="one or more hackathon subdomain slugs (space-separated), pooled into one run")
     mode.add_argument("--search", metavar="QUERY", help="auto-pick hackathons matching QUERY via the API")
     ap.add_argument("--hackathons", type=int, default=5, help="(--search) how many hackathons (default 5)")
     ap.add_argument("--completed", action="store_true",
@@ -225,23 +233,25 @@ def main():
 
     cache = None if args.no_ingest_cache else IngestCache(args.ingest_cache or _default_ingest_cache())
     with httpx.Client(follow_redirects=True) as c:
-        slugs = ([args.hackathon] if args.hackathon
+        slugs = (args.hackathon if args.hackathon
                  else hackathon_slugs(c, args.search, args.hackathons, args.completed))
         if not slugs:
             sys.exit("no hackathons matched")
-        sys.stderr.write(f"hackathons ({len(slugs)}): {', '.join(slugs)}\n")
+        per_slug = _per_slug_budget(args.limit, len(slugs))   # balance --limit across slugs (diversity)
+        sys.stderr.write(f"hackathons ({len(slugs)}): {', '.join(slugs)}"
+                         + (f"  · ~{per_slug}/slug" if len(slugs) > 1 else "") + "\n")
         records, seen, seen_urls = [], set(), set()
         for slug in slugs:
             if len(records) >= args.limit:
                 break
             got, page = 0, 1
-            while len(records) < args.limit and page <= args.max_pages:
+            while len(records) < args.limit and got < per_slug and page <= args.max_pages:
                 page_cached = cache is not None and cache.has(_ck_page(slug, page))
                 hits = page_projects(c, slug, page, cache)
                 if not hits:                      # empty page -> gallery exhausted
                     break
                 for project_url, winner in hits:
-                    if len(records) >= args.limit:
+                    if len(records) >= args.limit or got >= per_slug:
                         break
                     link_cached = cache is not None and cache.has(_ck_links(project_url))
                     repo, url = links_for(c, project_url, cache)
