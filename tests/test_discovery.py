@@ -235,7 +235,7 @@ def test_surface_metrics_low_on_a_form_less_landing_page(serve):
 
 # --- api-only feature seeding + vendor-path stripping -------------------------------------------
 from hacklet_runner.discovery import _VENDOR_PATH, _endpoints_from_features  # noqa: E402
-from hacklet_runner.schema import Form, Profile  # noqa: E402
+from hacklet_runner.schema import Endpoint, Form, Profile  # noqa: E402
 
 
 def test_endpoints_from_features_seeds_api_surface():
@@ -424,7 +424,7 @@ def test_surface_metrics_excludes_bundled_vendor_paths():
 
 
 # --- proactive discovery: merge an LLM perception of the rendered surface into the Profile ---------
-def test_merge_perceived_adds_missed_forms_and_endpoints_tagged_llm():
+def test_merge_perceived_adds_missed_forms_and_endpoints_tagged_perceived():
     prof = Profile(base_url="http://x", forms=[Form(action="/", method="get", fields=["q"])], endpoints=[])
     perceived = {
         "forms": [{"kind": "login", "action": "/api/login", "method": "post",
@@ -434,8 +434,8 @@ def test_merge_perceived_adds_missed_forms_and_endpoints_tagged_llm():
         "page_state": "working"}
     out = merge_perceived(prof, perceived)
     login = [f for f in out.forms if f.action == "/api/login"]
-    assert login and login[0].fields == ["email", "password"] and login[0].origin == "llm"   # wakes auth probes
-    assert any(e.raw_path == "/api/boards" and e.body_fields == ["title"] and e.origin == "llm"
+    assert login and login[0].fields == ["email", "password"] and login[0].origin == "perceived"  # wakes auth
+    assert any(e.raw_path == "/api/boards" and e.body_fields == ["title"] and e.origin == "perceived"
                for e in out.endpoints)                                                        # injection target
     assert out.forms[0].action == "/"                             # the crawled form is untouched (floor preserved)
 
@@ -473,8 +473,8 @@ def test_discover_wires_perceive_into_the_profile(serve):
                 "endpoints": [{"kind": "create", "path": "/__perceived_api", "method": "post",
                                "body_fields": ["title"]}], "page_state": "working"}
     prof = discover(base, render=_stub_render, perceive=_perceive)
-    assert any(f.action == "/__perceived_login" and f.origin == "llm" for f in prof.forms)
-    assert any(e.raw_path == "/__perceived_api" and e.origin == "llm" for e in prof.endpoints)
+    assert any(f.action == "/__perceived_login" and f.origin == "perceived" for f in prof.forms)
+    assert any(e.raw_path == "/__perceived_api" and e.origin == "perceived" for e in prof.endpoints)
 
 
 def test_discover_perceive_failure_degrades_to_the_deterministic_floor(serve):
@@ -487,3 +487,21 @@ def test_discover_perceive_failure_degrades_to_the_deterministic_floor(serve):
     degraded = discover(base, render=_stub_render, perceive=_boom)          # perception raises -> swallowed
     assert [f.action for f in degraded.forms] == [f.action for f in baseline.forms]
     assert len(degraded.endpoints) == len(baseline.endpoints)              # identical to the pure crawl (the floor)
+
+
+def test_surface_metrics_reports_the_perception_pointer():
+    # off-score telemetry: perceived surface is measured SEPARATELY from the source-read #2 pointer, and
+    # perceived endpoints split reachable/hallucinated via the frozen baseline (forms just count, having
+    # survived phantom-suppression). This is the honesty number for a --proactive A/B.
+    prof = Profile(base_url="http://x",
+                   forms=[Form(action="/login", method="post", fields=["email", "password"], origin="perceived")],
+                   endpoints=[
+                       Endpoint(path="/api/real", raw_path="/api/real", method="post", body_fields=["t"],
+                                baseline_status=200, origin="perceived"),
+                       Endpoint(path="/api/ghost", raw_path="/api/ghost", baseline_status=404, origin="perceived"),
+                       Endpoint(path="/api/src", raw_path="/api/src", baseline_status=200, origin="llm")])
+    ptr = surface_metrics(prof)["pointer"]
+    assert ptr["perceived_forms_seeded"] == 1 and ptr["perceived_form_actions"] == ["/login"]
+    assert ptr["perceived_endpoints_seeded"] == 2
+    assert ptr["perceived_endpoints_reachable"] == 1 and ptr["perceived_endpoints_hallucinated"] == 1
+    assert ptr["endpoints_seeded"] == 1        # the origin='llm' source-seed stays SEPARATE from perceived

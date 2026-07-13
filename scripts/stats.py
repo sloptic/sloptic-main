@@ -205,6 +205,19 @@ def main():
     ptr_judged = ptr_reach + ptr_halluc
     ptr_prec = round(ptr_reach / ptr_judged * 100, 1) if ptr_judged else None
 
+    # rendered-PERCEPTION pointer (proactive discovery, --proactive) — the same honesty measure on surface an
+    # LLM read off the RENDERED page (client-side logins/uploads/actions). Kept SEPARATE from the source pointer
+    # above so a --proactive A/B is legible. Forms are counted (they survived phantom-suppression to be probed);
+    # endpoint reachable/hallucinated via the frozen baseline. Off-score: measures perception, never scores it.
+    pcv_active = [p for r in recs for p in [_ptr(r)]
+                  if p and (p.get("perceived_endpoints_seeded") or p.get("perceived_forms_seeded"))]
+    pcv_eps = sum(p.get("perceived_endpoints_seeded", 0) for p in pcv_active)
+    pcv_reach = sum(p.get("perceived_endpoints_reachable", 0) for p in pcv_active)
+    pcv_halluc = sum(p.get("perceived_endpoints_hallucinated", 0) for p in pcv_active)
+    pcv_forms = sum(p.get("perceived_forms_seeded", 0) for p in pcv_active)
+    pcv_judged = pcv_reach + pcv_halluc
+    pcv_prec = round(pcv_reach / pcv_judged * 100, 1) if pcv_judged else None
+
     models = Counter(r.get("model") for r in recs if r.get("model"))   # LLM(s) used (a file may mix runs)
 
     if args.json:
@@ -228,6 +241,8 @@ def main():
                                  "max": max(xs)} for key, label in _PHASES for xs in [_phase(key)] if xs},
             "pointer": {"apps": len(ptr_active), "endpoints_seeded": ptr_seeded, "reachable": ptr_reach,
                         "hallucinated": ptr_halluc, "params_seeded": ptr_params, "precision_pct": ptr_prec},
+            "perception": {"apps": len(pcv_active), "endpoints_seeded": pcv_eps, "reachable": pcv_reach,
+                           "hallucinated": pcv_halluc, "forms_seeded": pcv_forms, "precision_pct": pcv_prec},
             "models": dict(models.most_common()),
         }, indent=2))
         return
@@ -430,6 +445,19 @@ def main():
                 pp = _ptr(r)
                 print(f"      {r['repo'].rsplit('/', 1)[-1][:30]:30} {pp['endpoints_hallucinated']} ghost "
                       f"/ {pp['endpoints_seeded']} seeded")
+        print()
+
+    # (i2) PERCEPTION POINTER (proactive discovery, off-score) — of the surface an LLM perceived off the
+    # RENDERED page (the client-side logins/uploads/actions the crawl missed), how much turned out REAL. The
+    # recall counterpart to (h) DISCOVERY GAPS: (h) says what's still missed, this says how good the fix is.
+    if pcv_active:
+        print(f"(i2) PERCEPTION POINTER (proactive discovery, off-score) — {len(pcv_active)} apps where the LLM "
+              f"perceived surface the crawl missed")
+        print(f"    {pcv_forms} forms + {pcv_eps} endpoints perceived (survived suppression) · "
+              f"{pcv_reach} endpoints reachable · {pcv_halluc} hallucinated (404)")
+        if pcv_judged:
+            print(f"    endpoint precision {pcv_prec:.0f}%  (reachable / {pcv_judged} judged)   "
+                  f"— how much of the RENDERED-page surface perception added was real (forms show up as woken probes)")
         print()
 
 

@@ -345,7 +345,7 @@ def _forms_from_perceived(perceived_forms) -> list:
         if method not in ("get", "post", "put", "patch", "delete"):
             method = "get"
         out.append(Form(action=action, method=method, fields=fields, file_fields=file_fields,
-                        enctype="multipart/form-data" if file_fields else "", origin="llm"))
+                        enctype="multipart/form-data" if file_fields else "", origin="perceived"))
     return out
 
 
@@ -360,8 +360,10 @@ def merge_perceived(profile: Profile, perceived: dict) -> Profile:
     catch-all host get suppressed too."""
     if not perceived:
         return profile
-    profile.endpoints = _dedup_merge_endpoints(
-        profile.endpoints + _endpoints_from_features(perceived.get("endpoints")))
+    perceived_eps = _endpoints_from_features(perceived.get("endpoints"))
+    for e in perceived_eps:
+        e.origin = "perceived"          # distinguish rendered-PERCEPTION from source-read #2 ("llm") for telemetry
+    profile.endpoints = _dedup_merge_endpoints(profile.endpoints + perceived_eps)
     seen = {_form_key(f) for f in profile.forms}
     for f in _forms_from_perceived(perceived.get("forms")):
         if _form_key(f) not in seen:
@@ -630,11 +632,21 @@ def surface_metrics(profile: Profile) -> dict:
     # hallucinated = 404 (the LLM named a path that isn't there); the rest were beyond the baseline cap
     # (unjudged). This MEASURES the pointer without ever letting it score — pointer/never-judge, quantified.
     llm_eps = [e for e in eps if getattr(e, "origin", "crawl") == "llm"]
+    perceived_eps = [e for e in eps if getattr(e, "origin", "crawl") == "perceived"]
+    perceived_forms = [f for f in forms if getattr(f, "origin", "crawl") == "perceived"]
     pointer = {
-        "endpoints_seeded": len(llm_eps),                                                 # coverage the pointer added
+        "endpoints_seeded": len(llm_eps),                                                 # coverage the SOURCE pointer(#2) added
         "endpoints_reachable": sum(e.baseline_status not in (None, 404) for e in llm_eps),  # path exists -> LLM right
         "endpoints_hallucinated": sum(e.baseline_status == 404 for e in llm_eps),         # 404 -> LLM named a ghost path
         "params_seeded": sum(len(e.query_params) + len(e.body_fields) for e in llm_eps),  # injection targets it added
+        # rendered-PERCEPTION pointer (proactive discovery, origin "perceived") — the same honesty measure on the
+        # surface an LLM read off the RENDERED page (client-side logins/uploads/actions the crawl missed). Forms
+        # here already survived phantom-suppression; endpoint reachable/hallucinated via the frozen baseline above.
+        "perceived_endpoints_seeded": len(perceived_eps),
+        "perceived_endpoints_reachable": sum(e.baseline_status not in (None, 404) for e in perceived_eps),
+        "perceived_endpoints_hallucinated": sum(e.baseline_status == 404 for e in perceived_eps),
+        "perceived_forms_seeded": len(perceived_forms),
+        "perceived_form_actions": [f.action for f in perceived_forms][:8],
     }
     return {
         "routes": len(app_routes),
