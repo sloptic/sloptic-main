@@ -5,6 +5,7 @@ import httpx
 
 from hacklet_runner.probes import (
     _csrf_candidates,
+    response_csp_weak,
     response_has_header,
     response_is_dotenv,
     response_is_git_config,
@@ -57,6 +58,21 @@ def test_ignores_public_by_design():
     assert not response_leaks_secret(_Resp('apiKey: "AIzaSyD-EXAMPLE_firebase_public_key_x12345"'))
     assert not response_leaks_secret(_Resp("pk_live_publishablekey1234567890"))
     assert not response_leaks_secret(_Resp('const config = { api: "/api" };'))
+
+
+def test_weak_csp_fires_on_toothless_policies():
+    csp = lambda v: _resp(200, {"content-security-policy": v})   # noqa: E731
+    assert response_csp_weak(csp("default-src 'self'; script-src 'self' 'unsafe-inline'"))  # inline runs
+    assert response_csp_weak(csp("script-src *"))                                            # any host
+    assert response_csp_weak(csp("default-src 'unsafe-inline'"))                             # via default-src fallback
+    assert response_csp_weak(csp("frame-ancestors 'none'"))                                  # no script restriction at all
+
+
+def test_weak_csp_clean_on_modern_and_absent():
+    csp = lambda v: _resp(200, {"content-security-policy": v})   # noqa: E731
+    assert not response_csp_weak(csp("script-src 'self' 'nonce-r4nd0m' 'strict-dynamic'"))   # nonce -> inline ignored
+    assert not response_csp_weak(csp("default-src 'self'; script-src 'self'"))               # locked to self
+    assert not response_csp_weak(_resp(200, {}))                                             # absent -> not THIS finding
 
 
 def test_detects_exposed_files():

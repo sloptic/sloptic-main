@@ -125,6 +125,32 @@ def response_missing_clickjacking_defense(resp, arg=None) -> bool:
     return "frame-ancestors" not in resp.headers.get("content-security-policy", "").lower()
 
 
+_CSP_NEUTRALIZED = re.compile(r"'nonce-|'sha(?:256|384|512)-|'strict-dynamic'")
+
+
+def response_csp_weak(resp, arg=None) -> bool:
+    """A CSP that's PRESENT but toothless against XSS — script execution allowed via 'unsafe-inline' or a
+    scheme/wildcard host source (`*`/`https:`/`http:`), with NO nonce/hash/strict-dynamic to neutralize it, or
+    no script restriction at all. Only fires when a CSP exists (absence is response_missing_header's job); a
+    modern nonce/hash CSP reads clean. A present-but-weak CSP is a false sense of XSS safety -> graded."""
+    if not _policy_applies(resp):
+        return False
+    csp = resp.headers.get("content-security-policy", "").lower()
+    if not csp:
+        return False   # absent -> the missing-header probe owns it; don't double-count
+    directives = {}
+    for part in csp.split(";"):
+        toks = part.split()
+        if toks:
+            directives[toks[0]] = toks[1:]
+    script = directives.get("script-src", directives.get("default-src"))
+    if script is None:
+        return True                                  # no script-src/default-src -> scripts unrestricted
+    if _CSP_NEUTRALIZED.search(" ".join(script)):
+        return False                                 # nonce/hash/strict-dynamic -> 'unsafe-inline' ignored -> strong
+    return any(s in script for s in ("'unsafe-inline'", "*", "https:", "http:"))  # scripts from anywhere
+
+
 def response_cors_misconfigured(resp, arg=None) -> bool:
     # Slop when the app reflects the request Origin into Access-Control-Allow-Origin AND allows
     # credentials: any site can then make credentialed cross-origin reads. Bare ACAO:* is excluded
@@ -234,6 +260,7 @@ MATCHERS = {
     "response_contains": response_contains,
     "response_missing_header": response_missing_header,
     "response_missing_clickjacking_defense": response_missing_clickjacking_defense,
+    "response_csp_weak": response_csp_weak,
     "response_cors_misconfigured": response_cors_misconfigured,
     "response_server_error": response_server_error,
     "response_uncompressed": response_uncompressed,
@@ -2596,6 +2623,7 @@ _MATCHER_REASONS = {
     "response_contains": "reflected the probe payload unescaped",
     "response_missing_header": "missing header: {arg}",
     "response_missing_clickjacking_defense": "no clickjacking defense (X-Frame-Options / CSP frame-ancestors)",
+    "response_csp_weak": "the Content-Security-Policy is present but toothless against XSS ('unsafe-inline' / wildcard script source with no nonce/hash) -> a false sense of safety",
     "response_cors_misconfigured": "reflects an arbitrary Origin with credentials (CORS)",
     "response_server_error": "returned a 5xx server error",
     "response_uncompressed": "sizeable text served without gzip (no Content-Encoding)",

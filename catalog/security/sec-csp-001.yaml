@@ -1,0 +1,13 @@
+id: sec-csp-001
+bundle: security
+category: csp
+pool: public
+evidence_model: provable
+penalty: 8   # a CSP present but toothless ('unsafe-inline' / wildcard script source, no nonce) — a false sense
+             # of XSS safety; priced below a MISSING header (partial CSP may still restrict frame-ancestors etc.)
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  target: /   # CSP is a global response header -> check once on the homepage
+  slop_if:
+    - response_csp_weak
