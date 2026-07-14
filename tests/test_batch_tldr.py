@@ -5,7 +5,7 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
-from run_batch import _Progress, _label, _last_record_for, _tldr_line  # noqa: E402
+from run_batch import _eta_footer, _Progress, _label, _last_record_for, _tldr_line  # noqa: E402
 
 
 def test_label_prefers_devpost_slug_then_repo_then_host():
@@ -50,3 +50,9 @@ def test_progress_eta_is_nonnegative_and_counts():
     d1, _ = p.tick()
     d2, eta2 = p.tick()
     assert d1 == 1 and d2 == 2 and eta2 >= 0
+
+
+def test_eta_footer_shows_batch_progress_and_eta_for_the_full_dump():
+    # non-tldr full-dump footer: batch [done/total], this-app seconds, and the same throughput ETA as --tldr
+    assert _eta_footer(180, 398, 294, 5999) == "    └─ batch [180/398] · 294s this app · ETA 99:59"
+    assert "ETA" not in _eta_footer(1, 398, 2, 0)      # first app: no throughput yet -> no ETA shown

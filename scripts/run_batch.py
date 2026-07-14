@@ -249,6 +249,13 @@ def _build_cmd(j, args, ckpt):
     return cmd
 
 
+def _eta_footer(done, total, secs, eta):
+    """Batch progress + ETA printed right after a full (non-tldr) per-app dump, so the ETA sits next to the
+    child's own timing/model line. Same throughput-based ETA as the --tldr line."""
+    eta_s = f" · ETA {int(eta) // 60}:{int(eta) % 60:02d}" if eta else ""
+    return f"    └─ batch [{done}/{total}] ·{secs:4.0f}s this app{eta_s}"
+
+
 def _run_job(j, idx, total, args, capture, progress=None):
     """Grade one job in a child process with a hard wall-clock kill. capture=True buffers the child's output
     and prints it as ONE block on completion (concurrent url jobs, so logs don't interleave); capture=False
@@ -296,17 +303,19 @@ def _run_job(j, idx, total, args, capture, progress=None):
         with _active_lock:
             _active.pop(proc.pid, None)
     secs = time.monotonic() - t0
+    done, eta = progress.tick() if progress else (idx, 0.0)
+    gtotal = progress.total if progress else total
     if args.tldr:                          # terse: one line from the child's record, not its full dump
         rec_out = _last_record_for(args.results, target)
-        done, eta = progress.tick() if progress else (idx, 0.0)
         with _print_lock:
-            print(_tldr_line(done, progress.total if progress else total, _label(j),
-                             rec_out, secs, eta, tail), flush=True)
-    elif capture:
-        with _print_lock:
-            print(hdr + "\n" + (out or "").rstrip() + (("\n" + tail) if tail else ""), flush=True)
-    elif tail:
-        print(tail, flush=True)
+            print(_tldr_line(done, gtotal, _label(j), rec_out, secs, eta, tail), flush=True)
+    else:                                  # full dump -> append a batch progress + ETA footer (right after the
+        foot = _eta_footer(done, gtotal, secs, eta)              # child's own timing/model line)
+        if capture:
+            with _print_lock:
+                print(hdr + "\n" + (out or "").rstrip() + (("\n" + tail) if tail else "") + "\n" + foot, flush=True)
+        else:
+            print(((tail + "\n") if tail else "") + foot, flush=True)
 
 
 def _kill_all_active():
@@ -447,7 +456,7 @@ def main():
     if conc > 1:
         note = f" · url {conc}-wide" + (f", {len(repo_jobs)} repo serial" if repo_jobs else "")
         print(f"   concurrency: {conc}{note}", flush=True)
-    prog = _Progress(len(repo_jobs) + len(url_jobs)) if args.tldr else None
+    prog = _Progress(len(repo_jobs) + len(url_jobs))   # drives the ETA in BOTH --tldr and the full-dump footer
     cap = args.tldr        # --tldr captures (suppresses) each child's dump; we print one line from its record
     try:
         for i, j in enumerate(repo_jobs, 1):                       # serial repo phase
