@@ -101,6 +101,20 @@ def _scan_text(text: str, rel: str) -> list[SecretFinding]:
     return out
 
 
+def scan_blob(text: str) -> list[str]:
+    """Provider-secret KINDS in an arbitrary text blob (a served JS bundle / HTML) — for the black-box HTTP
+    probes, which see the CLIENT bundle, not the source tree. Whole-text (NOT line-split: a production bundle is
+    minified to one giant line, which _scan_text skips), and PROVIDER formats only — the public-by-design keys
+    (Google AIza / Stripe pk_ / Supabase anon) aren't in _PROVIDER, so only a leaked SECRET fires. No generic
+    `<name>=<value>` here: it's too false-positive-prone across a minified bundle's sea of key/value pairs."""
+    kinds: set[str] = set()
+    for kind, pat in _PROVIDER:
+        m = pat.search(text)
+        if m and "example" not in m.group(0).lower():
+            kinds.add(kind)
+    return sorted(kinds)
+
+
 def _walk(root: Path):
     for p in root.rglob("*"):
         if not p.is_file() or set(p.relative_to(root).parts[:-1]) & _SKIP_DIRS:

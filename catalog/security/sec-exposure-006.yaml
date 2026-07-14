@@ -1,0 +1,11 @@
+id: sec-exposure-006
+bundle: security
+category: exposure
+pool: public
+evidence_model: provable
+penalty: 15   # a served .map reconstructs the ORIGINAL source (business logic, hidden endpoints, and secrets
+              # a minified scan misses) — info disclosure, priced below a live secret / served .env
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  predicate: source_map_exposed

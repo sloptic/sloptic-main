@@ -20,7 +20,7 @@ from dataclasses import replace
 
 import httpx
 
-from . import auth, browser, oob, perf
+from . import auth, browser, oob, perf, secretscan
 from .net import make_client
 from .schema import Endpoint
 from .discovery import _CATCHALL_PROBE, _body_sig
@@ -171,19 +171,9 @@ def response_is_aws_credentials(resp, arg=None) -> bool:
 # High-confidence server secrets that must never reach a client. Precision over recall: we skip
 # public-by-design values (Firebase apiKey AIza..., Stripe publishable pk_..., generic JWT session
 # tokens), because a false positive wrongly penalizes a non-flaw.
-_SECRET_PATTERNS = [
-    re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----"),
-    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),               # AWS access key id
-    re.compile(r"\b(?:sk|rk)_live_[0-9A-Za-z]{16,}"),  # Stripe live secret / restricted key
-    re.compile(r"\bsk_test_[0-9A-Za-z]{16,}"),         # Stripe test secret key
-    re.compile(r"\bghp_[0-9A-Za-z]{36}\b"),            # GitHub personal access token
-    re.compile(r"\bgithub_pat_[0-9A-Za-z_]{20,}"),     # GitHub fine-grained PAT
-    re.compile(r"\bxox[baprs]-[0-9A-Za-z-]{10,}"),     # Slack token
-]
-
-
 def response_leaks_secret(resp, arg=None) -> bool:
-    return any(p.search(resp.text) for p in _SECRET_PATTERNS)
+    # one comprehensive, public-key-guarded provider set, shared with the source scan (secretscan._PROVIDER)
+    return bool(secretscan.scan_blob(resp.text))
 
 
 # Credential material an API response must never contain: a populated password-family field, or a
@@ -1292,6 +1282,58 @@ def _client_bundle(ctx, cap: int = 2_000_000) -> str:
         if total >= cap:
             break
     return "\n".join(parts)
+
+
+def bundle_leaks_secret(ctx, probe) -> bool | None:
+    """SPA-native: mine the served CLIENT bundle (homepage + same-origin .js) for a hardcoded SECRET key that
+    shipped to the browser — a SERVER key (Stripe sk_ / OpenAI / AWS secret / GitHub PAT / private key) in the
+    bundle is account/DB takeover, the #1 real SPA leak. Public-by-design keys (Supabase anon / Firebase apiKey
+    / Stripe pk_) are NOT in the pattern set (secretscan._PROVIDER), so they never fire. N/A when no bundle."""
+    blob = _client_bundle(ctx)
+    if not blob.strip():
+        return None
+    kinds = secretscan.scan_blob(blob)
+    if kinds:
+        ctx.evidence.update(secret_kinds=kinds, source="client-bundle")
+        return True
+    ctx.evidence.update(secret_kinds=[], scanned_bytes=len(blob))
+    return False
+
+
+_SOURCEMAP_URL = re.compile(r"//[#@]\s*sourceMappingURL=(\S+)")
+
+
+def source_map_exposed(ctx, probe) -> bool | None:
+    """SPA-native info-disclosure: a production bundle ships its .map, so anyone can reconstruct the ORIGINAL
+    source — business logic, hidden endpoints, and (the real risk) hardcoded secrets a minified scan misses.
+    For each same-origin .js bundle, fetch the //# sourceMappingURL target (or the conventional <bundle>.map);
+    fire only on a REAL sourcemap (JSON with sources/sourcesContent), never a soft-404 shell (innocence check).
+    N/A when there are no .js bundles to check."""
+    js = [r for r in (["/"] + ctx.profile.routes) if r.split("?")[0].endswith(".js")]
+    if not js:
+        return None
+    for path in list(dict.fromkeys(js))[:10]:
+        try:
+            m = _SOURCEMAP_URL.search(ctx.client.get(path).text)
+        except (httpx.HTTPError, httpx.InvalidURL):
+            continue
+        cand = m.group(1) if m else None
+        for mp in [c for c in (cand, path + ".map") if c and not c.startswith(("http", "data:"))]:
+            try:
+                r = ctx.client.get(urllib.parse.urljoin(path, mp))
+            except (httpx.HTTPError, httpx.InvalidURL):
+                continue
+            if r.status_code != 200 or _is_phantom_shell(ctx, r):
+                continue                      # not served, or a soft-404 shell
+            try:
+                sm = r.json()
+            except ValueError:
+                continue
+            if isinstance(sm, dict) and sm.get("version") and ("sources" in sm or "sourcesContent" in sm):
+                ctx.evidence.update(bundle=path, source_map=mp, sources=len(sm.get("sources") or []),
+                                    reconstructable=bool(sm.get("sourcesContent")))
+                return True
+    return False
 
 
 def _postgrest_tables(resp) -> list[str]:
@@ -2511,6 +2553,8 @@ PREDICATES = {
     "content_type_mismatch": content_type_mismatch,
     "debug_mode_enabled": debug_mode_enabled,
     "exposed_backend_readable": exposed_backend_readable,
+    "bundle_leaks_secret": bundle_leaks_secret,
+    "source_map_exposed": source_map_exposed,
     "session_cookie_missing_flag": session_cookie_missing_flag,
     "session_token_in_local_storage": session_token_in_local_storage,
     "login_no_rate_limit": login_no_rate_limit,
@@ -2580,6 +2624,8 @@ _PREDICATE_REASONS = {
     "content_type_mismatch": "a response's body contradicts its declared Content-Type (e.g. JSON served as text/html -> client breakage / reflected-JSON XSS)",
     "debug_mode_enabled": "framework debug mode is on in production (interactive debugger / DEBUG page -> source, settings, env and an RCE console exposed)",
     "exposed_backend_readable": "the app's managed backend (Supabase/Firebase) is world-readable with its own public key -> the whole database is exposed (missing row-level security)",
+    "bundle_leaks_secret": "a hardcoded SECRET key (Stripe sk_ / OpenAI / AWS secret / GitHub PAT / private key) is shipped in the client JS bundle -> account/DB takeover (public anon/publishable keys are not flagged)",
+    "source_map_exposed": "a production JS bundle serves its .map -> the original source is reconstructable (business logic, hidden endpoints, and secrets a minified scan misses)",
     "session_cookie_missing_flag": "session cookie missing the {flag} flag",
     "session_token_in_local_storage": "session token persisted in localStorage (readable by any XSS on the origin — unlike an HttpOnly cookie)",
     "csrf_missing": "state-changing POST accepted cross-site with no token / SameSite",
