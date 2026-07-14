@@ -505,7 +505,8 @@ def _surface_skeleton(dom: str) -> str:
             f"inputs: {inputs[:20]}\nform_actions: {actions[:10]}\nvisible_text: {_visible_text(dom)[:280]}")
 
 
-def _llm_json(system: str, user: str, model: str = DEFAULT_MODEL, timeout: float = AUDIT_TIMEOUT_S):
+def _llm_json(system: str, user: str, model: str = DEFAULT_MODEL, timeout: float = AUDIT_TIMEOUT_S,
+              reasoning: bool = True):
     """One temp-0 OpenRouter chat call -> the first JSON object in the reply, or None (no key / API error /
     non-JSON / timeout). Never raises. HARD-capped at `timeout`s via a DAEMON thread we join(): a hung/slow
     response can never eat the grade budget (a scalar httpx timeout is only PER-PHASE — one call trickled
@@ -518,6 +519,11 @@ def _llm_json(system: str, user: str, model: str = DEFAULT_MODEL, timeout: float
         return None
     body = {"model": model, "temperature": 0,   # greedy: as stable as an LLM gets; the per-commit cache is the guarantee
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+    if not reasoning:
+        # perception + audit are EXTRACTION/classification, not deep reasoning -> disabling qwen's thinking cuts
+        # the dominant token cost AND is more deterministic. chat_template_kwargs is the Qwen-specific OpenRouter
+        # lever (reasoning.effort:"none" does NOT disable thinking on Qwen). Default keeps it on (validated baseline).
+        body["chat_template_kwargs"] = {"enable_thinking": False}
     out = {}
 
     def _call():
@@ -544,7 +550,7 @@ def _llm_json(system: str, user: str, model: str = DEFAULT_MODEL, timeout: float
 
 
 def audit_coverage(skeleton: str, observed: dict, features=None, model: str = DEFAULT_MODEL,
-                   timeout: float = AUDIT_TIMEOUT_S):
+                   timeout: float = AUDIT_TIMEOUT_S, reasoning: bool = True):
     """OFF-SCORE coverage critic: ask the LLM what surface `observed` (the fuzzer's discovery) missed + the
     page state. Returns {missed, page_state, notes} or None (best-effort, never raises). A FLAG only — never
     in the slop number (that's the perception pass's job to feed as probeable surface; this reports the gap)."""
@@ -554,7 +560,7 @@ def audit_coverage(skeleton: str, observed: dict, features=None, model: str = DE
             f"FUZZER OBSERVED (structured):\n{json.dumps(observed, default=str)[:1600]}")
     if features:
         user += f"\n\nSOURCE FEATURES (from the repo, if known):\n{json.dumps(features)[:800]}"
-    return _llm_json(_AUDIT_SYSTEM, user, model, timeout)
+    return _llm_json(_AUDIT_SYSTEM, user, model, timeout, reasoning)
 
 
 _PERCEIVE_SYSTEM = """You perceive a web page's INTERACTIVE SURFACE for a black-box fuzzer, so it can TEST
@@ -576,7 +582,8 @@ classify the page state. Respond with ONLY a JSON object, no prose/markdown:
 Empty "forms"/"endpoints" when the crawl already covers the page."""
 
 
-def perceive_surface(skeleton: str, observed: dict, model: str = DEFAULT_MODEL, timeout: float = AUDIT_TIMEOUT_S):
+def perceive_surface(skeleton: str, observed: dict, model: str = DEFAULT_MODEL, timeout: float = AUDIT_TIMEOUT_S,
+                     reasoning: bool = True):
     """PROACTIVE discovery: read the RENDERED page + what the crawl observed, and return the PROBEABLE surface
     the crawl MISSED as STRUCTURED targets — {forms:[{kind,action,method,fields,file_fields,label}],
     endpoints:[{kind,path,method,params,body_fields,label}], page_state} — for the fuzzer to MERGE into its
@@ -589,7 +596,7 @@ def perceive_surface(skeleton: str, observed: dict, model: str = DEFAULT_MODEL, 
         return None
     user = (f"PAGE SURFACE (rendered — what a user sees):\n{skeleton}\n\n"
             f"FUZZER CRAWL OBSERVED:\n{json.dumps(observed, default=str)[:1600]}")
-    return _llm_json(_PERCEIVE_SYSTEM, user, model, timeout)
+    return _llm_json(_PERCEIVE_SYSTEM, user, model, timeout, reasoning)
 
 
 def _print_perceived(perceived) -> None:
@@ -738,7 +745,8 @@ def _parse_headers(items) -> dict | None:
 
 
 def _grade_worker(url, use_browser, features, q, cached_profile=None, cache_key=None, repo_url=None,
-                  proactive=False, model=DEFAULT_MODEL, browser_auth=False, session_headers=None):
+                  proactive=False, model=DEFAULT_MODEL, browser_auth=False, session_headers=None,
+                  llm_reasoning=True):
     os.setsid()   # own process group so the parent can SIGKILL this child AND its headless chrome together
     try:
         render = browser.render_routes if use_browser else None
@@ -755,7 +763,7 @@ def _grade_worker(url, use_browser, features, q, cached_profile=None, cache_key=
                 if not skeleton.strip():
                     print("\n  🔮 PROACTIVE PERCEPTION — skipped: the render returned no page surface to read")
                     return None
-                p = perceive_surface(skeleton, observed, model=model)
+                p = perceive_surface(skeleton, observed, model=model, reasoning=llm_reasoning)
                 _print_perceived(p)   # None -> call failed; empty -> nothing to add; else -> the targets
                 return p
         # SPA AUTH: browser-driven self-registration for the session/idor probes (an SPA's form action is a
@@ -786,7 +794,7 @@ def _hard_kill_group(p) -> None:
 
 def grade(url: str, use_browser: bool, timeout=None, features=None,
           cached_profile=None, cache_key=None, repo_url=None, proactive=False, model=DEFAULT_MODEL,
-          browser_auth=False, session_headers=None):
+          browser_auth=False, session_headers=None, llm_reasoning=True):
     """Grade the running app in a CHILD PROCESS. A subprocess (not an in-process SIGALRM) because a signal
     can't interrupt a Playwright CPU-spin (the browser probes), but an EXTERNAL SIGKILL of the child + its
     chrome always works. `timeout` is the grading phase's OWN wall-clock budget (independent of deploy time,
@@ -797,7 +805,7 @@ def grade(url: str, use_browser: bool, timeout=None, features=None,
     q = ctx.Queue()
     p = ctx.Process(target=_grade_worker,
                     args=(url, use_browser, features, q, cached_profile, cache_key, repo_url, proactive, model,
-                          browser_auth, session_headers))
+                          browser_auth, session_headers, llm_reasoning))
     p.start()
     try:
         result = q.get(timeout=timeout)              # timeout=None (direct run) blocks until the child reports
@@ -984,6 +992,11 @@ def main():
     ap.add_argument("--no-web-search", dest="web_search", action="store_false",
                     help="don't let the LLM web-search on retries (default: retries CAN search OpenRouter's "
                          "web plugin for current dep versions / deploy config, ~$0.02/retry)")
+    ap.add_argument("--no-llm-reasoning", dest="llm_reasoning", action="store_false",
+                    help="disable the LLM's thinking/CoT for the PERCEPTION + AUDIT passes (qwen enable_thinking: "
+                         "false). They're extraction/classification jobs, not reasoning — turning off CoT cuts the "
+                         "dominant token cost and is MORE deterministic. Default keeps reasoning ON (the validated "
+                         "baseline); flip the default once an A/B confirms the DNF page-state classification holds.")
     ap.add_argument("--no-cache", action="store_true", help="don't reuse/store the per-commit deploy-plan "
                     "cache — re-plan from scratch every run (default: a commit's SUCCESSFUL plan is frozen so "
                     "re-grades are reproducible; the cache lives at HL_CACHE_DIR, default ~/.cache/hacklet-plan)")
@@ -1127,7 +1140,7 @@ def main():
                            cached_profile=cached_profile,
                            cache_key=(None if args.no_cache else _sha), repo_url=args.repo,
                            proactive=args.proactive, model=args.model, browser_auth=args.browser_auth,
-                           session_headers=_parse_headers(args.headers))
+                           session_headers=_parse_headers(args.headers), llm_reasoning=args.llm_reasoning)
         except GradeTimeout as e:
             timings["grade_s"] = round(time.monotonic() - _t, 1)
             result["grade_timeout"] = True         # deployed but ungradeable in budget (broken/pathological
@@ -1214,7 +1227,8 @@ def main():
                 if not skeleton:
                     why = "no rendered page surface (browser off or render empty)"
                 else:
-                    audit = audit_coverage(skeleton, report.surface, result.get("features"), model=args.model)
+                    audit = audit_coverage(skeleton, report.surface, result.get("features"), model=args.model,
+                                           reasoning=args.llm_reasoning)
                     if audit is None:
                         why = "LLM returned nothing (missing OPENROUTER_API_KEY or an API error)"
             except Exception as e:
