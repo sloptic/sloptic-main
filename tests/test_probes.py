@@ -46,7 +46,7 @@ class _Resp:
 
 
 def test_detects_real_secrets():
-    assert response_leaks_secret(_Resp("AKIAIOSFODNN7EXAMPLE"))                 # AWS key id
+    assert response_leaks_secret(_Resp("AKIAZ3PK7NBQWXYZ1234"))                 # AWS key id (non-placeholder)
     assert response_leaks_secret(_Resp('k="sk_live_abcdef0123456789ABCDEF"'))   # Stripe live secret
     assert response_leaks_secret(_Resp("ghp_" + "a" * 36))                      # GitHub PAT
     assert response_leaks_secret(_Resp("-----BEGIN PRIVATE KEY-----\nMIIE..."))  # private key block
