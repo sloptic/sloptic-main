@@ -23,6 +23,57 @@ import httpx
 from . import auth, browser, oob, perf
 from .net import make_client
 from .schema import Endpoint
+from .discovery import _CATCHALL_PROBE, _body_sig
+
+
+# --- innocence check: never fire a phantom finding on a catch-all / soft-404 SHELL ------------------------
+# An SPA / soft-404 host serves the SAME 200 shell for EVERY path (client-side routing has no real server
+# 404), so a probe hitting a nonexistent endpoint gets a 200 back and mistakes the shell for a real response
+# (a submission once scored a phantom SQLi-40 on a literal 404 page). discovery._drop_phantom_surface already
+# drops phantom DISCOVERED endpoints; these guards do the same for the probes that hit LITERAL targets. Every
+# endpoint is presumed innocent (a phantom that doesn't exist) until PROVEN real: a probe fires only when its
+# response DIFFERS from the shell the host serves to a guaranteed-nonexistent path — a real vulnerability makes
+# the endpoint behave distinctly, only phantoms match the shell, so this never suppresses a genuine finding.
+_UNSET = object()
+
+
+def _catch_all_sig(ctx):
+    """The app SHELL's fingerprint if this host is a catch-all/soft-404 (a guaranteed-nonexistent path answers
+    200 HTML), else None. Computed ONCE per grade against the LIVE app (fresh, not the frozen cache -> can't go
+    stale on re-grade) and memoized on ctx."""
+    cached = getattr(ctx, "_hl_catchall", _UNSET)
+    if cached is not _UNSET:
+        return cached
+    sig = None
+    client = getattr(ctx, "client", None)
+    if client is not None:
+        try:
+            r = client.get(_CATCHALL_PROBE)
+            if r.status_code == 200 and "html" in r.headers.get("content-type", "").lower():
+                sig = _body_sig(r.text)
+        except (httpx.HTTPError, httpx.InvalidURL):
+            pass
+    try:
+        ctx._hl_catchall = sig          # memoize (tolerates a stub ctx that rejects attribute writes)
+    except Exception:
+        pass
+    return sig
+
+
+def _is_phantom_shell(ctx, resp) -> bool:
+    """Innocence check: True when the host serves a catch-all shell AND `resp` IS that shell — the probed
+    endpoint isn't real, it just echoes the shell, so firing on it would be a phantom finding. False on an
+    honest host (real 404s) or a response that DIFFERS from the shell (a real endpoint, where genuine findings
+    live)."""
+    if resp is None:
+        return False
+    sig = _catch_all_sig(ctx)
+    if not sig:
+        return False
+    try:
+        return resp.status_code == 200 and _body_sig(resp.text) == sig
+    except Exception:
+        return False
 
 _TRACE = re.compile(
     r"Traceback \(most recent call last\)|File \"[^\"]+\", line \d+, in |"
@@ -391,6 +442,8 @@ def api_sqli(ctx, probe) -> bool | None:
                 continue
             if _SQL_ERROR.search(base.text):
                 continue  # baseline already errors for unrelated reasons -> can't attribute injection
+            if _is_phantom_shell(ctx, base):
+                continue  # baseline IS the catch-all shell -> a phantom endpoint, not a real SQL sink
             eps_tested.append(ep.raw_path)
             for slot in _sqli_slots(ep):
                 if budget <= 0:
@@ -1393,6 +1446,8 @@ def login_no_rate_limit(ctx, probe) -> bool | None:
             if resp.status_code in (429, 423):
                 ctx.evidence.update(throttled=True, after_attempts=n + 1)
                 return False  # throttled -> brute-force protection present -> clean
+    if _is_phantom_shell(ctx, resp):
+        return None  # the login POSTs just echoed the catch-all shell -> no real handler to rate-limit
     ctx.evidence.update(throttled=False, attempts=attempts, via="html-form")
     return True  # N attempts, never throttled -> no rate limiting -> slop
 
@@ -1480,6 +1535,7 @@ def csrf_missing(ctx, probe) -> bool | None:
             return False  # a SameSite session blocks cross-site sending -> already defended
         client = account.client
     try:
+        real_tested = 0
         for form in candidates:
             method = (form.method or "post").upper()
             data = {f: ("password" if "pass" in f.lower() else "hl-csrf") for f in form.fields}
@@ -1489,6 +1545,9 @@ def csrf_missing(ctx, probe) -> bool | None:
                                       follow_redirects=False, **kw)
             except (httpx.HTTPError, httpx.InvalidURL):
                 continue
+            if _is_phantom_shell(ctx, resp):
+                continue  # the POST just echoed the catch-all shell -> no real endpoint accepted anything
+            real_tested += 1
             if resp.is_redirect:
                 # a redirect to login/auth/error is a CSRF REJECTION, not an accepted state change
                 if any(h in resp.headers.get("location", "").lower() for h in _CSRF_REJECT_HINTS):
@@ -1498,8 +1557,8 @@ def csrf_missing(ctx, probe) -> bool | None:
             if resp.status_code < 400:
                 ctx.evidence.update(vulnerable=True, form=form.action)
                 return True  # state-changing, no token, accepted cross-site -> CSRF
-        ctx.evidence.update(vulnerable=False, forms_tested=len(candidates))
-        return False
+        ctx.evidence.update(vulnerable=False, forms_tested=real_tested)
+        return False if real_tested else None  # every candidate was a phantom shell -> couldn't test -> N/A
     finally:
         if account is not None:
             account.client.close()
