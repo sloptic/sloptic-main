@@ -157,10 +157,21 @@ def test_inject_build_cache_mounts_pip_and_strips_no_cache_dir():
     assert "--no-cache-dir" not in out
 
 
-def test_inject_build_cache_mounts_npm_and_leaves_plain_runs_untouched():
+def test_inject_build_cache_mounts_npm_and_apt():
     out = _inject_build_cache("RUN apt-get update && apt-get install -y ffmpeg\nRUN npm ci\n")
-    assert "RUN apt-get update && apt-get install -y ffmpeg" in out          # non-install RUN untouched
+    # apt: cache the .debs + strip the docker-clean hook that would auto-delete them (sharing=locked for dpkg)
+    assert ("RUN --mount=type=cache,target=/var/cache/apt,sharing=locked "
+            "rm -f /etc/apt/apt.conf.d/docker-clean; apt-get update && apt-get install -y ffmpeg") in out
     assert "RUN --mount=type=cache,target=/root/.npm npm ci" in out
+
+
+def test_inject_build_cache_uses_the_right_dir_per_package_manager():
+    # yarn/pnpm must NOT get npm's dir (they don't use it) -> each package manager gets its own cache dir
+    yout = _inject_build_cache("RUN yarn install --frozen-lockfile\n")
+    assert "--mount=type=cache,target=/usr/local/share/.cache/yarn yarn install" in yout and "/root/.npm" not in yout
+    pout = _inject_build_cache("RUN pnpm install\n")
+    assert "--mount=type=cache,target=/root/.local/share/pnpm/store pnpm install" in pout
+    assert _inject_build_cache("RUN yarn build\n") == "RUN yarn build"       # a non-install yarn cmd is left alone
 
 
 def test_inject_build_cache_handles_continuation_and_is_idempotent():

@@ -143,17 +143,24 @@ def _build_streamed(dockerfile, ctx, verbose=False, timeout=1200):
     return proc.returncode, "".join(lines)[-3000:]
 
 
-# pip/npm downloads are the slow step of a build, and on a low-bandwidth box a heavy-deps app can blow the
+# pip/npm/apt downloads are the slow step of a build, and on a low-bandwidth box a heavy-deps app can blow the
 # build timeout on downloads ALONE — then each retry re-downloads from scratch, so a marginally-too-heavy
 # app stays too heavy forever. A BuildKit cache mount banks those downloads OUTSIDE the image layer, in the
 # daemon's build cache, so they persist across the 3 attempts — and even across a timeout-KILLed build: the
 # cache ref survives cancellation, and pip re-fetches any half-written wheel via its own hash check. Per-app
-# _teardown disposes it. BuildKit is the default builder here (Docker 23+), so the mount flag needs no
-# `# syntax=` directive. --no-cache-dir is stripped because it defeats the very cache we add (and, unlike a
-# plain cacheless install, the mount keeps the wheels out of the image layer, so image size is unaffected).
+# _teardown keeps a size-capped slice, so packages one app downloads are REUSED by the next — the whole point
+# on a package-overlapping cohort. BuildKit is the default builder here (Docker 23+), so the mount flag needs
+# no `# syntax=` directive. Each package manager gets ITS OWN cache dir (npm's dir does nothing for yarn/pnpm);
+# apt additionally needs its docker-clean hook stripped (the base image auto-deletes the .debs, which would
+# defeat the mount) and sharing=locked (dpkg isn't concurrency-safe across the parallel builds). --no-cache-dir
+# is stripped because it defeats the very cache we add (the mount keeps the wheels out of the image layer anyway).
 _PIP_INSTALL = re.compile(r"\bpip[0-9.]*\s+install\b")
-_NPM_INSTALL = re.compile(r"\bnpm\s+(?:install|ci|i)\b|\byarn\b|\bpnpm\b")
+_NPM_INSTALL = re.compile(r"\bnpm\s+(?:install|ci|i)\b")
+_YARN_INSTALL = re.compile(r"\byarn\b(?!\s+(?:run|build|start|test|dev|lint)\b)")
+_PNPM_INSTALL = re.compile(r"\bpnpm\s+(?:install|i|add)\b")
+_APT_INSTALL = re.compile(r"\bapt(?:-get)?\s+install\b")
 _NO_CACHE_DIR = re.compile(r"\s--no-cache-dir\b")
+_APT_DECLEAN = "rm -f /etc/apt/apt.conf.d/docker-clean;"   # else the base image auto-deletes the cached .debs
 
 
 def _inject_build_cache(dockerfile: str) -> str:
@@ -173,13 +180,20 @@ def _inject_build_cache(dockerfile: str) -> str:
         while lines[j].rstrip().endswith("\\") and j + 1 < len(lines):
             j += 1
         body = "\n".join(lines[i:j + 1])
-        mounts = []
+        mounts, prefix = [], ""
         if _PIP_INSTALL.search(body):
             mounts.append("--mount=type=cache,target=/root/.cache/pip")
         if _NPM_INSTALL.search(body):
             mounts.append("--mount=type=cache,target=/root/.npm")
+        if _YARN_INSTALL.search(body):
+            mounts.append("--mount=type=cache,target=/usr/local/share/.cache/yarn")
+        if _PNPM_INSTALL.search(body):
+            mounts.append("--mount=type=cache,target=/root/.local/share/pnpm/store")
+        if _APT_INSTALL.search(body):    # cache the .debs; strip docker-clean (else they're auto-deleted)
+            mounts.append("--mount=type=cache,target=/var/cache/apt,sharing=locked")
+            prefix = _APT_DECLEAN + " "
         if mounts and "--mount=" not in lines[i]:   # don't double-inject if the LLM already added one
-            out[i] = f"{m.group(1)}RUN {' '.join(mounts)} {m.group(3)}"
+            out[i] = f"{m.group(1)}RUN {' '.join(mounts)} {prefix}{m.group(3)}"
         for k in range(i, j + 1):                   # --no-cache-dir defeats the cache we just added -> drop
             out[k] = _NO_CACHE_DIR.sub("", out[k])
         i = j + 1
