@@ -138,9 +138,18 @@ def test_vulnerable_app_accrues_slop():
     # (frequency x severity, see the catalog): security holds its catastrophic per-instance ceiling (40),
     # while qa/perf are priced up for their every-user frequency. On this deliberately security-riddled
     # reference, security still dominates; a realistic janky app (references/qa-janky) leans qa/perf.
-    assert report.axis_slop == {"security": 416, "qa": 158, "performance": 68}
-    assert report.slop_score == 642
+    assert report.axis_slop == {"security": 421, "qa": 146, "performance": 68}
+    assert report.slop_score == 635   # recalibrated: xss 30->35 (+5), broken-links 24->12 (-12)
     assert sum(report.axis_slop.values()) == report.slop_score
+
+
+def test_every_declarative_probe_wires_its_matchers():
+    # A declarative probe (no predicate) MUST carry a non-empty TOP-LEVEL slop_if, or the matcher never
+    # runs and the probe is silently dead. sec-csp-001 shipped dead for weeks because its slop_if was
+    # nested under `probe:` (so schema.Probe.slop_if was []) and only the matcher was unit-tested, never
+    # the wiring. This catches the whole class.
+    dead = [p.id for p in load_catalog(CATALOG) if "predicate" not in p.probe and not p.slop_if]
+    assert not dead, f"declarative probes with no top-level slop_if (matcher never runs): {dead}"
 
 
 def test_hardened_app_is_clean():

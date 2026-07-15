@@ -3,8 +3,9 @@ bundle: qa
 category: broken-links
 pool: public
 evidence_model: provable
-penalty: 24   # a dead internal link breaks the journey for every user who clicks it ->
-              # near-existential navigation failure (the site can't be used as intended).
+penalty: 12   # within-QA calibration (NOT a QA-vs-security retreat): a single dead internal link's own
+              # freq×sev is genuinely lower than its tier-mates (a11y 26, crash 32). At 24 it ranked near
+              # CSRF (25), overstating one broken link relative to real accessibility/crash failures. 24->12.
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:

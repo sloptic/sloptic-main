@@ -3,7 +3,10 @@ bundle: security
 category: xss
 pool: public
 evidence_model: provable
-penalty: 30
+penalty: 35   # XSS is the #1 serious vuln in AI-generated code and a real exploit vector. Raised 30->35 so the
+              # exploit tier outranks the worst QA/perf annoyances per-instance (slow load-time 34, crash 32):
+              # exploit > slow > crash. This fixes the ordering by lifting the exploit, NOT by clawing back the
+              # deliberate QA/perf aggregate weight. Sits below the catastrophic ceiling (40: SQLi/RCE/IDOR).
 applicability:
   requires: [any_endpoint_accepts_text_input]
 probe:

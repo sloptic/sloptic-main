@@ -9,5 +9,5 @@ applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:
   target: /   # CSP is a global response header -> check once on the homepage
-  slop_if:
-    - response_csp_weak
+slop_if:      # TOP-LEVEL (schema.Probe.slop_if). Was nested under probe: -> never ran (0 fires in 1043 apps).
+  - response_csp_weak
