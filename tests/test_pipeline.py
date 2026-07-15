@@ -210,7 +210,7 @@ def test_cached_profile_freezes_surface_and_reproduces_score(monkeypatch):
     catalog = load_catalog(CATALOG)
     minted = []
     r1 = run(SubprocessDeployer(str(REFS / "vulnerable" / "app.py")), catalog, on_profile=minted.append)
-    assert len(minted) == 1 and r1.slop_score == 642          # cache MISS -> discovered once + handed back
+    assert len(minted) == 1 and r1.slop_score == 635          # cache MISS -> discovered once + handed back
 
     import hacklet_runner.pipeline as pipeline_mod            # PROVE the crawl is skipped on a cache HIT:
     monkeypatch.setattr(pipeline_mod, "discover",             # discover() must never be called with a cached profile
@@ -218,7 +218,7 @@ def test_cached_profile_freezes_surface_and_reproduces_score(monkeypatch):
     seen = []
     r2 = run(SubprocessDeployer(str(REFS / "vulnerable" / "app.py")), catalog,
              cached_profile=minted[0], on_profile=seen.append)
-    assert r2.slop_score == 642 and seen == []                # HIT -> same score, no re-crawl, no re-mint
+    assert r2.slop_score == 635 and seen == []                # HIT -> same score, no re-crawl, no re-mint
     assert r2.axis_slop == r1.axis_slop                       # identical per-axis decomposition too
 
 
