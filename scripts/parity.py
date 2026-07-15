@@ -64,6 +64,7 @@ def _row(rec: dict) -> dict:
         # how much of the battery APPLIED — the fuzzer's-eye coverage. Low pct or many n/a kinds = we
         # tested little here (blind, or a genuinely tiny app); a low slop score then means little.
         "pct_applicable": cov.get("pct_applicable"),
+        "probes_applicable": cov.get("probes_applicable"),
         "na_kinds": len(cov.get("na_kinds") or []),
         # wall-clock per phase (measurement): which stacks are expensive to deploy vs grade
         "deploy_s": tm.get("deploy_s"), "grade_s": tm.get("grade_s"), "total_s": tm.get("total_s"),
@@ -75,6 +76,18 @@ def _row(rec: dict) -> dict:
 def _avg(xs):
     xs = [x for x in xs if x is not None]
     return round(statistics.mean(xs), 1) if xs else None
+
+
+def _dist(xs) -> dict | None:
+    """avg/median/stdev/min/max + quartiles over the non-None values (None if empty)."""
+    xs = [x for x in xs if x is not None]
+    if not xs:
+        return None
+    q = statistics.quantiles(xs, n=4) if len(xs) > 1 else [xs[0], xs[0], xs[0]]
+    return {"n": len(xs), "avg": round(statistics.mean(xs), 1), "median": round(statistics.median(xs), 1),
+            "stdev": round(statistics.stdev(xs), 1) if len(xs) > 1 else 0.0,
+            "min": round(min(xs), 1), "max": round(max(xs), 1),
+            "q1": round(q[0], 1), "q3": round(q[2], 1)}
 
 
 def group_parity(rows: list, key: str) -> dict:
@@ -188,6 +201,24 @@ def main():
         print(f"  {g:16} {agg['deployed']:>4} {str(agg['surface_avg']):>5} "
               f"{str(agg['coverage_avg']):>5} {str(agg['findings_avg']):>5} "
               f"{str(agg['slop_avg']):>5}   {par}")
+
+    # TEST COVERAGE PER APP — the cross-app spread of how much of the battery APPLIED. The per-stack cov%
+    # above is only an average; this is the full distribution. A wide stdev = coverage swings hard app-to-app
+    # (some apps barely tested), which bounds how comparable their slop scores are — a low slop on a
+    # low-coverage app means little. Over web-gradeable apps.
+    cov_pct = _dist([r["pct_applicable"] for r in web])
+    cov_cnt = _dist([r["probes_applicable"] for r in web])
+    print("\nTEST COVERAGE PER APP  (share of the probe battery that APPLIED — bounds slop comparability)")
+    if cov_pct:
+        print(f"  pct applicable   n={cov_pct['n']}  avg={cov_pct['avg']}%  median={cov_pct['median']}%  "
+              f"stdev={cov_pct['stdev']}  min={cov_pct['min']}%  max={cov_pct['max']}%  "
+              f"(q1={cov_pct['q1']}% q3={cov_pct['q3']}%)")
+    if cov_cnt:
+        print(f"  probes applied   n={cov_cnt['n']}  avg={cov_cnt['avg']}  median={cov_cnt['median']}  "
+              f"stdev={cov_cnt['stdev']}  min={cov_cnt['min']:.0f}  max={cov_cnt['max']:.0f}  "
+              f"(q1={cov_cnt['q1']} q3={cov_cnt['q3']})")
+    if not cov_pct:
+        print("  (no coverage data on these records)")
 
     # blind-spot ranking (prevalence × brokenness = # apps where we missed a surface the source implies)
     print("\nBLIND SPOTS  (fix order — apps where the source says a surface exists but we didn't see it)")

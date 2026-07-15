@@ -369,6 +369,28 @@ def _do(c, method, req):
     return c.request(method, path, params=query or None, json=body)
 
 
+_PREFIX_SENTINEL = "__hl_nx_9z1x__"   # a guaranteed-nonexistent path segment (fixed -> deterministic)
+
+
+def _serves_prefix_catchall(c, ep, method, base) -> bool:
+    """True when a guaranteed-nonexistent sibling under the endpoint's OWN path prefix answers the SAME as
+    the endpoint's benign baseline -> the host serves a PER-PREFIX catch-all shell, so this endpoint is a
+    phantom sink even though its baseline DIFFERS from the ROOT catch-all that _is_phantom_shell checks
+    (the.angle FP: `/api/…` served a distinct shell from `/`, slipping the root-only phantom gate -> a
+    spurious injectable at penalty 40). A real endpoint's nonexistent sibling 404s -> distinct -> fires."""
+    prefix = ep.raw_path.rsplit("/", 1)[0]
+    fake = f"{prefix}/{_PREFIX_SENTINEL}" if prefix else "/" + _PREFIX_SENTINEL
+    query = {n: _SQLI_BENIGN for n in ep.query_params} or None
+    body = {n: _SQLI_BENIGN for n in ep.body_fields} or None
+    try:
+        r = _do(c, method, (fake, query, body))
+        return r.status_code == base.status_code and _body_sig(r.text) == _body_sig(base.text)
+    except (httpx.HTTPError, httpx.InvalidURL):
+        return False
+    except Exception:
+        return False
+
+
 def _tech_error(c, method, reqfn) -> bool:
     """A lone quote induces a DB-error signature (the app leaks SQL errors)."""
     return bool(_SQL_ERROR.search(_do(c, method, reqfn(_SQLI_PAYLOAD)).text))
@@ -460,7 +482,9 @@ def api_sqli(ctx, probe) -> bool | None:
             if _SQL_ERROR.search(base.text):
                 continue  # baseline already errors for unrelated reasons -> can't attribute injection
             if _is_phantom_shell(ctx, base):
-                continue  # baseline IS the catch-all shell -> a phantom endpoint, not a real SQL sink
+                continue  # baseline IS the (root) catch-all shell -> a phantom endpoint, not a real SQL sink
+            if _serves_prefix_catchall(c, ep, method, base):
+                continue  # a per-prefix catch-all serves the same shell here -> phantom sink, not a real sink
             eps_tested.append(ep.raw_path)
             for slot in _sqli_slots(ep):
                 if budget <= 0:
