@@ -372,23 +372,31 @@ def _do(c, method, req):
 _PREFIX_SENTINEL = "__hl_nx_9z1x__"   # a guaranteed-nonexistent path segment (fixed -> deterministic)
 
 
-def _serves_prefix_catchall(c, ep, method, base) -> bool:
-    """True when a guaranteed-nonexistent sibling under the endpoint's OWN path prefix answers the SAME as
-    the endpoint's benign baseline -> the host serves a PER-PREFIX catch-all shell, so this endpoint is a
-    phantom sink even though its baseline DIFFERS from the ROOT catch-all that _is_phantom_shell checks
-    (the.angle FP: `/api/…` served a distinct shell from `/`, slipping the root-only phantom gate -> a
-    spurious injectable at penalty 40). A real endpoint's nonexistent sibling 404s -> distinct -> fires."""
-    prefix = ep.raw_path.rsplit("/", 1)[0]
+def _endpoint_is_live(ctx, client, path: str, method: str, base_resp) -> bool:
+    """Liveness gate for PHANTOM-SENSITIVE probes — the ones that need a REAL server handler to mean
+    anything (SQLi, CSRF, rate-limit, crash-resistance). True when `path` has a real handler: its benign
+    baseline differs from BOTH the ROOT catch-all shell AND a guaranteed-nonexistent sibling under its OWN
+    prefix. A catch-all / soft-404 host serves the same shell for every path (at the root AND per-prefix),
+    so firing a server-side probe there invents a finding on an endpoint that does not exist server-side
+    (the sec-sqli-40 / rate-limit / crash false positives). An HONEST host (real 404s for nonexistent
+    paths) always passes, so genuine findings still fire — this only suppresses phantoms. It is the single
+    gate that generalizes the root innocence check (_is_phantom_shell) and the per-prefix catch-all check.
+    Universal probes (headers/a11y/perf) never call it: a missing header is missing on a catch-all shell too."""
+    if base_resp is None:
+        return True                        # no baseline to judge -> don't suppress; the probe's oracle decides
+    if _is_phantom_shell(ctx, base_resp):
+        return False                       # baseline IS the root catch-all shell -> phantom endpoint
+    prefix = path.rsplit("/", 1)[0]
     fake = f"{prefix}/{_PREFIX_SENTINEL}" if prefix else "/" + _PREFIX_SENTINEL
-    query = {n: _SQLI_BENIGN for n in ep.query_params} or None
-    body = {n: _SQLI_BENIGN for n in ep.body_fields} or None
     try:
-        r = _do(c, method, (fake, query, body))
-        return r.status_code == base.status_code and _body_sig(r.text) == _body_sig(base.text)
+        r = client.request((method or "get").upper(), fake)
+        if r.status_code == base_resp.status_code and _body_sig(r.text) == _body_sig(base_resp.text):
+            return False                   # a nonexistent sibling answers identically -> per-prefix catch-all
     except (httpx.HTTPError, httpx.InvalidURL):
-        return False
+        pass
     except Exception:
-        return False
+        pass
+    return True
 
 
 def _tech_error(c, method, reqfn) -> bool:
@@ -481,10 +489,8 @@ def api_sqli(ctx, probe) -> bool | None:
                 continue
             if _SQL_ERROR.search(base.text):
                 continue  # baseline already errors for unrelated reasons -> can't attribute injection
-            if _is_phantom_shell(ctx, base):
-                continue  # baseline IS the (root) catch-all shell -> a phantom endpoint, not a real SQL sink
-            if _serves_prefix_catchall(c, ep, method, base):
-                continue  # a per-prefix catch-all serves the same shell here -> phantom sink, not a real sink
+            if not _endpoint_is_live(ctx, c, ep.raw_path, method, base):
+                continue  # phantom endpoint (root or per-prefix catch-all shell) -> not a real SQL sink
             eps_tested.append(ep.raw_path)
             for slot in _sqli_slots(ep):
                 if budget <= 0:
@@ -1583,8 +1589,8 @@ def login_no_rate_limit(ctx, probe) -> bool | None:
                 ctx.evidence.update(throttled=True, after_attempts=n + 1)
                 return False  # throttled -> brute-force protection present -> clean
             saw_auth = saw_auth or _looks_like_auth_reject(resp)
-    if _is_phantom_shell(ctx, resp):
-        return None  # the login POSTs just echoed the catch-all shell -> no real handler to rate-limit
+    if not _endpoint_is_live(ctx, ctx.client, form.action, form.method or "post", resp):
+        return None  # the login endpoint is a catch-all phantom (root or per-prefix) -> nothing to rate-limit
     if not saw_auth:
         return None  # no attempt looked like a real auth rejection -> client-side / static / platform login,
                      # no server auth of the app's to rate-limit (a phantom finding otherwise)
@@ -1685,8 +1691,8 @@ def csrf_missing(ctx, probe) -> bool | None:
                                       follow_redirects=False, **kw)
             except (httpx.HTTPError, httpx.InvalidURL):
                 continue
-            if _is_phantom_shell(ctx, resp):
-                continue  # the POST just echoed the catch-all shell -> no real endpoint accepted anything
+            if not _endpoint_is_live(ctx, client, form.action, method, resp):
+                continue  # a catch-all phantom endpoint (root or per-prefix) -> nothing really accepted it
             real_tested += 1
             if resp.is_redirect:
                 # a redirect to login/auth/error is a CSRF REJECTION, not an accepted state change
@@ -2511,10 +2517,13 @@ def crash_resistance(ctx, probe) -> bool | None:
     with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=False) as c:
         for action, method, fields in targets:            # 1. malformed field values
             try:
-                if _xss_send(c, method, action, {fn: "1" for fn in fields}).status_code >= 500:
-                    continue                               # already 5xx on benign input -> unattributable
+                base = _xss_send(c, method, action, {fn: "1" for fn in fields})
             except (httpx.HTTPError, httpx.InvalidURL):
                 continue
+            if base.status_code >= 500:
+                continue                                   # already 5xx on benign input -> unattributable
+            if not _endpoint_is_live(ctx, c, action, method, base):
+                continue                                   # catch-all phantom -> a 5xx here is a platform artifact
             for field in fields:
                 for val in _CRASH_VALUES:
                     if budget <= 0:
@@ -2534,11 +2543,14 @@ def crash_resistance(ctx, probe) -> bool | None:
             [f.action for f in ctx.profile.forms if (f.method or "").lower() == "post"]
             + [e.path for e in ctx.profile.endpoints if e.method.lower() == "post"]))
         for path in posts:
-            try:                                           # baseline: a WELL-FORMED empty JSON body. If THAT
-                if c.post(path, json={}).status_code >= 500:   # already 5xx, the endpoint is env-var-dead
-                    continue                               # (dummy key) — its 500 isn't OUR malformed input
+            try:                                           # baseline: a WELL-FORMED empty JSON body
+                base = c.post(path, json={})
             except (httpx.HTTPError, httpx.InvalidURL):
                 continue
+            if base.status_code >= 500:                    # already 5xx -> env-var-dead (dummy key), not OUR input
+                continue
+            if not _endpoint_is_live(ctx, c, path, "post", base):
+                continue                                   # catch-all phantom -> a 5xx here is a platform artifact
             for body in _CRASH_JSON:
                 if budget <= 0:
                     break

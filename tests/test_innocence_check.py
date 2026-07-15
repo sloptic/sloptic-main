@@ -10,7 +10,8 @@ from urllib.parse import urlparse
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from hacklet_runner.net import make_client  # noqa: E402
 from hacklet_runner.pipeline import _Ctx  # noqa: E402
-from hacklet_runner.probes import api_sqli, csrf_missing, login_no_rate_limit  # noqa: E402
+from hacklet_runner.probes import (  # noqa: E402
+    _endpoint_is_live, api_sqli, crash_resistance, csrf_missing, login_no_rate_limit)
 from hacklet_runner.schema import Endpoint, Form, Profile  # noqa: E402
 
 _SHELL = b"<html><body>App shell - client-side routing, nothing here server-side</body></html>"
@@ -118,3 +119,51 @@ def test_rate_limit_reads_na_on_client_side_auth():
     # an auth-shaped rejection -> N/A, not a phantom 'no rate limiting' (the big under-the-radar FP class).
     prof = Profile(base_url="x", forms=[Form(action="/login", method="post", fields=["username", "password"])])
     assert _run(_ClientSideAuth, prof, login_no_rate_limit) is None
+
+
+def test_endpoint_liveness_gate_primitive():
+    # _endpoint_is_live is the single gate the phantom-sensitive probes route through. An honest host's real
+    # endpoint is live (its nonexistent sibling 404s -> distinct); a catch-all host's endpoint is NOT (every
+    # path, incl the sibling, is the same shell).
+    srv = _serve(_Honest)
+    ctx = _ctx(f"http://127.0.0.1:{srv.server_address[1]}", Profile(base_url="x"))
+    ctx.profile.base_url = ctx.base_url
+    try:
+        real = ctx.client.get("/login")   # _Honest: /login -> 401 "invalid credentials" (a real handler)
+        assert _endpoint_is_live(ctx, ctx.client, "/login", "get", real) is True
+    finally:
+        ctx.client.close(); srv.shutdown()
+
+    srv = _serve(_CatchAll)
+    ctx = _ctx(f"http://127.0.0.1:{srv.server_address[1]}", Profile(base_url="x"))
+    ctx.profile.base_url = ctx.base_url
+    try:
+        shell = ctx.client.get("/whatever")   # 200 catch-all shell for every path
+        assert _endpoint_is_live(ctx, ctx.client, "/whatever", "get", shell) is False
+    finally:
+        ctx.client.close(); srv.shutdown()
+
+
+class _CatchAll5xxOnMalformed(http.server.BaseHTTPRequestHandler):
+    """A per-prefix catch-all: benign input and the nonexistent sibling both return the 200 shell, but a
+    malformed value 5xx's (a platform edge choking, not the app's own handler). WITHOUT the liveness gate
+    crash-resistance false-fires on that 5xx; WITH it the endpoint is a phantom (benign == sibling) and is
+    skipped."""
+    def log_message(self, *a): pass
+
+    def do_GET(self):
+        from urllib.parse import parse_qs
+        q = parse_qs(urlparse(self.path).query).get("q", [""])[0]
+        nasty = any(ch in q for ch in "<>'\";{}")           # a _CRASH_VALUES-style malformed value
+        self.send_response(500 if nasty else 200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(_SHELL))); self.end_headers(); self.wfile.write(_SHELL)
+
+
+def test_crash_does_not_phantom_fire_on_a_catch_all_that_5xxs_on_malformed():
+    # the exact FP the liveness gate prevents: a catch-all whose /api/x 200-shells benign input but 5xx's on
+    # a malformed value. Without the gate crash fires on the 5xx; with it the phantom endpoint is skipped, so
+    # crash never returns True (the platform 5xx is not the app's crash).
+    prof = Profile(base_url="x", endpoints=[
+        Endpoint(path="/api/x", method="get", raw_path="/api/x", query_params=["q"])])
+    assert _run(_CatchAll5xxOnMalformed, prof, crash_resistance) is not True
