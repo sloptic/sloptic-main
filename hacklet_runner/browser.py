@@ -570,28 +570,49 @@ def contrast_violations(url: str, headers=None, timeout: float = 12.0) -> int | 
     return _eval_page(url, headers, timeout, [_CONTRAST_JS])
 
 
-def console_errors(url: str, headers=None, timeout: float = 12.0) -> int | None:
-    """Render url and count uncaught JavaScript errors thrown on load (pageerror) — a page that throws
-    as it renders is broken regardless of intent. None if no browser or the render fails."""
+def _first_party_error(msg: str, stack: str, origin: str) -> bool:
+    """A pageerror is the APP's OWN when it isn't the cross-origin-sanitized "Script error." and its stack
+    points at the app's origin or an inline script (no cross-origin URL). A third-party widget/analytics
+    script that throws on another origin is browser-sanitized to a bare "Script error." with no usable
+    stack, or its stack names only a foreign host -> benign noise a working app commonly carries."""
+    if msg.strip().rstrip(".").lower() == "script error":
+        return False
+    # keep the ':' so a host:port survives; urlparse takes netloc up to the first '/', so a trailing
+    # ':line:col' from the stack frame lands in the path and doesn't corrupt the host:port comparison.
+    urls = re.findall(r"https?://[^\s)]+", stack)
+    if not urls:
+        return True   # inline / same-document script, no cross-origin frame -> the app's own code
+    return any(urllib.parse.urlparse(u).netloc == origin for u in urls)
+
+
+def console_errors(url: str, headers=None, timeout: float = 12.0) -> dict | None:
+    """Render url and capture uncaught JavaScript errors thrown on load (pageerror), split into FIRST-PARTY
+    (the app's own code threw -> a real breakage) and THIRD-PARTY (a widget/analytics script on another
+    origin threw, or the browser sanitized a cross-origin error -> benign noise). Returns
+    {"first_party", "third_party", "total"} or None if no browser / the render fails. Only pageerror is
+    captured, so console.log spam, a 404'd analytics fetch, and a missing source map never register."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
         return None
+    origin = urllib.parse.urlparse(url).netloc
     try:
+        errs = []
         with sync_playwright() as pw:
             b = _launch(pw)
             if b is None:
                 return None
             try:
                 page = b.new_page()
-                errors = []
-                page.on("pageerror", lambda e: errors.append(str(e)))
+                page.on("pageerror", lambda e: errs.append((str(getattr(e, "message", "") or e),
+                                                            str(getattr(e, "stack", "") or ""))))
                 _apply_auth(page, url, headers)
                 page.goto(url, timeout=timeout * 1000, wait_until="load")
                 page.wait_for_timeout(500)  # let late/async errors surface
-                return len(errors)
             finally:
                 b.close()
+        fp = sum(1 for msg, stack in errs if _first_party_error(msg, stack, origin))
+        return {"first_party": fp, "third_party": len(errs) - fp, "total": len(errs)}
     except Exception:
         return None
 

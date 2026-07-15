@@ -101,3 +101,15 @@ def test_resource_shaped_tells_a_race_from_a_fixed_redirect():
     assert not _resource_shaped("/home", "/notes")           # fixed landing page -> no id to compare
     assert not _resource_shaped("/dashboard", "/notes")
     assert not _resource_shaped("/notes", "/notes")          # the create endpoint / list itself
+
+
+def test_console_first_party_classification():
+    # qa-console-001 fires only on the APP'S OWN uncaught errors. A third-party widget/analytics script
+    # that throws (cross-origin, browser-sanitized to "Script error.") is benign noise a working app carries.
+    from hacklet_runner.browser import _first_party_error as fp
+    o = "127.0.0.1:8080"
+    assert fp("x is not defined", "ReferenceError\n    at http://127.0.0.1:8080/:61:1", o)   # inline, host:PORT
+    assert fp("boom", "at f (http://127.0.0.1:8080/main.js:2:9)", o)                          # same-origin script
+    assert fp("boom", "ReferenceError\n    at <anonymous>:1:1", o)                            # inline, no url
+    assert not fp("boom", "at g (https://cdn.analytics.com/w.js:1:2)", o)                     # third-party host
+    assert not fp("Script error.", "", o)                                                    # cross-origin sanitized

@@ -1830,13 +1830,17 @@ def slow_core_web_vitals(ctx, probe) -> bool:
 
 
 def console_errors_present(ctx, probe) -> bool:
-    """Browser oracle: the page throws an uncaught JavaScript error on load — broken regardless of
-    intent. Browser-gated."""
+    """Browser oracle: the page throws an uncaught JavaScript error FROM ITS OWN CODE on load — broken
+    regardless of intent. A third-party widget/analytics script throwing (cross-origin, browser-sanitized
+    to "Script error.") is common on working apps and does NOT count — only first-party errors are the
+    team's durability failure. Browser-gated."""
     url = ctx.base_url.rstrip("/") + probe.probe.get("target", "/")
-    n = browser.console_errors(url, headers=ctx.headers)
-    if isinstance(n, (int, float)):
-        ctx.evidence.update(js_errors=n)
-    return isinstance(n, (int, float)) and n > 0
+    res = browser.console_errors(url, headers=ctx.headers)
+    if res is None:
+        return False   # no browser / render failed -> can't test (browser-gated)
+    ctx.evidence.update(js_errors=res["total"], first_party=res["first_party"],
+                        third_party=res["third_party"], engine="pageerror")
+    return res["first_party"] > 0
 
 
 def a11y_violations_present(ctx, probe) -> bool:
