@@ -1,4 +1,4 @@
-# HackLet League — Fuzz Runner Specification
+# HackLet League: Fuzz Runner Specification
 
 *Architecture and conventions for the fuzz runner that executes the test catalog against submissions. Covers test format, runner phases, execution model, and catalog organization. Distinct from format_spec.md (what tests measure) and DATA_MODEL.md (how results are stored).*
 
@@ -15,33 +15,33 @@ Both modes share the same test format and execution semantics. They differ in wh
 
 ## Project identity & scope philosophy
 
-The fuzz runner is **its own project** — a universal, stack-blind, zero-config black-box resilience grader — that the league *plugs into*. The competition is its primary consumer (enqueue a submission → slop report → scoring); dogfooding any owned or authorized URL is a second. The boundary is the report contract, so the catalog and harness evolve independently of the platform (and could extract to their own repo).
+The fuzz runner is **its own project**, a universal, stack blind, zero config black box resilience grader that the league *plugs into*. The competition is its primary consumer (enqueue a submission, get a slop report, feed scoring). Dogfooding any owned or authorized URL is a second. The boundary is the report contract, so the catalog and harness evolve independently of the platform, and could extract to their own repo.
 
-**Comprehensiveness is the goal**, scoped precisely: ~95% of the **intent-independent, HTTP-observable** surface the average web app faces — the OWASP-aligned security classes, universal correctness, and speed/resilience the catalog scope below maps (130–200 probes). The aim is *depth within the common classes*, not the exotic long tail (steganographic uploads, deserialization gadget chains, blind SSRF); that ~5% is where effort re-fights mature scanners for diminishing returns.
+**Comprehensiveness is the goal**, scoped precisely. About 95% of the **intent independent, HTTP observable** surface the average web app faces: the OWASP aligned security classes, universal correctness, and the speed and resilience the catalog scope below maps (130 to 200 probes). The aim is *depth within the common classes*, not the exotic long tail (steganographic uploads, deserialization gadget chains, blind SSRF). That last 5% is where effort refights mature scanners for diminishing returns.
 
-**Division of labor (the intent boundary).** The runner owns what is automatable and intent-free; humans own intent. The line is sharper than "security = runner": the two *biggest* real-world slop classes — broken access control and secrets/crypto failures — each split, and the intent-free halves are ours:
+**Division of labor (the intent boundary).** The runner owns what is automatable and intent free. Humans own intent. The line is sharper than "security = runner". The two *biggest* real world slop classes, broken access control and secrets or crypto failures, each split, and the intent free halves are ours.
 
-- **Unauthenticated exposure** — no credentials needed: an anonymous request that returns sensitive or bulk data, an exposed datastore, a reachable `/admin` / `.env` / `.git` / backup. "Handed secret data to nobody" is a flaw regardless of intent.
-- **Secrets in the open** — API keys, tokens, private keys, Firebase/Supabase configs in responses or client JS. Observable, never intended.
-- **Auth *mechanics* via self-as-oracle** — session/cookie hygiene (Secure/HttpOnly/SameSite, predictable tokens, `alg:none` JWTs), logout actually invalidating a session, login rate-limiting, user enumeration, and horizontal IDOR between two accounts the runner created itself. These have a *universal correct behavior* independent of the app's purpose.
+- **Unauthenticated exposure**, no credentials needed: an anonymous request that returns sensitive or bulk data, an exposed datastore, a reachable `/admin` / `.env` / `.git` / backup. "Handed secret data to nobody" is a flaw regardless of intent.
+- **Secrets in the open.** API keys, tokens, private keys, Firebase or Supabase configs in responses or client JS. Observable, never intended.
+- **Auth *mechanics* by self registration.** Session and cookie hygiene (Secure, HttpOnly, SameSite, predictable tokens, `alg:none` JWTs), logout actually invalidating a session, login rate limiting, user enumeration, and horizontal IDOR between two accounts the runner created itself. These have a *universal correct behavior* independent of the app's purpose.
 
-Intent-*dependent* quality stays the **humans' axis** (judges + pitch + cross-examination): authorization **semantics** (should role X do action Y, per this app's design), business logic, idempotency / duplicate semantics, mass assignment. The runner refuses to guess intent. So the runner alone is comprehensive on the automatable surface; the *competition* is comprehensive because humans carry the intent.
+Intent *dependent* quality stays the **humans' axis** (judges, pitch, cross-examination): authorization **semantics** (should role X do action Y, per this app's design), business logic, idempotency and duplicate semantics, mass assignment. The runner refuses to guess intent. So the runner alone is comprehensive on the automatable surface, and the *competition* is comprehensive because humans carry the intent.
 
-**Self-as-oracle.** Where an app offers self-service registration, the runner creates its own accounts (typically two) and becomes an *authenticated* black-box tester — no league-supplied credentials — unlocking the authenticated surface for the intent-free auth probes above plus deeper discovery/injection behind login. It works cleanly in the competition (self-contained apps → instant registration, ephemeral per-run state) and degrades gracefully elsewhere (email verification or CAPTCHA simply blocks it → those probes go N/A, never a crash).
+**Self registration as the oracle.** Where an app offers self service registration, the runner creates its own accounts (typically two) and becomes an *authenticated* black box tester, with no league supplied credentials. That unlocks the authenticated surface for the intent free auth probes above plus deeper discovery and injection behind login. It works cleanly in the competition (self contained apps register instantly, with ephemeral per run state) and degrades gracefully elsewhere (email verification or a CAPTCHA simply blocks it, and those probes go N/A, never a crash).
 
-**Calibration follows the data.** Penalty magnitudes track real-world frequency × severity (format_spec §4.2): empirically, access control (~36% of vibe-coded-app vulnerabilities), secrets/crypto (~21%), and injection (~18%) dominate real slop — so they anchor the top of the scale, ahead of headers and perf.
+**Calibration follows the data.** Penalty magnitudes track real world frequency times severity (format_spec §4.2). Empirically, access control (about 36% of vibe-coded-app vulnerabilities), secrets and crypto (about 21%), and injection (about 18%) dominate real slop, so they anchor the top of the scale, ahead of headers and perf.
 
-**The moat is the score, not the check count.** Against ZAP / Nuclei / Observatory / Lighthouse, the differentiator is the comparable, universal, zero-config resilience score and the fairness harness — not catalog size. The runner curates for determinism and calibration; where breadth helps, it can *stand on* existing corpora (e.g. Nuclei templates, Lighthouse for the speed axis) under our scoring layer rather than re-authoring everything.
+**The moat is the score, not the check count.** Against ZAP, Nuclei, Observatory, and Lighthouse, the differentiator is the comparable, universal, zero config resilience score and the fairness harness, not catalog size. The runner curates for determinism and calibration, and where breadth helps it can *stand on* existing corpora (Nuclei templates, Lighthouse for the speed axis) under our scoring layer rather than re-authoring everything.
 
 ## v1 Catalog Design (Universal-Only)
 
 ### Universal-only principle
 
-The catalog is **language-, framework-, and protocol-agnostic**. Every submission is tested by the same black-box HTTP probing of its deployed app; the catalog contains **no framework-specific tests**. A Python/Flask app, a Go service, and a hand-rolled C HTTP server are all evaluated by the identical catalog.
+The catalog is **language, framework, and protocol agnostic**. Every submission is tested by the same black box HTTP probing of its deployed app. The catalog contains **no framework specific tests**. A Python and Flask app, a Go service, and a hand rolled C HTTP server are all evaluated by the identical catalog.
 
-"Tested the same way" means **same catalog, applicability-resolved per discovered surface** — not literally the same test set for every app. A submission that exposes a file-upload endpoint receives the upload probes; one that does not, cannot (there is nothing to test). That asymmetry is correct and is what **Attack Surface Coverage** (format_spec §4.2, narrow/moderate/broad) measures: exposing more surface means more applicable tests, which is itself signal.
+"Tested the same way" means **the same catalog, applicability resolved per discovered surface**, not literally the same test set for every app. A submission that exposes a file upload endpoint receives the upload probes. One that does not, cannot, because there is nothing to test. That asymmetry is correct, and it is what **Attack Surface Coverage** (format_spec §4.2, narrow, moderate, broad) measures: exposing more surface means more applicable tests, which is itself signal.
 
-The tradeoff (loss of framework-specific precision) is largely recovered through **universal symptom probes**: a misconfiguration that is framework-specific in cause is usually framework-agnostic in symptom. `DEBUG=True` surfaces as stack traces in responses (caught by universal error-hygiene); an exposed admin/actuator surfaces via a universal sensitive-path probe that GETs a list of known-dangerous paths (`/.env`, `/.git`, `/actuator`, `/admin`, `/debug`, `/swagger`) regardless of stack.
+The tradeoff (loss of framework specific precision) is largely recovered through **universal symptom probes**. A misconfiguration that is framework specific in cause is usually framework agnostic in symptom. `DEBUG=True` surfaces as stack traces in responses (caught by universal error hygiene). An exposed admin or actuator surfaces through a universal sensitive path probe that GETs a list of known dangerous paths (`/.env`, `/.git`, `/actuator`, `/admin`, `/debug`, `/swagger`) regardless of stack.
 
 ### The intent-independence litmus (authoring invariant)
 
@@ -60,15 +60,15 @@ A test may exist **only if its correct outcome is the same regardless of what th
 | `POST /pay` dedupes a double-submit | yes (an append-only event log wants both writes) | intent-dependent → excluded |
 | at-most-once delivery | yes (messaging legitimately wants at-least-once) | intent-dependent → excluded |
 
-Because every test in the catalog is universal by construction, the schema carries **no intent flag**. Intent-dependent engineering quality is not unmeasured: it is credentialed on the **communication axis** (PITCH.md + cross-examination + judge clickaround), where a human carries the intent the runner refuses to guess. The slop score stays intent-free and fully automated; there is no per-test judge override of slop outcomes.
+Because every test in the catalog is universal by construction, the schema carries **no intent flag**. Intent dependent engineering quality is not unmeasured. It is credentialed on the **communication axis** (PITCH.md, cross-examination, judge clickaround), where a human carries the intent the runner refuses to guess. The slop score stays intent free and fully automated. There is no per test judge override of slop outcomes.
 
 ### Bundles
 
 v1 ships three bundles. The six-axis Slop model (IDEAS_FOR_LATER) adds Race Conditions and Behavioral Consistency as later bundles without changing the runner.
 
-- **security** — OWASP-aligned: injection (SQL/NoSQL/command/template), XSS, auth bypass, broken access control / IDOR, CSRF, SSRF, security headers, sensitive-path exposure.
-- **qa** — universal QA per format_spec §4.2: crash resistance, error hygiene, HTTP semantics, encoding round-trip, deployment hygiene.
-- **performance** — speed checkpoints (below) plus load/spike handling and DoS resistance (oversized bodies/URLs/headers, decompression bombs, unbounded pagination, slow-loris). Load and DoS are measured inside the container's **fixed resource envelope** (identical CPU/RAM/PID quotas for every submission), so comparison is fair: it measures how the app holds up within the standard box, not scaling to arbitrary hardware. DoS probes are bounded so the runner cannot become its own amplifier.
+- **security.** OWASP aligned: injection (SQL, NoSQL, command, template), XSS, auth bypass, broken access control and IDOR, CSRF, SSRF, security headers, sensitive path exposure.
+- **qa.** Universal QA per format_spec §4.2: crash resistance, error hygiene, HTTP semantics, encoding round trip, deployment hygiene.
+- **performance.** Speed checkpoints (below) plus load and spike handling and DoS resistance (oversized bodies, URLs, and headers, decompression bombs, unbounded pagination, slow loris). Load and DoS are measured inside the container's **fixed resource envelope** (identical CPU, RAM, and PID quotas for every submission), so comparison is fair. It measures how the app holds up within the standard box, not scaling to arbitrary hardware. DoS probes are bounded so the runner cannot become its own amplifier.
 
 ### Speed checkpoints
 
@@ -80,9 +80,9 @@ Speed is scored as **boolean gates at user-abandonment thresholds**, not optimiz
 | FCP | ≥ 1.0s | headless browser, HTML rendering apps only |
 | INP | ≥ 600ms | headless browser (Total Blocking Time proxy, scripted interaction), HTML apps only |
 
-Clearing all gates adds no slop; each gate that trips adds the speed category's slop, with **no marginal credit for being faster** (Goodhart-resistant: players optimize to the gate, then redirect remaining time elsewhere). FCP and INP apply only to apps that serve a rendered HTML document; a pure JSON API scores them **N/A** (structural, from discovery). FCP/INP require the headless-browser harness, which renders untrusted submission pages and is therefore sandboxed like the rest of the runner (isolated context, no host FS, egress-restricted).
+Clearing all gates adds no slop. Each gate that trips adds the speed category's slop, with **no marginal credit for being faster** (Goodhart resistant: players optimize to the gate, then redirect remaining time elsewhere). FCP and INP apply only to apps that serve a rendered HTML document. A pure JSON API scores them **N/A** (from discovery, not from a probe outcome). FCP and INP require the headless browser harness, which renders untrusted submission pages and is therefore sandboxed like the rest of the runner (isolated context, no host FS, egress restricted).
 
-**Reconciliation with format_spec §4.2.** §4.2 previously excluded Core Web Vitals as optimization metrics that "penalize all submissions uniformly without differentiating skill." Abandonment-threshold *gates* are a different instrument: they do not penalize uniformly, they catch only the egregiously broken. The gates above supersede that blanket exclusion; optimization-target scoring (e.g., crediting LCP < 2.5s on a slope) stays out of scope.
+**Reconciliation with format_spec §4.2.** §4.2 previously excluded Core Web Vitals as optimization metrics that "penalize all submissions uniformly without differentiating skill." Abandonment threshold *gates* are a different instrument. They do not penalize uniformly, they catch only the egregiously broken. The gates above supersede that blanket exclusion. Optimization target scoring (crediting LCP < 2.5s on a slope) stays out of scope.
 
 ### Outcome semantics: deduction-only (slop)
 
@@ -94,52 +94,52 @@ Scoring is **deduction-only** (format_spec §4.2). A probe never adds credit, on
 | **clean** (applicable surface present, probe did not fire) | 0 |
 | **not_applicable** (no such surface) | 0 |
 
-`clean` and `not_applicable` both contribute 0 — they are tracked separately only for the reporting bundle (Attack Surface Coverage, Clean Rate). The submission's **slop score** is the sum of every fired probe's penalty.
+`clean` and `not_applicable` both contribute 0. They are tracked separately only for the reporting bundle (Attack Surface Coverage, Clean Rate). The submission's **slop score** is the sum of every fired probe's penalty.
 
-This collapses the earlier provable/failure-only scoring split. A clean result is 0 whether the defense was *observed* (an XSS payload returned escaped) or simply *never fired* (parameterized SQL, or no SQL at all), so **the runner no longer has to tell "defended" from "absent"** — the unsolvable case dissolves. Every probe needs only a **slop oracle**: the conditions under which slop is present. They match → penalty; otherwise → 0. We never prove the inverse.
+This collapses the earlier provable versus failure-only scoring split. A clean result is 0 whether the defense was *observed* (an XSS payload returned escaped) or simply *never fired* (parameterized SQL, or no SQL at all), so **the runner no longer has to tell "defended" from "absent"**, and the unsolvable case dissolves. Every probe needs only a **slop oracle**, the conditions under which slop is present. They match and the penalty applies, otherwise 0. We never prove the inverse.
 
 `evidence_model` survives only as a **detection hint**, never a scoring driver:
 
-- `provable` — the slop oracle reads observable output (the payload's fate is in the response: XSS escaping, a leaked stack trace, another user's record returned).
-- `oracle` — the sink is hidden (SQLi, command injection, SSTI), so the slop oracle uses a differential / timing / error signal.
+- `provable`. The slop oracle reads observable output (the payload's fate is in the response: XSS escaping, a leaked stack trace, another user's record returned).
+- `oracle`. The sink is hidden (SQLi, command injection, SSTI), so the slop oracle uses a differential, timing, or error signal.
 
 Both score identically (penalty if slop detected, else 0). The distinction only tells the runner *how* to look.
 
 ### Detecting slop (the oracle)
 
-Never a single payload against a single response — a matched set that fires only when the slop is real. SQLi:
+Never a single payload against a single response. A matched set that fires only when the slop is real. SQLi:
 
-- **Boolean differential** — `' OR '1'='1' --` vs `' AND '1'='2' --` diverge in the attacker's favor → slop.
-- **Error oracle** — a lone `'` yields a 500 with SQL error text → slop.
-- **Time oracle** — a `pg_sleep(5)`-style payload delays the response ~5s → slop.
+- **Boolean differential.** `' OR '1'='1' --` versus `' AND '1'='2' --` diverge in the attacker's favor, so slop.
+- **Error oracle.** A lone `'` yields a 500 with SQL error text, so slop.
+- **Time oracle.** A `pg_sleep(5)` style payload delays the response about 5s, so slop.
 
-If none fire → clean (0). Egress is locked, so oracles are **in-band only** (differential / timing / error / observed output); out-of-band callbacks are unavailable (see threat model), which bounds detection of fully-blind injections and OOB-only SSRF.
+If none fire, clean (0). Egress is locked, so oracles are **in band only** (differential, timing, error, observed output). Out of band callbacks are unavailable (see threat model), which bounds detection of fully blind injections and OOB-only SSRF.
 
 ### Aggregation
 
-The slop score sums fired-probe penalties, with two dampers (canonical in format_spec §4.2): a **variant group fires once** — its syntactic variants are detection robustness, not multipliers, so any variant firing applies the group's single penalty — and **within a category, repeated instances across endpoints have diminishing marginal penalty** (the tenth endpoint missing a header adds far less than the second). Across bundles, penalties are scaled **security ≫ qa > performance**. There is no worst_case/additive mode to maintain: with no positive credit to protect, the dampers plus per-bundle scale do the work, and a single catastrophic failure still dominates because its penalty is large.
+The slop score sums fired probe penalties, with two dampers (canonical in format_spec §4.2). First, a **variant group fires once**. Its syntactic variants are detection robustness, not multipliers, so any variant firing applies the group's single penalty. Second, **within a category, repeated instances across endpoints have diminishing marginal penalty** (the tenth endpoint missing a header adds far less than the second). Across bundles, penalties are scaled **security ≫ qa > performance**. There is no worst_case or additive mode to maintain. With no positive credit to protect, the dampers plus the per bundle scale do the work, and a single catastrophic failure still dominates because its penalty is large.
 
 ### N/A and reporting honesty
 
-A category never claims "defended." It reports slop found (with penalty) or **no slop found**. `not_applicable` (surface absent, structural from the discovery profile + `applicability.requires`) and `clean` (surface present, no slop) both score 0 but are tracked separately. **Clean Rate** = clean / (clean + slop_detected) over applicable probes; **Attack Surface Coverage** derives from the applicable count.
+A category never claims "defended." It reports slop found (with a penalty) or **no slop found**. `not_applicable` (surface absent, read from the discovery profile plus `applicability.requires`) and `clean` (surface present, no slop) both score 0 but are tracked separately. **Clean Rate** = clean / (clean + slop_detected) over applicable probes. **Attack Surface Coverage** derives from the applicable count.
 
-Authoring consequence: every test has a single `slop_if` (the oracle conditions). There is no `defended_if` — absence of slop is simply 0, never positive credit.
+Authoring consequence: every test has a single `slop_if` (the oracle conditions). There is no `defended_if`. Absence of slop is simply 0, never positive credit.
 
 ### Pool composition (public / hidden)
 
-The catalog splits roughly **75% public / 25% hidden** per version. Public probes are published — players study them and self-test via the local runner during build; hidden probes are the anti-gaming reserve, run only by the central runner at freeze. The gap between visible (public) slop and revealed (hidden) slop is the format's central suspense (format_spec §4.2).
+The catalog splits roughly **75% public and 25% hidden** per version. Public probes are published, and players study them and self test through the local runner during build. Hidden probes are the anti gaming reserve, run only by the central runner at freeze. The gap between visible (public) slop and revealed (hidden) slop is the format's central suspense (format_spec §4.2).
 
 The split *method* matters more than the ratio:
 
-- **Distribute the hidden 25% across every category — never hide whole categories.** A fully-hidden category is arbitrary noise, not skill measurement; every category keeps some hidden depth, so defending only the published probes still leaves exposure.
+- **Distribute the hidden 25% across every category, never hide whole categories.** A fully hidden category is arbitrary noise, not skill measurement. Every category keeps some hidden depth, so defending only the published probes still leaves exposure.
 - **Favor hidden variants and fresh payloads.** Within a variant group, mixing public and hidden variants catches blocklist-style partial defense: a player who neutralizes exactly the published payloads still trips an unanticipated hidden variant, while genuine architectural defense (parameterization, output encoding) clears public and hidden alike.
 - **Split by weight, not just count.** The hidden 25% must carry real penalty weight (hidden high-severity probes), or gaming the public set leaves little slop exposed and the deterrent is toothless.
-- **Scoring is pool-agnostic.** A probe's penalty is its penalty regardless of pool; "hidden" means *unpublished*, not *weighted differently*.
+- **Scoring is pool agnostic.** A probe's penalty is its penalty regardless of pool. "Hidden" means *unpublished*, not *weighted differently*.
 - **Rotation per version.** The split is per catalog version: burned hidden probes graduate to public the next quarter and fresh probes replace them (see Catalog Organization).
 
-**What belongs in the hidden pool.** Edge-case payloads and simple derivatives of *existing public categories* (a different SQLi syntax, an attribute-context XSS, an encoded path traversal), plus the same public probe types applied to surfaces the public pool did not advertise testing — never new exotic vulnerability classes. The litmus: **a hidden probe must be defeated by the same correct defense as its public sibling.** If genuine architectural defense (parameterized queries, output encoding, input canonicalization, real access checks) clears both the public and the hidden version, it is a good hidden probe — it catches only the player who blocklisted the published payloads, never the competent engineer. If a hidden probe would need a *new* defense the player could not anticipate, it is niche-of-niche and is rejected as an unfair surprise. The hidden pool tests **depth within known classes, not breadth into obscure ones.**
+**What belongs in the hidden pool.** Edge case payloads and simple derivatives of *existing public categories* (a different SQLi syntax, an attribute context XSS, an encoded path traversal), plus the same public probe types applied to surfaces the public pool did not advertise testing. Never new exotic vulnerability classes. The litmus: **a hidden probe must be defeated by the same correct defense as its public sibling.** If genuine architectural defense (parameterized queries, output encoding, input canonicalization, real access checks) clears both the public and the hidden version, it is a good hidden probe, because it catches only the player who blocklisted the published payloads, never the competent engineer. If a hidden probe would need a *new* defense the player could not anticipate, it is niche of niche and is rejected as an unfair surprise. The hidden pool tests **depth within known classes, not breadth into obscure ones.**
 
-**Repository boundary (hidden pool secrecy).** The `hacklet-league` repo is **public**, so hidden-pool probes must never live in it. The hidden pool belongs in a **separate private `fuzz-catalog` repo**; the runner host pulls it at run time with a read-only deploy token, and merges it with the public pool in memory. The public pool may live in the public repo (it is published by design). A `.gitignore` excluding `**/hidden/` is only a backstop — the boundary is the separate private repo, because a single accidental commit to a public repo is an irreversible leak (git history, clones, scrapers). This split is deferred until the first hidden probe is authored; until then the catalog is public-only.
+**Repository boundary (hidden pool secrecy).** The `hacklet-league` repo is **public**, so hidden pool probes must never live in it. The hidden pool belongs in a **separate private `fuzz-catalog` repo**. The runner host pulls it at run time with a read only deploy token and merges it with the public pool in memory. The public pool may live in the public repo, since it is published by design. A `.gitignore` excluding `**/hidden/` is only a backstop. The boundary is the separate private repo, because a single accidental commit to a public repo is an irreversible leak (git history, clones, scrapers). This split is deferred until the first hidden probe is authored. Until then the catalog is public only.
 
 ### Catalog scope (target)
 
@@ -149,7 +149,7 @@ three way reference calibration. The high frequency pilot core is done. The cata
 and qa and performance are the thinnest today with the most room to grow. The per-category targets below
 are the roadmap, not the current count.
 
-**security (~40–70)** — OWASP-aligned, universal web surface:
+**security (~40 to 70).** OWASP aligned, universal web surface:
 
 | Category | Probes | Type |
 | --- | --- | --- |
@@ -164,7 +164,7 @@ are the roadmap, not the current count.
 | Secrets-in-response, CORS misconfiguration, open redirect | ~5–8 | declarative |
 | SSRF (in-band reflection only) | ~2–3 | oracle |
 
-**qa (~50–90)** — universal correctness (format_spec §4.2):
+**qa (~50 to 90).** Universal correctness (format_spec §4.2):
 
 | Category | Probes | Type |
 | --- | --- | --- |
@@ -174,7 +174,7 @@ are the roadmap, not the current count.
 | Encoding: UTF-8 / emoji / CJK / RTL round-trip | ~5–10 | declarative |
 | Size limits: oversized body / URL / headers rejected, not crashed | ~5–8 | declarative |
 
-**performance (~25–45)** — speed + resilience under load:
+**performance (~25 to 45).** Speed and resilience under load:
 
 | Category | Probes | Type |
 | --- | --- | --- |
@@ -184,11 +184,11 @@ are the roadmap, not the current count.
 
 **Deliberately out of scope:**
 
-- **Not HTTP-observable** — memory safety, internal code quality, logging, dependency-version CVEs.
-- **Out-of-band dependent** — blind SSRF and fully-blind injection with no in-band signal (egress is locked; oracles are in-band only).
-- **Intent-dependent *semantics*** — business-logic authorization (should role X do action Y), idempotency / duplicate semantics, mass assignment. The *intent-independent* slices of access control and auth — unauthenticated exposure, secrets-in-the-open, and auth mechanics via self-created accounts (self-as-oracle) — are **in** scope; see Project identity & scope philosophy.
-- **Framework-specific** — per-stack exploits (universal-only).
-- **Later bundles** — race conditions and behavioral consistency become their own bundles post-v1 (the six-axis roadmap), not crammed into v1.
+- **Not HTTP observable.** Memory safety, internal code quality, logging, dependency version CVEs.
+- **Out of band dependent.** Blind SSRF and fully blind injection with no in band signal (egress is locked, oracles are in band only).
+- **Intent dependent *semantics*.** Business logic authorization (should role X do action Y), idempotency and duplicate semantics, mass assignment. The *intent independent* slices of access control and auth, namely unauthenticated exposure, secrets in the open, and auth mechanics through self created accounts, are **in** scope. See Project identity & scope philosophy.
+- **Framework specific.** Per stack exploits (universal only).
+- **Later bundles.** Race conditions and behavioral consistency become their own bundles post v1 (the six axis roadmap), not crammed into v1.
 - **Client side storage probing.** A localStorage session token exposure check is built (`sec-session-005`, off the browser register capture). Broader sessionStorage and IndexedDB fuzzing through the browser context is deferred to later catalog work.
 
 ## Runner as a Sandboxed, Deployable Service
@@ -201,24 +201,24 @@ The runner is a **standalone deployable component, separate from the hackletleag
 2. The platform enqueues a run: `{submission_id, artifact_ref, catalog_version}`.
 3. The runner pulls the artifact, deploys it to an ephemeral container, and runs the five phases.
 4. The runner returns a structured **slop report** (per-probe outcomes + penalties + metadata).
-5. The platform persists `FuzzResult` rows; the scoring engine (separate, see Scoring Integration) folds the result into the composite.
+5. The platform persists `FuzzResult` rows. The scoring engine (separate, see Scoring Integration) folds the result into the composite.
 
 The platform **never executes submission code in-process**.
 
 ### Deployment contract
 
-Getting an arbitrary BYOD submission to a running HTTP service is the **only stack-specific step** in the runner; once the container answers, everything downstream is stack-blind. The contract is deliberately small:
+Getting an arbitrary BYOD submission to a running HTTP service is the **only stack specific step** in the runner. Once the container answers, everything downstream is stack blind. The contract is deliberately small.
 
-- **A `Dockerfile`.** The submission includes one; the runner builds it and runs the image. This is the one mechanism universal across every stack, and it puts the build environment fully in the player's hands. The league ships per-stack starter Dockerfiles (Flask, FastAPI, Express, Go, …) so players barely touch it. (A lighter `hacklet.yaml` manifest is a possible future convenience; v1 is Dockerfile-only to avoid the runner maintaining per-stack base images.)
-- **Listen on `$PORT`.** The runner injects `$PORT`; the app must bind it (the Heroku / Cloud Run convention, shown in every template). No port guessing.
-- **Self-contained — no external services, no secrets.** The runner injects **only `$PORT`**: no `$DATABASE_URL`, no API keys, no credentials, and no third-party network egress (format_spec §5.7). Apps persist via SQLite committed to the submission, in-memory state, or client-side browser storage; the submission directory is mounted so committed SQLite files are readable. Code that needs secrets or external services simply fails at runtime and scores slop on the relevant probes — the runner neither provides the environment nor rejects the code. The fuzzed target is a single HTTP container; multi-service apps are out of v1 scope.
+- **A `Dockerfile`.** The submission includes one, and the runner builds it and runs the image. This is the one mechanism universal across every stack, and it puts the build environment fully in the player's hands. The league ships per stack starter Dockerfiles (Flask, FastAPI, Express, Go, …) so players barely touch it. (A lighter `hacklet.yaml` manifest is a possible future convenience. v1 is Dockerfile only to avoid the runner maintaining per stack base images.)
+- **Listen on `$PORT`.** The runner injects `$PORT`, and the app must bind it (the Heroku or Cloud Run convention, shown in every template). No port guessing.
+- **Self contained, no external services, no secrets.** The runner injects **only `$PORT`**: no `$DATABASE_URL`, no API keys, no credentials, and no third party network egress (format_spec §5.7). Apps persist through SQLite committed to the submission, in memory state, or client side browser storage, and the submission directory is mounted so committed SQLite files are readable. Code that needs secrets or external services simply fails at runtime and scores slop on the relevant probes. The runner neither provides the environment nor rejects the code. The fuzzed target is a single HTTP container. Multi service apps are out of v1 scope.
 
-**Health gate.** After build + run, the runner polls `$PORT` for any HTTP response within a fixed window (~60s). A response → Discovery (Phase 1) begins. No response within the window → **DNF** (did not deploy), the worst outcome: ranked below every completed submission regardless of its trivially-low raw slop, because under lower-is-better a non-deploying app is never a clean zero (format_spec §4.2). A submission that deploys but exposes almost no surface is still scored — the "Limited Engagement" status covers the sub-threshold case.
+**Health gate.** After build and run, the runner polls `$PORT` for any HTTP response within a fixed window (~60s). A response starts Discovery (Phase 1). No response within the window is a **DNF** (did not deploy), the worst outcome, ranked below every completed submission regardless of its trivially low raw slop, because under lower is better a non-deploying app is never a clean zero (format_spec §4.2). A submission that deploys but exposes almost no surface is still scored, and the "Limited Engagement" status covers the sub-threshold case.
 
 **Network posture** (extends the threat model below):
 
-- **Build phase**: network restricted to the **league package mirror** only (format_spec §5.4) — deterministic builds, no open-internet supply-chain surprises. A build that exceeds the build timeout (~5 min) fails to DNF.
-- **Run phase**: **no egress** — the submission container can reach nothing outbound. This is also why oracles are in-band only (no out-of-band callbacks).
+- **Build phase.** Network restricted to the **league package mirror** only (format_spec §5.4), for deterministic builds with no open internet supply chain surprises. A build that exceeds the build timeout (~5 min) fails to DNF.
+- **Run phase.** **No egress.** The submission container can reach nothing outbound. This is also why oracles are in band only (no out of band callbacks).
 
 **Run envelope.** Fixed CPU / RAM / PID / disk quotas and a wall-clock lifecycle bound, identical for every submission (the fairness envelope), set by runner config and never by the submission. Load and DoS probes are measured inside this envelope, so resilience-under-load stays comparable across submissions.
 
@@ -226,37 +226,37 @@ Getting an arbitrary BYOD submission to a running HTTP service is the **only sta
 
 Submissions are untrusted code generated by players directing AI. The runner is a sandbox first, a test executor second.
 
-- **Container isolation** — unprivileged user, no sudo, read-only base image where feasible, ephemeral, destroyed after each run.
-- **Resource exhaustion** — CPU / RAM / disk / PID quotas and a wall-clock lifecycle bound on every container; load and DoS probes are bounded so the runner is never an amplifier.
-- **Network egress** — submission containers have no outbound network except the runner's probe channel. This prevents data exfiltration, lateral movement, and using a submission as an egress proxy.
-- **Hidden-pool boundary** — hidden-pool test definitions exist **only on the central runner**. They are never deployed to workstations, never included in any client- or player-facing payload, and never echoed in player-visible results. The local (workstation) runner contains the public pool only.
-- **Headless-browser harness** — because it renders untrusted submission pages, it runs in the same sandbox posture: isolated browser context, no host filesystem access, egress-restricted.
+- **Container isolation.** Unprivileged user, no sudo, read only base image where feasible, ephemeral, destroyed after each run.
+- **Resource exhaustion.** CPU, RAM, disk, and PID quotas and a wall clock lifecycle bound on every container. Load and DoS probes are bounded so the runner is never an amplifier.
+- **Network egress.** Submission containers have no outbound network except the runner's probe channel. This prevents data exfiltration, lateral movement, and using a submission as an egress proxy.
+- **Hidden pool boundary.** Hidden pool test definitions exist **only on the central runner**. They are never deployed to workstations, never included in any client facing or player facing payload, and never echoed in player visible results. The local (workstation) runner contains the public pool only.
+- **Headless browser harness.** Because it renders untrusted submission pages, it runs in the same sandbox posture: isolated browser context, no host filesystem access, egress restricted.
 
 ### Production deploy (DockerDeployer)
 
-`DockerDeployer` is the central runner's implementation of the deployment contract — the production counterpart to the `SubprocessDeployer` used for trusted reference apps. It answers the universal-deploy problem directly: **the Dockerfile is the universal adapter.** All stack and build-step diversity lives in the player's Dockerfile, so the runner never special-cases a stack — it runs the identical pipeline against every submission, from a Flask app to a hand-rolled Go server.
+`DockerDeployer` is the central runner's implementation of the deployment contract, the production counterpart to the `SubprocessDeployer` used for trusted reference apps. It answers the universal deploy problem directly: **the Dockerfile is the universal adapter.** All stack and build step diversity lives in the player's Dockerfile, so the runner never special cases a stack. It runs the identical pipeline against every submission, from a Flask app to a hand rolled Go server.
 
 **Per-submission pipeline:**
 
 1. **Extract** the submission zip into an isolated, single-use build context.
-2. **Build** (`docker build`) with build-time network restricted to the league package mirror (above); a build timeout (~5 min) and resource caps apply; per-stack base layers are cached so repeat builds are fast. Build failure or timeout → **DNF**.
-3. **Run** (`docker run`) under the sandbox posture (below), injecting `-e PORT=<port>` and a clean environment — the runner host's env is never passed through.
-4. **Health-gate** the port (~60s, above). A response → Discovery (Phase 1) begins; silent or exited → **DNF**.
-5. **Fuzz** over an internal-only network: the runner reaches the container's port; the container reaches nothing outbound.
-6. **Teardown** — force-remove the container and its own image layers; cached base layers persist.
+2. **Build** (`docker build`) with build time network restricted to the league package mirror (above). A build timeout (~5 min) and resource caps apply, and per stack base layers are cached so repeat builds are fast. Build failure or timeout → **DNF**.
+3. **Run** (`docker run`) under the sandbox posture (below), injecting `-e PORT=<port>` and a clean environment. The runner host's env is never passed through.
+4. **Health gate** the port (~60s, above). A response → Discovery (Phase 1) begins. Silent or exited → **DNF**.
+5. **Fuzz** over an internal only network: the runner reaches the container's port, and the container reaches nothing outbound.
+6. **Teardown.** Force remove the container and its own image layers. Cached base layers persist.
 
 **Sandbox posture, concretely** (enforces the Threat model above):
 
 - unprivileged / rootless user, `--cap-drop=ALL`, `--security-opt no-new-privileges`, a seccomp profile
-- `--read-only` root filesystem + a small writable `tmpfs` for the app's data dir — committed SQLite still works, but the app cannot mutate the image
+- `--read-only` root filesystem plus a small writable `tmpfs` for the app's data dir, so committed SQLite still works but the app cannot mutate the image
 - quotas: `--memory`, `--cpus`, `--pids-limit`, a disk cap, and a wall-clock kill at the run budget (the fairness envelope)
 - internal-only network: runner→container reachable, container→internet blocked (no egress)
 - the **build** runs rootless too (e.g. rootless BuildKit), so the build step is not a privilege-escape surface either
 - defense in depth against container escape (contestant code is hostile by assumption): a **gVisor (`runsc`)** or **Firecracker microVM** runtime is available as a per submission hardening toggle. It defaults off. The always on posture is `--cap-drop=ALL` plus `--security-opt no-new-privileges`, and `runtime="runsc"` turns the extra isolation on where gVisor is installed
 
-**DNF, never a runner crash.** The contract converts every non-conforming submission into a *scored outcome*, never a runner failure: build fails/times out → DNF; doesn't bind `$PORT` or crashes on boot → DNF; needs an external DB or key → those features score slop (format_spec §5.7); resource hog or fork bomb → quotas + wall-clock kill → DNF. A failed submission is recorded and the worker moves to the next; one bad app never takes down the run. The runner's behavior is identical and bounded for every submission, however broken or hostile.
+**DNF, never a runner crash.** The contract converts every non-conforming submission into a *scored outcome*, never a runner failure. Build fails or times out → DNF. Does not bind `$PORT` or crashes on boot → DNF. Needs an external DB or key → those features score slop (format_spec §5.7). Resource hog or fork bomb → quotas plus wall clock kill → DNF. A failed submission is recorded and the worker moves to the next. One bad app never takes down the run. The runner's behavior is identical and bounded for every submission, however broken or hostile.
 
-**Throughput.** A pool of build+run workers with shared per-stack base-layer caching processes the queue (Central Runner, below) in parallel; containers are ephemeral and per-submission. The Tier C MVR target is all submissions evaluated within the 12-minute window.
+**Throughput.** A pool of build and run workers with shared per stack base layer caching processes the queue (Central Runner, below) in parallel, and containers are ephemeral and per submission. The Tier C MVR target is all submissions evaluated within the 12 minute window.
 
 ## Test Definition Format
 
@@ -278,7 +278,7 @@ evidence_model: <provable | oracle>                  # DETECTION hint only, not 
 description: <text description of what the test does>
 penalty: <positive integer>                          # slop added when slop_if fires; 0 otherwise
 variant_group_id: <UUID or null>  # if part of a syntactic variant group
-sampling: <null | object>          # null = deterministic single run; else {runs, rule, margin} — see Phase 3
+sampling: <null | object>          # null = deterministic single run, else {runs, rule, margin}, see Phase 3
 
 applicability:
   requires:
@@ -311,7 +311,7 @@ Common applicability conditions reference properties of the submission profile:
 - `submission_has_api_endpoints`
 - `submission_has_post_endpoints_creating_records`
 - `submission_stores_persistent_data`
-- `submission_serves_html_document`   # gates FCP/INP speed checks; false for pure JSON APIs
+- `submission_serves_html_document`   # gates FCP/INP speed checks, false for pure JSON APIs
 
 The discovery phase produces a submission profile listing which conditions are true for that submission.
 
@@ -319,13 +319,13 @@ The discovery phase produces a submission profile listing which conditions are t
 
 Targets identify which endpoints in the submission a probe should hit:
 
-- `homepage` — root URL
-- `all_discovered_routes` — every URL the discovery phase found
-- `discovered_form_endpoints` — every form-accepting endpoint
-- `discovered_api_endpoints` — every API endpoint
-- `file_upload_endpoints` — endpoints accepting file uploads
-- `auth_endpoints` — login, signup, password reset endpoints
-- `<specific_path>` — explicit URL pattern
+- `homepage`: root URL
+- `all_discovered_routes`: every URL the discovery phase found
+- `discovered_form_endpoints`: every form accepting endpoint
+- `discovered_api_endpoints`: every API endpoint
+- `file_upload_endpoints`: endpoints accepting file uploads
+- `auth_endpoints`: login, signup, password reset endpoints
+- `<specific_path>`: explicit URL pattern
 
 ### Assertion Conditions
 
@@ -334,7 +334,7 @@ A probe's `slop_if` lists structured conditions describing **when slop is presen
 **Response status conditions:**
 - `response_status_in: [<list_of_codes>]`
 - `response_status_equals: <code>`
-- `response_status_500_with_db_error` — a 500 leaking a DB error is itself slop
+- `response_status_500_with_db_error`: a 500 leaking a DB error is itself slop
 
 **Response content conditions** (slop = the bad thing is present):
 - `response_contains: <pattern>`
@@ -344,17 +344,17 @@ A probe's `slop_if` lists structured conditions describing **when slop is presen
 - `response_leaks_stack_trace`
 
 **Timing conditions:**
-- `response_received_after: <duration>` — e.g. a time-based injection oracle firing
+- `response_received_after: <duration>`: for example a time based injection oracle firing
 
-**Speed-gate conditions** (performance bundle; browser-measured ones apply only when `submission_serves_html_document`) — slop when the threshold is breached:
-- `ttfb_at_least: <duration>`   # server-side; slop at >= 3s
-- `fcp_at_least: <duration>`    # headless browser; slop at >= 5s
-- `inp_at_least: <duration>`    # headless browser (TBT proxy / scripted interaction); slop at >= 5s
+**Speed gate conditions** (performance bundle, the browser measured ones apply only when `submission_serves_html_document`). Slop when the threshold is breached:
+- `ttfb_at_least: <duration>`   # server timing, slop at >= 1.0s
+- `fcp_at_least: <duration>`    # headless browser, slop at >= 1.0s
+- `inp_at_least: <duration>`    # headless browser (TBT proxy, scripted interaction), slop at >= 600ms
 
 **Behavioral conditions** (slop = the attack succeeded):
 - `upload_succeeds_and_executes: true`
 - `auth_bypassed: true`
-- `boolean_differential_diverges: true` — injection oracle: the TRUE/FALSE payloads differ in the attacker's favor
+- `boolean_differential_diverges: true`: injection oracle, the TRUE/FALSE payloads differ in the attacker's favor
 
 **Complex conditions** that require code reference named predicates that return true **when slop is present**:
 
@@ -438,9 +438,9 @@ The discovery phase runs for a fixed time budget or until exhaustion, whichever 
 For each test in the catalog:
 
 1. Check whether all `applicability.requires` conditions are met against the submission profile
-2. If yes, mark the test as applicable; if not, the test resolves to `not_applicable` (structural N/A) and is skipped
+2. If yes, mark the test as applicable. If not, the test resolves to `not_applicable` (N/A from the surface) and is skipped
 
-Applicability is **fully automated** — the catalog is universal-only, so there are no intent-sensitive tests and no judge-resolution step. (Behavioral N/A, where an applicable test's vector turns out not to reach a live sink, is resolved during execution by the test's oracle, not here.) The result is the list of applicable tests.
+Applicability is **fully automated**. The catalog is universal only, so there are no intent sensitive tests and no judge resolution step. (Behavioral N/A, where an applicable test's vector turns out not to reach a live sink, is resolved during execution by the test's oracle, not here.) The result is the list of applicable tests.
 
 ### Phase 3: Execution
 
@@ -455,7 +455,7 @@ Applicable tests execute in parallel up to a concurrency limit (default: 20 conc
 
 Some tests may require sequential execution (e.g., session-dependent tests). The test definition can declare `requires_sequential: true` to opt out of parallel execution.
 
-**Stochastic probes.** Timing, load, and concurrency probes are non-deterministic, so they declare a `sampling` block and run N times; the aggregation rule depends on the failure shape:
+**Stochastic probes.** Timing, load, and concurrency probes are non-deterministic, so they declare a `sampling` block and run N times. The aggregation rule depends on the failure shape:
 
 - **Timing / speed / load gates** → **median of N breaches the threshold** (plus a small margin). Robust to a single jittery run in either direction: chronic slowness fires, a one-off blip does not.
 - **Race / concurrency** → **slop if the bad state occurs in *any* of N batches.** A race that manifests even intermittently is a real, exploitable bug.
@@ -483,8 +483,8 @@ Results are persisted via different paths depending on runner mode:
 
 **Central runner** (at code freeze):
 - Records to FuzzResult table (authoritative)
-- Triggers the scoring engine when the run completes — under universal-only the slop score is fully automated, with no per-probe override
-- Tester judges may spot-check for false positives out of band, but that does not gate scoring; judges' scored role is the communication axis (clickaround, pitch, cross-examination)
+- Triggers the scoring engine when the run completes. Under universal only, the slop score is fully automated, with no per probe override
+- Tester judges may spot check for false positives out of band, but that does not gate scoring. The judges' scored role is the communication axis (clickaround, pitch, cross-examination)
 
 ## Execution Architecture
 
@@ -504,7 +504,7 @@ The local runner does not contain hidden pool tests. Hidden pool YAML files are 
 Runs as a standalone, containerized service on league infrastructure, separate from the platform process (see "Runner as a Sandboxed, Deployable Service").
 
 - Pulls the submission **zip** the platform stored at code freeze (portal upload, TIER_C_OPERATIONS §6). There is no git in the league submission path. The standalone grader that scrapes past hackathons additionally supports git clone and a live URL target (`scripts/deploy_and_grade.py` clones a repo or takes `--url`), which is how the 1043-app validation ran. The league flow itself stays zip only.
-- Deploys the submission to an ephemeral Docker container under the sandbox posture (unprivileged, quota-bound, egress-restricted) — see Production deploy (DockerDeployer) for the build/run/health/teardown pipeline and exact flags
+- Deploys the submission to an ephemeral Docker container under the sandbox posture (unprivileged, quota bound, egress restricted). See Production deploy (DockerDeployer) for the build, run, health, and teardown pipeline and exact flags
 - Container exposes the submission's port to the runner only
 - Runner executes the full catalog (both pools) against the deployed container
 - After completion, the container is destroyed
@@ -561,7 +561,7 @@ fuzz-catalog/
 ```
 
 Catalog versioning follows semver:
-- **Major version**: structural changes to test format
+- **Major version**: breaking changes to test format
 - **Minor version**: new tests added, new categories introduced
 - **Patch version**: bug fixes to existing tests, scoring recalibrations
 
@@ -637,15 +637,15 @@ New tests are added to the catalog through this process:
 5. PR merged to main triggers catalog version bump
 6. Chapter platforms pull updated catalog at next sync
 
-**Reference-submission matrix.** Reference submissions are curated apps in the catalog repository (versioned with the catalog) that serve double duty: the **calibration anchor** for every probe and the runner's **regression suite**. They don't need three apps per probe — a small curated set whose cells cover every probe's three states. The core is a matched triad:
+**Reference submission matrix.** Reference submissions are curated apps in the catalog repository (versioned with the catalog) that serve double duty: the **calibration anchor** for every probe and the runner's **regression suite**. They do not need three apps per probe, just a small curated set whose cells cover every probe's three states. The core is a matched triad.
 
-- **Vulnerable** — exhibits every slop class (SQLi, XSS, missing headers, insecure upload, IDOR, crashers, slow endpoints). The `slop_detected` anchor for most probes at once.
-- **Hardened** — the *same feature surface* (login, search, upload, multi-user resources, forms) but correctly defended. The `clean` anchor, and the critical **false-positive guard**: every probe must read clean here despite the surface being present.
-- **Minimal** — a trivial app (~2 endpoints, no upload/auth/DB). The `not_applicable` anchor; also exercises the Limited-Engagement floor.
+- **Vulnerable.** Exhibits every slop class (SQLi, XSS, missing headers, insecure upload, IDOR, crashers, slow endpoints). The `slop_detected` anchor for most probes at once.
+- **Hardened.** The *same feature surface* (login, search, upload, multi user resources, forms) but correctly defended. The `clean` anchor, and the critical **false positive guard**: every probe must read clean here despite the surface being present.
+- **Minimal.** A trivial app (~2 endpoints, no upload, auth, or DB). The `not_applicable` anchor, and it also exercises the Limited Engagement floor.
 
-The vulnerable/hardened pair must have **matched surfaces** — that is what proves a probe distinguishes *defended* from *broken* rather than *present* from *absent*. Two additions beyond the triad: **stack-diversity clones** of the hardened app (e.g., Flask + Express + Go, same surface) — the catalog must yield identical outcomes across all three, the empirical proof of universal-only — and an **SPA reference** to validate that browser-driven discovery finds the API surface link-crawling misses.
+The vulnerable and hardened pair must have **matched surfaces**, which is what proves a probe distinguishes *defended* from *broken* rather than *present* from *absent*. Two additions beyond the triad. First, **stack diversity clones** of the hardened app (Flask, Express, Go, the same surface), where the catalog must yield identical outcomes across all three, the empirical proof of universal only. Second, an **SPA reference** to validate that browser driven discovery finds the API surface link crawling misses.
 
-CI deploys each reference app, runs the full catalog, and asserts the expected outcome per (probe × app) cell: a new probe must fire on vulnerable, stay clean on hardened, and read N/A on minimal, or it does not merge; a probe that starts false-positiving on the hardened app fails CI. The matrix manifest is both the calibration spec and the assertion source. Build the vulnerable/hardened pair **early** — the vertical slice needs them on day one, and the hardened app is the "0 slop" gold standard, grown as each category's probes land.
+CI deploys each reference app, runs the full catalog, and asserts the expected outcome per (probe × app) cell. A new probe must fire on vulnerable, stay clean on hardened, and read N/A on minimal, or it does not merge. A probe that starts false-positiving on the hardened app fails CI. The matrix manifest is both the calibration spec and the assertion source. Build the vulnerable and hardened pair **early**, since the vertical slice needs them on day one, and the hardened app is the "0 slop" gold standard, grown as each category's probes land.
 
 ## Scoring Integration
 
@@ -659,7 +659,7 @@ After runner completes, scoring integration follows:
 6. Generates result metadata (status, attack surface coverage, clean rate)
 7. Submission is ready for composite ranking
 
-The scoring engine is separate from the runner — runner produces structured outcomes, scoring engine interprets them into final scores.
+The scoring engine is separate from the runner. The runner produces structured outcomes, and the scoring engine interprets them into final scores.
 
 ---
 
