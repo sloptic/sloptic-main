@@ -520,10 +520,13 @@ def _llm_json(system: str, user: str, model: str = DEFAULT_MODEL, timeout: float
     body = {"model": model, "temperature": 0,   # greedy: as stable as an LLM gets; the per-commit cache is the guarantee
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
     if not reasoning:
-        # perception + audit are EXTRACTION/classification, not deep reasoning -> disabling qwen's thinking cuts
-        # the dominant token cost AND is more deterministic. chat_template_kwargs is the Qwen-specific OpenRouter
-        # lever (reasoning.effort:"none" does NOT disable thinking on Qwen). Default keeps it on (validated baseline).
-        body["chat_template_kwargs"] = {"enable_thinking": False}
+        # perception + audit are EXTRACTION/classification, not deep reasoning -> disabling thinking cuts the
+        # DOMINANT token cost AND wall-clock (qwen3.7-plus/Alibaba: ~10s/390-reason-tok -> ~0.8s/0 on a classify
+        # call) and is more deterministic. reasoning:{enabled:false} is the OpenRouter-canonical lever and the ONE
+        # that actually works here — chat_template_kwargs.enable_thinking is a provider passthrough Alibaba SILENTLY
+        # IGNORES (verified live), and reasoning.exclude only HIDES thinking (still generated + billed). Default
+        # keeps reasoning on (the validated baseline).
+        body["reasoning"] = {"enabled": False}
     out = {}
 
     def _call():
