@@ -1,0 +1,27 @@
+# Deliberately-vulnerable app corpus for RECALL validation: point the fuzzer at each and confirm it
+# catches the known vulns. These apps are BUILT TO BE HACKED, so every port binds to 127.0.0.1 only --
+# never expose this corpus to a network. `docker compose up -d` to bring it up, then run setup.sh once
+# (DVWA and bWAPP need their DB initialized before they serve vulnerable surface).
+name: hacklet-vuln-corpus
+
+services:
+  dvwa:            # classic PHP web vulns (SQLi, XSS, CSRF, upload, LFI, command injection). MySQL bundled.
+    image: vulnerables/web-dvwa
+    ports: ["127.0.0.1:8081:80"]
+    restart: unless-stopped
+
+  bwapp:           # "buggy web app" -- a very wide PHP bug surface. MySQL bundled.
+    image: raesene/bwapp
+    ports: ["127.0.0.1:8082:80"]
+    restart: unless-stopped
+
+  juice-shop:      # modern Node/Angular SPA (the form-less, JS-bundle-mined case). Self-contained, no setup.
+    image: bkimminich/juice-shop
+    ports: ["127.0.0.1:8083:3000"]
+    restart: unless-stopped
+
+  vampi:           # vulnerable REST API (Flask + OpenAPI). Exercises the JSON-API / spec-discovery path.
+    image: erev0s/vampi
+    environment: [vulnerable=1]
+    ports: ["127.0.0.1:8084:5000"]
+    restart: unless-stopped
