@@ -88,3 +88,16 @@ def test_exposure_needs_200_and_signature():
     assert not response_is_dotenv(_Resp("DATABASE_URL=x", status=404))   # not actually served
     assert not response_is_dotenv(_Resp("<html><body>hi</body></html>"))  # 200 but not a .env
     assert not response_is_git_head(_Resp("<html>not found</html>"))     # 200, wrong content
+
+
+def test_resource_shaped_tells_a_race_from_a_fixed_redirect():
+    # qa-race-001 fires on duplicate ids under concurrency. A per-resource landing (/notes/1) exposes an id
+    # to compare; a fixed success-page redirect (/home) exposes none, so uniform landings must NOT read as a
+    # race. This is the guard that keeps a create->redirect-to-dashboard app from a phantom race finding.
+    from hacklet_runner.probes import _resource_shaped
+    assert _resource_shaped("/notes/1", "/notes")            # sub-path of the create endpoint + numeric id
+    assert _resource_shaped("/api/notes/42", "/api/notes")
+    assert _resource_shaped("/items/a1b2c3d4e5", "/create")  # trailing hex/uuid id, different base
+    assert not _resource_shaped("/home", "/notes")           # fixed landing page -> no id to compare
+    assert not _resource_shaped("/dashboard", "/notes")
+    assert not _resource_shaped("/notes", "/notes")          # the create endpoint / list itself

@@ -1960,17 +1960,37 @@ def _concurrent_creates(base_url, path, cookies, data, n: int = 12):
     return _fanout(create, n)
 
 
+_RESOURCE_ID = re.compile(r"/(?:\d+|[0-9a-f]{6,})/?$", re.I)   # path ends in a numeric or hex/uuid id segment
+
+
+def _resource_shaped(u: str, action: str) -> bool:
+    """True when `u` is a PER-RESOURCE URL (a create landed on /notes/1), not a fixed landing page. A real
+    id-allocation race is only observable when creates expose distinct ids; a redirect to a shared success
+    page (/home, /dashboard) exposes none. It tells a catastrophic all-collide race (every create ->
+    /notes/1, which IS a real race) apart from a fixed success-page redirect (every create -> /home, which
+    is not). Match a sub-path of the create endpoint, or a trailing numeric/hex id."""
+    a = action.rstrip("/")
+    return (u.startswith(a + "/") and len(u) > len(a) + 1) or bool(_RESOURCE_ID.search(u))
+
+
 def race_resource_ids(ctx, probe) -> bool | None:
-    """Self-as-oracle: register, fire N concurrent resource creates, and inspect the assigned IDs.
-    Duplicate IDs mean id allocation isn't atomic under concurrency — a race condition. N distinct
-    creates must yield N distinct ids, so a collision is provable without knowing the app's intent.
-    N/A when there's no create form or we can't self-register (not a false clean)."""
+    """Self-as-oracle: register, then fire N concurrent resource creates and inspect the assigned IDs,
+    REPEATED across a few bursts. A duplicate id WITHIN a burst means id allocation isn't atomic under
+    concurrency — a race. A correct (atomic) app never collides, so a race is intent-independent slop; but
+    a race is probabilistic, so a single burst flip-flops the score on re-grade. We require the collision
+    to REPRODUCE across bursts (>= min_collisions) — a strong race fires every re-grade, a marginal one
+    reads clean every re-grade, which is the computational-reproducibility the score needs. We also require
+    a PARTIAL collision (some ids distinct AND some duplicated): if EVERY create returns the same path, the
+    app just doesn't use per-resource URLs (a fixed success-page redirect), which is not observable as a
+    race — read N/A, never a phantom fire. N/A too when there's no create form or we can't self-register."""
     form = auth.create_form(ctx.profile.forms)
     if form is None:
         return None
     account = ctx.register(suffix="_race")
     if account is None:
         return None
+    bursts = probe.probe.get("bursts", 3)
+    need = probe.probe.get("min_collisions", 2)   # repeated collision -> a reproducible fire
     try:
         # iterate the jar, not dict(cookies) — dict() raises httpx.CookieConflict when the session
         # cookie was set on multiple paths/domains during the register redirect chain.
@@ -1978,16 +1998,26 @@ def race_resource_ids(ctx, probe) -> bool | None:
         # fill the form's ACTUAL fields (was hardcoded {"text": ...}); a real create form named
         # content/body/title would otherwise get an empty POST and the race would never be detected.
         data = {f: "hl-race" for f in form.fields}
-        urls = _concurrent_creates(ctx.base_url, form.action, cookies, data)
-        # a redirect to a login/error page (an unauthenticated/rejected create) is NOT a created
-        # resource -> exclude it, so uniform redirects don't look like duplicate ids (a false race).
-        created = [u for u in urls if u and u != form.action
-                   and not any(h in u.lower() for h in _CSRF_REJECT_HINTS)]
-        if len(created) < 2:
-            return None  # couldn't create ≥2 resources (CSRF/session) -> couldn't test
-        dup = len(set(created)) < len(created)
-        ctx.evidence.update(race=dup, creates=len(created), distinct_ids=len(set(created)))
-        return dup
+        observed_ids = False   # did we EVER see per-resource URLs to compare (otherwise: can't observe ids)
+        collided = 0           # bursts that showed an id collision (the race signature)
+        for _ in range(bursts):
+            urls = _concurrent_creates(ctx.base_url, form.action, cookies, data)
+            # count only PER-RESOURCE URLs. A create landing on /notes/1 exposes an id to compare; one that
+            # redirects to the form action or a fixed landing (login/error/dashboard) exposes none, so
+            # uniform landings can't look like a race. This is what tells a real all-collide race (every
+            # create -> /notes/1) apart from a fixed success-page redirect (every create -> /home).
+            created = [u for u in urls if u and u != form.action
+                       and not any(h in u.lower() for h in _CSRF_REJECT_HINTS)
+                       and _resource_shaped(u, form.action)]
+            if len(created) < 2:
+                continue
+            observed_ids = True
+            if len(set(created)) < len(created):   # fewer distinct ids than creates -> a race this burst
+                collided += 1
+        if not observed_ids:
+            return None   # never saw per-resource ids to compare (fixed redirect / <2 creates) -> couldn't test
+        ctx.evidence.update(bursts=bursts, collided_bursts=collided, min_collisions=need)
+        return collided >= need
     finally:
         account.client.close()
 
