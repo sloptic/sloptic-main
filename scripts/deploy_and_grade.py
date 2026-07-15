@@ -506,7 +506,7 @@ def _surface_skeleton(dom: str) -> str:
 
 
 def _llm_json(system: str, user: str, model: str = DEFAULT_MODEL, timeout: float = AUDIT_TIMEOUT_S,
-              reasoning: bool = True):
+              reasoning: bool = False):
     """One temp-0 OpenRouter chat call -> the first JSON object in the reply, or None (no key / API error /
     non-JSON / timeout). Never raises. HARD-capped at `timeout`s via a DAEMON thread we join(): a hung/slow
     response can never eat the grade budget (a scalar httpx timeout is only PER-PHASE — one call trickled
@@ -553,7 +553,7 @@ def _llm_json(system: str, user: str, model: str = DEFAULT_MODEL, timeout: float
 
 
 def audit_coverage(skeleton: str, observed: dict, features=None, model: str = DEFAULT_MODEL,
-                   timeout: float = AUDIT_TIMEOUT_S, reasoning: bool = True):
+                   timeout: float = AUDIT_TIMEOUT_S, reasoning: bool = False):
     """OFF-SCORE coverage critic: ask the LLM what surface `observed` (the fuzzer's discovery) missed + the
     page state. Returns {missed, page_state, notes} or None (best-effort, never raises). A FLAG only — never
     in the slop number (that's the perception pass's job to feed as probeable surface; this reports the gap)."""
@@ -586,7 +586,7 @@ Empty "forms"/"endpoints" when the crawl already covers the page."""
 
 
 def perceive_surface(skeleton: str, observed: dict, model: str = DEFAULT_MODEL, timeout: float = AUDIT_TIMEOUT_S,
-                     reasoning: bool = True):
+                     reasoning: bool = False):
     """PROACTIVE discovery: read the RENDERED page + what the crawl observed, and return the PROBEABLE surface
     the crawl MISSED as STRUCTURED targets — {forms:[{kind,action,method,fields,file_fields,label}],
     endpoints:[{kind,path,method,params,body_fields,label}], page_state} — for the fuzzer to MERGE into its
@@ -749,7 +749,7 @@ def _parse_headers(items) -> dict | None:
 
 def _grade_worker(url, use_browser, features, q, cached_profile=None, cache_key=None, repo_url=None,
                   proactive=False, model=DEFAULT_MODEL, browser_auth=False, session_headers=None,
-                  llm_reasoning=True):
+                  llm_reasoning=False):
     os.setsid()   # own process group so the parent can SIGKILL this child AND its headless chrome together
     try:
         render = browser.render_routes if use_browser else None
@@ -797,7 +797,7 @@ def _hard_kill_group(p) -> None:
 
 def grade(url: str, use_browser: bool, timeout=None, features=None,
           cached_profile=None, cache_key=None, repo_url=None, proactive=False, model=DEFAULT_MODEL,
-          browser_auth=False, session_headers=None, llm_reasoning=True):
+          browser_auth=False, session_headers=None, llm_reasoning=False):
     """Grade the running app in a CHILD PROCESS. A subprocess (not an in-process SIGALRM) because a signal
     can't interrupt a Playwright CPU-spin (the browser probes), but an EXTERNAL SIGKILL of the child + its
     chrome always works. `timeout` is the grading phase's OWN wall-clock budget (independent of deploy time,
@@ -995,11 +995,14 @@ def main():
     ap.add_argument("--no-web-search", dest="web_search", action="store_false",
                     help="don't let the LLM web-search on retries (default: retries CAN search OpenRouter's "
                          "web plugin for current dep versions / deploy config, ~$0.02/retry)")
-    ap.add_argument("--no-llm-reasoning", dest="llm_reasoning", action="store_false",
-                    help="disable the LLM's thinking/CoT for the PERCEPTION + AUDIT passes (qwen enable_thinking: "
-                         "false). They're extraction/classification jobs, not reasoning — turning off CoT cuts the "
-                         "dominant token cost and is MORE deterministic. Default keeps reasoning ON (the validated "
-                         "baseline); flip the default once an A/B confirms the DNF page-state classification holds.")
+    ap.add_argument("--llm-reasoning", dest="llm_reasoning", action="store_true", default=False,
+                    help="opt the PERCEPTION + AUDIT passes back INTO the LLM's thinking/CoT. Default is OFF: an "
+                         "A/B (2026-07-15) showed no-think holds page-state + score + precision (paired median "
+                         "delta 0) while cutting the audit LLM ~3.7x (36s->10s) and the dominant token cost, and "
+                         "it's more deterministic. reasoning:{enabled:false} is the OpenRouter lever that actually "
+                         "works on qwen3.7-plus (chat_template_kwargs.enable_thinking is silently ignored).")
+    ap.add_argument("--no-llm-reasoning", dest="llm_reasoning", action="store_false", default=False,
+                    help="(now the default — accepted for back-compat) keep perceive+audit no-think.")
     ap.add_argument("--no-cache", action="store_true", help="don't reuse/store the per-commit deploy-plan "
                     "cache — re-plan from scratch every run (default: a commit's SUCCESSFUL plan is frozen so "
                     "re-grades are reproducible; the cache lives at HL_CACHE_DIR, default ~/.cache/hacklet-plan)")

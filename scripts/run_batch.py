@@ -259,8 +259,8 @@ def _build_cmd(j, args, ckpt):
         cmd += ["--proactive"]
     if args.browser_auth:
         cmd += ["--browser-auth"]
-    if not args.llm_reasoning:
-        cmd += ["--no-llm-reasoning"]
+    if args.llm_reasoning:
+        cmd += ["--llm-reasoning"]
     for h in (args.headers or []):
         cmd += ["--header", h]
     if args.model:
@@ -405,9 +405,12 @@ def main():
                     help="forward to deploy_and_grade (repeatable): a request header sent on the whole run — the "
                          "Option-B auth fallback (--header 'Cookie: …' or --header 'Authorization: Bearer …') so "
                          "the authed-surface probes reach the logged-in surface when self-registration can't.")
-    ap.add_argument("--no-llm-reasoning", dest="llm_reasoning", action="store_false",
-                    help="forward to deploy_and_grade: disable LLM thinking/CoT for the perception + audit passes "
-                         "(qwen enable_thinking: false) — cuts the dominant token cost, more deterministic. Default ON.")
+    ap.add_argument("--llm-reasoning", dest="llm_reasoning", action="store_true", default=False,
+                    help="forward to deploy_and_grade: opt the perceive+audit passes back INTO LLM thinking/CoT. "
+                         "Default is OFF (no-think) — the A/B showed it holds quality while cutting the audit LLM "
+                         "~3.7x and the dominant token cost, and it's more deterministic.")
+    ap.add_argument("--no-llm-reasoning", dest="llm_reasoning", action="store_false", default=False,
+                    help="(now the default — accepted for back-compat) keep perceive+audit no-think.")
     ap.add_argument("--attempts", type=int, default=3, help="deploy attempts per repo")
     ap.add_argument("--build-timeout", type=int, default=480, dest="build_timeout",
                     help="per-repo docker build timeout in seconds (default 480; lower = more throughput)")
