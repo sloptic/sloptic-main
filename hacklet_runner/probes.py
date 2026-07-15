@@ -822,7 +822,12 @@ def xxe(ctx, probe) -> bool | None:
 # param. Comprehensive: absolute paths, ../ traversal (raw / doubled / URL-encoded), null-byte, php://
 # wrapper; Unix (/etc/passwd) + Windows (win.ini). Detection = the target file's unmistakable content
 # signature, which reflecting the path string can never produce -> precise.
-_LFI_SIG = re.compile(r"root:.*?:0:0:|\[fonts\]|\[extensions\]|for 16-bit app support", re.IGNORECASE)
+# TIGHT: the passwd root line is `root:<pw>:0:0:` where <pw> is a SHORT placeholder (x/*/!/empty), never
+# arbitrary text — the old `root:.*?:0:0:` matched a spurious `root:`…`:0:0:` span across ONE line of a
+# minified JS bundle (a real arcgis-core-*.js false-fired at penalty 40). Bounding the middle + dropping
+# the bare `[fonts]`/`[extensions]` win.ini headers (common substrings in JS/CSS config blobs) keeps only
+# unmistakable signatures; win.ini stays via its distinctive 16-bit comment.
+_LFI_SIG = re.compile(r"root:[^:\r\n]{0,8}:0:0:|for 16-bit app support", re.IGNORECASE)
 _LFI_PARAMS = ("page", "file", "path", "include", "template", "doc", "filename", "load", "view", "dir")
 _INCLUDABLE = re.compile(r"fi|includ|file|page|view|download|load|template|doc|read|show", re.IGNORECASE)
 _LFI_PAYLOADS = (
@@ -860,7 +865,13 @@ def path_traversal(ctx, probe) -> bool | None:
                     fields_seen.add((action, field))
                     data = {fn: (payload if fn == field else _XSS_FILLER) for fn in fields}
                     try:
-                        if _LFI_SIG.search(_xss_send(c, method, action, data).text):
+                        r = _xss_send(c, method, action, data)
+                        ct = r.headers.get("content-type", "").lower()
+                        # a served /etc/passwd or win.ini is text/plain or octet-stream, NEVER the app's own
+                        # bundle — skip js/css so a signature can't match noise inside a minified script.
+                        if "javascript" in ct or "css" in ct:
+                            continue
+                        if _LFI_SIG.search(r.text):
                             ctx.evidence.update(found=True, target=action, field=field)
                             return True  # returned the contents of a system file -> traversal/LFI
                     except (httpx.HTTPError, httpx.InvalidURL):
@@ -1488,11 +1499,42 @@ def session_token_in_local_storage(ctx, probe) -> bool | None:
         account.client.close()
 
 
+# A genuine login backend REJECTS wrong creds with an auth-shaped answer. A client-side-auth SPA (Supabase/
+# Firebase from the browser) or a platform-hosted static page just echoes a 200 shell — or 405/404 — for the
+# POST: there's no server auth of the app's to rate-limit, so a "no rate limiting" finding there is a phantom
+# (the biggest sec-ratelimit-001 FP class, mostly UNDER precision.py's catch-all radar since these hosts 404
+# real paths). find_json_login already applies this test on the JSON path; this brings the HTML path to parity.
+_AUTH_REJECT = re.compile(
+    r"invalid|incorrect|wrong\s*(?:password|credential|email|username)|bad\s+credential|"
+    r"authentication\s+failed|login\s+failed|unauthor|not\s+authorized", re.IGNORECASE)
+
+
+def _looks_like_auth_reject(resp) -> bool:
+    """True when `resp` is a real login backend saying 'no' to wrong creds — an auth-failure status, a
+    redirect to a login/error page, a JSON answer, or an auth-failure phrase — NOT a bare 200 shell / 405 /
+    404. Gates the rate-limit finding onto endpoints that ACTUALLY process credentials."""
+    try:
+        sc = resp.status_code
+    except Exception:
+        return False
+    if sc in (400, 401, 403, 422):
+        return True
+    if sc in (301, 302, 303, 307, 308):
+        return any(h in resp.headers.get("location", "").lower() for h in _CSRF_REJECT_HINTS)
+    if "json" in resp.headers.get("content-type", "").lower():
+        return True
+    try:
+        return bool(_AUTH_REJECT.search(resp.text[:20000]))
+    except Exception:
+        return False
+
+
 def login_no_rate_limit(ctx, probe) -> bool | None:
     """Self-as-oracle: fire N wrong-password logins at the login form; slop if NONE is throttled
     (HTTP 429/423). With no brute-force protection every attempt returns the same auth-failure status,
     enabling credential stuffing / password spraying. Uses its own username so a per-account lockout
-    can't collide with other probes that hit /login (e.g. sqli_auth_bypass). N/A when no login form."""
+    can't collide with other probes that hit /login (e.g. sqli_auth_bypass). N/A when no login form, or
+    when the endpoint never returns an auth-shaped rejection (no real server auth to rate-limit)."""
     form = auth.login_form(ctx.profile.forms)
     if form is None:
         return _login_rate_limit_json(ctx, probe)  # no HTML login form -> try a JSON login endpoint
@@ -1506,6 +1548,7 @@ def login_no_rate_limit(ctx, probe) -> bool | None:
         else:
             data[name] = "hacklet_probe_rl"
     attempts = probe.probe.get("attempts", 10)
+    saw_auth = False
     with httpx.Client(base_url=ctx.base_url, timeout=15.0, follow_redirects=False) as c:
         for n in range(attempts):
             try:
@@ -1515,8 +1558,12 @@ def login_no_rate_limit(ctx, probe) -> bool | None:
             if resp.status_code in (429, 423):
                 ctx.evidence.update(throttled=True, after_attempts=n + 1)
                 return False  # throttled -> brute-force protection present -> clean
+            saw_auth = saw_auth or _looks_like_auth_reject(resp)
     if _is_phantom_shell(ctx, resp):
         return None  # the login POSTs just echoed the catch-all shell -> no real handler to rate-limit
+    if not saw_auth:
+        return None  # no attempt looked like a real auth rejection -> client-side / static / platform login,
+                     # no server auth of the app's to rate-limit (a phantom finding otherwise)
     ctx.evidence.update(throttled=False, attempts=attempts, via="html-form")
     return True  # N attempts, never throttled -> no rate limiting -> slop
 

@@ -49,6 +49,24 @@ class _Honest(http.server.BaseHTTPRequestHandler):
         self._send(401, b"invalid credentials") if urlparse(self.path).path == "/login" else self._send(404)
 
 
+class _ClientSideAuth(http.server.BaseHTTPRequestHandler):
+    """SPA with CLIENT-SIDE auth (Supabase/Firebase from the browser): honest 404s (NOT a catch-all, so the
+    phantom-shell check doesn't apply), and the /login POST just re-serves a 200 page with NO server-side
+    auth rejection — there's no backend of the app's to rate-limit, so a 'no rate limiting' fire is phantom."""
+    def log_message(self, *a): pass
+
+    def _send(self, code, body=b"", ctype="text/html"):
+        self.send_response(code); self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+
+    def do_GET(self): self._send(404, b"not found")       # honest 404 -> not a catch-all host
+
+    def do_POST(self):
+        try: self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
+        except Exception: pass
+        self._send(200, b"<html>dashboard</html>")        # client-side auth: no server rejection to see
+
+
 def _serve(cls):
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), cls)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -93,3 +111,10 @@ def test_rate_limit_STILL_fires_on_an_honest_host():
     # the check must not cost recall: an honest /login that never throttles is real slop, must still fire
     prof = Profile(base_url="x", forms=[Form(action="/login", method="post", fields=["username", "password"])])
     assert _run(_Honest, prof, login_no_rate_limit) is True
+
+
+def test_rate_limit_reads_na_on_client_side_auth():
+    # client-side (Supabase/Firebase) login: the POST reaches no server auth backend, so no attempt returns
+    # an auth-shaped rejection -> N/A, not a phantom 'no rate limiting' (the big under-the-radar FP class).
+    prof = Profile(base_url="x", forms=[Form(action="/login", method="post", fields=["username", "password"])])
+    assert _run(_ClientSideAuth, prof, login_no_rate_limit) is None
