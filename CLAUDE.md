@@ -81,7 +81,7 @@ back on. Export the key for a terminal session before a batch.
 | `probes.py` | probe execution. Injection (SQLi, XSS, SSTI, LFI, cmdi, XXE, SSRF), crash resistance, headers, CORS, compression, and more. Each vuln class runs comprehensive techniques that collapse to one finding. `MATCHERS` and `PREDICATES` are the primitive registries. |
 | `aggregate.py` | scoring. Deduction only slop, dampers (variant group fires once, within category geometric decay `CATEGORY_DECAY=0.6`), `coverage_metrics`. |
 | `reportcard.py` | turns a graded record into per finding feedback (expected, actual, indicates, fix), with public and hidden pool disclosure tiers. |
-| `schema.py` | `Report`, `Endpoint`, `Finding`, `Probe` dataclasses (surface, coverage, timings, `pool`). |
+| `schema.py` | `Report`, `Profile`, `Endpoint`, `Outcome`, `Probe` dataclasses (surface, coverage, timings, and `pool` on `Probe`). |
 | `auth.py` | login detection (form and JSON API), self registration, the password change withholding. |
 | `browser.py` | Playwright render (`render_routes` batch, system Chrome fallback), browser driven SPA registration. |
 | `deploy.py` | `RemoteDeployer` and target/URL handling. |
