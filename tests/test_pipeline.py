@@ -230,3 +230,32 @@ def test_progress_callback_fires_per_probe():
     starts = sum(1 for _, is_start in events if is_start)   # outcomes is None -> a start event
     dones = sum(1 for _, is_start in events if not is_start)
     assert starts == n and dones == n  # one start + one done per probe, none skipped
+
+
+def test_a_predicate_can_scale_its_penalty_down_but_never_up(monkeypatch):
+    # a11y grades its penalty by axe-core severity: the predicate sets evidence["penalty_scale"] and the
+    # framework scales the fire DOWN from the designed ceiling, never above it. Locks that bounded hook.
+    import httpx
+    from hacklet_runner.pipeline import _run_probe, _Ctx
+    from hacklet_runner.schema import Probe, Profile
+    from hacklet_runner.probes import PREDICATES
+    prof = Profile(base_url="http://x")
+    client = httpx.Client(base_url="http://x")
+
+    def run_one(scale):
+        def pred(ctx, probe):
+            if scale is not None:
+                ctx.evidence["penalty_scale"] = scale
+            return True
+        monkeypatch.setitem(PREDICATES, "_hl_scale_test", pred)
+        p = Probe(id="t", bundle="qa", category="c", penalty=26, probe={"predicate": "_hl_scale_test"})
+        return _run_probe(p, _Ctx("http://x", client, prof, None), client, prof)[0].penalty
+
+    try:
+        assert run_one(None) == 26     # no scale -> the designed ceiling
+        assert run_one(0.6) == 16      # moderate -> 26*0.6
+        assert run_one(0.3) == 8       # minor -> 26*0.3
+        assert run_one(1.0) == 26      # scale >= 1 ignored -> ceiling (cannot scale UP)
+        assert run_one(9.0) == 26      # out-of-range ignored -> ceiling
+    finally:
+        client.close()

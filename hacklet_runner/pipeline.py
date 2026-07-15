@@ -139,7 +139,11 @@ def _run_probe(probe: Probe, ctx: _Ctx, client: httpx.Client, profile: Profile) 
             # the predicate couldn't establish the conditions to test (e.g. self-registration failed
             # on a CSRF/JSON-API app) -> N/A, NOT a false "clean". A false clean is a missed finding.
             return [_outcome(probe, "not_applicable", 0, target, evidence=ev)]
-        return [_outcome(probe, "slop_detected" if slop else "clean", probe.penalty if slop else 0,
+        pen = probe.penalty
+        scale = ev.get("penalty_scale")   # a predicate MAY scale its fire DOWN from the designed ceiling
+        if slop and isinstance(scale, (int, float)) and 0 <= scale < 1:
+            pen = max(1, round(probe.penalty * scale))   # bounded: [1, probe.penalty], never above the ceiling
+        return [_outcome(probe, "slop_detected" if slop else "clean", pen if slop else 0,
                          target, reason=describe(probe) if slop else "", evidence=ev)]
     na_if_absent = probe.probe.get("na_if_absent", False)
     produced: list[Outcome] = []

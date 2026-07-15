@@ -113,3 +113,11 @@ def test_console_first_party_classification():
     assert fp("boom", "ReferenceError\n    at <anonymous>:1:1", o)                            # inline, no url
     assert not fp("boom", "at g (https://cdn.analytics.com/w.js:1:2)", o)                     # third-party host
     assert not fp("Script error.", "", o)                                                    # cross-origin sanitized
+
+
+def test_a11y_severity_scale_aims_at_exclusion_not_cosmetics():
+    from hacklet_runner.probes import _a11y_scale
+    assert _a11y_scale({"critical": 1}) == 1.0          # real exclusion -> full ceiling
+    assert _a11y_scale({"serious": 2, "minor": 3}) == 1.0
+    assert _a11y_scale({"moderate": 1, "minor": 4}) == 0.6
+    assert _a11y_scale({"minor": 5}) == 0.3             # decorative-alt nits -> scaled down

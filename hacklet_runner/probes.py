@@ -1843,10 +1843,24 @@ def console_errors_present(ctx, probe) -> bool:
     return res["first_party"] > 0
 
 
+def _a11y_scale(impacts: dict) -> float:
+    """Severity-scale factor for the a11y penalty, from the WORST axe-core impact present. Critical/serious
+    violations (real exclusion: no lang, unlabeled inputs, a keyboard trap) hold the full ceiling (1.0);
+    moderate and minor (a decorative-image alt nit) scale DOWN, so the penalty aims at exclusion, not
+    cosmetics. The runner only scales DOWN from the designed 26 ceiling, never up."""
+    if impacts.get("critical") or impacts.get("serious"):
+        return 1.0
+    if impacts.get("moderate"):
+        return 0.6
+    return 0.3   # minor only -> cosmetic
+
+
 def a11y_violations_present(ctx, probe) -> bool:
     """Browser oracle: WCAG 2 A/AA accessibility violations from axe-core (its deterministic `violations`
     set) above the threshold. Browser-gated; axe reports only algorithmically-determinable failures, so
-    it stays intent-independent (the `incomplete`/needs-review rules are excluded)."""
+    it stays intent-independent (the `incomplete`/needs-review rules are excluded). The penalty is
+    severity-graded by the worst impact (see _a11y_scale) so a cosmetic-only page isn't charged the full
+    exclusion penalty."""
     url = ctx.base_url.rstrip("/") + probe.probe.get("target", "/")
     viols = browser.a11y_violations(url, headers=ctx.headers)
     if viols is None:
@@ -1855,7 +1869,7 @@ def a11y_violations_present(ctx, probe) -> bool:
     for v in viols:
         impacts[v.get("impact")] = impacts.get(v.get("impact"), 0) + 1
     ctx.evidence.update(violations=len(viols), rules=sorted({v["id"] for v in viols})[:15],
-                        impacts=impacts, engine="axe-core")
+                        impacts=impacts, engine="axe-core", penalty_scale=_a11y_scale(impacts))
     return len(viols) > probe.probe.get("threshold", 0)
 
 
