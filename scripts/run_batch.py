@@ -97,6 +97,23 @@ def _only(jobs, only):
     return [j for j in jobs if only is None or j["source"] == only]
 
 
+def _interleave(jobs):
+    """Round-robin the jobs across their hackathon slugs (breadth-first) instead of draining one slug fully
+    before starting the next. Any prefix — a partial or interrupted run — is then a BALANCED sample across
+    ALL slugs (~one app each, cycling) rather than 100% of the first few slugs and 0% of the rest. Fully
+    deterministic (surface-cache-safe): groups by slug in first-appearance order, then cycles by index."""
+    groups = {}
+    for j in jobs:
+        groups.setdefault(j["rec"].get("hackathon"), []).append(j)
+    out, i = [], 0
+    while len(out) < len(jobs):
+        for g in groups.values():
+            if i < len(g):
+                out.append(g[i])
+        i += 1
+    return out
+
+
 def _pending(jobs, results_path, mode):
     """Jobs still needing to run under resume `mode`:
       "default"        every job not yet SUCCESSFULLY done — retries failed repos+urls, AND catches a
@@ -358,6 +375,10 @@ def main():
     ap.add_argument("--max-pages", type=int, default=25, dest="max_pages",
                     help="safety cap on gallery pages per hackathon (pages auto-fetched to fill --limit)")
     ap.add_argument("--limit", type=int, default=25, help="max repos to grade")
+    ap.add_argument("--no-interleave", dest="no_interleave", action="store_true",
+                    help="grade slug-by-slug (drain each hackathon fully before the next) instead of the "
+                         "default breadth-first round-robin. Default cycles across slugs so any partial/killed "
+                         "run is a balanced sample across ALL slugs, not 100%% of the first few.")
     ap.add_argument("--ingest-cache", metavar="FILE", dest="ingest_cache", default=None,
                     help="forward to devpost_repos: JSONL memo of Devpost fetches so a re-run of an already-"
                          "scraped hackathon does ~zero network (default: $HL_CACHE_DIR/devpost-ingest.jsonl).")
@@ -445,6 +466,8 @@ def main():
             "no_repeat_repo" if args.no_repeat_repo else "default")
     jobs = _only(_plan_jobs(records), args.only)   # --repo-only / --url-only cohort filter (None = both)
     to_run = _pending(jobs, args.results, mode)
+    if not args.no_interleave:
+        to_run = _interleave(to_run)   # breadth-first across slugs -> any partial run stays balanced
     n_repo = sum(j["source"] == "repo" for j in to_run)
     done_n = len(jobs) - len(to_run)
     only_tag = f" [{args.only}-only]" if args.only else ""
