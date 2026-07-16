@@ -27,7 +27,7 @@ def test_gate_credits_dnf_and_flags_only_ungated_residual_fps():
         # working catch-all: an UN-GATED phantom-sensitive probe (host-header) is a residual FP. A GATED probe
         # (sec-sqli-004, liveness-vetted) is NOT a phantom FP even here — a modern app has a catch-all frontend
         # AND a real API. A gated rate-limit is an ownership ADVISORY (real login, likely third-party), not an FP.
-        _rec("gh/catchall", 60, [_f("sec-hosthdr-001", 15), _f("sec-sqli-004", 40), _f("sec-ratelimit-001", 15),
+        _rec("gh/catchall", 60, [_f("sec-lfi-001", 30), _f("sec-sqli-004", 40), _f("sec-ratelimit-001", 15),
                                  _f("qa-http-001", 8, "qa"), _f("sec-headers-002", 12)], page_state="working"),
         # working, no catch-all -> nothing flagged
         _rec("gh/clean", 30, [_f("sec-headers-002", 12), _f("qa-a11y-001", 26, "qa")], page_state="working"),
@@ -40,7 +40,7 @@ def test_gate_credits_dnf_and_flags_only_ungated_residual_fps():
     assert a["gated_slop"] == 130                                             # 80 + 50 kept OUT of the distribution
     fp = {(repo, pid) for repo, pid, *_ in a["flagged"]}
     adv = {(repo, pid) for repo, pid, *_ in a["advisories"]}
-    assert ("gh/catchall", "sec-hosthdr-001") in fp                          # UN-GATED phantom-sensitive on catch-all -> FP
+    assert ("gh/catchall", "sec-lfi-001") in fp                              # UN-GATED phantom-sensitive on catch-all -> FP
     assert ("gh/catchall", "sec-sqli-004") not in fp                         # GATED (liveness-vetted) -> not a phantom FP
     assert ("gh/catchall", "sec-ratelimit-001") not in fp                    # gated -> not an FP...
     assert ("gh/catchall", "sec-ratelimit-001") in adv                       # ...but an ownership ADVISORY (real login)

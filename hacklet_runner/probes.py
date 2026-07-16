@@ -2678,6 +2678,13 @@ def host_header_injection(ctx, probe) -> bool:
     targets = list(dict.fromkeys(list(_HOST_TARGETS) + routes))
     with make_client(ctx.base_url, ctx.headers, timeout=10.0, follow_redirects=False) as c:
         for path in targets:
+            try:
+                baseline = c.get(path)
+            except (httpx.HTTPError, httpx.InvalidURL):
+                continue
+            if not _endpoint_is_live(ctx, c, path, "get", baseline):
+                continue   # catch-all / soft-404 host serves this auth route as the SPA shell -> a reflected
+                           # Host is the platform echoing it, not the app building a link -> phantom (the FP class)
             for hdr in _HOST_HEADERS:
                 try:
                     r = c.get(path, headers={hdr: marker})
