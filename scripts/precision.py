@@ -24,6 +24,13 @@ from collections import Counter, defaultdict
 _PHANTOM_SENSITIVE = ("sec-sqli", "sec-csrf", "sec-cmdi", "sec-ssti", "sec-lfi", "sec-hosthdr",
                       "sec-split", "sec-ratelimit", "sec-idor", "sec-redirect", "sec-dos", "sec-xss",
                       "sec-ssrf", "qa-crash", "qa-race")
+# These probes now route through the endpoint-level LIVENESS GATE (_endpoint_is_live in probes.py): they
+# only fire on an endpoint proven distinct from a nonexistent sibling under its own prefix. So a SURVIVING
+# fire is on a REAL server endpoint, and the host-level catch-all flag no longer implies a phantom — a modern
+# app routinely pairs a catch-all SPA FRONTEND with a real API BACKEND (roadio's /api/locations/search, a real
+# SQLi, was firing correctly but getting false-flagged here just because the frontend is a catch-all). We
+# TRUST the gate for these and never call their fires catch-all phantoms.
+_GATE_VETTED = ("sec-sqli-004", "sec-ratelimit-001", "sec-csrf-001", "qa-crash-010")
 # Everything else (headers/a11y/seo/perf/compression/dead-controls/...) measures the ACTUAL served
 # response and stays real even on a catch-all — a missing CSP header is missing regardless.
 _NON_WORKING = {"broken", "not-an-app", "placeholder"}   # page states where the WHOLE surface is untrustworthy
@@ -44,15 +51,26 @@ def _soft404(r):
 
 
 def _suspect(f, catch_all):
-    """Return a reason string if finding f is a likely false positive, else None. Called ONLY on scored apps —
-    non-working apps are gated out and a disputed-broken app has real captured surface, so page_state is no
-    longer a suspicion signal here; what remains is vendor-reflection XSS and catch-all phantom fires."""
+    """Classify finding f on a scored app as one of:
+      - ("fp", reason)        a likely FALSE POSITIVE (counts toward the precision gap)
+      - ("advisory", reason)  a REAL finding flagged for review (NOT an FP), e.g. a third-party platform login
+      - None                  looks real
+    Gate-aware: sec-sqli-004 / sec-ratelimit-001 / sec-csrf-001 / qa-crash-010 route through the liveness gate,
+    so a surviving fire is on a real endpoint — never a catch-all phantom. Rate-limit on a catch-all-frontend
+    host is the one nuance: the login is live but is often a THIRD-PARTY platform login (real endpoint, wrong
+    OWNER), so it is an advisory, not an FP — it dissolves when teams submit their own URLs."""
     pid = f.get("probe_id", "")
     ev = f.get("evidence") or {}
     if pid.startswith("sec-xss") and (ev.get("field") or "").lower() in _VENDOR_FIELDS:
-        return f"reflection is a vendor anti-bot field ({ev.get('field')}), not app-controlled XSS"
+        return ("fp", f"reflection is a vendor anti-bot field ({ev.get('field')}), not app-controlled XSS")
+    if pid == "sec-ratelimit-001" and catch_all:
+        return ("advisory", "rate-limit on a live login on a catch-all-frontend host — likely a third-party "
+                            "platform login (real endpoint, verify it is the team's own app)")
+    if pid in _GATE_VETTED:
+        return None   # liveness-gated: a surviving fire is on a REAL endpoint, not a catch-all phantom
     if _phantom_sensitive(pid) and catch_all:
-        return "catch-all / soft-404 host — the targeted endpoint likely doesn't exist server-side"
+        return ("fp", "catch-all / soft-404 host — the targeted endpoint likely doesn't exist server-side "
+                      "(un-gated phantom-sensitive probe)")
     # NOTE: a login-wall is NOT flagged — its login form + rate-limiting ARE real, testable surface.
     return None
 
@@ -83,9 +101,9 @@ def analyze(recs):
     have_score = [r for r in recs if isinstance(r.get("slop_score"), (int, float))]
     gated = [r for r in have_score if _gated(r)]          # correctly DNF'd by the gate -> not a precision problem
     scored = [r for r in have_score if not _gated(r)]     # the apps that ACTUALLY count toward the score
-    per_probe = defaultdict(lambda: [0, 0])              # pid -> [fires, suspect]
-    reasons = Counter()
-    flagged = []                                         # (repo, pid, penalty, count, reason)
+    per_probe = defaultdict(lambda: [0, 0])              # pid -> [fires, FALSE-positives]
+    fp_reasons, adv_reasons = Counter(), Counter()
+    flagged, advisories = [], []                         # (repo, pid, penalty, count, reason)
     catchall_apps = 0
     for r in scored:                                     # measure precision ONLY on what's actually scored
         catch_all = _soft404(r) or bool((r.get("observed_surface") or {}).get("catch_all"))
@@ -93,13 +111,21 @@ def analyze(recs):
         for f in r.get("findings", []):
             pid = f["probe_id"]
             per_probe[pid][0] += 1
-            why = _suspect(f, catch_all)
-            if why:
+            res = _suspect(f, catch_all)
+            if not res:
+                continue
+            klass, why = res
+            row = (r.get("repo", ""), pid, f.get("penalty", 0), f.get("count", 1), why)
+            if klass == "fp":
                 per_probe[pid][1] += 1
-                reasons[why.split(" —")[0].split(" (")[0]] += 1
-                flagged.append((r["repo"], pid, f.get("penalty", 0), f.get("count", 1), why))
+                fp_reasons[why.split(" —")[0].split(" (")[0]] += 1
+                flagged.append(row)
+            else:                                        # advisory: a REAL finding flagged for review, not an FP
+                adv_reasons[why.split(" —")[0].split(" (")[0]] += 1
+                advisories.append(row)
     return {"scored": scored, "gated": gated, "gated_slop": sum(r.get("slop_score") or 0 for r in gated),
-            "per_probe": per_probe, "reasons": reasons, "flagged": flagged, "catchall_apps": catchall_apps}
+            "per_probe": per_probe, "fp_reasons": fp_reasons, "adv_reasons": adv_reasons,
+            "flagged": flagged, "advisories": advisories, "catchall_apps": catchall_apps}
 
 
 def main():
@@ -112,18 +138,20 @@ def main():
     a = analyze(recs)
     scored = a["scored"]
     total_fires = sum(v[0] for v in a["per_probe"].values())
-    total_suspect = sum(v[1] for v in a["per_probe"].values())
-    suspect_apps = len({f[0] for f in a["flagged"]})
+    total_fp = sum(v[1] for v in a["per_probe"].values())
+    fp_apps = len({x[0] for x in a["flagged"]})
+    adv_apps = len({x[0] for x in a["advisories"]})
 
     if args.json:
         print(json.dumps({
             "n_scored": len(scored), "n_gated_dnf": len(a["gated"]), "gated_slop": a["gated_slop"],
-            "scored_fires": total_fires, "suspect_fires": total_suspect, "suspect_apps": suspect_apps,
-            "catchall_apps": a["catchall_apps"],
-            "per_probe_precision": {pid: {"fires": v[0], "suspect": v[1],
+            "scored_fires": total_fires, "false_positive_fires": total_fp, "fp_apps": fp_apps,
+            "advisory_fires": len(a["advisories"]), "advisory_apps": adv_apps, "catchall_apps": a["catchall_apps"],
+            "per_probe_precision": {pid: {"fires": v[0], "false_positives": v[1],
                                           "precision_pct": round((v[0] - v[1]) / v[0] * 100, 1) if v[0] else None}
                                     for pid, v in sorted(a["per_probe"].items())},
-            "residual_reasons": dict(a["reasons"].most_common()),
+            "fp_reasons": dict(a["fp_reasons"].most_common()),
+            "advisory_reasons": dict(a["adv_reasons"].most_common()),
         }, indent=2))
         return
 
@@ -131,25 +159,37 @@ def main():
     print(f"\n(0) DNF GATE — {len(a['gated'])} apps flagged broken/not-an-app -> ranked DNF-class, EXCLUDED from "
           f"scoring\n    ({a['gated_slop']} slop the gate correctly kept OUT of the distribution — not a precision gap).")
     print(f"\n(1) RESIDUAL FALSE POSITIVES ON SCORED APPS — the real precision gap that's LEFT")
-    if a["reasons"]:
-        print(f"    {total_suspect}/{total_fires} fires on scored apps suspect  ({total_suspect/(total_fires or 1)*100:.0f}%), "
-              f"across {suspect_apps} apps:")
-        for why, n in a["reasons"].most_common():
+    print(f"    (sqli/rate-limit/csrf/crash route through the liveness gate, so a surviving fire is on a REAL")
+    print(f"     endpoint — never a catch-all phantom. The residual is un-gated probes + vendor-reflection XSS.)")
+    if a["fp_reasons"]:
+        print(f"    {total_fp}/{total_fires} fires are likely FALSE POSITIVES  ({total_fp/(total_fires or 1)*100:.0f}%), "
+              f"across {fp_apps} apps:")
+        for why, n in a["fp_reasons"].most_common():
             print(f"      {n:>4}  {why}")
     else:
         print(f"    none — every fire on a scored app looks real (0/{total_fires}). Precision clean.")
-    print(f"\n(2) PER-PROBE PRECISION  (phantom-sensitive probes, SCORED apps only)")
+
+    if a["advisories"]:
+        print(f"\n(1b) OWNERSHIP-FLAGGED — REAL findings on live endpoints, NOT false positives")
+        print(f"    {len(a['advisories'])} fires across {adv_apps} apps. These dissolve when teams submit their OWN URLs:")
+        for why, n in a["adv_reasons"].most_common():
+            print(f"      {n:>4}  {why}")
+
+    print(f"\n(2) PER-PROBE PRECISION  (phantom-sensitive probes, SCORED apps only; [gated] = liveness-vetted)")
     rows = [(pid, v[0], v[1]) for pid, v in a["per_probe"].items() if _phantom_sensitive(pid) and v[0]]
-    for pid, fires, susp in sorted(rows, key=lambda x: -x[2]) or [(None, 0, 0)]:
+    for pid, fires, fp in sorted(rows, key=lambda x: -x[2]) or [(None, 0, 0)]:
         if pid is None:
             print("    (no phantom-sensitive probes fired on scored apps)")
             break
-        prec = (fires - susp) / fires * 100
-        print(f"    {pid:20} {fires:>4} fires · {susp:>4} suspect · precision {prec:5.0f}% {'█' * int(round(prec / 5))}")
-    if a["flagged"]:
-        print(f"\n(3) FLAGGED FINDINGS  (top {args.show} by penalty)")
-        for repo, pid, pen, cnt, why in sorted(a["flagged"], key=lambda x: -x[2])[:args.show]:
-            print(f"    {repo.rsplit('/', 1)[-1][:30]:30} {pid:18} pen={pen:>3}×{cnt:<2} — {why[:58]}")
+        prec = (fires - fp) / fires * 100
+        tag = " [gated]" if pid in _GATE_VETTED else ""
+        print(f"    {pid:20} {fires:>4} fires · {fp:>4} FP · precision {prec:5.0f}% {'█' * int(round(prec / 5))}{tag}")
+
+    combined = [("   ", *x) for x in a["flagged"]] + [("[A]", *x) for x in a["advisories"]]
+    if combined:
+        print(f"\n(3) FLAGGED FINDINGS  (top {args.show} by penalty; [A] = advisory/ownership, not an FP)")
+        for mark, repo, pid, pen, cnt, why in sorted(combined, key=lambda x: -x[3])[:args.show]:
+            print(f"    {mark} {(repo or '').rsplit('/', 1)[-1][:28]:28} {pid:18} pen={pen:>3}×{cnt:<2} — {why[:52]}")
     print()
 
 
