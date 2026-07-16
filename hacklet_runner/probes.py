@@ -2608,13 +2608,17 @@ def decompression_bomb(ctx, probe) -> bool | None:
     with make_client(ctx.base_url, ctx.headers, timeout=20.0) as c:
         for path in posts:
             try:                                       # 3-way: decompressed-valid != raw-gzip-bytes -> it decompresses
-                sa = c.post(path, content=valid, headers=json_ct).status_code       # valid body, no encoding
+                ra = c.post(path, content=valid, headers=json_ct)                   # valid body, no encoding
+                sa = ra.status_code
                 sb = c.post(path, content=gz_valid, headers=json_ct).status_code    # gzip BYTES, no CE header
                 sc = c.post(path, content=gz_valid, headers=gz_ct).status_code      # gzip body, CE: gzip
             except (httpx.HTTPError, httpx.InvalidURL):
                 continue
             if not (sc == sa and sc != sb):
                 continue                               # endpoint doesn't decompress request bodies -> no bomb surface
+            if not _endpoint_is_live(ctx, c, path, "post", ra):
+                continue                               # a catch-all phantom endpoint -> the decompression is a
+                                                       # platform-edge artifact, not the app's (the g-ai-sigma FP)
             tested = True
             try:
                 r = c.post(path, content=bomb, headers=gz_ct)
@@ -2636,7 +2640,11 @@ def decompression_bomb(ctx, probe) -> bool | None:
 # unique marker host; fire if it comes back in a Location header or the body. A random marker can't
 # reflect by coincidence -> near-zero false positives. Universally testable -> never N/A.
 _HOST_HEADERS = ("Host", "X-Forwarded-Host")
-_HOST_TARGETS = ("/", "/account", "/reset", "/password-reset", "/forgot", "/login", "/verify", "/link")
+# NOT the bare "/": a host reflected on the homepage is almost always the platform's canonical <link> /
+# og:url echoing the requested host (near-universal on SPA/CDN hosts), a benign artifact, not the app's
+# vuln. Host-header injection is dangerous where the app builds a link/redirect it hands the USER (a reset
+# email, a login redirect), so target the reset/account/verify routes where reflection means poisoning.
+_HOST_TARGETS = ("/account", "/reset", "/password-reset", "/forgot", "/login", "/verify", "/link")
 
 
 def host_header_injection(ctx, probe) -> bool:

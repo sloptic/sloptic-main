@@ -30,7 +30,7 @@ _PHANTOM_SENSITIVE = ("sec-sqli", "sec-csrf", "sec-cmdi", "sec-ssti", "sec-lfi",
 # app routinely pairs a catch-all SPA FRONTEND with a real API BACKEND (roadio's /api/locations/search, a real
 # SQLi, was firing correctly but getting false-flagged here just because the frontend is a catch-all). We
 # TRUST the gate for these and never call their fires catch-all phantoms.
-_GATE_VETTED = ("sec-sqli-004", "sec-ratelimit-001", "sec-csrf-001", "qa-crash-010")
+_GATE_VETTED = ("sec-sqli-004", "sec-ratelimit-001", "sec-csrf-001", "qa-crash-010", "sec-dos-001")
 # Everything else (headers/a11y/seo/perf/compression/dead-controls/...) measures the ACTUAL served
 # response and stays real even on a catch-all — a missing CSP header is missing regardless.
 _NON_WORKING = {"broken", "not-an-app", "placeholder"}   # page states where the WHOLE surface is untrustworthy
