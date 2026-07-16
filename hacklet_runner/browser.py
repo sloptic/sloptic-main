@@ -553,7 +553,10 @@ def a11y_violations(url: str, headers=None, timeout: float = 12.0) -> list | Non
                 page = b.new_page(bypass_csp=True)   # inject our audit tool even when the target sets a CSP
                 _apply_auth(page, url, headers)
                 page.goto(url, timeout=timeout * 1000, wait_until="load")
-                page.wait_for_timeout(300)
+                try:                                              # let the SPA finish its post-load render +
+                    page.wait_for_load_state("networkidle", timeout=8000)   # data fetch BEFORE axe scans, else
+                except Exception:                                 # it scans a half-rendered DOM and under-counts
+                    page.wait_for_timeout(300)                    # violations (and the count flaps between runs)
                 page.add_script_tag(content=_axe_js())            # defines window.axe
                 results = page.evaluate(
                     "() => axe.run(document, {runOnly: {type: 'tag', values: %s}})" % json.dumps(_AXE_WCAG_TAGS))

@@ -1859,24 +1859,32 @@ def console_errors_present(ctx, probe) -> bool:
     return res["first_party"] > 0
 
 
-def _a11y_scale(impacts: dict) -> float:
-    """Severity-scale factor for the a11y penalty, from the WORST axe-core impact present. Critical/serious
-    violations (real exclusion: no lang, unlabeled inputs, a keyboard trap) hold the full ceiling (1.0);
-    moderate and minor (a decorative-image alt nit) scale DOWN, so the penalty aims at exclusion, not
-    cosmetics. The runner only scales DOWN from the designed 26 ceiling, never up."""
-    if impacts.get("critical") or impacts.get("serious"):
-        return 1.0
-    if impacts.get("moderate"):
-        return 0.6
-    return 0.3   # minor only -> cosmetic
+_A11Y_TIER = {"critical": 30, "serious": 18, "moderate": 10, "minor": 4}
+# a no-browser static hard-fail -> the axe impact of the equivalent rule, so a11y-002's SUM uses the same
+# tiers as a11y-001 (the two probes are one logical flaw, one static one rendered).
+_STATIC_A11Y_IMPACT = {"missing-lang": "serious", "img-missing-alt": "critical", "missing-title": "serious",
+                       "control-no-accessible-name": "critical", "low-contrast": "serious"}
+
+
+def _a11y_penalty(impacts: dict) -> int:
+    """Per-rule-capped SUM of the a11y penalty: each DISTINCT violated rule contributes its impact tier
+    ONCE (axe assigns one impact per rule, and `impacts` already counts rules, not nodes — so a systematic
+    issue across 50 buttons is still one barrier, not 50). a11y harm is ADDITIVE across orthogonal
+    populations — a contrast miss (serious: blocks low-vision) and an unlabeled control (critical: blocks
+    screen-reader users) are different barriers on different axes, so they STACK rather than collapse to the
+    worst one (the opposite of security's weakest-link). Tiers aim weight at exclusion over cosmetics;
+    corpus-calibrated (critical 30 > serious 18 > moderate 10 > minor 4) so a genuinely unusable app
+    exceeds the old flat 26 ceiling while a lone contrast miss settles below it. Unbounded by design (the
+    slop score is deduction-only + unbounded); the per-RULE cap is the only cap."""
+    return sum(n * _A11Y_TIER.get(level, _A11Y_TIER["minor"]) for level, n in impacts.items())
 
 
 def a11y_violations_present(ctx, probe) -> bool:
     """Browser oracle: WCAG 2 A/AA accessibility violations from axe-core (its deterministic `violations`
     set) above the threshold. Browser-gated; axe reports only algorithmically-determinable failures, so
-    it stays intent-independent (the `incomplete`/needs-review rules are excluded). The penalty is
-    severity-graded by the worst impact (see _a11y_scale) so a cosmetic-only page isn't charged the full
-    exclusion penalty."""
+    it stays intent-independent (the `incomplete`/needs-review rules are excluded). The penalty is a
+    per-rule severity-tiered SUM (see _a11y_penalty) so a multi-barrier page outscores a single-barrier
+    one and a lone cosmetic issue isn't charged the full exclusion penalty."""
     url = ctx.base_url.rstrip("/") + probe.probe.get("target", "/")
     viols = browser.a11y_violations(url, headers=ctx.headers)
     if viols is None:
@@ -1885,7 +1893,7 @@ def a11y_violations_present(ctx, probe) -> bool:
     for v in viols:
         impacts[v.get("impact")] = impacts.get(v.get("impact"), 0) + 1
     ctx.evidence.update(violations=len(viols), rules=sorted({v["id"] for v in viols})[:15],
-                        impacts=impacts, engine="axe-core", penalty_scale=_a11y_scale(impacts))
+                        impacts=impacts, engine="axe-core", penalty_override=_a11y_penalty(impacts))
     return len(viols) > probe.probe.get("threshold", 0)
 
 
@@ -2315,7 +2323,9 @@ def a11y_hard_fails(ctx, probe) -> bool | None:
     """Parse the homepage HTML for objective WCAG hard-fails with no browser: <html> without lang
     (3.1.1), <img> without alt (1.1.1), a form control with no accessible name (4.1.2/3.3.2), a
     missing/empty <title> (2.4.2), and inline-styled text below the universal 3:1 contrast floor (1.4.3,
-    the ratio math). One finding. N/A on a non-HTML homepage."""
+    the ratio math). Each DISTINCT hard-fail contributes its severity tier to a SUM (see _a11y_penalty /
+    _STATIC_A11Y_IMPACT), matching the browser axe probe's model so a multi-barrier page outscores a
+    single-barrier one and the score doesn't jump when the browser is on vs off. N/A on a non-HTML page."""
     with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
         try:
             r = c.get(probe.probe.get("target", "/"))
@@ -2324,18 +2334,16 @@ def a11y_hard_fails(ctx, probe) -> bool | None:
     if "html" not in r.headers.get("content-type", "").lower():
         return None
     doc = r.text
+    fails: list[str] = []                                         # every distinct barrier, not the first
     m = re.search(r"<html\b([^>]*)>", doc, re.IGNORECASE)          # 1. <html> missing lang
     if m and not re.search(r"\blang\s*=", m.group(1), re.IGNORECASE):
-        ctx.evidence.update(fail="missing-lang")
-        return True
-    for tag in re.findall(r"<img\b[^>]*>", doc, re.IGNORECASE):    # 2. <img> missing alt
-        if not re.search(r"\balt\s*=", tag, re.IGNORECASE):
-            ctx.evidence.update(fail="img-missing-alt")
-            return True
+        fails.append("missing-lang")
+    if any(not re.search(r"\balt\s*=", tag, re.IGNORECASE)        # 2. <img> missing alt
+           for tag in re.findall(r"<img\b[^>]*>", doc, re.IGNORECASE)):
+        fails.append("img-missing-alt")
     tm = re.search(r"<title\b[^>]*>(.*?)</title>", doc, re.IGNORECASE | re.DOTALL)  # 3. missing/empty <title>
     if not tm or not tm.group(1).strip():
-        ctx.evidence.update(fail="missing-title")
-        return True
+        fails.append("missing-title")
     label_fors = set(re.findall(r"""<label\b[^>]*\bfor\s*=\s*["']?([^"'>\s]+)""", doc, re.IGNORECASE))
     label_spans = [(mm.start(), mm.end())                          # 4. control with no accessible name
                    for mm in re.finditer(r"<label\b.*?</label>", doc, re.IGNORECASE | re.DOTALL)]
@@ -2351,8 +2359,8 @@ def a11y_hard_fails(ctx, probe) -> bool | None:
             continue
         if any(s <= mm.start() < e for s, e in label_spans):
             continue
-        ctx.evidence.update(fail="control-no-accessible-name")
-        return True
+        fails.append("control-no-accessible-name")
+        break                                                     # one unlabeled control -> the barrier exists
     for mm in re.finditer(r"""<([a-z0-9]+)\b[^>]*\bstyle\s*=\s*["']([^"']*)["'][^>]*>(.*?)</\1>""",
                           doc, re.IGNORECASE | re.DOTALL):         # 5. inline-style contrast < 3:1 floor
         style = mm.group(2)
@@ -2363,10 +2371,17 @@ def a11y_hard_fails(ctx, probe) -> bool | None:
         if cm and bm:
             fg, bg = _parse_color(cm.group(1)), _parse_color(bm.group(1))
             if fg and bg and _contrast_ratio(fg, bg) < 3.0:
-                ctx.evidence.update(fail="low-contrast", ratio=round(_contrast_ratio(fg, bg), 2))
-                return True
-    ctx.evidence.update(fail=None)   # all objective WCAG hard-fails passed
-    return False
+                fails.append("low-contrast")
+                break
+    if not fails:
+        ctx.evidence.update(fails=[])   # all objective WCAG hard-fails passed
+        return False
+    impacts: dict[str, int] = {}
+    for f in fails:
+        lvl = _STATIC_A11Y_IMPACT.get(f, "serious")
+        impacts[lvl] = impacts.get(lvl, 0) + 1
+    ctx.evidence.update(fails=fails, impacts=impacts, penalty_override=_a11y_penalty(impacts))
+    return True
 
 
 # Broken links — an internal <a href> that leads to a 4xx is a dead end in the user's journey. Fire on

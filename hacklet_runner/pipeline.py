@@ -118,6 +118,10 @@ def _matches(probe: Probe, resp: httpx.Response) -> bool:
     return bool(probe.slop_if)
 
 
+_PENALTY_CAP = 250   # runaway guard on penalty_override — above any real per-rule a11y sum (axe dedups to
+                     # ~100 rules max), so it only ever catches a bug, never clips a legitimate multi-barrier fire
+
+
 def _run_probe(probe: Probe, ctx: _Ctx, client: httpx.Client, profile: Profile) -> list[Outcome]:
     """Resolve one probe to its outcome(s): applicability gate, then an oracle predicate or a
     declarative fan-out across discovered targets. One Outcome per (probe x target)."""
@@ -140,9 +144,9 @@ def _run_probe(probe: Probe, ctx: _Ctx, client: httpx.Client, profile: Profile) 
             # on a CSRF/JSON-API app) -> N/A, NOT a false "clean". A false clean is a missed finding.
             return [_outcome(probe, "not_applicable", 0, target, evidence=ev)]
         pen = probe.penalty
-        scale = ev.get("penalty_scale")   # a predicate MAY scale its fire DOWN from the designed ceiling
-        if slop and isinstance(scale, (int, float)) and 0 <= scale < 1:
-            pen = max(1, round(probe.penalty * scale))   # bounded: [1, probe.penalty], never above the ceiling
+        override = ev.get("penalty_override")   # a predicate MAY set an ABSOLUTE penalty that can EXCEED the
+        if slop and isinstance(override, (int, float)) and override >= 0:   # nominal ceiling (the a11y per-rule
+            pen = max(1, min(round(override), _PENALTY_CAP))                # severity sum); runaway-guarded
         return [_outcome(probe, "slop_detected" if slop else "clean", pen if slop else 0,
                          target, reason=describe(probe) if slop else "", evidence=ev)]
     na_if_absent = probe.probe.get("na_if_absent", False)

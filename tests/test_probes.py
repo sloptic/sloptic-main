@@ -115,9 +115,11 @@ def test_console_first_party_classification():
     assert not fp("Script error.", "", o)                                                    # cross-origin sanitized
 
 
-def test_a11y_severity_scale_aims_at_exclusion_not_cosmetics():
-    from hacklet_runner.probes import _a11y_scale
-    assert _a11y_scale({"critical": 1}) == 1.0          # real exclusion -> full ceiling
-    assert _a11y_scale({"serious": 2, "minor": 3}) == 1.0
-    assert _a11y_scale({"moderate": 1, "minor": 4}) == 0.6
-    assert _a11y_scale({"minor": 5}) == 0.3             # decorative-alt nits -> scaled down
+def test_a11y_penalty_sums_barriers_by_severity_tier():
+    from hacklet_runner.probes import _a11y_penalty
+    assert _a11y_penalty({"serious": 1}) == 18                  # a lone contrast miss -> below the old flat 26
+    assert _a11y_penalty({"critical": 1}) == 30                 # a screen-reader blocker -> above the old ceiling
+    assert _a11y_penalty({"serious": 1, "critical": 1}) == 48   # additive across populations: barriers STACK
+    assert _a11y_penalty({"serious": 3}) == 54                  # 3 distinct serious barriers, not maxed to one
+    assert _a11y_penalty({"moderate": 1, "minor": 2}) == 18     # 10 + 2*4 -> cosmetics stay cheap
+    assert _a11y_penalty({}) == 0

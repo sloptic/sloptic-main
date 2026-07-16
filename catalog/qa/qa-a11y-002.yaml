@@ -4,8 +4,9 @@ category: accessibility
 variant_group_id: qa-a11y   # same flaw as qa-a11y-001 (browser), two detection methods -> fire once
 pool: public
 evidence_model: provable
-penalty: 26   # objective WCAG hard-fails from static HTML; ~16% of users barred (WHO 2023).
-              # High-frequency-population harm. Grouped w/ qa-a11y-001 (browser), fires once.
+penalty: 30   # NOMINAL — real fire is a per-fail severity SUM (_a11y_penalty), matching the browser probe so
+              # the score doesn't jump browser-on vs off. Objective WCAG hard-fails from static HTML; ~16% of
+              # users barred (WHO 2023). High-frequency-population harm. Grouped w/ qa-a11y-001, fires once.
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:

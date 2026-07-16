@@ -138,8 +138,10 @@ def test_vulnerable_app_accrues_slop():
     # (frequency x severity, see the catalog): security holds its catastrophic per-instance ceiling (40),
     # while qa/perf are priced up for their every-user frequency. On this deliberately security-riddled
     # reference, security still dominates; a realistic janky app (references/qa-janky) leans qa/perf.
-    assert report.axis_slop == {"security": 421, "qa": 146, "performance": 68}
-    assert report.slop_score == 635   # recalibrated: xss 30->35 (+5), broken-links 24->12 (-12)
+    assert report.axis_slop == {"security": 421, "qa": 186, "performance": 68}
+    assert report.slop_score == 675   # xss 30->35, broken-links 24->12; a11y flat-26 -> per-rule severity
+                                      # SUM (+40: the vulnerable ref's 3 barriers — no lang/no title/unlabeled
+                                      # control = 18+18+30 = 66 — now stack instead of short-circuiting at 26)
     assert sum(report.axis_slop.values()) == report.slop_score
 
 
@@ -210,7 +212,7 @@ def test_cached_profile_freezes_surface_and_reproduces_score(monkeypatch):
     catalog = load_catalog(CATALOG)
     minted = []
     r1 = run(SubprocessDeployer(str(REFS / "vulnerable" / "app.py")), catalog, on_profile=minted.append)
-    assert len(minted) == 1 and r1.slop_score == 635          # cache MISS -> discovered once + handed back
+    assert len(minted) == 1 and r1.slop_score == 675          # cache MISS -> discovered once + handed back
 
     import hacklet_runner.pipeline as pipeline_mod            # PROVE the crawl is skipped on a cache HIT:
     monkeypatch.setattr(pipeline_mod, "discover",             # discover() must never be called with a cached profile
@@ -218,7 +220,7 @@ def test_cached_profile_freezes_surface_and_reproduces_score(monkeypatch):
     seen = []
     r2 = run(SubprocessDeployer(str(REFS / "vulnerable" / "app.py")), catalog,
              cached_profile=minted[0], on_profile=seen.append)
-    assert r2.slop_score == 635 and seen == []                # HIT -> same score, no re-crawl, no re-mint
+    assert r2.slop_score == 675 and seen == []                # HIT -> same score, no re-crawl, no re-mint
     assert r2.axis_slop == r1.axis_slop                       # identical per-axis decomposition too
 
 
@@ -232,30 +234,31 @@ def test_progress_callback_fires_per_probe():
     assert starts == n and dones == n  # one start + one done per probe, none skipped
 
 
-def test_a_predicate_can_scale_its_penalty_down_but_never_up(monkeypatch):
-    # a11y grades its penalty by axe-core severity: the predicate sets evidence["penalty_scale"] and the
-    # framework scales the fire DOWN from the designed ceiling, never above it. Locks that bounded hook.
+def test_a_predicate_can_override_its_penalty_absolutely(monkeypatch):
+    # a11y computes a per-rule severity SUM that can EXCEED the nominal ceiling (barriers stack); the
+    # predicate sets evidence["penalty_override"] and the framework uses it as the absolute fire penalty,
+    # bounded to [1, _PENALTY_CAP]. Locks that hook (which subsumes the old down-only scale).
     import httpx
-    from hacklet_runner.pipeline import _run_probe, _Ctx
+    from hacklet_runner.pipeline import _run_probe, _Ctx, _PENALTY_CAP
     from hacklet_runner.schema import Probe, Profile
     from hacklet_runner.probes import PREDICATES
     prof = Profile(base_url="http://x")
     client = httpx.Client(base_url="http://x")
 
-    def run_one(scale):
+    def run_one(override):
         def pred(ctx, probe):
-            if scale is not None:
-                ctx.evidence["penalty_scale"] = scale
+            if override is not None:
+                ctx.evidence["penalty_override"] = override
             return True
-        monkeypatch.setitem(PREDICATES, "_hl_scale_test", pred)
-        p = Probe(id="t", bundle="qa", category="c", penalty=26, probe={"predicate": "_hl_scale_test"})
+        monkeypatch.setitem(PREDICATES, "_hl_override_test", pred)
+        p = Probe(id="t", bundle="qa", category="c", penalty=26, probe={"predicate": "_hl_override_test"})
         return _run_probe(p, _Ctx("http://x", client, prof, None), client, prof)[0].penalty
 
     try:
-        assert run_one(None) == 26     # no scale -> the designed ceiling
-        assert run_one(0.6) == 16      # moderate -> 26*0.6
-        assert run_one(0.3) == 8       # minor -> 26*0.3
-        assert run_one(1.0) == 26      # scale >= 1 ignored -> ceiling (cannot scale UP)
-        assert run_one(9.0) == 26      # out-of-range ignored -> ceiling
+        assert run_one(None) == 26            # no override -> the nominal catalog penalty
+        assert run_one(18) == 18              # below nominal -> down (a lone serious barrier)
+        assert run_one(48) == 48              # ABOVE nominal -> up (barriers sum past the ceiling — the point)
+        assert run_one(0) == 1                # bounded to >= 1
+        assert run_one(9999) == _PENALTY_CAP  # runaway-guarded
     finally:
         client.close()
