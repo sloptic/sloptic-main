@@ -86,6 +86,16 @@ def coverage_metrics(outcomes: list[Outcome]) -> dict:
     # the exact probe_ids that APPLIED here (fired or clean). Aggregated across a batch, the catalog minus
     # the union of these is the set of probes that were N/A on EVERY app — never reached their target.
     applied = sorted(pid for pid, (status, _, _) in best.items() if status != "not_applicable")
+    # per-kind N/A REASON telemetry: for a kind that was entirely N/A, surface WHY it couldn't run (e.g.
+    # access-control -> "couldn't establish two accounts"). Turns a silent no-op into visible, honest
+    # coverage — the credential reports what it TRIED and why it didn't apply, not just a blank. A probe
+    # sets ctx.evidence["na_reason"] at the precondition it fell out of; the N/A outcome carries it here.
+    na_reasons: dict[str, str] = {}
+    for o in outcomes:
+        if o.outcome == "not_applicable" and o.category in na_kinds and o.category not in na_reasons:
+            reason = (getattr(o, "evidence", None) or {}).get("na_reason")
+            if reason:
+                na_reasons[o.category] = reason
     return {
         "probes_total": total,
         "probes_applicable": applicable,
@@ -95,4 +105,5 @@ def coverage_metrics(outcomes: list[Outcome]) -> dict:
         "na_kinds": na_kinds,
         "by_kind": by_kind,
         "applied": applied,
+        "na_reasons": na_reasons,
     }

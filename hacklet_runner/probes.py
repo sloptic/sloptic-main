@@ -1027,6 +1027,32 @@ _SENSITIVE_FIELD = re.compile(
     r"credit_?card|card_?number|cvv|iban|passport", re.IGNORECASE)
 
 
+_NA_TWO_ACCT = ("couldn't establish two independent accounts to compare — self-serve signup isn't reachable "
+                "black-box (SDK/client-side auth, email confirmation, or captcha)")
+_NA_PROVIDED = "a single provided --header session is one identity — can't act as two different users"
+
+
+def _two_accounts(ctx):
+    """Register two independent accounts (A, B) for a cross-user authorization probe (IDOR/BOLA). Returns
+    (a, b), or (None, None) with an na_reason set on the evidence. The corpus wall these probes hit: on an
+    SDK-auth SPA a second confirmed identity usually can't be minted black-box, so a cross-user read can't
+    be PROVEN — the probe is then honestly N/A (with a reason) rather than guessing a finding."""
+    a = ctx.register(suffix="_a")
+    b = ctx.register(suffix="_b")
+    if a is None or b is None:
+        for acct in (a, b):
+            if acct:
+                acct.client.close()
+        ctx.evidence["na_reason"] = _NA_TWO_ACCT
+        return None, None
+    if a.provided:   # a single --header session is ONE identity -> B == A -> not a cross-user read
+        a.client.close()
+        b.client.close()
+        ctx.evidence["na_reason"] = _NA_PROVIDED
+        return None, None
+    return a, b
+
+
 def api_bola(ctx, probe) -> bool | None:
     """Register two accounts A and B; A creates an object whose sensitive field carries a canary; if B
     can read that object and sees A's canary, object-level authorization is broken. Only pairs whose
@@ -1035,18 +1061,11 @@ def api_bola(ctx, probe) -> bool | None:
     pairs = [(c, r, p, idf) for (c, r, p, idf) in _bola_pairs(ctx.profile.endpoints)
              if any(_SENSITIVE_FIELD.search(f) for f in c.body_fields)]
     if not pairs:
+        ctx.evidence["na_reason"] = "no create+read API pair with a private field to cross-check"
         return None  # no create+read pair with a private field to exercise -> couldn't test
-    a = ctx.register(suffix="_a")
-    b = ctx.register(suffix="_b")
-    if a is None or b is None:
-        for acct in (a, b):
-            if acct:
-                acct.client.close()
-        return None  # couldn't establish two accounts (no JSON register) -> couldn't test
-    if a.provided:   # a single --header session is ONE identity -> B re-reading A's own object isn't BOLA (false pos)
-        a.client.close()
-        b.client.close()
-        return None
+    a, b = _two_accounts(ctx)
+    if a is None:
+        return None   # couldn't mint two accounts (na_reason set) -> couldn't test
     tested = False
     try:
         with make_client(ctx.base_url, ctx.headers, timeout=10.0, follow_redirects=True) as anon:
@@ -1091,26 +1110,20 @@ def idor_user_record(ctx, probe) -> bool | None:
     access-gated, not public], and (3) the SAME read returns A's canary AS B [a second logged-in user reads it
     -> broken object-level authorization]. N/A when two distinct accounts can't be established, A has no
     addressable id (cookie session with no JWT), or no id-addressed endpoint returns A's own record."""
-    a = ctx.register(suffix="_a")
-    b = ctx.register(suffix="_b")
-    if a is None or b is None:
-        for acct in (a, b):
-            if acct:
-                acct.client.close()
-        return None
-    if a.provided:   # a single --header session is ONE identity -> B == A -> not a cross-user read
-        a.client.close()
-        b.client.close()
+    a, b = _two_accounts(ctx)
+    if a is None:
         return None
     try:
         a_id = auth.session_subject(a)
         canary = a.username                        # unique per-registration token, stored in A's own record
         if not a_id or not canary:
+            ctx.evidence["na_reason"] = "account A has no addressable user id (cookie session, no JWT subject)"
             return None                            # no addressable user id (cookie session) -> couldn't test
         reads = [(e, e.path_params[0]) for e in ctx.profile.endpoints
                  if e.method.lower() == "get" and len(e.path_params) == 1
                  and e.raw_path.endswith("/{" + e.path_params[0] + "}")]
         if not reads:
+            ctx.evidence["na_reason"] = "no id-addressed record endpoint (GET /{id}) served same-origin"
             return None
         tested = False
         with make_client(ctx.base_url, ctx.headers, timeout=10.0, follow_redirects=True) as anon:
@@ -1150,16 +1163,8 @@ def bola_managed_backend(ctx, probe) -> bool | None:
     separate sec-exposure finding) — ALSO returns A's record for B: a second user reads A's private row -> RLS
     is per-user broken. A's unique registration username is the oracle. N/A when no backend reads were observed
     (no --browser-auth, or a same-origin/cookie app) or two distinct accounts can't be established."""
-    a = ctx.register(suffix="_a")
-    b = ctx.register(suffix="_b")
-    if a is None or b is None:
-        for acct in (a, b):
-            if acct:
-                acct.client.close()
-        return None
-    if a.provided:   # one --header identity can't be both A and B
-        a.client.close()
-        b.client.close()
+    a, b = _two_accounts(ctx)
+    if a is None:
         return None
     try:
         canary = a.username
@@ -1167,6 +1172,7 @@ def bola_managed_backend(ctx, probe) -> bool | None:
         b_auth = b.client.headers.get("Authorization")
         reads = getattr(a, "backend_reads", None) or []
         if not reads or not canary or not a_auth or not b_auth:
+            ctx.evidence["na_reason"] = "no managed-backend (Supabase) reads captured to replay (needs --browser-auth)"
             return None
         tested = False
         with httpx.Client(timeout=10.0, follow_redirects=True) as c:
@@ -1203,6 +1209,7 @@ def data_integrity_roundtrip(ctx, probe) -> bool | None:
     create succeeds (couldn't establish the round-trip -> not a clean pass, a missed test)."""
     pairs = _bola_pairs(ctx.profile.endpoints)
     if not pairs:
+        ctx.evidence["na_reason"] = "no create+read endpoint pair to round-trip (SPA writes go off-origin)"
         return None
     account = ctx.register()   # some creates are auth-gated
     client = (account.client if account
@@ -1231,8 +1238,11 @@ def data_integrity_roundtrip(ctx, probe) -> bool | None:
                 ctx.evidence.update(create_status=created.status_code, read_status=read.status_code,
                                     endpoint=read_path, durable=False)
                 return True  # server acknowledged the create but the object isn't readable -> data lost
+        if not tested:
+            ctx.evidence["na_reason"] = "no create endpoint accepted a write to read back"
+            return None
         ctx.evidence.update(tested=tested, durable=True)
-        return False if tested else None
+        return False
     finally:
         client.close()
 
@@ -1927,17 +1937,10 @@ def idor_horizontal(ctx, probe) -> bool | None:
     both accounts or A can't create a distinct resource to test against (not a false clean)."""
     form = auth.create_form(ctx.profile.forms)
     if form is None:
+        ctx.evidence["na_reason"] = "no create form to seed a resource A owns"
         return None
-    a = ctx.register(suffix="_a")
-    b = ctx.register(suffix="_b")
-    if a is None or b is None:
-        for acct in (a, b):
-            if acct:
-                acct.client.close()
-        return None
-    if a.provided:   # a single --header session is ONE identity -> B re-reading A's own resource isn't IDOR
-        a.client.close()
-        b.client.close()
+    a, b = _two_accounts(ctx)
+    if a is None:
         return None
     # extract each session cookie (jar iteration avoids CookieConflict) and re-send it plainly, so an
     # authed create/read isn't dropped over http when the app sets a Secure cookie (that's tested by
@@ -1954,6 +1957,7 @@ def idor_horizontal(ctx, probe) -> bool | None:
                           cookies=a_cookies, headers=a_auth) as ac:
             resource = ac.post(form.action, data={n: marker for n in form.fields}).url.path
         if not resource or resource == form.action:  # no distinct resource created -> couldn't test
+            ctx.evidence["na_reason"] = "create didn't yield a distinct per-resource URL (SPA client-render)"
             return None
         with httpx.Client(base_url=ctx.base_url, timeout=10.0, cookies=b_cookies, headers=b_auth) as bc:
             leaked = bc.get(resource)
@@ -2009,9 +2013,11 @@ def race_resource_ids(ctx, probe) -> bool | None:
     race — read N/A, never a phantom fire. N/A too when there's no create form or we can't self-register."""
     form = auth.create_form(ctx.profile.forms)
     if form is None:
+        ctx.evidence["na_reason"] = "no create form to race"
         return None
     account = ctx.register(suffix="_race")
     if account is None:
+        ctx.evidence["na_reason"] = "self-registration not reachable black-box (SDK/email-confirm/captcha signup)"
         return None
     bursts = probe.probe.get("bursts", 3)
     need = probe.probe.get("min_collisions", 2)   # repeated collision -> a reproducible fire
@@ -2039,6 +2045,7 @@ def race_resource_ids(ctx, probe) -> bool | None:
             if len(set(created)) < len(created):   # fewer distinct ids than creates -> a race this burst
                 collided += 1
         if not observed_ids:
+            ctx.evidence["na_reason"] = "creates don't expose per-resource URLs to compare (SPA client-render / fixed redirect)"
             return None   # never saw per-resource ids to compare (fixed redirect / <2 creates) -> couldn't test
         ctx.evidence.update(bursts=bursts, collided_bursts=collided, min_collisions=need)
         return collided >= need

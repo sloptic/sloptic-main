@@ -67,6 +67,23 @@ def test_coverage_counts_applicable_vs_na_by_probe_and_kind():
     assert c["applied"] == ["headers-1", "xss-1"]          # exact probe_ids that ran (batch union -> never-applied)
 
 
+def test_coverage_surfaces_na_reason_only_for_entirely_na_kinds():
+    # telemetry: a probe that goes N/A on a precondition sets evidence["na_reason"]; coverage surfaces it
+    # for kinds that were ENTIRELY N/A (the honest "we tried this, here's why it couldn't run"), but NOT
+    # for a kind that partly ran (that kind is covered, not blind).
+    outs = [
+        Outcome(probe_id="idor-1", bundle="security", category="access-control", outcome="not_applicable",
+                penalty=40, evidence={"na_reason": "couldn't establish two accounts"}),
+        Outcome(probe_id="csrf-1", bundle="security", category="csrf", outcome="clean", penalty=15),
+        Outcome(probe_id="csrf-2", bundle="security", category="csrf", outcome="not_applicable", penalty=15,
+                evidence={"na_reason": "no form"}),
+    ]
+    c = coverage_metrics(outs)
+    assert c["na_reasons"] == {"access-control": "couldn't establish two accounts"}
+    assert "csrf" not in c["na_reasons"]      # partially-covered kind isn't reported as blind
+
+
 def test_coverage_empty_outcomes():
     c = coverage_metrics([])
     assert c["probes_total"] == 0 and c["pct_applicable"] == 0 and c["na_kinds"] == []
+    assert c["na_reasons"] == {}
