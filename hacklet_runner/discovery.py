@@ -286,6 +286,42 @@ def _clean_names(v) -> list:
 
 
 _OBS_ENDPOINT_CAP = 40
+# Known THIRD-PARTY hosts an app's client talks to that are NEVER the app's own backend -> never probed.
+_VENDOR_HOSTS = re.compile(
+    r"google-analytics|googletagmanager|doubleclick|gstatic|fonts\.google|jsdelivr|unpkg|cdnjs|cloudflareinsights|"
+    r"sentry|datadog|hotjar|clarity\.ms|mixpanel|amplitude|posthog|segment|"
+    r"clerk\.|auth0|accounts\.google|identitytoolkit|oauth|"
+    r"openai|anthropic|generativelanguage|api\.stripe|paypal|"
+    r"mapbox|maps\.googleapis|cloudinary|algolia|imgix|res\.cloudinary|tile\.|basemaps|"   # maps/media/search vendors
+    r"facebook|twitter|\bx\.com|vercel-insights|vitals\.vercel|va\.vercel|analytics", re.I)
+# Managed BaaS: the app's OWN data plane, config-testable (the idor-004 / backend-exposure "test the config" lane).
+_BAAS_HOSTS = re.compile(r"supabase\.co|firebaseio|firebasedatabase|firestore\.googleapis|\.appwrite|"
+                         r"convex\.cloud|pocketbase|planetscale|neon\.tech|upstash|xata\.io|nhost", re.I)
+
+
+def _classify_hosts(observed, base_url) -> dict:
+    """Where does the app's runtime traffic actually GO? Classify each observed xhr/fetch host to see the real
+    backend location (OFF-SCORE diagnostic): same-origin (probe-able now), managed BaaS (Supabase/Firebase —
+    the config-testable data plane), a known third-party VENDOR (never the app's -> never probed), or OTHER
+    off-origin (an unknown host = likely the app's OWN custom backend = the recall frontier). The SPA corpus
+    keeps its server-side surface off-origin, so this tells us WHICH lever (better driving vs off-origin
+    targeting) unlocks it."""
+    app_host = urlparse(base_url).netloc
+    counts = {"same_origin": 0, "managed_baas": 0, "vendor": 0, "other_off_origin": 0}
+    baas, other = set(), set()
+    for _method, url, _pd in observed:
+        h = urlparse(url).netloc
+        if not h or h == app_host:
+            counts["same_origin"] += 1
+        elif _BAAS_HOSTS.search(h):
+            counts["managed_baas"] += 1
+            baas.add(h)
+        elif _VENDOR_HOSTS.search(h):
+            counts["vendor"] += 1
+        else:
+            counts["other_off_origin"] += 1
+            other.add(h)
+    return {"counts": counts, "baas_hosts": sorted(baas), "other_hosts": sorted(other)[:10]}
 
 
 def _endpoints_from_observed(observed, base_url) -> list:
@@ -295,11 +331,14 @@ def _endpoints_from_observed(observed, base_url) -> list:
     JSON POST body's keys as body_fields for the injection/crash probes to reach. No 404-verification needed
     (it was observed). origin='observed' for the off-score pointer telemetry."""
     out, seen = [], set()
+    app_host = urlparse(base_url).netloc
     for method, url, post_data in observed:
         try:
             u = urlparse(url)
         except Exception:
             continue
+        if u.netloc and u.netloc != app_host:
+            continue                        # off-origin (BaaS/vendor/app-backend) -> not a same-origin probe target
         path, m = u.path or "/", (method or "get").lower()
         if path.startswith("/_next/") or path.startswith("/__") or "_rsc" in (u.query or ""):
             continue                        # Next.js RSC / route-prefetch / framework noise, not the app's API

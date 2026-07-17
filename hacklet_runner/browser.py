@@ -225,12 +225,10 @@ def render_routes(base_url: str, paths, headers=None, timeout: float = 12.0,
             try:
                 page = b.new_page()
                 _apply_auth(page, base_url, headers)  # cookies/headers persist for the origin across gotos
-                if net_sink is not None:              # harvest the app's OWN same-origin xhr/fetch calls as it
-                    _host = urllib.parse.urlparse(base_url).netloc       # renders -> the REAL endpoint surface,
-                    def _cap(req):                                       # vs the LLM guessing invisible API paths
-                        with contextlib.suppress(Exception):
-                            if (req.resource_type in ("xhr", "fetch")
-                                    and urllib.parse.urlparse(req.url).netloc == _host and len(net_sink) < 100):
+                if net_sink is not None:              # harvest ALL the app's xhr/fetch calls as it renders (same-
+                    def _cap(req):                    # origin AND off-origin) -> the REAL backend surface + where it
+                        with contextlib.suppress(Exception):   # LIVES (discovery same-origin-filters + classifies)
+                            if req.resource_type in ("xhr", "fetch") and len(net_sink) < 150:
                                 net_sink.append((req.method, req.url, req.post_data))
                     page.on("request", _cap)
                 deadline = time.monotonic() + total_timeout

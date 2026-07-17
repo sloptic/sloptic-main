@@ -82,6 +82,21 @@ def test_observed_requests_become_real_endpoints():
     assert all(e.origin == "observed" for e in by.values())
 
 
+def test_classify_hosts_separates_app_backend_from_vendor():
+    # the SPA-pivot recon: where does the app's runtime traffic GO? same-origin (probe now) / managed BaaS
+    # (config-test lane) / third-party VENDOR (never probe) / OTHER off-origin (likely the app's own backend).
+    from hacklet_runner.discovery import _classify_hosts
+    obs = [
+        ("GET", "http://myapp.com/api/x", None),                    # same-origin
+        ("GET", "https://abc.supabase.co/rest/v1/t", None),         # managed BaaS = app data plane
+        ("POST", "https://api.myapp-backend.io/todos", None),       # app's OWN custom backend (unknown off-origin)
+        ("GET", "https://www.google-analytics.com/collect", None),  # vendor
+        ("GET", "https://api.mapbox.com/tiles", None),              # vendor (maps — the growforgood case)
+    ]
+    c = _classify_hosts(obs, "http://myapp.com")["counts"]
+    assert c == {"same_origin": 1, "managed_baas": 1, "vendor": 2, "other_off_origin": 1}
+
+
 def test_logout_links_are_excluded_from_the_crawl():
     # following a logout link would destroy the runner's own authenticated session
     for href in ("/logout.php", "logout", "/auth/sign-out", "/user_logout", "/logoff"):
