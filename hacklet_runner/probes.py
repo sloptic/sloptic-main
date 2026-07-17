@@ -1860,6 +1860,9 @@ def console_errors_present(ctx, probe) -> bool:
 
 
 _A11Y_TIER = {"critical": 30, "serious": 18, "moderate": 10, "minor": 4}
+_A11Y_DECAY = 0.6   # SAME within-category diminishing-returns constant as aggregate.CATEGORY_DECAY: each
+                    # additional barrier adds less MARGINAL exclusion (populations overlap; a multi-barrier
+                    # app is already substantially unusable) -> a11y stacks like every other category, not raw
 # a no-browser static hard-fail -> the axe impact of the equivalent rule, so a11y-002's SUM uses the same
 # tiers as a11y-001 (the two probes are one logical flaw, one static one rendered).
 _STATIC_A11Y_IMPACT = {"missing-lang": "serious", "img-missing-alt": "critical", "missing-title": "serious",
@@ -1867,16 +1870,18 @@ _STATIC_A11Y_IMPACT = {"missing-lang": "serious", "img-missing-alt": "critical",
 
 
 def _a11y_penalty(impacts: dict) -> int:
-    """Per-rule-capped SUM of the a11y penalty: each DISTINCT violated rule contributes its impact tier
-    ONCE (axe assigns one impact per rule, and `impacts` already counts rules, not nodes — so a systematic
-    issue across 50 buttons is still one barrier, not 50). a11y harm is ADDITIVE across orthogonal
-    populations — a contrast miss (serious: blocks low-vision) and an unlabeled control (critical: blocks
-    screen-reader users) are different barriers on different axes, so they STACK rather than collapse to the
-    worst one (the opposite of security's weakest-link). Tiers aim weight at exclusion over cosmetics;
-    corpus-calibrated (critical 30 > serious 18 > moderate 10 > minor 4) so a genuinely unusable app
-    exceeds the old flat 26 ceiling while a lone contrast miss settles below it. Unbounded by design (the
-    slop score is deduction-only + unbounded); the per-RULE cap is the only cap."""
-    return sum(n * _A11Y_TIER.get(level, _A11Y_TIER["minor"]) for level, n in impacts.items())
+    """Diminishing-returns sum of the a11y penalty: each DISTINCT violated rule contributes its impact tier,
+    but the worst counts FULL and each additional decays by _A11Y_DECAY (sorted desc) — the SAME damper every
+    other multi-finding category gets. a11y was the lone raw-SUM category, which let barriers stack to a
+    runaway tail (one app hit 150, 2.5x the security ceiling); the damper caps the worst at ~65 while leaving
+    single-/few-barrier apps untouched. Still ADDITIVE across orthogonal populations (2 barriers > 1: a
+    contrast miss blocks low-vision, a missing label blocks screen-readers), just with decreasing MARGINAL
+    harm — the 6th barrier adds less new exclusion than the 1st (populations overlap; the app is already
+    largely unusable). `impacts` counts RULES not nodes (a systematic issue across 50 buttons is one barrier).
+    Tiers (critical 30 > serious 18 > moderate 10 > minor 4) aim weight at exclusion over cosmetics."""
+    tiers = sorted((_A11Y_TIER.get(level, _A11Y_TIER["minor"])
+                    for level, n in impacts.items() for _ in range(n)), reverse=True)
+    return round(sum(v * (_A11Y_DECAY ** i) for i, v in enumerate(tiers)))
 
 
 def a11y_violations_present(ctx, probe) -> bool:

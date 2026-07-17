@@ -115,11 +115,11 @@ def test_console_first_party_classification():
     assert not fp("Script error.", "", o)                                                    # cross-origin sanitized
 
 
-def test_a11y_penalty_sums_barriers_by_severity_tier():
+def test_a11y_penalty_damps_stacked_barriers():
     from hacklet_runner.probes import _a11y_penalty
     assert _a11y_penalty({"serious": 1}) == 18                  # a lone contrast miss -> below the old flat 26
     assert _a11y_penalty({"critical": 1}) == 30                 # a screen-reader blocker -> above the old ceiling
-    assert _a11y_penalty({"serious": 1, "critical": 1}) == 48   # additive across populations: barriers STACK
-    assert _a11y_penalty({"serious": 3}) == 54                  # 3 distinct serious barriers, not maxed to one
-    assert _a11y_penalty({"moderate": 1, "minor": 2}) == 18     # 10 + 2*4 -> cosmetics stay cheap
+    assert _a11y_penalty({"critical": 1, "serious": 1}) == 41   # additive but DAMPED: 30 + 18*.6 (not a raw 48)
+    assert _a11y_penalty({"serious": 3}) == 35                  # worst full, rest decay: 18 + 18*.6 + 18*.36
+    assert _a11y_penalty({"moderate": 1, "minor": 2}) == 14     # 10 + 4*.6 + 4*.36 -> cosmetics stay cheap
     assert _a11y_penalty({}) == 0
