@@ -152,6 +152,11 @@ def test_depscan_flags_vulnerable_versions_not_patched():
     assert libs.get("Moment.js") == "2.10.0"              # < 2.29.4 -> ReDoS
     assert not scan_deps("/*! jQuery v3.6.0 */ Bootstrap v4.6.2")   # patched versions -> no finding
     assert all("cve" in h and "fix" in h for h in hits)   # remediation rides on the finding (teach by proxy)
+    # broadened set: banners with a RELIABLE version + a real CVE (AngularJS XSS, Axios CSRF token leak, mXSS)
+    more = {h["library"]: h["version"] for h in scan_deps(
+        "AngularJS v1.7.9 | Axios v1.5.1 | /*! @license DOMPurify 2.4.0 | (c) Cure53 */")}
+    assert more.get("AngularJS") == "1.7.9" and more.get("Axios") == "1.5.1" and more.get("DOMPurify") == "2.4.0"
+    assert not scan_deps("AngularJS v1.8.3 | Axios v1.6.2 | DOMPurify 3.1.3")   # all patched -> clean
 
 
 def test_declared_constraint_values_and_acceptance():

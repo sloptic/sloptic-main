@@ -3014,7 +3014,7 @@ _PREDICATE_REASONS = {
     "leaks_error_detail": "an induced server error leaked a stack trace or a database error to the user (info disclosure + a broken error path)",
     "exposed_backend_readable": "the app's managed backend (Supabase/Firebase) is world-readable with its own public key -> the whole database is exposed (missing row-level security)",
     "bundle_leaks_secret": "a hardcoded SECRET key (Stripe sk_ / OpenAI / AWS secret / GitHub PAT / private key) is shipped in the client JS bundle -> account/DB takeover (public anon/publishable keys are not flagged)",
-    "vulnerable_dependency": "the app ships a client library with a KNOWN CVE (retire.js-style: jQuery / Bootstrap / Moment / Handlebars) -> supply-chain risk the team chose; upgrade per the finding",
+    "vulnerable_dependency": "the app ships a client library with a KNOWN CVE (retire.js-style: jQuery / AngularJS / Bootstrap / Axios / Moment / Handlebars / DOMPurify) -> supply-chain risk the team chose; upgrade per the finding",
     "source_map_exposed": "a production JS bundle serves its .map -> the original source is reconstructable (business logic, hidden endpoints, and secrets a minified scan misses)",
     "session_cookie_missing_flag": "session cookie missing the {flag} flag",
     "session_token_in_local_storage": "session token persisted in localStorage (readable by any XSS on the origin — unlike an HttpOnly cookie)",
