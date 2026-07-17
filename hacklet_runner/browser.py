@@ -22,11 +22,10 @@ _XSS_MARKER = "hl-domxss-9a2b"
 
 
 def browser_available() -> bool:
-    try:
-        import playwright.sync_api  # noqa: F401
-        return True
-    except ImportError:
-        return False
+    """True when a browser can ACTUALLY launch here — not merely when playwright imports (the old check,
+    which let a broken/missing chromium read as 'available' and silently degrade a browser run to
+    static-only). Tests skip on this; the CLIs use browser_preflight() for the (ok, detail) form."""
+    return browser_preflight()[0]
 
 
 # Pinned bundled Chromium first (reproducible), then any system browser. Bundled Chromium for
@@ -35,11 +34,39 @@ def browser_available() -> bool:
 _LAUNCH_ORDER = ({}, {"channel": "chromium"}, {"channel": "chrome"}, {"channel": "msedge"})
 
 
+_LAST_LAUNCH_ERROR = ""
+
+
 def _launch(p):
+    global _LAST_LAUNCH_ERROR
     for kwargs in _LAUNCH_ORDER:
-        with contextlib.suppress(Exception):
+        try:
             return p.chromium.launch(headless=True, **kwargs)
+        except Exception as e:     # try the next channel; keep the last failure so the preflight can report WHY
+            _LAST_LAUNCH_ERROR = f"{type(e).__name__}: {str(e).splitlines()[0][:200]}"
     return None
+
+
+def browser_preflight() -> tuple[bool, str]:
+    """Preflight: can chromium ACTUALLY launch here? Returns (ok, detail). Lets the CLIs FAIL LOUD when
+    --browser is requested but the browser is missing/broken — instead of silently grading every app
+    browser-less (a swallowed launch error reads as 'no browser' -> every browser probe N/A -> a static
+    grade wearing a browser-run label; the lost-overnight-run failure). Uses the same _launch path the
+    probes use, so it catches exactly what they'd hit."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as e:
+        return False, f"playwright import failed: {type(e).__name__}: {e}"
+    try:
+        with sync_playwright() as pw:
+            b = _launch(pw)
+            if b is None:
+                return False, _LAST_LAUNCH_ERROR or "chromium.launch() failed for every channel"
+            ver = b.version
+            b.close()
+            return True, f"chromium {ver}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {str(e).splitlines()[0][:200]}"
 
 
 def _apply_auth(page, url: str, headers) -> None:

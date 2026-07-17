@@ -28,6 +28,7 @@ from urllib.parse import urlparse
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from hacklet_runner.jsonl import append_jsonl  # noqa: E402  (lock-guarded results append, safe under concurrency)
+from hacklet_runner.browser import browser_preflight  # noqa: E402  (fail-loud browser preflight)
 
 _HERE = pathlib.Path(__file__).resolve().parent
 # Launch children (deploy_and_grade / devpost_repos / stats / parity) with the PROJECT'S OWN venv python —
@@ -436,6 +437,13 @@ def main():
     args = ap.parse_args()
     if not (args.hackathon or args.search or args.urls):
         ap.error("need a source: --hackathon, --search, or --urls")
+    if args.browser:               # FAIL LOUD before spawning the batch: a broken browser silently degrades
+        ok, detail = browser_preflight()   # EVERY app to static-only (all browser probes N/A). Catch it in ~2s,
+        if not ok:                         # not after a wasted overnight run (the multihacksfullrevised failure).
+            sys.exit(f"ERROR: --browser is on (the default) but chromium won't launch here:\n    {detail}\n"
+                     f"  fix:  uv run playwright install chromium chromium-headless-shell\n"
+                     f"  or grade static-only (skips a11y/console/CWV/dead-controls/dom-xss):  add --no-browser")
+        os.environ["HL_BROWSER_PREFLIGHTED"] = "1"   # children inherit -> skip the redundant per-app preflight
     if args.app_timeout is None:   # sum of the phase budgets (clone 300 + per-attempt build + grade) + margin
         args.app_timeout = 300 + args.attempts * (args.build_timeout + 90) + args.grade_timeout + 120
 

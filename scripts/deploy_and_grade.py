@@ -1033,6 +1033,12 @@ def main():
                     help="metadata to merge into the record, e.g. from devpost_repos --json "
                          "('{\"hackathon\":\"x\",\"project\":\"...\",\"winner\":true}')")
     args = ap.parse_args()
+    if args.browser and not os.environ.get("HL_BROWSER_PREFLIGHTED"):   # single-app: fail loud too, unless
+        ok, detail = browser.browser_preflight()                        # run_batch already preflighted (env set)
+        if not ok:
+            sys.exit(f"ERROR: --browser is on (the default) but chromium won't launch here:\n    {detail}\n"
+                     f"  fix:  uv run playwright install chromium chromium-headless-shell\n"
+                     f"  or grade static-only (skips a11y/console/CWV/dead-controls/dom-xss):  add --no-browser")
 
     meta = json.loads(args.meta) if args.meta.strip() else {}
     # source: the LENS this grade is — "repo" (our controlled Docker deploy, dummy keys, powers the
