@@ -66,6 +66,7 @@ class Profile:
     forms: list[Form] = field(default_factory=list)         # discovered forms with their fields
     capabilities: dict[str, bool] = field(default_factory=dict)
     endpoints: list[Endpoint] = field(default_factory=list)  # API operations from an OpenAPI spec
+    host_tiers: dict = field(default_factory=dict)          # off-score: where runtime traffic goes (classify_hosts)
 
     @property
     def form_endpoints(self) -> list[str]:  # back-compat for predicates that target form actions
@@ -89,6 +90,7 @@ def profile_to_dict(profile: Profile) -> dict:
         "forms": [asdict(f) for f in profile.forms],
         "capabilities": dict(profile.capabilities),
         "endpoints": [asdict(e) for e in profile.endpoints],
+        "host_tiers": dict(profile.host_tiers),   # off-score telemetry, frozen with the surface so a cached re-grade reports the same backend map
     }
 
 
@@ -100,7 +102,8 @@ def profile_from_dict(d: dict) -> Profile:
     endpoints = [Endpoint(**{k: v for k, v in e.items() if k in _ENDPOINT_FIELDS})
                  for e in d.get("endpoints") or []]
     return Profile(base_url=d.get("base_url", ""), routes=list(d.get("routes") or []), forms=forms,
-                   capabilities=dict(d.get("capabilities") or {}), endpoints=endpoints)
+                   capabilities=dict(d.get("capabilities") or {}), endpoints=endpoints,
+                   host_tiers=dict(d.get("host_tiers") or {}))
 
 
 @dataclass

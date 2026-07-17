@@ -598,7 +598,8 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
             routes.setdefault(ep.path, None)
 
     browser_ok = False
-    if render is not None:
+    host_tiers: dict = {}     # off-score: where the app's runtime traffic goes (same-origin / BaaS / vendor /
+    if render is not None:    # other off-origin) — populated from the observed net once the browser render runs
         # Browser-render the discovered HTML routes and harvest their client-rendered forms AND formless
         # inputs. A SPA paints its login/upload/search controls on their OWN routes (often with no <form>
         # at all), so the old single-"/" render only ever saw a form-less landing page — and every
@@ -607,8 +608,9 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
         # client-rendered links into the route set; (2) render the rest of the now-fuller HTML route set
         # in one reused browser session (bounded — each goto costs). render(base_url, paths, headers) ->
         # {path: DOM} is browser.render_routes; None/{} when no browser launched (browser probes read N/A).
-        observed_net = []                       # the app's OWN same-origin xhr/fetch calls, harvested as it renders
-        rendered = render(base_url, [start_path], headers=headers, net_sink=observed_net) or {}
+        observed_net, observed_scripts = [], []  # xhr/fetch (the app's API surface) + runtime-loaded same-origin
+        rendered = render(base_url, [start_path], headers=headers,   # .js URLs (native ESM import() chunks a static
+                          net_sink=observed_net, script_sink=observed_scripts) or {}   # <script> scan can't see)
         if rendered:
             browser_ok = True  # a real render returned HTML -> the browser actually launched/works
             any_response = True
@@ -624,7 +626,8 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
             if (auth[0] or auth[1]) and not any(any("pass" in n.lower() for n in f.fields) for f in forms):
                 extra += [p for p in _AUTH_ROUTES if p not in extra and p not in visited]
             if extra:                               # phase 2: render the rest of the HTML surface
-                rendered.update(render(base_url, extra, headers=headers, net_sink=observed_net) or {})
+                rendered.update(render(base_url, extra, headers=headers,
+                                       net_sink=observed_net, script_sink=observed_scripts) or {})
             for path, dom in rendered.items():
                 _l, _s = _auth_triggers(dom)   # a SPA paints 'Sign in'/'Sign up' client-side, so scan the DOM too
                 auth[0] |= _l
@@ -644,6 +647,15 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
                     if p:
                         routes.setdefault(p, None)
 
+            for u in observed_scripts:   # runtime-loaded same-origin .js (native ESM import() chunks / modulepreload)
+                p = _same_origin_path(u, base_url, start_path)   # that leave no <script src> tag -> fold into routes
+                if p and p.split("?")[0].endswith(".js"):        # so the bundle probes (depscan / secret-scan /
+                    routes.setdefault(p, None)                   # source-map) actually read the lazy chunk
+
+            host_tiers = _classify_hosts(observed_net, base_url)  # off-score: WHERE the traffic goes — same-origin
+                                                                  # (probe-able) / managed BaaS (config-test lane) /
+                                                                  # vendor (never the app's) / other off-origin (the
+                                                                  # app's OWN backend = the recall frontier for Move 2)
             # OBSERVED-request harvest: the REAL endpoints the app called as it rendered/interacted (its own
             # same-origin xhr/fetch) -> the accurate endpoint surface. Ground truth the crawl + static JS-mine
             # miss when the path is built dynamically. Observed == real (no 404-verify); a GET baseline just
@@ -730,7 +742,7 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
         "has_auth_entrypoint": has_pw or auth[0] or auth[1],
     }
     return Profile(base_url=base_url, routes=list(routes), forms=forms, capabilities=capabilities,
-                   endpoints=endpoints)
+                   endpoints=endpoints, host_tiers=host_tiers)
 
 
 def surface_metrics(profile: Profile) -> dict:
@@ -808,4 +820,6 @@ def surface_metrics(profile: Profile) -> dict:
         "surface_size": len(app_routes) + inputs + len(healthy_eps),
         "pointer": pointer,                          # LLM-pointer precision telemetry (off-score, build #2)
         "catch_all": bool(caps.get("catch_all")),    # phantom server-side surface was suppressed (soft-404/SPA)
+        "host_tiers": profile.host_tiers,            # off-score: backend-tier map (where runtime traffic GOES) —
+                                                     # batch-aggregates to size the SPA off-origin gap (Move 2)
     }

@@ -97,6 +97,18 @@ def test_classify_hosts_separates_app_backend_from_vendor():
     assert c == {"same_origin": 1, "managed_baas": 1, "vendor": 2, "other_off_origin": 1}
 
 
+def test_host_tiers_rides_the_surface_and_survives_the_cache():
+    # Move 1 wiring: the classify-hosts backend map must reach the RECORD (via surface_metrics -> Report.surface)
+    # AND survive the per-commit surface cache, so an overnight batch can aggregate the off-origin distribution.
+    from hacklet_runner.discovery import surface_metrics
+    from hacklet_runner.schema import Profile, profile_from_dict, profile_to_dict
+    tiers = {"counts": {"same_origin": 2, "managed_baas": 1, "vendor": 3, "other_off_origin": 1},
+             "baas_hosts": ["abc.supabase.co"], "other_hosts": ["api.myapp-backend.io"]}
+    prof = Profile(base_url="http://x", host_tiers=tiers)
+    assert surface_metrics(prof)["host_tiers"] == tiers                    # reaches the off-score record channel
+    assert profile_from_dict(profile_to_dict(prof)).host_tiers == tiers   # frozen with the surface -> reproducible
+
+
 def test_logout_links_are_excluded_from_the_crawl():
     # following a logout link would destroy the runner's own authenticated session
     for href in ("/logout.php", "logout", "/auth/sign-out", "/user_logout", "/logoff"):
@@ -502,7 +514,7 @@ def test_merge_perceived_rejects_third_party_and_fieldless_forms():
     assert prof.forms == []
 
 
-def _stub_render(base_url, paths, headers=None, net_sink=None):
+def _stub_render(base_url, paths, headers=None, net_sink=None, script_sink=None):
     return {p: "<html><body><h1>App</h1><button>Sign in</button></body></html>" for p in paths}
 
 
