@@ -615,6 +615,18 @@ def _first_party_error(msg: str, stack: str, origin: str) -> bool:
     return any(urllib.parse.urlparse(u).netloc == origin for u in urls)
 
 
+# render-health, evaluated in the SAME render that captures the errors: visible body text length + whether a
+# framework crash overlay/message is on the page. Lets the probe SCALE — an uncaught error that left the page
+# rendered and overlay-free is a real defect but not a functional break; one showing a crash screen is full.
+_RENDER_HEALTH_JS = r"""() => {
+  const body = document.body;
+  const text = (body && body.innerText || '').trim();
+  const html = body ? body.innerHTML : '';
+  const overlay = /Application error: a client-side exception|Unhandled Runtime Error|react-error-overlay|vite-error-overlay|nextjs__container_errors/i.test(html);
+  return { content_len: text.length, error_overlay: overlay };
+}"""
+
+
 def console_errors(url: str, headers=None, timeout: float = 12.0) -> dict | None:
     """Render url and capture uncaught JavaScript errors thrown on load (pageerror), split into FIRST-PARTY
     (the app's own code threw -> a real breakage) and THIRD-PARTY (a widget/analytics script on another
@@ -639,10 +651,15 @@ def console_errors(url: str, headers=None, timeout: float = 12.0) -> dict | None
                 _apply_auth(page, url, headers)
                 page.goto(url, timeout=timeout * 1000, wait_until="load")
                 page.wait_for_timeout(500)  # let late/async errors surface
+                try:                        # render-health so the probe can SCALE the penalty by impact
+                    health = page.evaluate(_RENDER_HEALTH_JS)
+                except Exception:
+                    health = {}
             finally:
                 b.close()
         fp = sum(1 for msg, stack in errs if _first_party_error(msg, stack, origin))
-        return {"first_party": fp, "third_party": len(errs) - fp, "total": len(errs)}
+        return {"first_party": fp, "third_party": len(errs) - fp, "total": len(errs),
+                "content_len": health.get("content_len"), "error_overlay": bool(health.get("error_overlay"))}
     except Exception:
         return None
 

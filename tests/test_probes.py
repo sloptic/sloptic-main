@@ -123,3 +123,21 @@ def test_a11y_penalty_damps_stacked_barriers():
     assert _a11y_penalty({"serious": 3}) == 35                  # worst full, rest decay: 18 + 18*.6 + 18*.36
     assert _a11y_penalty({"moderate": 1, "minor": 2}) == 14     # 10 + 4*.6 + 4*.36 -> cosmetics stay cheap
     assert _a11y_penalty({}) == 0
+
+
+def test_console_scales_by_render_health():
+    from hacklet_runner.probes import _console_broken_render
+    assert _console_broken_render({"error_overlay": True, "content_len": 5000}) is True    # crash overlay -> full
+    assert _console_broken_render({"error_overlay": False, "content_len": 8}) is True       # near-empty -> full
+    assert _console_broken_render({"error_overlay": False, "content_len": 5000}) is False   # page fine -> reduced
+    assert _console_broken_render({"error_overlay": False, "content_len": None}) is False   # unmeasured -> not broken
+
+
+def test_error_hygiene_signatures_match_leaks_not_prose():
+    from hacklet_runner.probes import _TRACE, _SQL_ERROR
+    assert _TRACE.search('Traceback (most recent call last):\n  File "app.py", line 9, in f')   # Python
+    assert _TRACE.search('at handler (/srv/app/server.js:12:7)')                                  # Node
+    assert _TRACE.search('goroutine 17 [chan receive]:')                                          # Go panic
+    assert _TRACE.search("\tfrom app.rb:23:in `block'")                                           # Ruby
+    assert _SQL_ERROR.search('sqlite3.OperationalError: no such column: x')                       # leaked DB error
+    assert not _TRACE.search('Our guide explains how to handle errors: retry at most once.')      # ordinary prose

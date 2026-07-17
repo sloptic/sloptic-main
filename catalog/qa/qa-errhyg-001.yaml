@@ -2,13 +2,11 @@ id: qa-errhyg-001
 bundle: qa
 category: error-hygiene
 pool: public
-evidence_model: provable
+evidence_model: oracle
 penalty: 14   # a leaked stack trace fires only on error paths (lower frequency) and is a
               # moderate info-leak -> priced modestly, below the every-user qa failures.
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:
-  method: GET
-  target: /crash
-slop_if:
-  - response_leaks_stack_trace
+  predicate: leaks_error_detail   # induce errors across discovered endpoints (+ /crash), scan for a leaked
+                                  # stack trace or DB error — fires on REAL apps, not only the reference route

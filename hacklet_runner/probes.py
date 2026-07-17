@@ -76,8 +76,11 @@ def _is_phantom_shell(ctx, resp) -> bool:
         return False
 
 _TRACE = re.compile(
-    r"Traceback \(most recent call last\)|File \"[^\"]+\", line \d+, in |"
-    r"\bat [\w.$]+\([\w.]+:\d+\)"
+    r"Traceback \(most recent call last\)|File \"[^\"]+\", line \d+, in |"   # Python
+    r"\bat [\w.$<>]+ ?\([^\s)]+:\d+:\d+\)|"                                  # JS / Node: at fn (file:line:col)
+    r"goroutine \d+ \[[\w ]+\]:|"                                            # Go panic
+    r"\.rb:\d+:in [`']|"                                                     # Ruby backtrace
+    r"Stack trace:\s*#0 "                                                    # PHP
 )
 
 # Fingerprints of a framework's DEBUG UI (the full interactive debugger / DEBUG=True page), not merely a
@@ -91,10 +94,6 @@ _DEBUG_FINGERPRINT = re.compile(
 
 
 # ---- declarative matchers -------------------------------------------------------------------
-
-def response_leaks_stack_trace(resp, arg=None) -> bool:
-    return bool(_TRACE.search(resp.text))
-
 
 def ttfb_at_least(resp, arg) -> bool:
     # Slice uses one sample; production samples N and takes the median (see FUZZ_RUNNER_SPEC).
@@ -255,7 +254,6 @@ def response_is_git_head(resp, arg=None) -> bool:
 
 
 MATCHERS = {
-    "response_leaks_stack_trace": response_leaks_stack_trace,
     "ttfb_at_least": ttfb_at_least,
     "response_contains": response_contains,
     "response_missing_header": response_missing_header,
@@ -1305,19 +1303,14 @@ def debug_mode_enabled(ctx, probe) -> bool | None:
     """Framework debug mode shipped to production: an error surfaces the full interactive debugger /
     DEBUG page (Werkzeug, Django DEBUG=True, Rails Better Errors, Laravel Whoops), leaking source,
     settings and env -- and, for Werkzeug, an RCE console. Strictly worse than a bare leaked stack
-    trace (qa-errhyg): this is the framework's debug UI. Inspects the error route (default /crash) and
-    probes for a live Werkzeug debugger resource. N/A when nothing could be inspected."""
+    trace (qa-errhyg): this is the framework's debug UI. Scans errors induced across discovered endpoints
+    (+ the /crash route) and probes for a live Werkzeug debugger resource. N/A when nothing was inspected."""
     inspected = False
-    target = probe.probe.get("target", "/crash")
-    if _served(ctx, target):
-        try:
-            resp = ctx.client.get(target)
-            inspected = True
-            if _DEBUG_FINGERPRINT.search(resp.text):
-                ctx.evidence.update(endpoint=target, status=resp.status_code, debug_ui=True)
-                return True
-        except (httpx.HTTPError, httpx.InvalidURL):
-            pass
+    for r in _induce_error_responses(ctx):
+        inspected = True
+        if _DEBUG_FINGERPRINT.search(r.text):
+            ctx.evidence.update(status=r.status_code, debug_ui=True)
+            return True
     # Werkzeug/Flask debug ships an interactive debugger reachable WITHOUT an error: it serves its own JS
     # resource. A normal app 404s or returns HTML here; only a live debugger answers with javascript --
     # gating on the javascript content-type avoids false-firing on a 404 page that reflects the query.
@@ -1845,18 +1838,40 @@ def slow_core_web_vitals(ctx, probe) -> bool:
     return any(bad.values())
 
 
+_CONSOLE_INTACT_SCALE = 0.4   # an uncaught error that DIDN'T visibly break the render is a real defect but not
+                              # a functional break -> scaled below the ceiling (the flat 22 over-fired on these)
+_CONSOLE_MIN_CONTENT = 50     # visible body text below this (+ an error) reads as a near-empty/degraded render
+
+
+def _console_broken_render(res: dict) -> bool:
+    """Did the uncaught error visibly BREAK the render? True on a framework crash overlay/message or a
+    near-empty body. A FULL white-screen is already DNF'd upstream (functional=False), so the live zone here
+    is PARTIAL breakage — the app rendered but shows a crash / lost a region."""
+    if res.get("error_overlay"):
+        return True
+    cl = res.get("content_len")
+    return cl is not None and cl < _CONSOLE_MIN_CONTENT
+
+
 def console_errors_present(ctx, probe) -> bool:
-    """Browser oracle: the page throws an uncaught JavaScript error FROM ITS OWN CODE on load — broken
-    regardless of intent. A third-party widget/analytics script throwing (cross-origin, browser-sanitized
-    to "Script error.") is common on working apps and does NOT count — only first-party errors are the
-    team's durability failure. Browser-gated."""
+    """Browser oracle: the page throws an uncaught JavaScript error FROM ITS OWN CODE on load. A third-party
+    widget/analytics script throwing (cross-origin, browser-sanitized to "Script error.") is common on
+    working apps and does NOT count — only first-party errors are the team's durability failure. The penalty
+    is SCALED by render impact (see _console_broken_render): full when the error visibly broke the page,
+    reduced when the app rendered fine despite it (a real but non-fatal defect). Browser-gated."""
     url = ctx.base_url.rstrip("/") + probe.probe.get("target", "/")
     res = browser.console_errors(url, headers=ctx.headers)
     if res is None:
         return False   # no browser / render failed -> can't test (browser-gated)
     ctx.evidence.update(js_errors=res["total"], first_party=res["first_party"],
                         third_party=res["third_party"], engine="pageerror")
-    return res["first_party"] > 0
+    if res["first_party"] <= 0:
+        return False
+    broken = _console_broken_render(res)
+    ctx.evidence.update(content_len=res.get("content_len"), error_overlay=bool(res.get("error_overlay")),
+                        render_broken=broken,
+                        penalty_override=probe.penalty if broken else max(1, round(probe.penalty * _CONSOLE_INTACT_SCALE)))
+    return True
 
 
 _A11Y_TIER = {"critical": 30, "serious": 18, "moderate": 10, "minor": 4}
@@ -2532,6 +2547,78 @@ _CRASH_JSON = (
 _CRASH_PATHS = ("/%ff%fe", "/%c0%ae%c0%ae", "/%00", "/%e0%80%80")
 
 
+def _induce_error_responses(ctx, budget=20):
+    """Yield SERVER-ERROR responses (status >= 400) induced by malformed input on discovered forms/endpoints,
+    plus the deliberate /crash route (the reference anchor + apps that ship one). Error-hygiene and debug-mode
+    scan these BODIES for a leaked trace / debug UI — the induction crash-resistance does for STATUS, reused
+    for CONTENT so those two probes fire on REAL apps, not only on a fixed /crash route. _endpoint_is_live-
+    gated (a catch-all shell's error page isn't the app's), and only ERROR responses are yielded — a leak
+    lives on an error, and 2xx content never carries a real trace, so this is the precision gate."""
+    bad_val = _CRASH_VALUES[0]        # one oversized value -> induces an unhandled error on a brittle handler
+    with make_client(ctx.base_url, ctx.headers, timeout=12.0, follow_redirects=False) as c:
+        try:                          # the references' deliberate error route; a real app usually 404s here
+            r = c.get("/crash")
+            if r.status_code >= 400:
+                yield r
+        except (httpx.HTTPError, httpx.InvalidURL):
+            pass
+        forms = [(f.action, (f.method or "get").lower(), list(f.fields)) for f in ctx.profile.forms if f.fields]
+        gets = [(e.raw_path, "get", list(e.query_params)) for e in ctx.profile.endpoints
+                if e.method.lower() == "get" and e.query_params]
+        for action, method, fields in forms + gets:
+            if budget <= 0:
+                break
+            try:
+                base = _xss_send(c, method, action, {fn: "1" for fn in fields})
+            except (httpx.HTTPError, httpx.InvalidURL):
+                continue
+            if base.status_code >= 500 or not _endpoint_is_live(ctx, c, action, method, base):
+                continue              # already-5xx (env-var-dead) or a catch-all phantom -> unattributable
+            budget -= 1
+            try:
+                r = _xss_send(c, method, action, {fn: bad_val for fn in fields})
+                if r.status_code >= 400:
+                    yield r
+            except (httpx.HTTPError, httpx.InvalidURL):
+                continue
+        posts = list(dict.fromkeys([f.action for f in ctx.profile.forms if (f.method or "").lower() == "post"]
+                                   + [e.path for e in ctx.profile.endpoints if e.method.lower() == "post"]))
+        for path in posts:
+            if budget <= 0:
+                break
+            try:
+                base = c.post(path, json={})
+            except (httpx.HTTPError, httpx.InvalidURL):
+                continue
+            if base.status_code >= 500 or not _endpoint_is_live(ctx, c, path, "post", base):
+                continue
+            budget -= 1
+            try:
+                r = c.post(path, content=_CRASH_JSON[0], headers={"Content-Type": "application/json"})
+                if r.status_code >= 400:
+                    yield r
+            except (httpx.HTTPError, httpx.InvalidURL):
+                continue
+
+
+def leaks_error_detail(ctx, probe) -> bool | None:
+    """Error-hygiene: an induced server error leaks a raw STACK TRACE or a DATABASE error to the user (info
+    disclosure + a broken-error-path signal). Scans errors induced across discovered endpoints + /crash.
+    Distinct from sec-debug (the full interactive DEBUG UI — strictly worse) and from SQLi (a leaked error on
+    ANY error path, not proof of injectability). N/A when no error response could be induced."""
+    inspected = False
+    for r in _induce_error_responses(ctx):
+        inspected = True
+        if _TRACE.search(r.text):
+            ctx.evidence.update(status=r.status_code, leak="stack-trace")
+            return True
+        if _SQL_ERROR.search(r.text):
+            ctx.evidence.update(status=r.status_code, leak="db-error")
+            return True
+    ctx.evidence.update(inspected=inspected, leak=None)
+    return False if inspected else None
+
+
 def crash_resistance(ctx, probe) -> bool | None:
     """Fuzz discovered forms/params with malformed values, POST malformed JSON to POST endpoints, and
     request decode-crashing paths; fire if any yields a 5xx (an unhandled exception) rather than a
@@ -2752,6 +2839,7 @@ PREDICATES = {
     "data_integrity_roundtrip": data_integrity_roundtrip,
     "content_type_mismatch": content_type_mismatch,
     "debug_mode_enabled": debug_mode_enabled,
+    "leaks_error_detail": leaks_error_detail,
     "exposed_backend_readable": exposed_backend_readable,
     "bundle_leaks_secret": bundle_leaks_secret,
     "source_map_exposed": source_map_exposed,
@@ -2791,7 +2879,6 @@ PREDICATES = {
 
 # Human-readable "why it fired" reasons for verbose / --failed output, derived from the probe's check.
 _MATCHER_REASONS = {
-    "response_leaks_stack_trace": "leaked a stack trace",
     "ttfb_at_least": "slow time-to-first-byte (>{arg}s)",
     "response_contains": "reflected the probe payload unescaped",
     "response_missing_header": "missing header: {arg}",
@@ -2824,6 +2911,7 @@ _PREDICATE_REASONS = {
     "data_integrity_roundtrip": "a created object could not be read back afterward (non-durable write / silent data loss)",
     "content_type_mismatch": "a response's body contradicts its declared Content-Type (e.g. JSON served as text/html -> client breakage / reflected-JSON XSS)",
     "debug_mode_enabled": "framework debug mode is on in production (interactive debugger / DEBUG page -> source, settings, env and an RCE console exposed)",
+    "leaks_error_detail": "an induced server error leaked a stack trace or a database error to the user (info disclosure + a broken error path)",
     "exposed_backend_readable": "the app's managed backend (Supabase/Firebase) is world-readable with its own public key -> the whole database is exposed (missing row-level security)",
     "bundle_leaks_secret": "a hardcoded SECRET key (Stripe sk_ / OpenAI / AWS secret / GitHub PAT / private key) is shipped in the client JS bundle -> account/DB takeover (public anon/publishable keys are not flagged)",
     "source_map_exposed": "a production JS bundle serves its .map -> the original source is reconstructable (business logic, hidden endpoints, and secrets a minified scan misses)",
