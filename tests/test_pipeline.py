@@ -18,6 +18,7 @@ REFS = ROOT / "references"
 ALL_PROBES = [
     "sec-sqli-001", "sec-sqli-002", "sec-sqli-003",  # variant group
     "sec-xss-001", "sec-secrets-001",
+    "sec-deps-001",  # supply-chain: ships jQuery 1.12.4 (known XSS CVE) in the client bundle
     "sec-session-001", "sec-session-002", "sec-session-003",  # cookie hygiene: HttpOnly / SameSite / Secure
     "sec-csrf-001", "sec-cors-001", "sec-ratelimit-001", "sec-redirect-001", "sec-hosthdr-001",
     "sec-split-001",  # HTTP response splitting (CRLF into a reflected header)
@@ -139,10 +140,10 @@ def test_vulnerable_app_accrues_slop():
     # (frequency x severity, see the catalog): security holds its catastrophic per-instance ceiling (40),
     # while qa/perf are priced up for their every-user frequency. On this deliberately security-riddled
     # reference, security still dominates; a realistic janky app (references/qa-janky) leans qa/perf.
-    assert report.axis_slop == {"security": 421, "qa": 183, "performance": 68}
-    assert report.slop_score == 672   # a11y tiered-sum damped ×0.6 (ref's 3 barriers = 47); +16 qa-input-001:
-                                      # /register accepts type=email="hlnotanemail" (client-only validation) ->
-                                      # the server doesn't enforce its own declared constraint
+    assert report.axis_slop == {"security": 439, "qa": 183, "performance": 68}
+    assert report.slop_score == 690   # +16 qa-input-001 (server accepts type=email="hlnotanemail"); +18
+                                      # sec-deps-001 (supply-chain: /config.js ships jQuery 1.12.4, a known
+                                      # XSS CVE — the app's OWN bundle, so it's their finding)
     assert sum(report.axis_slop.values()) == report.slop_score
 
 
@@ -213,7 +214,7 @@ def test_cached_profile_freezes_surface_and_reproduces_score(monkeypatch):
     catalog = load_catalog(CATALOG)
     minted = []
     r1 = run(SubprocessDeployer(str(REFS / "vulnerable" / "app.py")), catalog, on_profile=minted.append)
-    assert len(minted) == 1 and r1.slop_score == 672          # cache MISS -> discovered once + handed back
+    assert len(minted) == 1 and r1.slop_score == 690          # cache MISS -> discovered once + handed back
 
     import hacklet_runner.pipeline as pipeline_mod            # PROVE the crawl is skipped on a cache HIT:
     monkeypatch.setattr(pipeline_mod, "discover",             # discover() must never be called with a cached profile
@@ -221,7 +222,7 @@ def test_cached_profile_freezes_surface_and_reproduces_score(monkeypatch):
     seen = []
     r2 = run(SubprocessDeployer(str(REFS / "vulnerable" / "app.py")), catalog,
              cached_profile=minted[0], on_profile=seen.append)
-    assert r2.slop_score == 672 and seen == []                # HIT -> same score, no re-crawl, no re-mint
+    assert r2.slop_score == 690 and seen == []                # HIT -> same score, no re-crawl, no re-mint
     assert r2.axis_slop == r1.axis_slop                       # identical per-axis decomposition too
 
 

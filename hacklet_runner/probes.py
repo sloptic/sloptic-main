@@ -20,7 +20,7 @@ from dataclasses import replace
 
 import httpx
 
-from . import auth, browser, oob, perf, secretscan
+from . import auth, browser, depscan, oob, perf, secretscan
 from .net import make_client
 from .schema import Endpoint
 from .discovery import _CATCHALL_PROBE, _body_sig
@@ -1368,6 +1368,23 @@ def bundle_leaks_secret(ctx, probe) -> bool | None:
         ctx.evidence.update(secret_kinds=kinds, source="client-bundle")
         return True
     ctx.evidence.update(secret_kinds=[], scanned_bytes=len(blob))
+    return False
+
+
+def vulnerable_dependency(ctx, probe) -> bool | None:
+    """Supply-chain: the app SHIPS a client library with a KNOWN CVE (retire.js-style). Reads the app's OWN
+    bundle (ETHICAL — their code, never a third party's server) and fingerprints a curated set by license-
+    banner version. The team CHOSE the vulnerable dep (24h is enough for `npm audit`), so it's their finding,
+    and the report's remediation teaches vendor due diligence by proxy. Precision-first (unambiguous banner +
+    established CVE range). N/A when no bundle was served."""
+    blob = _client_bundle(ctx)
+    if not blob.strip():
+        return None
+    vulns = depscan.scan_deps(blob)
+    if vulns:
+        ctx.evidence.update(vulnerable_deps=vulns, count=len(vulns))
+        return True
+    ctx.evidence.update(vulnerable_deps=[], scanned_bytes=len(blob))
     return False
 
 
@@ -2923,6 +2940,7 @@ PREDICATES = {
     "leaks_error_detail": leaks_error_detail,
     "exposed_backend_readable": exposed_backend_readable,
     "bundle_leaks_secret": bundle_leaks_secret,
+    "vulnerable_dependency": vulnerable_dependency,
     "source_map_exposed": source_map_exposed,
     "session_cookie_missing_flag": session_cookie_missing_flag,
     "session_token_in_local_storage": session_token_in_local_storage,
@@ -2996,6 +3014,7 @@ _PREDICATE_REASONS = {
     "leaks_error_detail": "an induced server error leaked a stack trace or a database error to the user (info disclosure + a broken error path)",
     "exposed_backend_readable": "the app's managed backend (Supabase/Firebase) is world-readable with its own public key -> the whole database is exposed (missing row-level security)",
     "bundle_leaks_secret": "a hardcoded SECRET key (Stripe sk_ / OpenAI / AWS secret / GitHub PAT / private key) is shipped in the client JS bundle -> account/DB takeover (public anon/publishable keys are not flagged)",
+    "vulnerable_dependency": "the app ships a client library with a KNOWN CVE (retire.js-style: jQuery / Bootstrap / Moment / Handlebars) -> supply-chain risk the team chose; upgrade per the finding",
     "source_map_exposed": "a production JS bundle serves its .map -> the original source is reconstructable (business logic, hidden endpoints, and secrets a minified scan misses)",
     "session_cookie_missing_flag": "session cookie missing the {flag} flag",
     "session_token_in_local_storage": "session token persisted in localStorage (readable by any XSS on the origin — unlike an HttpOnly cookie)",

@@ -1,0 +1,15 @@
+id: sec-deps-001
+bundle: security
+category: dependency
+pool: public
+evidence_model: oracle
+penalty: 18   # a client dependency with a KNOWN CVE (retire.js-style) shipped to every visitor -> XSS /
+              # prototype-pollution / ReDoS the team could have avoided with `npm audit`. Supply-chain
+              # responsibility (the team CHOSE it, 24h is enough for due diligence); moderate — exploitation
+              # needs the vulnerable path actually used, and it's client-side, so priced below active XSS (35).
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  predicate: vulnerable_dependency   # read the app's OWN bundle (ethical), fingerprint a curated lib set by
+                                     # license-banner version, fire on an established CVE range. The finding's
+                                     # remediation (upgrade to X) teaches vendor due diligence by proxy.

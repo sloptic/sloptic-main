@@ -143,6 +143,17 @@ def test_error_hygiene_signatures_match_leaks_not_prose():
     assert not _TRACE.search('Our guide explains how to handle errors: retry at most once.')      # ordinary prose
 
 
+def test_depscan_flags_vulnerable_versions_not_patched():
+    from hacklet_runner.depscan import scan_deps
+    hits = scan_deps("/*! jQuery v1.12.4 */ x Bootstrap v4.1.3 y moment.js version : 2.10.0")
+    libs = {h["library"]: h["version"] for h in hits}
+    assert libs.get("jQuery") == "1.12.4"                 # < 3.5.0 -> XSS CVE
+    assert libs.get("Bootstrap") == "4.1.3"               # 4.x < 4.3.1 -> XSS CVE
+    assert libs.get("Moment.js") == "2.10.0"              # < 2.29.4 -> ReDoS
+    assert not scan_deps("/*! jQuery v3.6.0 */ Bootstrap v4.6.2")   # patched versions -> no finding
+    assert all("cve" in h and "fix" in h for h in hits)   # remediation rides on the finding (teach by proxy)
+
+
 def test_declared_constraint_values_and_acceptance():
     from hacklet_runner.probes import _constraint_values, _submission_accepted
     assert _constraint_values({"type": "email"}) == ("hl.probe@example.com", "hlnotanemail")   # invalid: no @

@@ -89,8 +89,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(500, "decode error")  # and 500s on malformed %-encoding (no 400 guard)
         if self.path == "/":
             return self._send(200, HOME)
-        if self.path == "/config.js":  # leaks a (fake, non-placeholder) AWS key in client JS — classic slop
-            return self._send(200, 'const AWS_KEY = "AKIAZ3PK7NBQWXYZ1234";\n', "application/javascript")
+        if self.path == "/config.js":  # leaks a (fake, non-placeholder) AWS key in client JS — classic slop;
+            # also ships a jQuery with a known XSS CVE (sec-deps-001 supply-chain) via its license banner
+            return self._send(200, '/*! jQuery v1.12.4 | (c) jQuery Foundation | jquery.org/license */\n'
+                                    'const AWS_KEY = "AKIAZ3PK7NBQWXYZ1234";\n', "application/javascript")
         if self.path == "/.env":  # secrets file served at the webroot — deployment slop
             return self._send(
                 200, "DATABASE_URL=postgres://app:hunter2@db/app\nDJANGO_SECRET_KEY=insecure-dev-key\n",

@@ -99,8 +99,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/":
             return self._send(200, HOME)
-        if self.path == "/config.js":  # same surface, no secret in client code
-            body = b'const CONFIG = { api: "/api" };\n'
+        if self.path == "/config.js":  # same surface, no secret in client code; ships a PATCHED jQuery
+            # (>=3.5.0) so sec-deps-001 sees the lib but reads it CLEAN (version discrimination, not lib presence)
+            body = b'/*! jQuery v3.6.0 | (c) OpenJS Foundation | jquery.org/license */\nconst CONFIG = { api: "/api" };\n'
             etag = '"%s"' % hashlib.md5(body).hexdigest()   # cacheable static asset with a real validator
             if self.headers.get("If-None-Match") == etag:   # honor revalidation -> cheap 304, no refetch
                 return self._send(304, b"", "application/javascript", cache="public, max-age=3600", etag=etag)
