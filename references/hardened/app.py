@@ -55,7 +55,7 @@ HOME = b"""<!doctype html><html lang="en"><head><title>demo app</title>
 </form>
 <form action="/register" method="post">
   <input name="username" aria-label="new username" placeholder="user">
-  <input name="email" aria-label="email" placeholder="email">
+  <input name="email" type="email" aria-label="email" placeholder="email">
   <input name="password" type="password" aria-label="new password" placeholder="pw">
   <button type="submit">register</button>
 </form>
@@ -162,6 +162,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path == "/register":
             length = int(self.headers.get("Content-Length", "0"))
             form = urllib.parse.parse_qs(self.rfile.read(length).decode())
+            email = form.get("email", [""])[0]
+            if email and "@" not in email:                    # SERVER-side enforcement of the declared type=email
+                return self._send(400, "invalid email")       # (not client-JS only) -> qa-input-001 stays clean
             user = form.get("username", ["anon"])[0] or "anon"
             sid = secrets.token_hex(16)
             _SESSIONS[sid] = user

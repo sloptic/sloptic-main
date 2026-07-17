@@ -90,7 +90,7 @@ def test_interaction_reveals_click_gated_login_and_upload():
         static = browser.render_routes(base, ["/"], interact=False)["/"]
         live = browser.render_routes(base, ["/"], interact=True)["/"]
         assert _scan_form_inputs(static)[2] is False           # static render is blind to the gated controls
-        _, files, has_pw = _scan_form_inputs(live)
+        _, files, has_pw, _ = _scan_form_inputs(live)
         assert has_pw is True and files == ["doc"]             # interaction surfaces login + upload
     finally:
         srv.shutdown()
@@ -127,6 +127,72 @@ def test_interaction_is_bounded_to_first_n_routes():
         out = browser.render_routes(base, ["/", "/two"], interact=True, interact_routes=1)
         assert _scan_form_inputs(out["/"])[2] is True        # route 0 interacted -> the click-gated login surfaces
         assert _scan_form_inputs(out["/two"])[2] is False     # route 1 only rendered -> the gated control stays hidden
+    finally:
+        srv.shutdown()
+
+
+def test_observed_network_requests_become_endpoints():
+    # the accurate sensor end-to-end: a page that fetches on load -> the REAL endpoint is OBSERVED in the
+    # network and added to the profile (origin='observed'), no LLM guessing. Method + path + query survive.
+    import http.server
+    import threading
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path.startswith("/api/data"):
+                body, ct = b'{"ok":true}', "application/json"
+            else:
+                body = b'<!doctype html><html><body>hi<script>fetch("/api/data?x=1")</script></body></html>'
+                ct = "text/html"
+            self.send_response(200)
+            self.send_header("Content-Type", ct)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        prof = discover(f"http://127.0.0.1:{srv.server_address[1]}", render=browser.render_routes)
+        obs = [e for e in prof.endpoints if e.origin == "observed" and e.path == "/api/data"]
+        assert obs, "the app's load-time fetch should be harvested as an observed endpoint"
+        assert obs[0].method == "get" and "x" in obs[0].query_params
+    finally:
+        srv.shutdown()
+
+
+def test_action_driving_harvests_interaction_gated_endpoints():
+    # the recall win: driving a discovered action (click a non-destructive button) fires the app's business
+    # API call, which the harvest catches -> the interaction-gated endpoint no crawl/JS-mine/load-render sees.
+    import http.server
+    import threading
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path.startswith("/api/generate"):
+                body, ct = b'{"ok":1}', "application/json"
+            else:
+                body = (b'<!doctype html><html><body>'
+                        b'<button onclick="fetch(\'/api/generate?n=1\')">Generate</button></body></html>')
+                ct = "text/html"
+            self.send_response(200)
+            self.send_header("Content-Type", ct)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        prof = discover(f"http://127.0.0.1:{srv.server_address[1]}", render=browser.render_routes)
+        assert any(e.origin == "observed" and e.path == "/api/generate" for e in prof.endpoints), \
+            "driving the 'Generate' button should fire + harvest /api/generate"
     finally:
         srv.shutdown()
 

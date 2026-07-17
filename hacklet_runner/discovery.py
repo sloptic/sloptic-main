@@ -7,6 +7,7 @@ can't see (client-rendered forms), plus per-endpoint baselines for oracle differ
 """
 from __future__ import annotations
 
+import json
 import re
 from urllib.parse import parse_qs, urljoin, urlparse
 
@@ -146,8 +147,17 @@ def _infer_name(attrs: str, label: str | None) -> str | None:
     return idm.group(1) if idm else None                      # a structural id (kept verbatim, not slugged)
 
 
+_ATTR_REQUIRED = re.compile(r'(?<![-\w])required(?![-\w])', re.I)                 # boolean attr
+_ATTR_MIN = re.compile(r'(?<![-\w])min=["\']?([^"\'\s>]+)', re.I)
+_ATTR_MAX = re.compile(r'(?<![-\w])max=["\']?([^"\'\s>]+)', re.I)
+# HTML5 input types the BROWSER validates -> the app's DECLARED contract. A server that accepts a value
+# violating one is doing client-only validation (tested by qa-input-001 / declared_constraint_unenforced).
+_CONSTRAINT_TYPES = {"email", "url", "number", "range", "date", "datetime-local", "time", "month", "week"}
+
+
 def _scan_form_inputs(html: str, drop_named_noninjectable: bool = False):
-    """(fields, file_fields, has_password) for the interactive controls in an HTML fragment, in document
+    """(fields, file_fields, has_password, constraints) for the interactive controls in an HTML fragment, in
+    document
     order. A NAMED control keeps its name for any type (a real <form> needs its hidden/CSRF fields to
     submit faithfully); a NAME-less control gets an inferred name (_infer_name) so React inputs with no
     name/id are still addressable. File inputs also appear in `fields` (a superset — lets the text-input
@@ -156,6 +166,7 @@ def _scan_form_inputs(html: str, drop_named_noninjectable: bool = False):
     fields: list[str] = []
     file_fields: list[str] = []
     has_password = False
+    constraints: dict = {}
     label: str | None = None
     for label_text, tag, attrs in _LABEL_OR_INPUT.findall(html):
         if not tag:                                   # a <label> — remember it for the NEXT input
@@ -191,7 +202,19 @@ def _scan_form_inputs(html: str, drop_named_noninjectable: bool = False):
         if name not in fields:
             fields.append(name)
             has_password = has_password or itype == "password"
-    return fields, file_fields, has_password
+        cons = {}                                     # the field's DECLARED constraint (its own HTML5 contract)
+        if itype in _CONSTRAINT_TYPES:
+            cons["type"] = itype
+        if _ATTR_REQUIRED.search(attrs):
+            cons["required"] = True
+        mnm, mxm = _ATTR_MIN.search(attrs), _ATTR_MAX.search(attrs)
+        if mnm:
+            cons["min"] = mnm.group(1)
+        if mxm:
+            cons["max"] = mxm.group(1)
+        if cons:
+            constraints.setdefault(name, cons)
+    return fields, file_fields, has_password, constraints
 
 
 def _parse_forms(matches, base_url: str, page_path: str) -> list[Form]:
@@ -206,13 +229,14 @@ def _parse_forms(matches, base_url: str, page_path: str) -> list[Form]:
             continue
         method = mm.group(1).lower() if mm else "get"
         em = _ENCTYPE.search(attrs)
-        fields, file_fields, _ = _scan_form_inputs(body)  # keeps hidden/CSRF fields for a faithful submit
+        fields, file_fields, _, constraints = _scan_form_inputs(body)  # keeps hidden/CSRF fields for faithful submit
         forms.append(Form(
             action=action,
             method=method if method in ("get", "post") else "get",
             fields=fields,
             enctype=em.group(1).lower() if em else "",
             file_fields=file_fields,
+            constraints=constraints,
         ))
     return forms
 
@@ -239,7 +263,7 @@ def _formless_form(html: str, page_path: str) -> Form | None:
     can't manufacture a false positive). Field names come from _scan_form_inputs/_infer_name, which
     handle the name-less React inputs these apps use. Returns None when the page has no such inputs."""
     body = _FORM.sub(" ", html)   # drop real <form>s (handled by _parse_forms) -> only UNwrapped inputs
-    fields, file_fields, has_password = _scan_form_inputs(body, drop_named_noninjectable=True)
+    fields, file_fields, has_password, _ = _scan_form_inputs(body, drop_named_noninjectable=True)
     if not fields:
         return None
     return Form(
@@ -259,6 +283,42 @@ def _clean_names(v) -> list:
         if isinstance(x, str) and x.strip() and x.strip() not in out:
             out.append(x.strip())
     return out[:12]
+
+
+_OBS_ENDPOINT_CAP = 40
+
+
+def _endpoints_from_observed(observed, base_url) -> list:
+    """Endpoints OBSERVED in the app's own same-origin xhr/fetch traffic during render+interaction — the
+    ACCURATE endpoint surface (the app actually called these), which the deterministic crawl and the static
+    JS mine (jsmine) both miss when the path is built dynamically. Ground truth: real method, real path, and a
+    JSON POST body's keys as body_fields for the injection/crash probes to reach. No 404-verification needed
+    (it was observed). origin='observed' for the off-score pointer telemetry."""
+    out, seen = [], set()
+    for method, url, post_data in observed:
+        try:
+            u = urlparse(url)
+        except Exception:
+            continue
+        path, m = u.path or "/", (method or "get").lower()
+        if path.startswith("/_next/") or path.startswith("/__") or "_rsc" in (u.query or ""):
+            continue                        # Next.js RSC / route-prefetch / framework noise, not the app's API
+        if (m, path) in seen or _same_origin_path(path, base_url, "/") is None:
+            continue                        # deduped; _same_origin_path drops logout / template-artifact paths
+        seen.add((m, path))
+        bf = []
+        if post_data:
+            try:
+                body = json.loads(post_data)
+                if isinstance(body, dict):
+                    bf = list(body.keys())[:12]
+            except (ValueError, TypeError):
+                pass
+        out.append(Endpoint(path=path, method=m, query_params=sorted(parse_qs(u.query)),
+                            body_fields=bf, raw_path=path, origin="observed"))
+        if len(out) >= _OBS_ENDPOINT_CAP:
+            break
+    return out
 
 
 def _endpoints_from_features(features) -> list:
@@ -508,7 +568,8 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
         # client-rendered links into the route set; (2) render the rest of the now-fuller HTML route set
         # in one reused browser session (bounded — each goto costs). render(base_url, paths, headers) ->
         # {path: DOM} is browser.render_routes; None/{} when no browser launched (browser probes read N/A).
-        rendered = render(base_url, [start_path], headers=headers) or {}
+        observed_net = []                       # the app's OWN same-origin xhr/fetch calls, harvested as it renders
+        rendered = render(base_url, [start_path], headers=headers, net_sink=observed_net) or {}
         if rendered:
             browser_ok = True  # a real render returned HTML -> the browser actually launched/works
             any_response = True
@@ -524,7 +585,7 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
             if (auth[0] or auth[1]) and not any(any("pass" in n.lower() for n in f.fields) for f in forms):
                 extra += [p for p in _AUTH_ROUTES if p not in extra and p not in visited]
             if extra:                               # phase 2: render the rest of the HTML surface
-                rendered.update(render(base_url, extra, headers=headers) or {})
+                rendered.update(render(base_url, extra, headers=headers, net_sink=observed_net) or {})
             for path, dom in rendered.items():
                 _l, _s = _auth_triggers(dom)   # a SPA paints 'Sign in'/'Sign up' client-side, so scan the DOM too
                 auth[0] |= _l
@@ -543,6 +604,24 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
                     p = _same_origin_path(ref, base_url, path)
                     if p:
                         routes.setdefault(p, None)
+
+            # OBSERVED-request harvest: the REAL endpoints the app called as it rendered/interacted (its own
+            # same-origin xhr/fetch) -> the accurate endpoint surface. Ground truth the crawl + static JS-mine
+            # miss when the path is built dynamically. Observed == real (no 404-verify); a GET baseline just
+            # feeds the probes' health gate. Added BEFORE perception so the LLM is told these, not re-guessing.
+            obs_eps = [e for e in _endpoints_from_observed(observed_net, base_url)
+                       if not any(x.method == e.method and x.path == e.path for x in endpoints)
+                       and not (e.method == "get" and not e.query_params and e.path in routes)]  # nav prefetch
+            if obs_eps:
+                with make_client(base_url, headers, timeout=5.0, follow_redirects=True) as pc:
+                    for e in obs_eps[:_BASELINE_CAP]:
+                        try:
+                            e.baseline_status = pc.get(e.path).status_code
+                        except (httpx.HTTPError, httpx.InvalidURL):
+                            e.baseline_status = None
+                endpoints += obs_eps
+                for e in obs_eps:
+                    routes.setdefault(e.path, None)
 
             # PROACTIVE discovery: the injected LLM perceives the RENDERED pages and returns the probeable
             # surface the crawl MISSED (client-rendered logins / uploads / action buttons a static crawl can't

@@ -36,6 +36,8 @@ class Form:
     enctype: str = ""                                     # e.g. multipart/form-data (file uploads)
     file_fields: list[str] = field(default_factory=list)  # names of <input type=file> controls
     origin: str = "crawl"                                  # "crawl" | "llm" (perceived) — pointer telemetry, never scored
+    constraints: dict = field(default_factory=dict)        # field name -> declared constraint {type,required,min,max}
+    #     (HTML5 type=email/number/url/date, required, min/max) — the app's OWN contract, tested by qa-input-001
 
 
 @dataclass

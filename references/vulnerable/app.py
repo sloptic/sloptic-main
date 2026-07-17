@@ -49,7 +49,7 @@ HOME = b"""<!doctype html><html><body>
 </form>
 <form action="/register" method="post">
   <input name="username" placeholder="user">
-  <input name="email" placeholder="email">
+  <input name="email" type="email" placeholder="email">
   <input name="password" type="password" placeholder="pw">
   <button type="submit">register</button>
 </form>

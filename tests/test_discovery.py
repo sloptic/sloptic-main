@@ -52,6 +52,36 @@ def test_self_submitting_form_resolves_to_current_page():
     assert forms[0].action == "/vulnerabilities/sqli/" and forms[0].fields == ["id", "Submit"]
 
 
+def test_forms_capture_declared_field_constraints():
+    # the app's OWN declared HTML5 constraints (type=email/number, required, min/max) ride on the Form so
+    # qa-input-001 can test whether the SERVER enforces them (declared_constraint_unenforced)
+    html = ('<form action="/register" method="post">'
+            '<input name="email" type="email" required>'
+            '<input name="age" type="number" min="0" max="120">'
+            '<input name="username"></form>')
+    form = _parse_forms(_FORM.findall(html), "http://x", "/")[0]
+    assert form.constraints["email"] == {"type": "email", "required": True}
+    assert form.constraints["age"] == {"type": "number", "min": "0", "max": "120"}
+    assert "username" not in form.constraints            # unconstrained -> no entry
+
+
+def test_observed_requests_become_real_endpoints():
+    # the accurate sensor: the app's OWN xhr/fetch calls (observed during render) become real endpoints -
+    # method + path + JSON body keys, deduped - instead of the LLM guessing invisible API paths at ~15%.
+    from hacklet_runner.discovery import _endpoints_from_observed
+    obs = [
+        ("GET", "http://x/api/todos?filter=open", None),
+        ("POST", "http://x/api/todos", '{"title":"a","done":false}'),
+        ("GET", "http://x/api/todos?filter=open", None),          # dup -> collapsed
+        ("GET", "http://x/logout", None),                         # logout -> dropped (destroys our session)
+    ]
+    by = {(e.method, e.path): e for e in _endpoints_from_observed(obs, "http://x")}
+    assert by[("get", "/api/todos")].query_params == ["filter"]
+    assert set(by[("post", "/api/todos")].body_fields) == {"title", "done"}
+    assert ("get", "/logout") not in by
+    assert all(e.origin == "observed" for e in by.values())
+
+
 def test_logout_links_are_excluded_from_the_crawl():
     # following a logout link would destroy the runner's own authenticated session
     for href in ("/logout.php", "logout", "/auth/sign-out", "/user_logout", "/logoff"):
@@ -204,14 +234,14 @@ def test_infer_name_prefers_autocomplete_then_label_then_placeholder():
 
 def test_scan_infers_anonymous_login_and_keeps_hidden_in_a_form():
     # a real <form> keeps its CSRF/hidden field (needed to submit) AND infers the anonymous credential inputs
-    fields, files, has_pw = _scan_form_inputs(
+    fields, files, has_pw, _ = _scan_form_inputs(
         '<input type="hidden" name="csrf"><label>Email</label><input type="email">'
         '<input type="password"><button type="submit">Go</button>')
     assert fields == ["csrf", "email", "password"] and has_pw and files == []
 
 
 def test_scan_associates_nearest_label():
-    fields, _, _ = _scan_form_inputs('<label>Username</label><input type="text">'
+    fields, _, _, _ = _scan_form_inputs('<label>Username</label><input type="text">'
                                      '<label>Bio</label><textarea></textarea>')
     assert fields == ["username", "bio"]
 
@@ -361,7 +391,7 @@ def test_catch_all_host_drops_phantom_endpoints_and_forms():
 
 def test_vendor_antibot_fields_excluded_from_injectable_surface():
     from hacklet_runner.discovery import _scan_form_inputs
-    fields, _files, _pw = _scan_form_inputs(
+    fields, _files, _pw, _ = _scan_form_inputs(
         "<input name='email'><input name='cf-turnstile-response' type='hidden'>"
         "<input name='g-recaptcha-response'><input name='password' type='password'>")
     assert "email" in fields and "password" in fields                                      # real inputs kept
@@ -457,7 +487,7 @@ def test_merge_perceived_rejects_third_party_and_fieldless_forms():
     assert prof.forms == []
 
 
-def _stub_render(base_url, paths, headers=None):
+def _stub_render(base_url, paths, headers=None, net_sink=None):
     return {p: "<html><body><h1>App</h1><button>Sign in</button></body></html>" for p in paths}
 
 

@@ -1,0 +1,16 @@
+id: qa-input-001
+bundle: qa
+category: input-validation
+pool: public
+evidence_model: oracle
+penalty: 16   # the server accepts a value that violates the app's OWN declared field constraint (HTML5
+              # type=email/number/url/date) -> client-only validation: garbage bypasses the browser straight
+              # into the datastore. ISO/IEC 25010 User Error Protection. Moderate — a data-integrity /
+              # robustness gap, priced with the other qa robustness probes (crash 32 > this > errhyg 14).
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  predicate: declared_constraint_unenforced   # differential: a valid submission is accepted, then the same
+                                              # submission with ONE field set to an unambiguously-invalid value
+                                              # (no @ in an email, letters in a number) — if that is ALSO
+                                              # accepted, the server isn't enforcing its own declared type

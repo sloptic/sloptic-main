@@ -141,3 +141,19 @@ def test_error_hygiene_signatures_match_leaks_not_prose():
     assert _TRACE.search("\tfrom app.rb:23:in `block'")                                           # Ruby
     assert _SQL_ERROR.search('sqlite3.OperationalError: no such column: x')                       # leaked DB error
     assert not _TRACE.search('Our guide explains how to handle errors: retry at most once.')      # ordinary prose
+
+
+def test_declared_constraint_values_and_acceptance():
+    from hacklet_runner.probes import _constraint_values, _submission_accepted
+    assert _constraint_values({"type": "email"}) == ("hl.probe@example.com", "hlnotanemail")   # invalid: no @
+    assert _constraint_values({"type": "number", "min": "3"})[0] == "3"        # valid = the declared min
+    assert not _constraint_values({"type": "number"})[1].isdigit()             # invalid = non-numeric
+    assert _constraint_values({"type": "text"}) is None                        # unconstrained -> not testable
+
+    class R:
+        def __init__(self, code, loc=""):
+            self.status_code, self.headers = code, {"location": loc}
+    assert _submission_accepted(R(200), "/register") is True
+    assert _submission_accepted(R(302, "/dashboard"), "/register") is True     # POST-redirect-GET success
+    assert _submission_accepted(R(302, "/register"), "/register") is False     # redirect back to form = re-show
+    assert _submission_accepted(R(400), "/register") is False                  # explicit rejection

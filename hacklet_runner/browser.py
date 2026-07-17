@@ -155,9 +155,51 @@ def _reveal_hidden_controls(page, max_clicks: int = 6, per_wait_ms: int = 350) -
     return ("<!--revealed-controls-->" + "".join(revealed)) if revealed else ""
 
 
+_DRIVE_ROUTES = 3   # drive actions on only the first few routes (submit+wait is costly + mutates) -> grade budget
+
+
+def _drive_actions(page, max_actions: int = 5, per_wait_ms: int = 450) -> None:
+    """ACT on the page — fill visible forms with benign values and submit them, and click NON-destructive
+    action buttons — so the app FIRES its OWN business API calls, which the net_sink harvest turns into real
+    endpoints. This surfaces the INTERACTION-GATED runtime surface (a chat submit -> /api/chat) that no static
+    crawl, JS-mine, or load-render can see, and that the LLM was left guessing. The inverse of
+    _reveal_hidden_controls (open-ONLY): guarded by the SAME _NO_CLICK regex (skips delete/pay/logout/send/
+    publish/external), benign values, bounded. State mutation is within the envelope the probes already accept
+    (they submit discovered forms). Best-effort + isolated (suppress) so one hostile control never breaks the render."""
+    acted = 0
+    with contextlib.suppress(Exception):                     # 1. real <form>s: fill benign values + submit
+        for form in page.query_selector_all("form"):
+            if acted >= max_actions:
+                break
+            with contextlib.suppress(Exception):
+                if not form.is_visible() or _NO_CLICK.search((form.inner_text() or "")[:200]):
+                    continue                                 # a delete/pay/logout form -> never submit it
+                for inp in form.query_selector_all("input:not([type=hidden]):not([type=file]), textarea"):
+                    with contextlib.suppress(Exception):
+                        t = (inp.get_attribute("type") or "text").lower()
+                        if t not in ("submit", "button", "checkbox", "radio"):
+                            inp.fill("hl.probe@example.com" if t == "email" else "hlprobe")
+                form.evaluate("f => (f.requestSubmit ? f.requestSubmit() : f.submit())")  # fires the onsubmit fetch
+                page.wait_for_timeout(per_wait_ms)           # let the fetch land so net_sink captures it
+                acted += 1
+    with contextlib.suppress(Exception):                     # 2. action BUTTONS (SPA onclick->fetch, not a <form>)
+        for btn in page.query_selector_all("button, [role=button]"):
+            if acted >= max_actions:
+                break
+            with contextlib.suppress(Exception):
+                lbl = ((btn.inner_text() or "") + " " + (btn.get_attribute("aria-label") or "")).strip().lower()[:80]
+                if not lbl or _NO_CLICK.search(lbl) or not btn.is_visible():
+                    continue
+                if btn.evaluate("e => e.tagName==='BUTTON' && e.type==='submit' && !!e.form"):
+                    continue                                 # a form submitter -> already handled in (1)
+                btn.click(timeout=1500)
+                page.wait_for_timeout(per_wait_ms)
+                acted += 1
+
+
 def render_routes(base_url: str, paths, headers=None, timeout: float = 12.0,
                   total_timeout: float = 60.0, interact: bool = True,
-                  interact_routes: int = 6) -> dict[str, str]:
+                  interact_routes: int = 6, net_sink: list | None = None) -> dict[str, str]:
     """Render each same-origin path in ONE reused browser session and return {path: rendered_DOM}.
     Paths that fail to load are omitted; {} if no browser is available. A single launch is amortized
     across all routes — a launch-per-route helper would relaunch (and re-warm) the browser each time.
@@ -183,6 +225,14 @@ def render_routes(base_url: str, paths, headers=None, timeout: float = 12.0,
             try:
                 page = b.new_page()
                 _apply_auth(page, base_url, headers)  # cookies/headers persist for the origin across gotos
+                if net_sink is not None:              # harvest the app's OWN same-origin xhr/fetch calls as it
+                    _host = urllib.parse.urlparse(base_url).netloc       # renders -> the REAL endpoint surface,
+                    def _cap(req):                                       # vs the LLM guessing invisible API paths
+                        with contextlib.suppress(Exception):
+                            if (req.resource_type in ("xhr", "fetch")
+                                    and urllib.parse.urlparse(req.url).netloc == _host and len(net_sink) < 100):
+                                net_sink.append((req.method, req.url, req.post_data))
+                    page.on("request", _cap)
                 deadline = time.monotonic() + total_timeout
                 for idx, path in enumerate(paths):
                     if time.monotonic() > deadline:
@@ -194,6 +244,8 @@ def render_routes(base_url: str, paths, headers=None, timeout: float = 12.0,
                         dom = page.content()
                         if interact and idx < interact_routes:  # bound: reveal-clicking every route on a big
                             dom += _reveal_hidden_controls(page)  # SPA is the grade-timeout — cap to the first N
+                            if net_sink is not None and idx < _DRIVE_ROUTES:   # then ACT (submit/click) to fire
+                                _drive_actions(page)                            # the app's business API calls
                         out[path] = dom
             finally:
                 b.close()

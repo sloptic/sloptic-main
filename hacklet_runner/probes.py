@@ -2619,6 +2619,87 @@ def leaks_error_detail(ctx, probe) -> bool | None:
     return False if inspected else None
 
 
+_CONSTRAINT_VALUES = {
+    "email": ("hl.probe@example.com", "hlnotanemail"),       # no @ -> unambiguously invalid
+    "url": ("https://example.com/x", "hl not a url"),
+    "date": ("2020-06-15", "hl-not-a-date"),
+    "datetime-local": ("2020-06-15T10:00", "hl-not-a-date"),
+    "time": ("10:30", "hl-not-a-time"),
+    "month": ("2020-06", "hl-not-a-month"),
+    "week": ("2020-W25", "hl-not-a-week"),
+}
+
+
+def _constraint_values(cons: dict):
+    """(valid, invalid) pair for a declared field constraint, or None if not cleanly testable. The invalid
+    value is UNAMBIGUOUSLY invalid (no @ in an email, letters in a number) so a server that accepts it is
+    definitely not enforcing — this dodges the 'what counts as valid' fuzziness (a stricter-but-reasonable
+    regex is not a bug)."""
+    t = (cons.get("type") or "").lower()
+    if t in ("number", "range"):
+        return (str(cons.get("min") or "5"), "hlxyz")        # letters -> invalid for a number field
+    return _CONSTRAINT_VALUES.get(t)
+
+
+def _valid_for(cons: dict) -> str:
+    """A value the field WILL accept: its declared-valid value, else a benign UNIQUE filler (fresh per call
+    so a second submission never collides with the first on a unique field like username)."""
+    v = _constraint_values(cons)
+    return v[0] if v else "hl" + secrets.token_hex(3)
+
+
+def _submission_accepted(resp, action: str) -> bool:
+    """The server ACCEPTED the submission: a 2xx, or a 3xx redirect AWAY from the form (POST-redirect-GET
+    success). A 4xx is a rejection; a 3xx back to the form action is an error re-show, also a rejection."""
+    if 200 <= resp.status_code < 300:
+        return True
+    if 300 <= resp.status_code < 400:
+        return action.rstrip("/") not in resp.headers.get("location", "")
+    return False
+
+
+def declared_constraint_unenforced(ctx, probe) -> bool | None:
+    """The server accepts a value that violates the app's OWN declared field constraint (HTML5 type=email/
+    number/url/date) — client-only validation, so garbage bypasses the browser straight into the app. The
+    app's DECLARED type is the oracle (not our guess of intent), so this stays inside the wedge. Differential,
+    other fields held valid: a VALID submission must be accepted first (baseline — else other fields/auth/CSRF
+    are needed and it isn't attributable to this field), then the SAME submission with the one field set to an
+    unambiguously-invalid value; if THAT is also accepted, the constraint isn't enforced. N/A when no declared-
+    constrained form accepts a valid baseline."""
+    tested = False
+    with make_client(ctx.base_url, ctx.headers, timeout=12.0, follow_redirects=False) as c:
+        for form in ctx.profile.forms:
+            targets = [(f, form.constraints[f]) for f in form.fields
+                       if f in form.constraints and _constraint_values(form.constraints[f])]
+            method = (form.method or "post").lower()
+            for field, cons in targets:
+                valid_val, invalid_val = _constraint_values(cons)
+                good = {f: _valid_for(form.constraints.get(f, {})) for f in form.fields}
+                good[field] = valid_val
+                try:
+                    base = _xss_send(c, method, form.action, good)
+                except (httpx.HTTPError, httpx.InvalidURL):
+                    continue
+                if not _submission_accepted(base, form.action):
+                    continue                                 # baseline rejected -> can't attribute to THIS field
+                if not _endpoint_is_live(ctx, c, form.action, method, base):
+                    continue                                 # catch-all phantom -> the 'acceptance' is the shell
+                tested = True
+                bad = {f: _valid_for(form.constraints.get(f, {})) for f in form.fields}
+                bad[field] = invalid_val
+                try:
+                    r = _xss_send(c, method, form.action, bad)
+                except (httpx.HTTPError, httpx.InvalidURL):
+                    continue
+                if _submission_accepted(r, form.action):
+                    ctx.evidence.update(action=form.action, field=field, declared=cons.get("type"),
+                                        invalid=str(invalid_val)[:40], valid_status=base.status_code,
+                                        invalid_status=r.status_code)
+                    return True                              # accepted a value violating its own declared type
+    ctx.evidence.update(tested=tested)
+    return False if tested else None
+
+
 def crash_resistance(ctx, probe) -> bool | None:
     """Fuzz discovered forms/params with malformed values, POST malformed JSON to POST endpoints, and
     request decode-crashing paths; fire if any yields a 5xx (an unhandled exception) rather than a
@@ -2854,6 +2935,7 @@ PREDICATES = {
     "race_resource_ids": race_resource_ids,
     "load_resilience": load_resilience,
     "crash_resistance": crash_resistance,
+    "declared_constraint_unenforced": declared_constraint_unenforced,
     "perf_ttfb": perf_ttfb,
     "perf_page_weight": perf_page_weight,
     "perf_request_count": perf_request_count,
@@ -2925,6 +3007,7 @@ _PREDICATE_REASONS = {
     "race_resource_ids": "concurrent creates collided on one id (non-atomic allocation)",
     "load_resilience": "endpoint 5xx'd under a concurrent burst",
     "crash_resistance": "malformed input caused an unhandled 5xx instead of a graceful 4xx",
+    "declared_constraint_unenforced": "the server accepted a value violating the app's own declared field constraint (type=email/number/... -> client-only validation)",
     "perf_ttfb": "slow server response (time-to-first-byte over the perf budget)",
     "perf_page_weight": "heavy page (transfer weight over the perf budget)",
     "perf_request_count": "too many requests to render the homepage (over the perf budget)",
