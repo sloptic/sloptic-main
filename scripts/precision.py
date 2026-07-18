@@ -72,6 +72,15 @@ def _suspect(f, catch_all):
     if _phantom_sensitive(pid) and catch_all:
         return ("fp", "catch-all / soft-404 host — the targeted endpoint likely doesn't exist server-side "
                       "(un-gated phantom-sensitive probe)")
+    # content-interpreter probes read a fetched body as a specific artifact — on a catch-all the body is the app
+    # shell for EVERY path, so a served-file match is almost always the shell (a real .env can't exist on a host
+    # that returns the shell for all paths), while a bundle secret-match CAN be real (an sk-ant key in a live SPA).
+    if pid.startswith("sec-exposure") and pid != "sec-exposure-006" and catch_all:  # 006 VALIDATES the .map parses
+        return ("fp", "served-file match on a catch-all / soft-404 host — the path returns the app shell for "
+                      "every route, not a real .env/.git/.aws artifact")            # as source-map JSON -> not shell-fakeable
+    if pid.startswith("sec-secret") and catch_all:
+        return ("advisory", "secret-pattern match in the bundle of a catch-all-frontend host — verify it's a "
+                            "real embedded key (sk-ant / sk-live / AKIA…), not a library constant or the shell")
     # NOTE: a login-wall is NOT flagged — its login form + rate-limiting ARE real, testable surface.
     return None
 
