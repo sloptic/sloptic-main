@@ -182,8 +182,12 @@ def main():
         return [r for r in recs if r.get("winner") is True and pred(r)], \
                [r for r in recs if r.get("winner") is False and pred(r)]
     win_all, non_all = split(lambda r: True)
-    win_scores = [r["slop_score"] for r in win_all if r.get("deployed") and "slop_score" in r]
-    non_scores = [r["slop_score"] for r in non_all if r.get("deployed") and "slop_score" in r]
+    # SAME population as (b) graded — exclude non-functional/DNF (they carry a slop_score but are banished from
+    # the distribution) and recon records, so the winner comparison isn't contaminated by broken high-slop apps.
+    win_scores = [r["slop_score"] for r in win_all
+                  if r.get("deployed") and "slop_score" in r and r.get("functional") is not False and not r.get("recon")]
+    non_scores = [r["slop_score"] for r in non_all
+                  if r.get("deployed") and "slop_score" in r and r.get("functional") is not False and not r.get("recon")]
 
     # ---- (e) anomalies ----
     mean = statistics.mean(scores) if scores else 0
