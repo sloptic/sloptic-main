@@ -199,7 +199,8 @@ def _drive_actions(page, max_actions: int = 5, per_wait_ms: int = 450) -> None:
 
 def render_routes(base_url: str, paths, headers=None, timeout: float = 12.0,
                   total_timeout: float = 60.0, interact: bool = True,
-                  interact_routes: int = 6, net_sink: list | None = None) -> dict[str, str]:
+                  interact_routes: int = 6, net_sink: list | None = None,
+                  script_sink: list | None = None) -> dict[str, str]:
     """Render each same-origin path in ONE reused browser session and return {path: rendered_DOM}.
     Paths that fail to load are omitted; {} if no browser is available. A single launch is amortized
     across all routes — a launch-per-route helper would relaunch (and re-warm) the browser each time.
@@ -225,12 +226,18 @@ def render_routes(base_url: str, paths, headers=None, timeout: float = 12.0,
             try:
                 page = b.new_page()
                 _apply_auth(page, base_url, headers)  # cookies/headers persist for the origin across gotos
-                if net_sink is not None:              # harvest ALL the app's xhr/fetch calls as it renders (same-
-                    def _cap(req):                    # origin AND off-origin) -> the REAL backend surface + where it
-                        with contextlib.suppress(Exception):   # LIVES (discovery same-origin-filters + classifies)
-                            if req.resource_type in ("xhr", "fetch") and len(net_sink) < 150:
-                                net_sink.append((req.method, req.url, req.post_data))
-                    page.on("request", _cap)
+                if net_sink is not None or script_sink is not None:  # harvest the app's runtime requests as it renders
+                    _host = urllib.parse.urlparse(base_url).netloc
+                    def _cap(req):
+                        with contextlib.suppress(Exception):
+                            u = req.url
+                            if net_sink is not None and req.resource_type in ("xhr", "fetch") and len(net_sink) < 150:
+                                net_sink.append((req.method, u, req.post_data))   # xhr/fetch = the API surface (all
+                            if script_sink is not None and len(script_sink) < 60:  # origins; discovery classifies)
+                                pu = urllib.parse.urlparse(u)         # a runtime-loaded same-origin .js — a native ESM
+                                if pu.netloc == _host and pu.path.rsplit(".", 1)[-1].lower() == "js":  # import() chunk
+                                    script_sink.append(u)             # / modulepreload leaves NO <script src> tag for
+                    page.on("request", _cap)                          # the DOM scan -> discovery folds it into routes
                 deadline = time.monotonic() + total_timeout
                 for idx, path in enumerate(paths):
                     if time.monotonic() > deadline:

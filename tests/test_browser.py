@@ -164,6 +164,39 @@ def test_observed_network_requests_become_endpoints():
         srv.shutdown()
 
 
+def test_runtime_esm_import_chunk_is_folded_into_routes():
+    # the SPA recall gap: a native ESM dynamic import() loads a chunk over the network with NO <script src> tag in
+    # the DOM, so the static crawl AND the rendered-DOM script scan both miss it. The runtime .js-load capture must
+    # fold it into routes, so the bundle probes (depscan / secret-scan / source-map) read the lazy chunk shipped.
+    import http.server
+    import threading
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path.startswith("/lazy"):
+                body, ct = b'/*! jQuery v1.12.4 */\nexport const x = 1;\n', "application/javascript"
+            else:  # the entry shell references the chunk ONLY via import() — there is no <script src> to scrape
+                body = (b'<!doctype html><html><body>hi'
+                        b'<script type="module">import("/lazy.js").then(m => m)</script></body></html>')
+                ct = "text/html"
+            self.send_response(200)
+            self.send_header("Content-Type", ct)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        prof = discover(f"http://127.0.0.1:{srv.server_address[1]}", render=browser.render_routes)
+        assert "/lazy.js" in prof.routes, "a native ESM import() chunk (no <script> tag) must be folded into routes"
+    finally:
+        srv.shutdown()
+
+
 def test_action_driving_harvests_interaction_gated_endpoints():
     # the recall win: driving a discovered action (click a non-destructive button) fires the app's business
     # API call, which the harvest catches -> the interaction-gated endpoint no crawl/JS-mine/load-render sees.
