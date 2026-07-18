@@ -137,7 +137,8 @@ def main():
     # working submission, so it's EXCLUDED from the score distribution (never rescued to a low slop score).
     nonfunctional = [r for r in recs if r.get("functional") is False]
     disputed = [r for r in recs if r.get("disputed_broken") and r.get("functional") is not False]  # veto: scored, flagged
-    graded = [r for r in recs if r.get("deployed") and "slop_score" in r and r.get("functional") is not False]
+    graded = [r for r in recs if r.get("deployed") and "slop_score" in r and r.get("functional") is not False
+              and not r.get("recon")]   # recon records carry host_tiers only (no probes) -> not a real grade
     ungraded = [r for r in deployed if "slop_score" not in r]   # repo app came up but grading aborted
     scores = [r["slop_score"] for r in graded]
     # (g) pairing: a submission graded BOTH ways — keyed by project, the delta is the reproducibility signal
@@ -218,10 +219,10 @@ def main():
     pcv_judged = pcv_reach + pcv_halluc
     pcv_prec = round(pcv_reach / pcv_judged * 100, 1) if pcv_judged else None
 
-    # BACKEND-TIER distribution (OFF-SCORE): where each app's runtime traffic GOES (classify-hosts). Sizes the SPA
-    # off-origin gap. Tiers OVERLAP (an app can have a same-origin API + a BaaS + a custom backend) -> each count is
-    # "how many apps have ANY traffic of this tier" = the denominator for "can we reach it"; vendor_only is the
-    # exclusive slice with no gradeable data plane observed.
+    # BACKEND-TIER distribution (OFF-SCORE): WHOSE is each host the app's traffic hits (classify-hosts). Sizes the
+    # Move-2 gap = how many apps have an ATTRIBUTED own off-origin backend (same domain / self-host PaaS) we could
+    # safely probe. Tiers OVERLAP (an app can have a same-origin API + a BaaS + a custom backend) -> each count is
+    # "how many apps have ANY host of this tier". opaque = unattributable off-origin (not probed; flagged instead).
     def _tiers(r):
         s = r.get("observed_surface")
         t = s.get("host_tiers") if isinstance(s, dict) else None
@@ -229,11 +230,12 @@ def main():
     tiered = [t for r in recs for t in [_tiers(r)] if t and sum(t["counts"].values())]
     n_tier = len(tiered)
     tier_same = sum(1 for t in tiered if t["counts"].get("same_origin"))
+    tier_own = sum(1 for t in tiered if t["counts"].get("own_backend"))     # ATTRIBUTED own backend = Move-2 target
     tier_baas = sum(1 for t in tiered if t["counts"].get("managed_baas"))
-    tier_own = sum(1 for t in tiered if t["counts"].get("other_off_origin"))   # the app's OWN off-origin backend
-    tier_vendor_only = sum(1 for t in tiered if not any(
-        t["counts"].get(k) for k in ("same_origin", "managed_baas", "other_off_origin")))
-    own_hosts = Counter(h for t in tiered for h in (t.get("other_hosts") or []))
+    tier_vendor = sum(1 for t in tiered if t["counts"].get("vendor"))       # consumed third-party, not graded
+    tier_opaque = sum(1 for t in tiered if t["counts"].get("opaque"))       # unattributable -> flagged, not probed
+    own_hosts = Counter(h for t in tiered for h in (t.get("own_hosts") or []))
+    opaque_hosts = Counter(h for t in tiered for h in (t.get("opaque_hosts") or []))
 
     models = Counter(r.get("model") for r in recs if r.get("model"))   # LLM(s) used (a file may mix runs)
 
@@ -260,9 +262,9 @@ def main():
                         "hallucinated": ptr_halluc, "params_seeded": ptr_params, "precision_pct": ptr_prec},
             "perception": {"apps": len(pcv_active), "endpoints_seeded": pcv_eps, "reachable": pcv_reach,
                            "hallucinated": pcv_halluc, "forms_seeded": pcv_forms, "precision_pct": pcv_prec},
-            "backend_tiers": {"apps": n_tier, "has_same_origin": tier_same, "has_managed_baas": tier_baas,
-                              "has_own_off_origin": tier_own, "vendor_only": tier_vendor_only,
-                              "top_own_hosts": own_hosts.most_common(8)},
+            "backend_tiers": {"apps": n_tier, "has_same_origin": tier_same, "has_own_backend": tier_own,
+                              "has_managed_baas": tier_baas, "has_vendor": tier_vendor, "has_opaque": tier_opaque,
+                              "top_own_hosts": own_hosts.most_common(8), "top_opaque_hosts": opaque_hosts.most_common(8)},
             "models": dict(models.most_common()),
         }, indent=2))
         return
@@ -509,12 +511,15 @@ def main():
     # Move-2 recall frontier we can't yet reach. Tiers OVERLAP (an app can span all three).
     if n_tier:
         print(f"(i3) BACKEND-TIER DISTRIBUTION (off-score) — {n_tier} apps with observed runtime traffic")
-        print(f"    same-origin (probe-able now):          {tier_same:>4} ({tier_same/n_tier*100:.0f}%)")
-        print(f"    managed BaaS (config-test lane):       {tier_baas:>4} ({tier_baas/n_tier*100:.0f}%)")
-        print(f"    OWN off-origin backend (Move-2):       {tier_own:>4} ({tier_own/n_tier*100:.0f}%)   <- recall frontier")
-        print(f"    vendor/analytics only (no data plane): {tier_vendor_only:>4} ({tier_vendor_only/n_tier*100:.0f}%)")
+        print(f"    same-origin (probe-able now):        {tier_same:>4} ({tier_same/n_tier*100:.0f}%)")
+        print(f"    OWN off-origin backend (attributed): {tier_own:>4} ({tier_own/n_tier*100:.0f}%)   <- Move-2 target (same domain / self-host PaaS)")
+        print(f"    managed BaaS (config-test lane):     {tier_baas:>4} ({tier_baas/n_tier*100:.0f}%)")
+        print(f"    vendor (consumed, not graded):       {tier_vendor:>4} ({tier_vendor/n_tier*100:.0f}%)")
+        print(f"    opaque off-origin (unattributable):  {tier_opaque:>4} ({tier_opaque/n_tier*100:.0f}%)   <- not probed (safety); no clean-bill credit")
         if own_hosts:
             print("    top own-backend hosts: " + ", ".join(f"{h}({c})" for h, c in own_hosts.most_common(6)))
+        if opaque_hosts:
+            print("    top opaque hosts:      " + ", ".join(f"{h}({c})" for h, c in opaque_hosts.most_common(6)))
         print()
 
 

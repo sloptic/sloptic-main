@@ -82,19 +82,24 @@ def test_observed_requests_become_real_endpoints():
     assert all(e.origin == "observed" for e in by.values())
 
 
-def test_classify_hosts_separates_app_backend_from_vendor():
-    # the SPA-pivot recon: where does the app's runtime traffic GO? same-origin (probe now) / managed BaaS
-    # (config-test lane) / third-party VENDOR (never probe) / OTHER off-origin (likely the app's own backend).
+def test_classify_hosts_attributes_by_deployment_not_just_domain():
+    # WHOSE is each host? Attribution is broad by DEPLOYMENT (same registrable domain OR a self-hosting PaaS =
+    # the app's own backend, safe to probe), a branded third-party it CONSUMES is a vendor, and an unknown
+    # off-origin host is OPAQUE (unattributable -> flagged, never probed). The old classifier mislabeled
+    # Google/Stripe/Cloudflare as "own backend" (they fell through to a catch-all) — they're consumed, not ours.
     from hacklet_runner.discovery import _classify_hosts
     obs = [
-        ("GET", "http://myapp.com/api/x", None),                    # same-origin
-        ("GET", "https://abc.supabase.co/rest/v1/t", None),         # managed BaaS = app data plane
-        ("POST", "https://api.myapp-backend.io/todos", None),       # app's OWN custom backend (unknown off-origin)
-        ("GET", "https://www.google-analytics.com/collect", None),  # vendor
-        ("GET", "https://api.mapbox.com/tiles", None),              # vendor (maps — the growforgood case)
+        ("GET",  "http://myapp.com/api/x", None),                       # same-origin
+        ("GET",  "https://api.myapp.com/v1/t", None),                   # same registrable domain -> OWN backend
+        ("POST", "https://myapp-api.onrender.com/todos", None),         # self-hosting PaaS deploy -> OWN backend
+        ("GET",  "https://abc.supabase.co/rest/v1/t", None),            # managed BaaS
+        ("GET",  "https://www.googleapis.com/maps/x", None),            # branded VENDOR (was mislabeled own-backend)
+        ("POST", "https://m.stripe.com/6", None),                       # branded VENDOR (Stripe beacon)
+        ("GET",  "https://challenges.cloudflare.com/turnstile", None),  # branded VENDOR (Turnstile)
+        ("GET",  "https://api.some-unknown-co.io/data", None),          # unknown off-origin -> OPAQUE (not probed)
     ]
     c = _classify_hosts(obs, "http://myapp.com")["counts"]
-    assert c == {"same_origin": 1, "managed_baas": 1, "vendor": 2, "other_off_origin": 1}
+    assert c == {"same_origin": 1, "own_backend": 2, "managed_baas": 1, "vendor": 3, "opaque": 1}
 
 
 def test_host_tiers_rides_the_surface_and_survives_the_cache():
@@ -102,8 +107,8 @@ def test_host_tiers_rides_the_surface_and_survives_the_cache():
     # AND survive the per-commit surface cache, so an overnight batch can aggregate the off-origin distribution.
     from hacklet_runner.discovery import surface_metrics
     from hacklet_runner.schema import Profile, profile_from_dict, profile_to_dict
-    tiers = {"counts": {"same_origin": 2, "managed_baas": 1, "vendor": 3, "other_off_origin": 1},
-             "baas_hosts": ["abc.supabase.co"], "other_hosts": ["api.myapp-backend.io"]}
+    tiers = {"counts": {"same_origin": 2, "own_backend": 1, "managed_baas": 1, "vendor": 3, "opaque": 1},
+             "own_hosts": ["api.myapp.com"], "baas_hosts": ["abc.supabase.co"], "opaque_hosts": ["api.unknown.io"]}
     prof = Profile(base_url="http://x", host_tiers=tiers)
     assert surface_metrics(prof)["host_tiers"] == tiers                    # reaches the off-score record channel
     assert profile_from_dict(profile_to_dict(prof)).host_tiers == tiers   # frozen with the surface -> reproducible

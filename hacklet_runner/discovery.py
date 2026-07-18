@@ -286,31 +286,65 @@ def _clean_names(v) -> list:
 
 
 _OBS_ENDPOINT_CAP = 40
-# Known THIRD-PARTY hosts an app's client talks to that are NEVER the app's own backend -> never probed.
+# Known THIRD-PARTY branded hosts an app CONSUMES (never the app's own -> never probed). NOT a safety-critical
+# blocklist: with the 'opaque' bucket below, an UNLISTED vendor just lands in opaque (flagged, not probed), so
+# this only needs to be good enough for clean MEASUREMENT, not exhaustive.
 _VENDOR_HOSTS = re.compile(
     r"google-analytics|googletagmanager|doubleclick|gstatic|fonts\.google|jsdelivr|unpkg|cdnjs|cloudflareinsights|"
-    r"sentry|datadog|hotjar|clarity\.ms|mixpanel|amplitude|posthog|segment|"
-    r"clerk\.|auth0|accounts\.google|identitytoolkit|oauth|"
-    r"openai|anthropic|generativelanguage|api\.stripe|paypal|"
-    r"mapbox|maps\.googleapis|cloudinary|algolia|imgix|res\.cloudinary|tile\.|basemaps|"   # maps/media/search vendors
+    r"challenges\.cloudflare|"                                             # Cloudflare Turnstile (bot challenge)
+    r"sentry|datadog|hotjar|clarity\.ms|mixpanel|amplitude|posthog|segment|intercom|zendesk|fullstory|"
+    r"clerk\.|auth0|accounts\.google|identitytoolkit|oauth|recaptcha|hcaptcha|"
+    r"openai|anthropic|generativelanguage|stripe\.com|paypal|braintree|"   # stripe\.com: api/js/m/checkout.stripe
+    r"googleapis|clients6\.google|googlesyndication|googleadservices|youtube|ytimg|"   # Google APIs / ads / media
+    r"mapbox|cloudinary|algolia|imgix|res\.cloudinary|tile\.|basemaps|"    # maps/media/search vendors
     r"facebook|twitter|\bx\.com|vercel-insights|vitals\.vercel|va\.vercel|analytics", re.I)
 # Managed BaaS: the app's OWN data plane, config-testable (the idor-004 / backend-exposure "test the config" lane).
 _BAAS_HOSTS = re.compile(r"supabase\.co|firebaseio|firebasedatabase|firestore\.googleapis|\.appwrite|"
                          r"convex\.cloud|pocketbase|planetscale|neon\.tech|upstash|xata\.io|nhost", re.I)
+# Public suffixes where each label is its OWN site (a.vercel.app != b.vercel.app), so registrable-domain math
+# keeps one extra label. Common ccTLD-2LDs + the PaaS / static-host suffixes this corpus uses.
+_MULTI_SUFFIX = {
+    "co.uk", "org.uk", "gov.uk", "ac.uk", "com.au", "net.au", "org.au", "co.nz", "co.in", "co.jp",
+    "com.br", "com.mx", "co.za",
+    "vercel.app", "netlify.app", "github.io", "pages.dev", "web.app", "firebaseapp.com", "surge.sh",
+    "onrender.com", "render.com", "herokuapp.com", "railway.app", "fly.dev", "workers.dev", "run.app",
+    "deno.dev", "koyeb.app", "cyclic.app", "adaptable.app", "glitch.me", "replit.app",
+}
+# Self-hosting PaaS where teams deploy their OWN BACKEND -> an off-origin host here is the app's responsibility
+# (the outsourced-backend case: probe it). Excludes pure frontend/static hosts (vercel/netlify/github.io), whose
+# own serverless API is same-origin and whose cross-origin siblings are ambiguous -> those fall to 'opaque'.
+_BACKEND_PAAS = {"onrender.com", "render.com", "herokuapp.com", "railway.app", "fly.dev", "workers.dev",
+                 "run.app", "deno.dev", "koyeb.app", "cyclic.app", "adaptable.app"}
+
+
+def _registrable_domain(host: str) -> str:
+    """The 'site' (eTLD+1) of a host via a small public-suffix set: api.myapp.com -> myapp.com; a.b.co.uk ->
+    b.co.uk; x.onrender.com -> x.onrender.com (each PaaS project is its own site)."""
+    labels = host.split(".")
+    if len(labels) < 2:
+        return host
+    if ".".join(labels[-2:]) in _MULTI_SUFFIX and len(labels) >= 3:
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
 
 
 def _classify_hosts(observed, base_url) -> dict:
-    """Where does the app's runtime traffic actually GO? Classify each observed xhr/fetch host to see the real
-    backend location (OFF-SCORE diagnostic): same-origin (probe-able now), managed BaaS (Supabase/Firebase —
-    the config-testable data plane), a known third-party VENDOR (never the app's -> never probed), or OTHER
-    off-origin (an unknown host = likely the app's OWN custom backend = the recall frontier). The SPA corpus
-    keeps its server-side surface off-origin, so this tells us WHICH lever (better driving vs off-origin
-    targeting) unlocks it."""
+    """WHOSE is each host the app's runtime traffic hits? (OFF-SCORE diagnostic + the Move-2 attribution gate.)
+    The responsibility line and the don't-attack-a-third-party line are the SAME line: grade what the team STOOD
+    UP, never what they merely CONSUME. Buckets: same_origin (probe-able now); own_backend (the app's OWN
+    off-origin backend — SAME registrable domain OR a self-hosting PaaS deploy — its responsibility, safe to
+    probe = the Move-2 target); managed_baas (Supabase/Firebase — the config-test lane); vendor (a known branded
+    third-party it CONSUMES — never probed); opaque (an unknown off-origin host we CAN'T attribute — NOT probed,
+    for safety, but FLAGGED so a backend hidden behind an unattributable host can't buy a clean bill of health).
+    Attribution is broad by DEPLOYMENT, not narrow by domain: moving your backend to *.onrender.com doesn't hide
+    it (still yours), but an unlisted vendor slips safely into opaque rather than getting attacked."""
     app_host = urlparse(base_url).netloc
-    counts = {"same_origin": 0, "managed_baas": 0, "vendor": 0, "other_off_origin": 0}
-    baas, other = set(), set()
+    app_site = _registrable_domain(app_host.split(":")[0])
+    counts = {"same_origin": 0, "own_backend": 0, "managed_baas": 0, "vendor": 0, "opaque": 0}
+    own, baas, opaque = set(), set(), set()
     for _method, url, _pd in observed:
         h = urlparse(url).netloc
+        hp = h.split(":")[0]                             # host without port, for domain attribution
         if not h or h == app_host:
             counts["same_origin"] += 1
         elif _BAAS_HOSTS.search(h):
@@ -318,10 +352,14 @@ def _classify_hosts(observed, base_url) -> dict:
             baas.add(h)
         elif _VENDOR_HOSTS.search(h):
             counts["vendor"] += 1
+        elif _registrable_domain(hp) == app_site or ".".join(hp.split(".")[-2:]) in _BACKEND_PAAS:
+            counts["own_backend"] += 1                   # same site OR a self-hosting PaaS deploy -> the app's own
+            own.add(h)
         else:
-            counts["other_off_origin"] += 1
-            other.add(h)
-    return {"counts": counts, "baas_hosts": sorted(baas), "other_hosts": sorted(other)[:10]}
+            counts["opaque"] += 1                        # unknown branded off-origin -> unattributable: DON'T probe, flag
+            opaque.add(h)
+    return {"counts": counts, "own_hosts": sorted(own)[:10], "baas_hosts": sorted(baas),
+            "opaque_hosts": sorted(opaque)[:10]}
 
 
 def _endpoints_from_observed(observed, base_url) -> list:
