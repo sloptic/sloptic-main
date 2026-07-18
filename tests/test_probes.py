@@ -50,7 +50,14 @@ def test_detects_real_secrets():
     assert response_leaks_secret(_Resp("AKIAZ3PK7NBQWXYZ1234"))                 # AWS key id (non-placeholder)
     assert response_leaks_secret(_Resp('k="sk_live_abcdef0123456789ABCDEF"'))   # Stripe live secret
     assert response_leaks_secret(_Resp("ghp_" + "a" * 36))                      # GitHub PAT
-    assert response_leaks_secret(_Resp("-----BEGIN PRIVATE KEY-----\nMIIE..."))  # private key block
+    assert response_leaks_secret(_Resp(                                         # a REAL private key: body + END
+        "-----BEGIN PRIVATE KEY-----\n" + "MIIEvQIBADANBgkqhkiG9w0BAQ\n" * 6 + "-----END PRIVATE KEY-----"))
+
+
+def test_private_key_marker_alone_is_not_a_leak():
+    # a bare `-----BEGIN PRIVATE KEY-----` with no key body is a code constant in every crypto/PEM library
+    # (verified: `e.indexOf("-----BEGIN PRIVATE KEY-----")!==0` in 5 live bundles) — NOT a leaked key.
+    assert not response_leaks_secret(_Resp('if(e.indexOf("-----BEGIN PRIVATE KEY-----")!==0)throw new Error(e)'))
 
 
 def test_ignores_public_by_design():
@@ -88,6 +95,16 @@ def test_exposure_needs_200_and_signature():
     assert not response_is_dotenv(_Resp("DATABASE_URL=x", status=404))   # not actually served
     assert not response_is_dotenv(_Resp("<html><body>hi</body></html>"))  # 200 but not a .env
     assert not response_is_git_head(_Resp("<html>not found</html>"))     # 200, wrong content
+
+
+def test_dotenv_ignores_the_catch_all_html_shell():
+    # a catch-all / SPA host serves its HTML app shell for EVERY path incl. /.env; tens of KB of HTML almost
+    # always hold a KEY=value-looking substring, which a bare env-regex false-fires on (a real live railway app
+    # did exactly this). A body that opens as HTML must NOT read as a served .env.
+    shell = ('<!DOCTYPE html>\n<html><head><style>:root{--api-base=https://x}</style></head>'
+             '<body><script>const CONFIG_KEY="abc"; let TOKEN=1;</script>hi</body></html>')
+    assert not response_is_dotenv(_Resp(shell))                                   # the shell, not a .env
+    assert response_is_dotenv(_Resp("DATABASE_URL=postgres://a\nSECRET_KEY=b\n"))  # a real .env still fires
 
 
 def test_resource_shaped_tells_a_race_from_a_fixed_redirect():

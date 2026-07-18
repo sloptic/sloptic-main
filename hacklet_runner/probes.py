@@ -241,7 +241,19 @@ _DOTENV = re.compile(r"(?im)^[ \t]*(?:export[ \t]+)?[A-Z0-9_]*(?:SECRET|PASSWORD
 
 
 def response_is_dotenv(resp, arg=None) -> bool:
-    return resp.status_code == 200 and bool(_DOTENV.search(resp.text))
+    # A catch-all / SPA host serves its HTML app shell for EVERY path (incl. /.env), and tens of KB of HTML
+    # almost always contain a KEY=value-looking substring -> a bare `_DOTENV.search` false-fires on the shell
+    # (verified on a live railway catch-all). A real served .env is NOT html: reject a body that opens as an
+    # HTML document, or is typed text/html.
+    if resp.status_code != 200:
+        return False
+    body = resp.text
+    if body.lstrip()[:20].lower().startswith(("<!doctype", "<html")):
+        return False
+    hdrs = getattr(resp, "headers", None)
+    if hdrs is not None and "html" in hdrs.get("content-type", "").lower():
+        return False
+    return bool(_DOTENV.search(body))
 
 
 def response_is_git_config(resp, arg=None) -> bool:

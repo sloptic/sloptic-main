@@ -21,7 +21,9 @@ from pathlib import Path
 # publishable keys are public-BY-DESIGN -> excluded, matching the HTTP probe; whether a Firebase/Supabase
 # backend is actually world-readable is judged separately by the exposed-backend probe.)
 _PROVIDER = [
-    ("private-key", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----")),
+    # require ACTUAL key material (base64 body + END) between the markers — a bare `-----BEGIN PRIVATE KEY-----`
+    # is just a code constant in every crypto/PEM library (`indexOf("-----BEGIN PRIVATE KEY-----")`), NOT a leak.
+    ("private-key", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----[A-Za-z0-9+/=\s]{100,}-----END")),
     ("aws-access-key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
     ("stripe-secret", re.compile(r"\b(?:sk|rk)_live_[0-9A-Za-z]{16,}\b")),
     ("stripe-test-secret", re.compile(r"\bsk_test_[0-9A-Za-z]{16,}\b")),
