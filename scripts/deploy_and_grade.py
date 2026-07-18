@@ -749,7 +749,7 @@ def _parse_headers(items) -> dict | None:
 
 def _grade_worker(url, use_browser, features, q, cached_profile=None, cache_key=None, repo_url=None,
                   proactive=False, model=DEFAULT_MODEL, browser_auth=False, session_headers=None,
-                  llm_reasoning=False):
+                  llm_reasoning=False, recon=False):
     os.setsid()   # own process group so the parent can SIGKILL this child AND its headless chrome together
     try:
         render = browser.render_routes if use_browser else None
@@ -779,7 +779,7 @@ def _grade_worker(url, use_browser, features, q, cached_profile=None, cache_key=
         report = run(RemoteDeployer(url, health_timeout=20), load_catalog(str(_ROOT / "catalog")),
                      render=render, on_progress=_grade_heartbeat, seed_features=features, headers=session_headers,
                      cached_profile=cached_profile, on_profile=on_profile, perceive=perceive,
-                     browser_register=browser_register)
+                     browser_register=browser_register, recon=recon)
         q.put(("ok", report))
     except BaseException as e:   # report ANY failure back to the parent instead of dying silently
         q.put(("err", f"{type(e).__name__}: {e}"))
@@ -797,7 +797,7 @@ def _hard_kill_group(p) -> None:
 
 def grade(url: str, use_browser: bool, timeout=None, features=None,
           cached_profile=None, cache_key=None, repo_url=None, proactive=False, model=DEFAULT_MODEL,
-          browser_auth=False, session_headers=None, llm_reasoning=False):
+          browser_auth=False, session_headers=None, llm_reasoning=False, recon=False):
     """Grade the running app in a CHILD PROCESS. A subprocess (not an in-process SIGALRM) because a signal
     can't interrupt a Playwright CPU-spin (the browser probes), but an EXTERNAL SIGKILL of the child + its
     chrome always works. `timeout` is the grading phase's OWN wall-clock budget (independent of deploy time,
@@ -808,7 +808,7 @@ def grade(url: str, use_browser: bool, timeout=None, features=None,
     q = ctx.Queue()
     p = ctx.Process(target=_grade_worker,
                     args=(url, use_browser, features, q, cached_profile, cache_key, repo_url, proactive, model,
-                          browser_auth, session_headers, llm_reasoning))
+                          browser_auth, session_headers, llm_reasoning, recon))
     p.start()
     try:
         result = q.get(timeout=timeout)              # timeout=None (direct run) blocks until the child reports
@@ -1024,6 +1024,11 @@ def main():
                     help="skip the browser-rendered surface (faster). DEFAULT is browser ON for grading: "
                          "the render finds SPA forms/routes a static crawl misses (biggest recall win) + "
                          "adds a11y / Core Web Vitals / DOM-XSS / console-error probes")
+    ap.add_argument("--recon", action="store_true",
+                    help="RECON mode: deploy -> render -> classify backend hosts, then STOP (skip the ~66-probe "
+                         "gauntlet). Records host_tiers only (no slop score) to SIZE the SPA off-origin gap "
+                         "cheaply — a fast sample. Implies browser (recon needs the render). Point --record at a "
+                         "SEPARATE file; stats.py (i3) BACKEND-TIER DISTRIBUTION aggregates it.")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="stream the full docker build output (default: high-level steps only)")
     ap.add_argument("--keep", action="store_true", help="don't tear the containers down after grading")
@@ -1147,12 +1152,13 @@ def main():
                   f"{len(cached_profile.endpoints)} endpoints) — frozen, skipping the crawl")
         _t = time.monotonic()
         try:
-            report = grade(url, args.browser, timeout=args.grade_timeout,
+            report = grade(url, args.browser or args.recon, timeout=args.grade_timeout,   # recon NEEDS the render
                            features=(plan.get("features") if plan else None),   # url-ingest has no plan
                            cached_profile=cached_profile,
                            cache_key=(None if args.no_cache else _sha), repo_url=args.repo,
                            proactive=args.proactive, model=args.model, browser_auth=args.browser_auth,
-                           session_headers=_parse_headers(args.headers), llm_reasoning=args.llm_reasoning)
+                           session_headers=_parse_headers(args.headers), llm_reasoning=args.llm_reasoning,
+                           recon=args.recon)
         except GradeTimeout as e:
             timings["grade_s"] = round(time.monotonic() - _t, 1)
             result["grade_timeout"] = True         # deployed but ungradeable in budget (broken/pathological
@@ -1196,6 +1202,8 @@ def main():
             findings.append(f)
         result.update(slop_score=report.slop_score, axis_slop=report.axis_slop,
                       observed_surface=report.surface, coverage=report.coverage, findings=findings)
+        if args.recon:
+            result["recon"] = True   # host_tiers-only record (no probes ran) -> excluded from the score distribution
         print(f"\n  SLOP SCORE: {report.slop_score}   ({_axis_str(report.axis_slop)})")
         cov = report.coverage
         if cov.get("probes_total"):   # test coverage: how much of the battery applied vs went n/a (calibration)

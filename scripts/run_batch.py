@@ -258,6 +258,8 @@ def _build_cmd(j, args, ckpt):
         cmd += ["--audit-coverage"]
     if args.proactive:
         cmd += ["--proactive"]
+    if args.recon:
+        cmd += ["--recon"]
     if args.browser_auth:
         cmd += ["--browser-auth"]
     if args.llm_reasoning:
@@ -398,6 +400,10 @@ def main():
                          "pages and feeds the probeable surface the crawl missed INTO forms/endpoints (opt-in; "
                          "probes self-gate, so it only widens targets, never touches the score). Pair with "
                          "--audit-coverage to watch the DISCOVERY GAPS shrink as it closes them.")
+    ap.add_argument("--recon", action="store_true",
+                    help="forward to deploy_and_grade: RECON mode — deploy -> render -> classify backend hosts, "
+                         "then skip probing. A FAST SAMPLE to size the SPA off-origin gap (read stats.py (i3) "
+                         "BACKEND-TIER DISTRIBUTION). Use a SEPARATE --results file (records carry no slop score).")
     ap.add_argument("--browser-auth", action="store_true", dest="browser_auth",
                     help="forward to deploy_and_grade: SPA auth — when httpx self-registration gets no session, "
                          "drive the browser to fill+submit the signup so the app's JS registers, and use the "

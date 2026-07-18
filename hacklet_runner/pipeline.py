@@ -174,7 +174,7 @@ def _run_probe(probe: Probe, ctx: _Ctx, client: httpx.Client, profile: Profile) 
 
 def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_progress=None,
         source_dir=None, seed_features=None, cached_profile=None, on_profile=None, perceive=None,
-        browser_register=None) -> Report:
+        browser_register=None, recon: bool = False) -> Report:
     """on_progress(done, total, probe, outcomes): called twice per probe — before it runs with
     outcomes=None (so a caller can show what's currently testing), and after with its outcomes.
 
@@ -194,6 +194,10 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
                                perceive=perceive)
             if on_profile is not None:
                 on_profile(profile)   # cache MISS -> hand the freshly-minted canonical surface to the caller
+        if recon:   # deploy -> discover(render + classify) -> STOP, skipping the probe gauntlet. Recon only needs
+            # the surface fingerprint (host_tiers backend-tier map) to SIZE the off-origin gap; no probes -> slop 0
+            # (the record is marked recon so it's never read as a clean grade). A fraction of a full grade's cost.
+            return Report(slop_score=0, outcomes=[], surface=surface_metrics(profile))
         outcomes: list[Outcome] = []
         total = len(catalog)
         # bind the client + probes to the ORIGIN (a --target may carry an entry path; discover() crawls

@@ -226,6 +226,16 @@ def test_cached_profile_freezes_surface_and_reproduces_score(monkeypatch):
     assert r2.axis_slop == r1.axis_slop                       # identical per-axis decomposition too
 
 
+def test_recon_mode_deploys_and_classifies_but_skips_the_gauntlet():
+    # --recon: deploy -> discover(render + classify) -> STOP. A fast SAMPLE to size the SPA off-origin gap
+    # (host_tiers) without paying for the ~66-probe gauntlet. slop is 0 (no probes ran; the record is marked
+    # recon), but the surface fingerprint — incl. the backend-tier map — still rides out to the record.
+    catalog = load_catalog(CATALOG)
+    r = run(SubprocessDeployer(str(REFS / "vulnerable" / "app.py")), catalog, recon=True)
+    assert r.slop_score == 0 and r.outcomes == []      # the probe gauntlet was skipped
+    assert "host_tiers" in r.surface                    # but the surface fingerprint (backend-tier map) survives
+
+
 def test_progress_callback_fires_per_probe():
     events = []
     run(SubprocessDeployer(str(REFS / "minimal" / "app.py")), load_catalog(CATALOG),
