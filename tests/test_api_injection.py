@@ -111,6 +111,20 @@ def test_sqli_time_technique(jsonapi):
     assert api_sqli(_only(jsonapi, "/api/tsearch"), _Probe()) is True
 
 
+def test_time_technique_needs_dose_response_not_bare_latency(monkeypatch):
+    # the favicon FP guard: a SLOW but non-injectable endpoint (fixed latency, ignores the payload) must read
+    # CLEAN — the differential (injected − baseline) is ~0 — while a PROPORTIONAL sleep still fires. This is the
+    # live-URL latency false positive (a 2.5MB favicon flagged SQL-injectable under a congested concurrent batch).
+    import time as _t
+    from hacklet_runner import probes
+    reqfn = lambda v: v                                                        # the "request" IS the payload  # noqa: E731
+    monkeypatch.setattr(probes, "_do", lambda c, m, payload: _t.sleep(0.25))   # fixed slow, ignores the payload
+    assert probes._tech_time(None, "GET", reqfn, delay=1) is False             # slow but not injectable -> clean
+    monkeypatch.setattr(probes, "_do",                                         # sleeps ONLY for the SLEEP payload
+        lambda c, m, payload: _t.sleep(1) if "sleep(1)" in payload.lower() else None)
+    assert probes._tech_time(None, "GET", reqfn, delay=1) is True              # real dose-response -> fires
+
+
 def test_sqli_clean_on_parameterized_reflecting_endpoint(jsonapi):
     # /api/notes reflects q but is parameterized; equal-length true/false payloads -> no divergence,
     # no error, no marker, no delay -> every technique stays clean (precision on a reflecting API)

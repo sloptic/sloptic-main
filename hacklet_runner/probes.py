@@ -457,15 +457,20 @@ _TIME_PAYLOADS = ("1' OR SLEEP({d}) -- ", "1'||pg_sleep({d})-- ",
 
 
 def _tech_time(c, method, reqfn, delay) -> bool:
-    """A time-delay payload measurably slows the response (confirmed twice, to reject jitter) — fully
-    blind injection where nothing observable changes but attacker SQL still executes."""
-    def elapsed(p):
+    """A time-delay payload slows the response by ~delay RELATIVE TO A BENIGN BASELINE, confirmed on two
+    trials. Dose-response, not absolute latency: the DIFFERENTIAL (injected − baseline) cancels uniform
+    network/load latency, so a slow or concurrently-graded endpoint can't fake it — a static 2.5MB favicon
+    that ignores the param shows ~0 delta and stays clean, whereas a real SLEEP tracks `delay`. Requiring
+    it on BOTH trials rejects a one-off jitter spike. Fully blind: nothing observable changes but the SQL ran."""
+    def elapsed(v):
         t0 = time.perf_counter()
-        _do(c, method, reqfn(p))
+        _do(c, method, reqfn(v))
         return time.perf_counter() - t0
     for tmpl in _TIME_PAYLOADS:
-        p = tmpl.format(d=delay)
-        if elapsed(p) >= delay * 0.8 and elapsed(p) >= delay * 0.8:
+        payload = tmpl.format(d=delay)
+        # injected − baseline must approach `delay` on both trials; a bare `elapsed >= delay` false-fires
+        # on any slow/noisy endpoint (network, load, a huge asset), which is how a favicon read as injectable.
+        if all(elapsed(payload) - elapsed(_SQLI_BENIGN) >= delay * 0.7 for _ in range(2)):
             return True
     return False
 
