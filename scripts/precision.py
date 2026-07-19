@@ -37,6 +37,14 @@ _GATE_VETTED = ("sec-sqli-004", "sec-ratelimit-001", "sec-csrf-001", "qa-crash-0
 _NON_WORKING = {"broken", "not-an-app", "placeholder"}   # page states where the WHOLE surface is untrustworthy
 # Third-party fields that reflect by design (anti-bot tokens) — an XSS "reflection" here is the vendor's, not the app's.
 _VENDOR_FIELDS = ("cf-turnstile-response", "g-recaptcha-response", "h-captcha-response", "__requestverificationtoken")
+# Fires whose SIGNAL is timing (perf) or a load-induced error (crash / sqli-error) — trustworthy only when the
+# app was graded in ISOLATION at stable latency. Under a concurrent batch a saturated grader inflates timing and
+# a shared backend leaks 500s, so precision.py CANNOT vouch for these from the record alone: it reports them
+# UNCONFIRMED (neither clean nor FP) -> re-fire in isolation to resolve. This is the anti-"0 FP is a lie" fix —
+# the audit never again counts a concurrency-sensitive fire as verified-clean. (sqli-004's TIME technique is now
+# dose-response-hardened and load-robust, but its error technique and crash can still ride a load-induced 500.)
+_SIGNAL_SENSITIVE = {"perf-cwv-001", "perf-cwv-002", "perf-loadtime-001", "perf-ttfb-001",
+                     "qa-crash-010", "sec-sqli-004"}
 
 
 def _phantom_sensitive(pid):
@@ -67,6 +75,9 @@ def _suspect(f, catch_all):
     if pid == "sec-ratelimit-001" and catch_all:
         return ("advisory", "rate-limit on a live login on a catch-all-frontend host — likely a third-party "
                             "platform login (real endpoint, verify it is the team's own app)")
+    if pid in _SIGNAL_SENSITIVE:   # timing / load-induced-error signal: reliable only if graded in isolation.
+        return ("unconfirmed", "timing / load-induced-error signal — not verifiable from batch data; clean if "
+                               "graded in isolation, else re-fire isolated to confirm (not counted clean or FP)")
     if pid in _GATE_VETTED:
         return None   # liveness-gated: a surviving fire is on a REAL endpoint, not a catch-all phantom
     if _phantom_sensitive(pid) and catch_all:
@@ -112,8 +123,8 @@ def analyze(recs):
     gated = [r for r in have_score if _gated(r)]          # correctly DNF'd by the gate -> not a precision problem
     scored = [r for r in have_score if not _gated(r)]     # the apps that ACTUALLY count toward the score
     per_probe = defaultdict(lambda: [0, 0])              # pid -> [fires, FALSE-positives]
-    fp_reasons, adv_reasons = Counter(), Counter()
-    flagged, advisories = [], []                         # (repo, pid, penalty, count, reason)
+    fp_reasons, adv_reasons, unconf_reasons = Counter(), Counter(), Counter()
+    flagged, advisories, unconfirmed = [], [], []        # (repo, pid, penalty, count, reason)
     catchall_apps = 0
     for r in scored:                                     # measure precision ONLY on what's actually scored
         catch_all = _soft404(r) or bool((r.get("observed_surface") or {}).get("catch_all"))
@@ -130,11 +141,15 @@ def analyze(recs):
                 per_probe[pid][1] += 1
                 fp_reasons[why.split(" —")[0].split(" (")[0]] += 1
                 flagged.append(row)
+            elif klass == "unconfirmed":                 # concurrency/latency-sensitive — NOT counted clean or FP
+                unconf_reasons[why.split(" —")[0].split(" (")[0]] += 1
+                unconfirmed.append(row)
             else:                                        # advisory: a REAL finding flagged for review, not an FP
                 adv_reasons[why.split(" —")[0].split(" (")[0]] += 1
                 advisories.append(row)
     return {"scored": scored, "gated": gated, "gated_slop": sum(r.get("slop_score") or 0 for r in gated),
             "per_probe": per_probe, "fp_reasons": fp_reasons, "adv_reasons": adv_reasons,
+            "unconf_reasons": unconf_reasons, "unconfirmed": unconfirmed,
             "flagged": flagged, "advisories": advisories, "catchall_apps": catchall_apps}
 
 
@@ -151,12 +166,17 @@ def main():
     total_fp = sum(v[1] for v in a["per_probe"].values())
     fp_apps = len({x[0] for x in a["flagged"]})
     adv_apps = len({x[0] for x in a["advisories"]})
+    total_unconf = len(a["unconfirmed"])
+    unconf_apps = len({x[0] for x in a["unconfirmed"]})
+    verified = total_fires - total_fp - len(a["advisories"]) - total_unconf   # only ROBUST-signal fires
 
     if args.json:
         print(json.dumps({
             "n_scored": len(scored), "n_gated_dnf": len(a["gated"]), "gated_slop": a["gated_slop"],
             "scored_fires": total_fires, "false_positive_fires": total_fp, "fp_apps": fp_apps,
             "advisory_fires": len(a["advisories"]), "advisory_apps": adv_apps, "catchall_apps": a["catchall_apps"],
+            "verified_fires": verified, "unconfirmed_fires": total_unconf, "unconfirmed_apps": unconf_apps,
+            "unconfirmed_reasons": dict(a["unconf_reasons"].most_common()),
             "per_probe_precision": {pid: {"fires": v[0], "false_positives": v[1],
                                           "precision_pct": round((v[0] - v[1]) / v[0] * 100, 1) if v[0] else None}
                                     for pid, v in sorted(a["per_probe"].items())},
@@ -168,16 +188,19 @@ def main():
     print(f"\n═══ precision audit — {len(scored)} SCORED apps  ({len(a['gated'])} DNF'd by the gate, excluded) ═══")
     print(f"\n(0) DNF GATE — {len(a['gated'])} apps flagged broken/not-an-app -> ranked DNF-class, EXCLUDED from "
           f"scoring\n    ({a['gated_slop']} slop the gate correctly kept OUT of the distribution — not a precision gap).")
-    print(f"\n(1) RESIDUAL FALSE POSITIVES ON SCORED APPS — the real precision gap that's LEFT")
-    print(f"    (sqli/rate-limit/csrf/crash route through the liveness gate, so a surviving fire is on a REAL")
-    print(f"     endpoint — never a catch-all phantom. The residual is un-gated probes + vendor-reflection XSS.)")
+    print(f"\n(1) SIGNAL-CLASSIFIED PRECISION — what the audit CAN and CANNOT vouch for (no blanket '0 FP')")
+    print(f"    {verified}/{total_fires} VERIFIED  — robust content / header / structure signals; stand behind these.")
+    if total_unconf:
+        print(f"    {total_unconf}/{total_fires} UNCONFIRMED  ({unconf_apps} apps) — TIMING / load-induced-error "
+              f"signals; clean IF graded in isolation, else re-fire to confirm. NOT counted clean:")
+        for why, n in a["unconf_reasons"].most_common():
+            print(f"      {n:>4}  {why}")
     if a["fp_reasons"]:
-        print(f"    {total_fp}/{total_fires} fires are likely FALSE POSITIVES  ({total_fp/(total_fires or 1)*100:.0f}%), "
-              f"across {fp_apps} apps:")
+        print(f"    {total_fp}/{total_fires} LIKELY FALSE POSITIVES  ({fp_apps} apps):")
         for why, n in a["fp_reasons"].most_common():
             print(f"      {n:>4}  {why}")
     else:
-        print(f"    none — every fire on a scored app looks real (0/{total_fires}). Precision clean.")
+        print(f"    {total_fp}/{total_fires} likely false positives (catch-all class).")
 
     if a["advisories"]:
         print(f"\n(1b) OWNERSHIP-FLAGGED — REAL findings on live endpoints, NOT false positives")
