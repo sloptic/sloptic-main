@@ -421,6 +421,71 @@ def test_catch_all_host_drops_phantom_endpoints_and_forms():
         ca.shutdown(); real.shutdown()
 
 
+def test_subpath_deploy_landing_path_and_homepage_probe_target():
+    # user.github.io/Project/ : the origin ROOT is a 404 "Site not found" shell; the app lives under /Project/.
+    # discover() must set landing_path to the entry sub-path, and a homepage probe (seo) must then grade the
+    # app page — not the host's not-found page (the false-positive that hit 15 github.io apps' a11y/seo/headers).
+    import http.server
+    import threading
+
+    from hacklet_runner.net import make_client
+    from hacklet_runner.probes import seo_meta_missing
+    from hacklet_runner.schema import Profile
+
+    _APP = (b"<html lang='en'><head><meta name='viewport' content='width=device-width'>"
+            b"<meta name='description' content='real app'><title>App</title></head><body>hi</body></html>")
+    _404 = b"<html><head></head><body><h1>Site not found</h1><p>no metas here</p></body></html>"
+
+    class _GhPages(http.server.BaseHTTPRequestHandler):     # root 404s; the app is only under /Project/
+        def do_GET(self):
+            app = self.path.rstrip("/") == "/Project" or self.path.startswith("/Project/")
+            self.send_response(200 if app else 404)
+            self.send_header("Content-Type", "text/html"); self.end_headers()
+            self.wfile.write(_APP if app else _404)
+
+        def log_message(self, *a):
+            pass
+
+    class _Root(http.server.BaseHTTPRequestHandler):        # a normal app served at the origin root
+        def do_GET(self):
+            self.send_response(200); self.send_header("Content-Type", "text/html"); self.end_headers()
+            self.wfile.write(_APP)
+
+        def log_message(self, *a):
+            pass
+
+    def _serve(handler):
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        return srv
+
+    class _P:
+        probe: dict = {}
+
+    class _C:
+        def __init__(self, base, prof):
+            self.base_url, self.profile, self.headers, self.evidence = base, prof, None, {}
+            self.client = make_client(base, None, timeout=10.0, follow_redirects=True)
+
+    gh = _serve(_GhPages); root = _serve(_Root)
+    try:
+        base = f"http://127.0.0.1:{gh.server_address[1]}"
+        p_sub = discover(base + "/Project/")
+        assert p_sub.landing_path == "/Project/"      # dead root + live subpath -> grade the subpath
+
+        p_bare = discover(base)                        # bare-origin target (root 404s, no subpath) -> not overridden
+        assert p_bare.landing_path == "/"
+        p_root = discover(f"http://127.0.0.1:{root.server_address[1]}")
+        assert p_root.landing_path == "/"              # healthy root -> unchanged (no-op for the normal corpus)
+
+        # the payoff: the homepage probe honors landing_path. With the fix it reads /Project/ (has both metas)
+        # -> clean; the OLD behavior (target the origin root "/") reads the 404 shell (no metas) -> false-fires.
+        assert seo_meta_missing(_C(base, p_sub), _P()) is False
+        assert seo_meta_missing(_C(base, Profile(base_url=base, landing_path="/")), _P()) is True
+    finally:
+        gh.shutdown(); root.shutdown()
+
+
 def test_vendor_antibot_fields_excluded_from_injectable_surface():
     from hacklet_runner.discovery import _scan_form_inputs
     fields, _files, _pw, _ = _scan_form_inputs(

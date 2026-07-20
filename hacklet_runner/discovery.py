@@ -779,8 +779,22 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
         # false-fires — it just lets the auth-probe cluster reach the CTA-login SPAs a password-form check missed.
         "has_auth_entrypoint": has_pw or auth[0] or auth[1],
     }
-    return Profile(base_url=base_url, routes=list(routes), forms=forms, capabilities=capabilities,
-                   endpoints=endpoints, host_tiers=host_tiers)
+    # Landing page for the universal homepage probes (target: /). When --target names a sub-path
+    # (user.github.io/Project/) whose origin ROOT is a 404 — GitHub Pages with no user-site repo, a
+    # project deployed under a base path — the homepage probes (a11y/seo/headers/perf) must grade the
+    # entry sub-path, not the origin root's not-found shell (which false-fires a11y/seo/headers on the
+    # host's "Site not found" page). Override ONLY when the root is dead AND the entry is live, so a
+    # bare-origin target or a healthy root keeps landing_path = "/" (a no-op for the whole normal corpus).
+    landing_path = "/"
+    if start_path != "/":
+        try:
+            with make_client(base_url, headers, timeout=5.0, follow_redirects=True) as _lc:
+                if _lc.get("/").status_code >= 400 and _lc.get(start_path).status_code < 400:
+                    landing_path = start_path
+        except (httpx.HTTPError, httpx.InvalidURL):
+            pass
+    return Profile(base_url=base_url, landing_path=landing_path, routes=list(routes), forms=forms,
+                   capabilities=capabilities, endpoints=endpoints, host_tiers=host_tiers)
 
 
 def surface_metrics(profile: Profile) -> dict:

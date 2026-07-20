@@ -1306,12 +1306,29 @@ def _is_json(body: str) -> bool:
         return False
 
 
+def _landing(ctx) -> str:
+    """The app's homepage PATH. Normally '/', but the discovered entry sub-path when the origin root is a
+    404 shell — a sub-path deployment like user.github.io/Project/, whose '/' is GitHub's 'Site not found'
+    page. The universal homepage probes (target: /) grade THIS, so they never penalize the app for the
+    host's not-found page. landing_path is '/' for every root-served app, so this is a no-op for them."""
+    return getattr(getattr(ctx, "profile", None), "landing_path", "/") or "/"
+
+
+def _home_path(ctx, probe) -> str:
+    """Resolve a homepage probe's target to a PATH: the 'target: /' homepage sentinel maps to the discovered
+    landing page (_landing); an explicitly declared reference path (a perf/vulnerable reference route) is used
+    verbatim. Every homepage-grading probe routes its target through this so sub-path deployments are graded
+    at the page the app serves, not the origin-root not-found shell."""
+    t = probe.probe.get("target") or "/"
+    return _landing(ctx) if t == "/" else t
+
+
 def content_type_mismatch(ctx, probe) -> bool | None:
     """Do any responses declare a Content-Type their body contradicts? Fetches the safe no-path-param GET
     endpoints (plus the homepage) and fires on an unambiguous mismatch -- above all JSON served as
     text/html (a browser may render it: a reflected-JSON XSS vector, and JSON clients break on the wrong
     type). N/A when no response returns a body we can classify (couldn't test)."""
-    target = probe.probe.get("target", "/")
+    target = _home_path(ctx, probe)
     seen, candidates = set(), []
     for path in [target] + [e.path for e in ctx.profile.endpoints
                             if e.method.lower() == "get" and not e.path_params]:
@@ -1860,9 +1877,9 @@ def slow_first_paint(ctx, probe) -> bool:
     """Browser oracle: render and read First Contentful Paint; slop if it exceeds the gate — the
     user-facing 'slow app' signal (client render delay, distinct from server TTFB). Browser-gated.
     Measures the declared page if served, else the homepage (real apps don't serve the reference path)."""
-    target = probe.probe.get("target", "/")
+    target = _home_path(ctx, probe)
     if not _served(ctx, target):
-        target = "/"
+        target = _landing(ctx)
     url = ctx.base_url.rstrip("/") + target
     # median of N renders, not one sample: FCP is wall-clock timing (JIT warmup, CPU/network jitter),
     # so a single sample near the gate flips between runs -> non-deterministic score. The isinstance
@@ -1882,9 +1899,9 @@ def slow_core_web_vitals(ctx, probe) -> bool:
     renders and scored off the PLAYER-FAVORABLE EDGE (best-of-N) against Google's POOR thresholds (set
     beyond the normal variance band) -- so the app has to be poor even on its BEST run to fire, and
     measurement variance can only ever help the player. Browser-gated."""
-    target = probe.probe.get("target", "/")
+    target = _home_path(ctx, probe)
     if not _served(ctx, target):
-        target = "/"
+        target = _landing(ctx)
     url = ctx.base_url.rstrip("/") + target
     samples = browser.web_vitals(url, headers=ctx.headers, samples=probe.probe.get("samples", 3))
     if not samples:
@@ -1921,7 +1938,7 @@ def console_errors_present(ctx, probe) -> bool:
     working apps and does NOT count — only first-party errors are the team's durability failure. The penalty
     is SCALED by render impact (see _console_broken_render): full when the error visibly broke the page,
     reduced when the app rendered fine despite it (a real but non-fatal defect). Browser-gated."""
-    url = ctx.base_url.rstrip("/") + probe.probe.get("target", "/")
+    url = ctx.base_url.rstrip("/") + _home_path(ctx, probe)
     res = browser.console_errors(url, headers=ctx.headers)
     if res is None:
         return False   # no browser / render failed -> can't test (browser-gated)
@@ -1967,7 +1984,7 @@ def a11y_violations_present(ctx, probe) -> bool:
     it stays intent-independent (the `incomplete`/needs-review rules are excluded). The penalty is a
     per-rule severity-tiered SUM (see _a11y_penalty) so a multi-barrier page outscores a single-barrier
     one and a lone cosmetic issue isn't charged the full exclusion penalty."""
-    url = ctx.base_url.rstrip("/") + probe.probe.get("target", "/")
+    url = ctx.base_url.rstrip("/") + _home_path(ctx, probe)
     viols = browser.a11y_violations(url, headers=ctx.headers)
     if viols is None:
         return False
@@ -1985,7 +2002,7 @@ def dead_controls_present(ctx, probe) -> bool:
     Browser-gated. The helper under-reports rather than over-reports (any observed motion clears a
     control), so a fired finding is high-confidence — we never penalize a working app whose effect we
     merely failed to observe."""
-    url = ctx.base_url.rstrip("/") + probe.probe.get("target", "/")
+    url = ctx.base_url.rstrip("/") + _home_path(ctx, probe)
     dead = browser.inert_controls(url, headers=ctx.headers, max_controls=probe.probe.get("max_controls", 10))
     if dead is None:
         return False   # no browser / render failed -> inconclusive, not a false "clean"
@@ -2156,12 +2173,12 @@ def _concurrent_get(base_url, path, n: int = 20, headers=None):
 def load_resilience(ctx, probe) -> bool:
     """Fire a concurrent burst at an endpoint; slop if it falls over (>10% 5xx) under load — the
     resource-exhaustion / unsynchronized-shared-state failure that only surfaces under concurrency."""
-    target = probe.probe.get("target", "/")
+    target = _home_path(ctx, probe)
     if not _served(ctx, target):
         # declared endpoint not served (real app) -> burst the homepage, the representative
         # always-present endpoint. NEVER fan across all routes: concurrent bursts at every endpoint
         # of a live target is a DoS.
-        target = "/"
+        target = _landing(ctx)
     ratios = []
     for _ in range(3):  # median of N bursts, not one: a target near the 10% gate flips between runs
         statuses = _concurrent_get(ctx.base_url, target, headers=ctx.headers)
@@ -2222,7 +2239,7 @@ def perf_ttfb(ctx, probe) -> bool:
     """Homepage time-to-first-byte (server compute) exceeds the tier threshold — p90 over samples."""
     thresh = perf.TTFB_CEILING if probe.probe.get("tier") == "ceiling" else perf.TTFB_PROFILE
     with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
-        sample = perf.sample_ttfb(c, probe.probe.get("target", "/"))
+        sample = perf.sample_ttfb(c, _home_path(ctx, probe))
     ctx.evidence.update(ttfb_s=round(sample, 3), threshold_s=thresh,
                         tier=probe.probe.get("tier", "profile"))
     return sample >= thresh
@@ -2232,7 +2249,7 @@ def perf_page_weight(ctx, probe) -> bool:
     """Total homepage transfer weight (HTML + critical assets) exceeds the tier threshold."""
     thresh = perf.WEIGHT_CEILING if probe.probe.get("tier") == "ceiling" else perf.WEIGHT_PROFILE
     with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
-        weight = _page_weight(c, ctx.base_url, probe.probe.get("target", "/"))[0]
+        weight = _page_weight(c, ctx.base_url, _home_path(ctx, probe))[0]
     ctx.evidence.update(weight_bytes=weight, threshold_bytes=thresh,
                         tier=probe.probe.get("tier", "profile"))
     return weight >= thresh
@@ -2241,7 +2258,7 @@ def perf_page_weight(ctx, probe) -> bool:
 def perf_request_count(ctx, probe) -> bool:
     """The homepage needs more than the profile's round-trip budget to render (too chatty)."""
     with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
-        reqs = _page_weight(c, ctx.base_url, probe.probe.get("target", "/"))[1]
+        reqs = _page_weight(c, ctx.base_url, _home_path(ctx, probe))[1]
     ctx.evidence.update(requests=reqs, threshold=perf.REQUESTS_PROFILE)
     return reqs > perf.REQUESTS_PROFILE
 
@@ -2249,7 +2266,7 @@ def perf_request_count(ctx, probe) -> bool:
 def perf_load_time(ctx, probe) -> bool:
     """Computed end-to-end load time on the published profile crosses the absolute abandonment ceiling
     (~5s) -> most users leave. Deterministic: TTFB + weight/bandwidth + round-trips."""
-    target = probe.probe.get("target", "/")
+    target = _home_path(ctx, probe)
     with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
         ttfb = perf.sample_ttfb(c, target, n=3)
         weight, reqs = _page_weight(c, ctx.base_url, target)
@@ -2297,7 +2314,7 @@ def caching_ineffective(ctx, probe) -> bool | None:
     tested = False
     n_assets = 0
     with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
-        for path in _static_assets(c, ctx.base_url, probe.probe.get("target", "/")):
+        for path in _static_assets(c, ctx.base_url, _home_path(ctx, probe)):
             if budget <= 0:
                 break
             budget -= 1
@@ -2410,7 +2427,7 @@ def a11y_hard_fails(ctx, probe) -> bool | None:
     single-barrier one and the score doesn't jump when the browser is on vs off. N/A on a non-HTML page."""
     with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
         try:
-            r = c.get(probe.probe.get("target", "/"))
+            r = c.get(_home_path(ctx, probe))
         except (httpx.HTTPError, httpx.InvalidURL):
             return None
     if "html" not in r.headers.get("content-type", "").lower():
@@ -2476,7 +2493,7 @@ def broken_links(ctx, probe) -> bool | None:
     """Fetch each same-origin <a href> link on the homepage; fire if one lands on a 4xx dead end. N/A
     when the page has no internal links to follow."""
     budget = probe.probe.get("max_attempts", 40)
-    target = probe.probe.get("target", "/")
+    target = _home_path(ctx, probe)
     base = urllib.parse.urlparse(ctx.base_url)
     with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
         try:
@@ -2537,7 +2554,7 @@ def mixed_content(ctx, probe) -> bool | None:
         return None
     with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:  # verify=False by default
         try:
-            r = c.get(probe.probe.get("target", "/"))
+            r = c.get(_home_path(ctx, probe))
         except (httpx.HTTPError, httpx.InvalidURL):
             return None
     if "html" not in r.headers.get("content-type", "").lower():
@@ -2554,7 +2571,7 @@ def seo_meta_missing(ctx, probe) -> bool | None:
     """Fire when the homepage lacks a viewport meta or a description meta. N/A on a non-HTML page."""
     with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
         try:
-            r = c.get(probe.probe.get("target", "/"))
+            r = c.get(_home_path(ctx, probe))
         except (httpx.HTTPError, httpx.InvalidURL):
             return None
     if "html" not in r.headers.get("content-type", "").lower():
@@ -2574,7 +2591,7 @@ def http_conformance(ctx, probe) -> bool | None:
     """Fire on an HTML response served without a declared charset. N/A on a non-HTML homepage."""
     with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
         try:
-            r = c.get(probe.probe.get("target", "/"))
+            r = c.get(_home_path(ctx, probe))
         except (httpx.HTTPError, httpx.InvalidURL):
             return None
     ctype = r.headers.get("content-type", "").lower()

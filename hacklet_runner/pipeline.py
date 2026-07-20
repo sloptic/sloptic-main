@@ -99,6 +99,9 @@ def _expand(probe: Probe, profile: Profile):
     """Concrete (label, fetch) targets for a declarative probe: a selector fans across discovered
     surface; a literal path is a single target."""
     target = probe.probe.get("target", "/")
+    if target == "/":
+        target = profile.landing_path or "/"   # homepage sentinel -> the discovered landing page (sub-path
+        #     deploys whose origin root is a 404 shell grade the entry page, not the host's not-found shell)
     if target == "routes":
         return [(r, lambda c, r=r: _fetch_path(probe, c, r)) for r in profile.routes]
     if target == "forms":

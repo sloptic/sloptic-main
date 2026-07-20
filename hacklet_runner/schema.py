@@ -62,6 +62,9 @@ class Endpoint:
 class Profile:
     """The stack-agnostic surface map produced by discovery."""
     base_url: str
+    landing_path: str = "/"    # the app's homepage path: '/' normally, but the entry sub-path when the origin
+    #     root is a 404 shell (a sub-path deploy like user.github.io/Project/) -> the universal homepage
+    #     probes (target: /) grade THIS, so they don't score the host's not-found page as the app
     routes: list[str] = field(default_factory=list)        # discovered paths (incl "/")
     forms: list[Form] = field(default_factory=list)         # discovered forms with their fields
     capabilities: dict[str, bool] = field(default_factory=dict)
@@ -86,6 +89,7 @@ def profile_to_dict(profile: Profile) -> dict:
     to the fresh deployment on reuse: the surface paths are all relative (base_url is the sole absolute)."""
     return {
         "base_url": profile.base_url,
+        "landing_path": profile.landing_path,
         "routes": list(profile.routes),
         "forms": [asdict(f) for f in profile.forms],
         "capabilities": dict(profile.capabilities),
@@ -101,7 +105,8 @@ def profile_from_dict(d: dict) -> Profile:
     forms = [Form(**{k: v for k, v in f.items() if k in _FORM_FIELDS}) for f in d.get("forms") or []]
     endpoints = [Endpoint(**{k: v for k, v in e.items() if k in _ENDPOINT_FIELDS})
                  for e in d.get("endpoints") or []]
-    return Profile(base_url=d.get("base_url", ""), routes=list(d.get("routes") or []), forms=forms,
+    return Profile(base_url=d.get("base_url", ""), landing_path=d.get("landing_path") or "/",
+                   routes=list(d.get("routes") or []), forms=forms,
                    capabilities=dict(d.get("capabilities") or {}), endpoints=endpoints,
                    host_tiers=dict(d.get("host_tiers") or {}))
 
