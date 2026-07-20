@@ -341,6 +341,47 @@ def test_inert_controls_flags_only_the_dead_button():
         srv.shutdown()
 
 
+def test_inert_controls_clears_off_channel_and_active_controls():
+    # the two confirmed dead-control FP classes: (1) OFF-CHANNEL effects — a smooth-scroll nav button and a
+    # copy-to-clipboard button move no DOM/network but ARE working controls; (2) an already-ACTIVE tab/toggle
+    # (aria-selected/aria-pressed) whose re-click is a correct no-op. All must clear or be skipped, while a
+    # genuinely handler-less button STILL flags (the fix must not cost recall).
+    import http.server
+    import threading
+
+    page = (
+        "<!doctype html><html><body>"
+        "<button id='scroll'>Scroll down</button>"                    # scrolls the page -> scroll channel -> live
+        "<button id='copy'>Copy link</button>"                        # execCommand('copy') -> clipboard channel -> live
+        "<button id='tab' aria-selected='true'>Active tab</button>"   # already active -> excluded (never clicked)
+        "<button id='tog' aria-pressed='true'>Bold</button>"          # already pressed -> excluded
+        "<button id='dead'>Show details</button>"                     # no handler, no aria -> genuinely DEAD (recall)
+        "<div style='height:3000px'></div><script>"
+        "document.getElementById('scroll').onclick=function(){window.scrollTo(0,900);};"
+        "document.getElementById('copy').onclick=function(){document.execCommand('copy');};"
+        "</script></body></html>").encode("ascii")
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200); self.send_header("Content-Type", "text/html"); self.end_headers()
+            self.wfile.write(page)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        dead = browser.inert_controls(base)
+        assert dead is not None
+        assert "Show details" in dead                     # genuinely inert -> still flagged (recall preserved)
+        for cleared in ("Scroll down", "Copy link", "Active tab", "Bold"):
+            assert cleared not in dead                     # off-channel effect or already-active -> not "dead"
+    finally:
+        srv.shutdown()
+
+
 @pytest.fixture
 def serve():
     deployers = []

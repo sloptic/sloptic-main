@@ -442,6 +442,11 @@ _INERT_TAG_JS = r"""() => {
   const vis = el => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
   const ok = el => {
     if (!vis(el) || el.disabled) return false;
+    // an already-active tab / pressed toggle / selected segment correctly no-ops when re-clicked -> excluding
+    // it is not a dead control (a confirmed FP class); aria-disabled is the ARIA disabled the .disabled DOM
+    // property misses on role=button divs and styled toggles.
+    const aria = k => (el.getAttribute(k) || '').toLowerCase();
+    if (aria('aria-disabled') === 'true' || aria('aria-selected') === 'true' || aria('aria-pressed') === 'true') return false;
     const t = el.tagName;
     // a <button> defaults to type=submit even with no attribute, so gate on "submits a REAL form" (el.form),
     // not the type alone — else every plain button (type=submit, but no form) would be wrongly excluded.
@@ -457,7 +462,7 @@ _INERT_TAG_JS = r"""() => {
 # Re-installed on EVERY navigation (add_init_script): counts DOM mutations + app-initiated fetch/XHR. The
 # Playwright-side page.on hooks below add ALL network (img/beacon), dialogs, and uncaught errors as channels.
 _INERT_WATCH_JS = r"""(() => {
-  window.__hlw = {muts: 0, reqs: 0};
+  window.__hlw = {muts: 0, reqs: 0, clip: 0, scroll: 0};
   // this init script runs BEFORE <html> is parsed, so documentElement can be null here -> defer the
   // observer to DOMContentLoaded (else observe(null) throws and NO DOM mutation is ever recorded).
   const arm = () => { try { new MutationObserver(m => { window.__hlw.muts += m.length; })
@@ -466,17 +471,34 @@ _INERT_WATCH_JS = r"""(() => {
   const wrap = (o, k) => { const f = o[k]; if (f) o[k] = function () { window.__hlw.reqs++; return f.apply(this, arguments); }; };
   wrap(window, 'fetch');
   if (window.XMLHttpRequest) wrap(XMLHttpRequest.prototype, 'open');
+  // off-channel effects a WORKING control commonly has (the two biggest dead-control FP classes): smooth-scroll
+  // nav and copy-to-clipboard. Watched here so they CLEAR a control instead of reading as "dead". Scroll uses
+  // capture so a scrollable-container scroll counts too; Playwright's own click-time scroll is excluded by
+  // scrolling the control into view BEFORE the per-click counter reset (see inert_controls).
+  window.addEventListener('scroll', () => { window.__hlw.scroll++; }, true);
+  try { const c = navigator.clipboard, w = c && c.writeText;
+        if (w) c.writeText = function () { window.__hlw.clip++; return w.apply(this, arguments); }; } catch (e) {}
+  const ec = document.execCommand;
+  if (ec) document.execCommand = function (cmd) { if (/copy|cut/i.test(cmd || '')) window.__hlw.clip++;
+        return ec.apply(this, arguments); };
 })()"""
+
+
+def _quiet_close(popup):
+    with contextlib.suppress(Exception):
+        popup.close()
 
 
 def inert_controls(url: str, headers=None, timeout: float = 12.0, max_controls: int = 10,
                    per_wait_ms: int = 400, total_timeout: float = 40.0) -> list | None:
     """Click each reveal-safe control on the page and return the labels of the ones that produced NO
-    observable effect on ANY channel (DOM mutation / network / navigation / dialog / uncaught error) —
-    inert ("dead") controls. None if no browser or the render fails; [] if every control did something.
-    Observed behavior, so event-delegated handlers (invisible to a static check) still clear a control;
-    a control whose only effect is slower than per_wait_ms, or off-channel (clipboard/print), reads as
-    live-or-skipped, never dead — the miss-don't-invent bias that keeps this safe to score."""
+    observable effect on ANY watched channel — inert ("dead") controls. None if no browser or the render
+    fails; [] if every control did something. Channels: DOM mutation / network / navigation / dialog /
+    uncaught error / scroll (smooth-scroll nav) / clipboard (copy) / popup (window.open) / file-chooser
+    (upload). Observed behavior, so event-delegated handlers (invisible to a static check) still clear a
+    control; a control whose only effect is slower than per_wait_ms reads as live-or-skipped, never dead —
+    the miss-don't-invent bias that keeps this safe to score. Already-active tabs/toggles (aria-selected/
+    pressed) are not clicked (re-clicking them is a correct no-op, not a dead control)."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -489,9 +511,15 @@ def inert_controls(url: str, headers=None, timeout: float = 12.0, max_controls: 
             try:
                 page = b.new_page()
                 net, dialogs, errs = {"n": 0}, {"n": 0}, {"n": 0}
+                popups, choosers = {"n": 0}, {"n": 0}
                 page.on("request", lambda r: net.__setitem__("n", net["n"] + 1))         # ALL network (img/beacon too)
                 page.on("dialog", lambda d: (dialogs.__setitem__("n", dialogs["n"] + 1), d.dismiss()))
                 page.on("pageerror", lambda e: errs.__setitem__("n", errs["n"] + 1))
+                # window.open (wallet-connect, OAuth, "open in new tab") and the native file picker (a <button>
+                # that triggers a hidden <input type=file> — the standard upload pattern) are real effects off
+                # the DOM/network channels; watch them so those controls clear instead of reading as dead.
+                page.on("popup", lambda p: (popups.__setitem__("n", popups["n"] + 1), _quiet_close(p)))
+                page.on("filechooser", lambda fc: choosers.__setitem__("n", choosers["n"] + 1))
                 page.add_init_script(script=_INERT_WATCH_JS)   # re-installs the watcher on every navigation
                 _apply_auth(page, url, headers)
                 page.goto(url, timeout=timeout * 1000, wait_until="load")
@@ -504,14 +532,23 @@ def inert_controls(url: str, headers=None, timeout: float = 12.0, max_controls: 
                     if _NO_CLICK.search(label or ""):
                         continue   # never click a destructive-labeled control (pay/delete/logout/checkout/...)
                     with contextlib.suppress(Exception):
-                        page.evaluate("() => { if (window.__hlw) { window.__hlw.muts = 0; window.__hlw.reqs = 0; } }")
-                        n0, d0, e0, url0 = net["n"], dialogs["n"], errs["n"], page.url
-                        page.click(f'[data-hl-btn="{i}"]', timeout=1500)
+                        loc = page.locator(f'[data-hl-btn="{i}"]')
+                        # Playwright auto-scrolls a control into view to click it; do that scroll BEFORE the
+                        # counter reset so it isn't miscounted as the app's own scroll — then the only scroll we
+                        # read is the effect of the click (e.g. a smooth-scroll nav anchor).
+                        with contextlib.suppress(Exception):
+                            loc.scroll_into_view_if_needed(timeout=1000)
+                        page.evaluate("() => { if (window.__hlw) { window.__hlw.muts = 0; window.__hlw.reqs = 0;"
+                                      " window.__hlw.clip = 0; window.__hlw.scroll = 0; } }")
+                        n0, d0, e0, p0, f0, url0 = (net["n"], dialogs["n"], errs["n"], popups["n"],
+                                                    choosers["n"], page.url)
+                        loc.click(timeout=1500)
                         page.wait_for_timeout(per_wait_ms)
-                        w = page.evaluate("() => window.__hlw || {muts: 0, reqs: 0}")
+                        w = page.evaluate("() => window.__hlw || {muts: 0, reqs: 0, clip: 0, scroll: 0}")
                         navigated = page.url != url0
-                        moved = ((w.get("muts") or 0) or (w.get("reqs") or 0) or (net["n"] - n0)
-                                 or (dialogs["n"] - d0) or (errs["n"] - e0) or navigated)
+                        moved = ((w.get("muts") or 0) or (w.get("reqs") or 0) or (w.get("clip") or 0)
+                                 or (w.get("scroll") or 0) or (net["n"] - n0) or (dialogs["n"] - d0)
+                                 or (errs["n"] - e0) or (popups["n"] - p0) or (choosers["n"] - f0) or navigated)
                         if not moved:
                             dead.append(label or "(unlabeled)")
                         if navigated:   # a live control that navigated away -> restore + re-tag to continue
