@@ -10,8 +10,21 @@ import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
 from deploy_and_grade import (  # noqa: E402
     CloneError, _broken_verdict, _dead_shell_reason, _dead_url_reason, _inject_build_cache,
-    _looks_like_client_404, _looks_like_source_dump, _record_plan_meta, _surface_skeleton, _trigger_str,
-    audit_coverage, clone)
+    _looks_like_client_404, _looks_like_source_dump, _non_app_url, _record_plan_meta, _surface_skeleton,
+    _trigger_str, audit_coverage, clone)
+
+
+def test_non_app_url_rejects_source_and_notebook_links_but_keeps_deployed_pages():
+    # a submission URL that is a code-repo page / notebook / doc / video is NOT the team's deployed app —
+    # grading it tests the PLATFORM (GitHub's login+headers, Colab's page). *.github.io IS a deployed Pages site.
+    for u in ("https://github.com/user/repo", "https://github.iu.edu/adiharin/mana.ai",
+              "https://github.gatech.edu/nnayar32/HackGT-12", "https://gitlab.com/u/r",
+              "https://colab.research.google.com/drive/1abc", "https://devpost.com/software/x",
+              "https://youtu.be/abc"):
+        assert _non_app_url(u), u                                  # rejected -> DNF, not graded
+    for u in ("https://t-hasic.github.io/ChatMIT/", "https://mammothedu.github.io/",
+              "https://myapp.vercel.app/", "https://lifelineapp.site", "https://x.base44.app"):
+        assert _non_app_url(u) is None, u                          # a real deployed app -> gradeable
 
 
 def test_surface_skeleton_extracts_interactive_surface_not_scripts():

@@ -907,11 +907,35 @@ def _dead_shell_reason(html: str):
     return None
 
 
+# A submission URL that is SOURCE / a notebook / a doc / a video — NOT the team's deployed app. Grading it tests
+# the PLATFORM (GitHub's login + headers, Colab's page) to meaningless slop. *.github.io is a real deployed Pages
+# site and is NOT matched. (Verified: ~25 v2 "apps" were github-enterprise repo pages / Colab drive notebooks.)
+_NON_APP_HOST = re.compile(
+    r"^https?://(?:www\.)?(?:"
+    r"github\.com/|gitlab\.com/|bitbucket\.org/|github\.[a-z0-9-]+\.(?:edu|com|org)/|"   # code-repo pages
+    r"colab\.research\.google\.com|colab\.google|kaggle\.com/code|deepnote\.com|"        # notebooks
+    r"devpost\.com|notion\.so|docs\.google\.com|drive\.google\.com|figma\.com|"          # docs / design
+    r"youtube\.com|youtu\.be|loom\.com|vimeo\.com"                                       # demo videos
+    r")", re.I)
+
+
+def _non_app_url(url: str):
+    """A source / notebook / doc / video link rather than a deployed app -> reason (else None). *.github.io is a
+    deployed GitHub Pages site -> gradeable."""
+    host = url.split("://", 1)[-1].split("/", 1)[0].lower().split(":")[0]
+    if host == "github.io" or host.endswith(".github.io"):
+        return None
+    return "source / notebook / doc link, not a deployed app" if _NON_APP_HOST.match(url) else None
+
+
 def _dead_url_reason(url: str, render=None, timeout: float = 10.0):
     """Returns a reason string if `url` is NOT a working deployment, else None. A NOTE, not a grade — so a
     dead demo link is counted honestly instead of grading a 404 page or crashing the batch child. Catches:
-    unreachable / 4xx-5xx entry / host placeholder shell / coming-soon-maintenance splash (static), and —
-    when `render` is supplied — a client-side 404 or rendered placeholder the static shell hides."""
+    a source/notebook/doc link (not a deployed app), unreachable / 4xx-5xx entry / host placeholder shell /
+    coming-soon-maintenance splash (static), and — with `render` — a client-side 404 or rendered placeholder."""
+    non_app = _non_app_url(url)
+    if non_app:
+        return non_app
     try:
         r = httpx.get(url, timeout=timeout, follow_redirects=True, verify=False,
                       headers={"User-Agent": _UA})
