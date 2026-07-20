@@ -12,10 +12,23 @@ def _mk(root, files: dict):
 
 
 def test_catches_provider_secrets(tmp_path):
+    # realistic high-entropy key bodies (mixed case + digits) — a real sk-/sk_live_/ghp_ key is never all
+    # one lowercase char, and the openai-key pattern now REQUIRES that entropy to avoid kebab-case FPs.
     _mk(tmp_path, {"a.py": 'o="sk-proj-%s"\ns="sk_live_%s"\ng="ghp_%s"\n'
-                   % ("a" * 30, "b" * 20, "c" * 36)})
+                   % ("aB3dE7fG" * 6, "b" * 20, "c" * 36)})
     kinds = {f.kind for f in scan_secrets(tmp_path)}
     assert {"openai-key", "stripe-secret", "github-pat"} <= kinds
+
+
+def test_openai_key_pattern_ignores_kebab_case_lookalikes(tmp_path):
+    # the SpinKit / locale FP: kebab-case identifiers sharing the sk- prefix are NOT keys (all-lowercase
+    # words, or no digit) — they must not fire, while a real mixed-entropy key alongside them still does.
+    _mk(tmp_path, {"ui.css": ".sk-cube-inner-wrapper-item{}\n.sk-chase-dot-before-animation-delay{}\n",
+                   "i18n.js": 'const loc="sk-SK-u-ca-gregory-nu-latn-x-long";\n',
+                   "real.js": 'const k="sk-proj-%s";\n' % ("Xy7Zq2Wv" * 6)})
+    kinds = {f.kind for f in scan_secrets(tmp_path)}
+    assert "openai-key" in kinds                                        # the genuine key still fires
+    assert sum(f.kind == "openai-key" for f in scan_secrets(tmp_path)) == 1   # exactly one — no kebab FPs
 
 
 def test_catches_hardcoded_db_password(tmp_path):

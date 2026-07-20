@@ -30,7 +30,11 @@ _PROVIDER = [
     ("github-pat", re.compile(r"\bghp_[0-9A-Za-z]{36}\b")),
     ("github-fine-grained-pat", re.compile(r"\bgithub_pat_[0-9A-Za-z_]{22,}\b")),
     ("slack-token", re.compile(r"\bxox[baprs]-[0-9A-Za-z-]{10,}\b")),
-    ("openai-key", re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b")),
+    # sk-/sk-proj-/sk-ant- keys. Require key-like ENTROPY (>=32 chars AND >=1 uppercase AND >=1 digit) so
+    # kebab-case identifiers with the same prefix don't false-fire — SpinKit CSS classes (sk-cube-inner-
+    # wrapper-item, sk-chase-dot-...) and BCP-47 locales (sk-SK-u-ca-...) are all-lowercase-words / no digit.
+    # A real high-entropy key always has both; the audit's live fires were 108-164-char base64 bodies.
+    ("openai-key", re.compile(r"\bsk-(?:proj-)?(?=[A-Za-z0-9_-]*[A-Z])(?=[A-Za-z0-9_-]*[0-9])[A-Za-z0-9_-]{32,}\b")),
     ("google-oauth-secret", re.compile(r"\bGOCSPX-[0-9A-Za-z_-]{20,}\b")),
     ("sendgrid-key", re.compile(r"\bSG\.[0-9A-Za-z_-]{22}\.[0-9A-Za-z_-]{43}\b")),
     ("twilio-account-sid", re.compile(r"\bAC[0-9a-fA-F]{32}\b")),
