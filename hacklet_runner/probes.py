@@ -409,9 +409,12 @@ def _endpoint_is_live(ctx, client, path: str, method: str, base_resp) -> bool:
     return True
 
 
-def _tech_error(c, method, reqfn) -> bool:
-    """A lone quote induces a DB-error signature (the app leaks SQL errors)."""
-    return bool(_SQL_ERROR.search(_do(c, method, reqfn(_SQLI_PAYLOAD)).text))
+def _tech_error(c, method, reqfn):
+    """A lone quote induces a DB-error signature (the app leaks SQL errors) -> return the MATCHED signature
+    (self-documenting for the audit), else None. The signature set is specific DB strings a validation error
+    or SPA shell can't produce, so a match is a high-confidence real leak."""
+    m = _SQL_ERROR.search(_do(c, method, reqfn(_SQLI_PAYLOAD)).text)
+    return m.group(0) if m else None
 
 
 _SQLI_TRUE = "1' OR '1'='1' -- "
@@ -515,9 +518,10 @@ def api_sqli(ctx, probe) -> bool | None:
                 slots_tested += 1
                 reqfn = (lambda ep=ep, slot=slot: lambda v: _sqli_request(ep, slot, v))()
                 try:
-                    if _tech_error(c, method, reqfn) or _tech_boolean(c, method, reqfn):
-                        ctx.evidence.update(injectable=True, via="error/boolean", param=slot,
-                                            endpoint=ep.raw_path, techniques_tried=techs)
+                    err = _tech_error(c, method, reqfn)
+                    if err or _tech_boolean(c, method, reqfn):
+                        ctx.evidence.update(injectable=True, via=("error" if err else "boolean"), param=slot,
+                                            endpoint=ep.raw_path, sql_error=err, techniques_tried=techs)
                         return True
                 except (httpx.HTTPError, httpx.InvalidURL):
                     continue
@@ -527,8 +531,9 @@ def api_sqli(ctx, probe) -> bool | None:
                 break
         for method, reqfn, path, slot in deep:
             try:
-                if _tech_union(c, method, reqfn) or _tech_time(c, method, reqfn, delay):
-                    ctx.evidence.update(injectable=True, via="union/time", param=slot,
+                union = _tech_union(c, method, reqfn)
+                if union or _tech_time(c, method, reqfn, delay):
+                    ctx.evidence.update(injectable=True, via=("union" if union else "time"), param=slot,
                                         endpoint=path, techniques_tried=techs)
                     return True
             except (httpx.HTTPError, httpx.InvalidURL):

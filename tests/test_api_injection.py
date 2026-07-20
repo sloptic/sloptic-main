@@ -125,6 +125,23 @@ def test_time_technique_needs_dose_response_not_bare_latency(monkeypatch):
     assert probes._tech_time(None, "GET", reqfn, delay=1) is True              # real dose-response -> fires
 
 
+def test_sqli_evidence_records_the_specific_technique(jsonapi):
+    # auditability: the fire records WHICH technique fired (not a merged "error/boolean" / "union/time"), and
+    # an ERROR fire carries the leaked DB-error signature, so an audit is reproducible without re-guessing the
+    # discovered field set. This is the sqli analog of xss recording its payload.
+    err = _only(jsonapi, "/api/search")             # error-leaking endpoint (a lone quote -> sqlite3 error)
+    assert api_sqli(err, _Probe()) is True
+    assert err.evidence["via"] == "error" and "sqlite3.OperationalError" in (err.evidence.get("sql_error") or "")
+
+    b = _only(jsonapi, "/api/bsearch")              # blind boolean endpoint (no error leaked)
+    assert api_sqli(b, _Probe()) is True
+    assert b.evidence["via"] == "boolean" and not b.evidence.get("sql_error")
+
+    u = _only(jsonapi, "/api/usearch")              # union-marker endpoint
+    assert api_sqli(u, _Probe()) is True
+    assert u.evidence["via"] == "union"
+
+
 def test_sqli_clean_on_parameterized_reflecting_endpoint(jsonapi):
     # /api/notes reflects q but is parameterized; equal-length true/false payloads -> no divergence,
     # no error, no marker, no delay -> every technique stays clean (precision on a reflecting API)
