@@ -602,18 +602,22 @@ def _reflects(resp, detect: str) -> bool:
 
 
 def xss_injectable(ctx, probe) -> bool | None:
-    """Reflected + stored XSS across discovered forms and reflecting query params. Per field, injects
-    each payload shape (script / img / svg / javascript-URI / attribute-breakout / script-breakout /
-    case-varied) and fires on verbatim unescaped reflection of a unique marker; for POST forms, also
-    submits then re-fetches the page to catch STORED XSS. N/A when there's no HTML input surface."""
+    """Reflected + stored XSS across discovered forms and reflecting query params. A cheap server-side
+    pre-filter (does the field echo a unique marker unescaped into HTML?) narrows the surface; a GET
+    reflection is then CONFIRMED BY EXECUTION in a headless browser (the payload actually runs), not by
+    string-presence — the research-backed fix that kills the Next.js RSC/JSON flight-data FP class (a
+    payload present-but-inert in serialized data never executes). POST/stored (and the no-browser mode)
+    fall back to the hardened unescaped-reflection heuristic. N/A when there's no HTML input surface."""
     targets = _injectable_targets(ctx.profile)
     if not targets:
         return None
     m = "hlx" + secrets.token_hex(4)
     payloads = _xss_payloads(m)
     budget = probe.probe.get("max_attempts", 150)
+    browser_ok = ctx.profile.capabilities.get("browser", False)
     tested = False
     checked = 0
+    get_candidates: list[tuple[str, str]] = []   # (action, field) GET reflections to confirm by execution
     with make_client(ctx.base_url, ctx.headers, timeout=10.0, follow_redirects=True) as c:
         for action, method, fields in targets:
             for field in fields:
@@ -623,14 +627,17 @@ def xss_injectable(ctx, probe) -> bool | None:
                 tested = True
                 checked += 1
                 # Cheap gate: does this field echo the marker into an HTML response at all? If not, no
-                # reflected XSS is possible here -> skip the 8 payload shapes. Keeps breadth across every
-                # form affordable (a non-reflecting form costs 1 request/field, not 8).
+                # reflected XSS is possible here -> skip. Keeps breadth across every form affordable.
                 try:
                     probe_resp = _xss_send(c, method, action, {fn: (m if fn == field else _XSS_FILLER) for fn in fields})
                 except (httpx.HTTPError, httpx.InvalidURL):
                     continue
                 if not _reflects(probe_resp, m):
                     continue
+                if method == "get" and browser_ok:
+                    get_candidates.append((action, field))   # defer to execution confirmation (below)
+                    continue
+                # POST, or no-browser GET: hardened server-side payload-shape reflection (the fallback)
                 for inject, detect in payloads:
                     if budget <= 0:
                         break
@@ -638,8 +645,8 @@ def xss_injectable(ctx, probe) -> bool | None:
                     data = {fn: (inject if fn == field else _XSS_FILLER) for fn in fields}
                     try:
                         if _reflects(_xss_send(c, method, action, data), detect):
-                            ctx.evidence.update(injectable=True, kind="reflected", target=action, field=field,
-                                                payload=inject)   # record WHICH vector fired -> reproducible audit
+                            ctx.evidence.update(injectable=True, kind="reflected", via="reflection",
+                                                target=action, field=field, payload=inject)
                             return True  # reflected unescaped in an HTML (executable) context -> XSS
                     except (httpx.HTTPError, httpx.InvalidURL):
                         continue
@@ -652,11 +659,26 @@ def xss_injectable(ctx, probe) -> bool | None:
                 try:
                     _xss_send(c, "post", action, {fn: inject for fn in fields})
                     if _reflects(c.get(action), detect):
-                        ctx.evidence.update(injectable=True, kind="stored", target=action, payload=inject)
+                        ctx.evidence.update(injectable=True, kind="stored", via="reflection",
+                                            target=action, payload=inject)
                         return True  # persisted across a fresh request -> stored XSS
                 except (httpx.HTTPError, httpx.InvalidURL):
                     pass
-    ctx.evidence.update(injectable=False, fields_tested=checked, payload_shapes=len(payloads))
+    # CONFIRM GET reflections by EXECUTION, not string-presence: a param that reflects the marker but whose
+    # payload never RUNS in a real browser is inert (framework-escaped / RSC-flight data — the FP class).
+    # Group by action so one browser launch covers all of that page's reflecting fields.
+    if get_candidates and browser_ok:
+        by_action: dict[str, list[str]] = {}
+        for action, field in get_candidates:
+            by_action.setdefault(action, []).append(field)
+        for action, gfields in by_action.items():
+            if browser.dom_xss_executes(ctx.base_url, [action], params=tuple(gfields),
+                                        payloads=browser._XSS_EXEC_PAYLOADS, headers=ctx.headers):
+                ctx.evidence.update(injectable=True, kind="reflected", via="execution",
+                                    target=action, fields=gfields)   # executed in a real DOM -> provable XSS
+                return True
+    ctx.evidence.update(injectable=False, fields_tested=checked, payload_shapes=len(payloads),
+                        get_candidates_unconfirmed=len(get_candidates))
     return False if tested else None
 
 
@@ -1384,10 +1406,37 @@ def debug_mode_enabled(ctx, probe) -> bool | None:
 # client bundle, but ships the database with NO row-level security -> anyone with the (public) key reads
 # the whole DB. We mine the bundle for the config, then issue the SAME read-only query the app's own
 # frontend makes, with the SAME public key, and see whether real rows come back. Host-restricted to the
-# managed providers (never an arbitrary URL from the bundle -> no SSRF), read-only, bounded.
+# managed providers (never an arbitrary URL from the bundle -> no SSRF), read-only, bounded. Covers all
+# three data planes: Supabase PostgREST (/rest/v1/<table>), Firebase Realtime DB (<db>/.json), and
+# Firestore (the default Firebase DB — REST documents endpoint with the public web key).
 _SUPABASE_URL = re.compile(r"https://([a-z0-9]{15,40})\.supabase\.co")
 _FIREBASE_RTDB = re.compile(r"https://([a-z0-9][a-z0-9-]{2,60}\.firebaseio\.com)")
 _JWT = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")
+# Firestore (the DEFAULT Firebase DB since ~2019 — RTDB above is the legacy one, so RTDB-only coverage
+# misses most Firebase apps). Config is public by design: the AIza web key + projectId + a firestore SDK
+# reference. We read collections via the REST API with the public key; open rules (allow read: if true)
+# return documents to anyone.
+_FIREBASE_APIKEY = re.compile(r"AIza[0-9A-Za-z_-]{35}")
+_FIREBASE_PROJECT = re.compile(r"""projectId["']?\s*[:=]\s*["']([a-z][a-z0-9-]{3,40})["']""")
+_FIRESTORE_SIGNAL = re.compile(r"firestore", re.I)   # SDK import / getFirestore / firestore.googleapis.com
+_FIRESTORE_COLL = re.compile(r"""\bcollection\(\s*(?:[A-Za-z_$][\w$]*\s*,\s*)?["']([A-Za-z][\w-]{1,60})["']""")
+_COMMON_COLLECTIONS = ("users", "messages", "posts", "chats", "orders", "products", "profiles", "items",
+                       "todos", "notes", "comments", "rooms", "events", "data")
+# Supabase table enumeration + leak gating. The anon key can no longer read the PostgREST OpenAPI root
+# (Supabase blocked it for the anon role Apr 2026 -> 403), so table names come from the BUNDLE — the app's
+# own .from('t') / /rest/v1/t string literals, which survive minification — plus a common-name fallback.
+# A readable table is a LEAK only if it looks PRIVATE (sensitive name or PII/secret column): a public-by-
+# design table (blog posts, product catalog, a countries reference) reading to anon is NOT a finding.
+_SUPABASE_PUB = re.compile(r"\bsb_publishable_[A-Za-z0-9_-]{10,}\b")   # 2025+ publishable key (not a JWT)
+_SUPABASE_FROM = re.compile(r"""\.from\(\s*["']([A-Za-z_][A-Za-z0-9_]{0,60})["']""")
+_SUPABASE_REST = re.compile(r"/rest/v1/([A-Za-z_][A-Za-z0-9_]{0,60})")
+_SUPABASE_COMMON = ("users", "profiles", "accounts", "posts", "orders", "messages", "todos", "customers",
+                    "subscriptions", "payments", "transactions", "api_keys", "comments", "products",
+                    "notes", "contacts", "bookings", "reviews", "sessions", "members")
+_SENSITIVE_TABLE = re.compile(r"user|account|profile|payment|order|customer|subscription|transaction|"
+                              r"credential|session|contact|booking|member|billing|invoice|message", re.I)
+_SENSITIVE_COLUMN = re.compile(r"email|password|passwd|phone|token|api_?key|secret|stripe|address|ssn|"
+                               r"credit|dob|birth|first_?name|last_?name|full_?name|access_?token", re.I)
 
 
 def _client_bundle(ctx, cap: int = 2_000_000) -> str:
@@ -1489,26 +1538,58 @@ def _postgrest_tables(resp) -> list[str]:
     return []
 
 
-def _supabase_readable(client, base: str, keys: list[str]):
-    """Return {table, rows, sample} if any table returns rows to the anon key (RLS missing), 'unreachable'
-    if the host can't be reached (egress blocked -> N/A), else None (reached but nothing readable)."""
+def _supabase_tables(blob: str) -> list[str]:
+    """Candidate tables to probe: names the app's OWN code queries — supabase-js `.from('t')` and hardcoded
+    `/rest/v1/t` paths (string literals that survive minification) — first (the real signal), then a common
+    fallback. Bundle-driven because the anon key can no longer enumerate the PostgREST OpenAPI root."""
+    mined = list(dict.fromkeys([m.group(1) for m in _SUPABASE_FROM.finditer(blob)]
+                               + [m.group(1) for m in _SUPABASE_REST.finditer(blob)]))
+    return (mined + [t for t in _SUPABASE_COMMON if t not in mined])[:16]
+
+
+def _sensitive_leak(table: str, columns: list[str]) -> bool:
+    """A table readable to anon is a LEAK only if it looks private: a sensitive table name OR a PII/secret
+    column. A public-by-design table (blog posts, product catalog, countries) reading to anon is NOT a
+    finding — this gate is what separates a real RLS misconfiguration from an intentionally-public table."""
+    return bool(_SENSITIVE_TABLE.search(table) or any(_SENSITIVE_COLUMN.search(c) for c in columns))
+
+
+def _supabase_readable(client, base: str, keys: list[str], tables: list[str]):
+    """Return {table, rows, columns} for the first SENSITIVE table that returns rows to the anon/publishable
+    key (RLS off or permissive + anon grant), 'unreachable' if the host can't be reached (-> N/A), else None.
+    The PostgREST response taxonomy is the detector: non-empty 200 array = rows exposed (candidate); []+200 =
+    RLS default-deny (SECURE); 401/403 (42501) = no grant; 404 (42P01) = table absent — none of which fire.
+    A publishable key (sb_publishable_, not a JWT) goes in `apikey` only; a JWT anon key also selects the
+    role via `Authorization: Bearer`. Reads ONE row (for column-name sensitivity), never writes."""
     reached = False
-    for key in keys[:4]:
-        hdr = {"apikey": key, "Authorization": "Bearer " + key}
-        try:
+    for key in keys[:3]:
+        hdr = {"apikey": key}
+        if key.startswith("eyJ"):
+            hdr["Authorization"] = "Bearer " + key   # JWT = PostgREST role selector; publishable keys aren't
+        cand = list(tables)
+        try:   # self-hosted / pre-Apr-2026 PostgREST may still expose the table list at the mount root
             root = client.get(base + "/rest/v1/", headers=hdr, timeout=6.0)
+            reached = True
+            cand += [t for t in _postgrest_tables(root) if t not in cand]
         except (httpx.HTTPError, httpx.InvalidURL):
-            continue
-        reached = True
-        for table in _postgrest_tables(root)[:8]:
+            pass
+        for table in cand[:20]:
             try:
                 r = client.get(base + "/rest/v1/" + table, params={"select": "*", "limit": "1"},
                                headers=hdr, timeout=6.0)
-                rows = r.json() if r.status_code == 200 else None
-            except (httpx.HTTPError, httpx.InvalidURL, ValueError):
+            except (httpx.HTTPError, httpx.InvalidURL):
                 continue
-            if isinstance(rows, list) and rows:   # real rows to the public key -> world-readable DB
-                return {"table": table, "rows": len(rows), "columns": sorted(rows[0])[:8]}
+            reached = True
+            if r.status_code != 200:
+                continue                              # 401/403 no grant, 404 absent -> not a leak
+            try:
+                rows = r.json()
+            except ValueError:
+                continue
+            if isinstance(rows, list) and rows:       # non-empty -> RLS off/permissive
+                columns = sorted(rows[0]) if isinstance(rows[0], dict) else []
+                if _sensitive_leak(table, columns):   # gate out intentionally-public tables
+                    return {"table": table, "rows": len(rows), "columns": columns[:8]}
     return None if reached else "unreachable"
 
 
@@ -1529,6 +1610,36 @@ def _firebase_readable(client, json_url: str):
     return None
 
 
+def _firestore_collections(blob: str) -> list[str]:
+    """Collections the app's OWN code queries (Firestore `collection(db, 'name')` calls), then a small
+    common-name fallback — the set to test for public readability. App-referenced names first (real signal)."""
+    found = list(dict.fromkeys(m.group(1) for m in _FIRESTORE_COLL.finditer(blob)))
+    return (found + [c for c in _COMMON_COLLECTIONS if c not in found])[:14]
+
+
+def _firestore_readable(client, base: str, project: str, api_key: str, collections: list[str]):
+    """A Firestore collection world-readable to the PUBLIC web API key: GET the REST documents endpoint;
+    a 200 with a non-empty `documents` array = rules allow public read (allow read: if true). 'unreachable'
+    on a network error (-> N/A); None if reached but every collection is protected (403) or empty."""
+    reached = False
+    for coll in collections:
+        url = "%s/v1/projects/%s/databases/(default)/documents/%s" % (base, project, coll)
+        try:
+            r = client.get(url, params={"key": api_key, "pageSize": "1"}, timeout=6.0)
+        except (httpx.HTTPError, httpx.InvalidURL):
+            continue
+        reached = True
+        if r.status_code == 200:
+            try:
+                docs = r.json().get("documents")
+            except (ValueError, AttributeError):
+                continue
+            if isinstance(docs, list) and docs:   # real documents to the public key -> world-readable rules
+                fields = sorted((docs[0].get("fields") or {}).keys())[:8]
+                return {"collection": coll, "documents": len(docs), "fields": fields}
+    return None if reached else "unreachable"
+
+
 def exposed_backend_readable(ctx, probe) -> bool | None:
     """Managed backend (Supabase/Firebase) shipped without row-level security: mine the client bundle for
     the config + public key, then read the DB with that key. Fire if real rows come back. N/A when no such
@@ -1536,14 +1647,17 @@ def exposed_backend_readable(ctx, probe) -> bool | None:
     blob = _client_bundle(ctx)
     sm = _SUPABASE_URL.search(blob)
     fm = _FIREBASE_RTDB.search(blob)
-    if not sm and not fm:
+    proj_m = _FIREBASE_PROJECT.search(blob)
+    key_m = _FIREBASE_APIKEY.search(blob)
+    fs_used = bool(_FIRESTORE_SIGNAL.search(blob) and proj_m and key_m)   # Firestore SDK + public web config
+    if not sm and not fm and not fs_used:
         return None  # no managed-backend config in the client -> nothing to test
     reached = False
-    keys = [m.group(0) for m in _JWT.finditer(blob)]
+    keys = [m.group(0) for m in _JWT.finditer(blob)] + _SUPABASE_PUB.findall(blob)   # JWT anon + publishable
     with httpx.Client(timeout=8.0, follow_redirects=True, verify=False) as ext:   # external provider hosts
         if sm:
             base = "https://" + sm.group(1) + ".supabase.co"
-            hit = _supabase_readable(ext, base, keys)
+            hit = _supabase_readable(ext, base, keys, _supabase_tables(blob))
             if isinstance(hit, dict):
                 ctx.evidence.update(backend="supabase", host=base, table=hit["table"],
                                     rows_readable=hit["rows"], columns=hit["columns"])
@@ -1556,6 +1670,15 @@ def exposed_backend_readable(ctx, probe) -> bool | None:
                                     sample_keys=sorted(data)[:8] if isinstance(data, dict) else len(data))
                 return True
             reached = reached or data != "unreachable"
+        if fs_used:
+            proj, key = proj_m.group(1), key_m.group(0)
+            hit = _firestore_readable(ext, "https://firestore.googleapis.com", proj, key,
+                                      _firestore_collections(blob))
+            if isinstance(hit, dict):
+                ctx.evidence.update(backend="firestore", project=proj, collection=hit["collection"],
+                                    documents_readable=hit["documents"], fields=hit["fields"])
+                return True
+            reached = reached or hit != "unreachable"
     ctx.evidence.update(checked=True, reachable=reached, world_readable=False)
     return False if reached else None   # reached-but-protected = clean; unreachable = N/A (egress blocked)
 

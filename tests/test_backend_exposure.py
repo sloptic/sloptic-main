@@ -65,7 +65,7 @@ def test_supabase_readable_fires_when_rows_come_back(serve):
         return 200, "application/json", json.dumps({"definitions": {"users": {}}}).encode()
     base = serve(h)
     with httpx.Client(timeout=5) as c:
-        hit = probes._supabase_readable(c, base, ["eyJanon"])
+        hit = probes._supabase_readable(c, base, ["eyJanon"], [])   # root still exposes the list (self-hosted path)
     assert hit["table"] == "users" and hit["rows"] == 1 and "password" in hit["columns"]
 
 
@@ -76,12 +76,46 @@ def test_supabase_clean_when_rls_returns_no_rows(serve):
         return 200, "application/json", json.dumps({"definitions": {"users": {}}}).encode()
     base = serve(h)
     with httpx.Client(timeout=5) as c:
-        assert probes._supabase_readable(c, base, ["eyJanon"]) is None
+        assert probes._supabase_readable(c, base, ["eyJanon"], []) is None
 
 
 def test_supabase_unreachable_is_na():
     with httpx.Client(timeout=1) as c:
-        assert probes._supabase_readable(c, "http://127.0.0.1:1", ["eyJanon"]) == "unreachable"
+        assert probes._supabase_readable(c, "http://127.0.0.1:1", ["eyJanon"], []) == "unreachable"
+
+
+def test_supabase_tables_mined_from_bundle():
+    # bundle-driven enumeration (the OpenAPI root is anon-blocked since Apr 2026): app-referenced .from()
+    # and /rest/v1/ tables first (real signal), then the common-name fallback appended.
+    blob = 'supabase.from("profiles").select();x.from(\'orders\');fetch("/rest/v1/api_keys?select=*")'
+    t = probes._supabase_tables(blob)
+    assert t[:3] == ["profiles", "orders", "api_keys"]
+    assert "users" in t and len(t) <= 16
+
+
+def test_supabase_sensitivity_gate_ignores_intentionally_public_table(serve):
+    # a NON-sensitive, public-by-design table (a product catalog) readable to anon is NOT a finding — the
+    # sensitivity gate is what stops an intentionally-public table from false-firing (rows-to-anon != leak).
+    def h(path):
+        if "/rest/v1/products" in path and path != "/rest/v1/":
+            return 200, "application/json", json.dumps([{"id": 1, "name": "Widget", "price": 9}]).encode()
+        return 403, "application/json", b'{"code":"42501","message":"permission denied"}'
+    base = serve(h)
+    with httpx.Client(timeout=5) as c:
+        assert probes._supabase_readable(c, base, ["eyJanon"], ["products"]) is None
+
+
+def test_supabase_fires_on_sensitive_bundle_table(serve):
+    # a private-looking table (accounts, with PII columns) readable to anon -> RLS misconfiguration -> fires.
+    # Non-target tables 42501 (no grant); the OpenAPI root is 403 (post-Apr-2026), so the table came from the bundle.
+    def h(path):
+        if "/rest/v1/accounts" in path and path != "/rest/v1/":
+            return 200, "application/json", json.dumps([{"id": 1, "email": "a@x.com", "password_hash": "x"}]).encode()
+        return 403, "application/json", b'{"code":"42501","message":"permission denied"}'
+    base = serve(h)
+    with httpx.Client(timeout=5) as c:
+        hit = probes._supabase_readable(c, base, ["eyJanon"], ["accounts"])
+    assert hit["table"] == "accounts" and "email" in hit["columns"]
 
 
 def test_firebase_readable_fires_on_open_rtdb(serve):
@@ -95,6 +129,47 @@ def test_firebase_clean_on_permission_denied(serve):
     base = serve(lambda p: (200, "application/json", b"null"))   # locked RTDB returns null to anon
     with httpx.Client(timeout=5) as c:
         assert probes._firebase_readable(c, base + "/.json") is None
+
+
+def test_firestore_config_detected_in_bundle():
+    blob = ('firebase.initializeApp({apiKey:"AIza%s",projectId:"my-cool-app"});'
+            'import{getFirestore}from"firebase/firestore";' % ("b" * 35))
+    assert probes._FIREBASE_APIKEY.search(blob).group(0) == "AIza" + "b" * 35
+    assert probes._FIREBASE_PROJECT.search(blob).group(1) == "my-cool-app"
+    assert probes._FIRESTORE_SIGNAL.search(blob)
+
+
+def test_firestore_collections_mined_from_bundle():
+    # app-referenced collections first (the real signal), then the common-name fallback appended
+    blob = 'const db=getFirestore(app);collection(db,"users");collection(db, "chat_rooms");x.collection("orders");'
+    colls = probes._firestore_collections(blob)
+    assert colls[:3] == ["users", "chat_rooms", "orders"]
+    assert "messages" in colls and len(colls) <= 14
+
+
+def test_firestore_readable_fires_on_open_collection(serve):
+    def h(path):
+        if "/documents/users" in path:   # this collection's rules are `allow read: if true`
+            return 200, "application/json", json.dumps({"documents": [
+                {"name": "projects/p/databases/(default)/documents/users/1",
+                 "fields": {"email": {"stringValue": "a@x.com"}, "role": {"stringValue": "admin"}}}]}).encode()
+        return 200, "application/json", b'{"documents": []}'
+    base = serve(h)
+    with httpx.Client(timeout=5) as c:
+        hit = probes._firestore_readable(c, base, "my-proj", "AIzaKEY", ["posts", "users"])
+    assert hit["collection"] == "users" and hit["documents"] == 1 and "email" in hit["fields"]
+
+
+def test_firestore_clean_on_permission_denied(serve):
+    base = serve(lambda p: (403, "application/json",
+                            json.dumps({"error": {"code": 403, "status": "PERMISSION_DENIED"}}).encode()))
+    with httpx.Client(timeout=5) as c:
+        assert probes._firestore_readable(c, base, "my-proj", "AIzaKEY", ["users", "posts"]) is None
+
+
+def test_firestore_unreachable_is_na():
+    with httpx.Client(timeout=1) as c:
+        assert probes._firestore_readable(c, "http://127.0.0.1:1", "p", "k", ["users"]) == "unreachable"
 
 
 def test_predicate_na_when_no_backend_config():
