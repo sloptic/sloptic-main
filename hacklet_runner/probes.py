@@ -579,9 +579,21 @@ def _xss_send(c, method, action, data):
 
 
 def _reflects(resp, detect: str) -> bool:
-    """The payload reflects unescaped AND in an HTML response — a payload echoed into a JSON API body
-    is not XSS (JSON isn't rendered as HTML), so gate on the content type to avoid that false positive."""
-    return "html" in resp.headers.get("content-type", "").lower() and detect in resp.text
+    """The payload reflects unescaped, into an HTML response, in an EXECUTABLE position — not merely present.
+    Two guards against a non-executable echo: (1) content-type must be HTML (a JSON API body echoing the payload
+    isn't rendered as HTML); (2) the matched occurrence must not be BACKSLASH-ESCAPED — a `\\"` means the marker
+    sits inside serialized JSON data embedded in the HTML (Next.js RSC / __PAGE__ flight, <script type=json>),
+    where the escaped quote can't break an attribute (verified: mekong-watch reflected `" onmouseover` into
+    __PAGE__ flight data, not real HTML)."""
+    if "html" not in resp.headers.get("content-type", "").lower():
+        return False
+    text = resp.text
+    i = text.find(detect)
+    while i >= 0:
+        if i == 0 or text[i - 1] != "\\":   # un-escaped occurrence -> a real executable reflection
+            return True
+        i = text.find(detect, i + 1)          # escaped (JSON/JS string) -> keep looking for an executable one
+    return False
 
 
 def xss_injectable(ctx, probe) -> bool | None:
@@ -621,7 +633,8 @@ def xss_injectable(ctx, probe) -> bool | None:
                     data = {fn: (inject if fn == field else _XSS_FILLER) for fn in fields}
                     try:
                         if _reflects(_xss_send(c, method, action, data), detect):
-                            ctx.evidence.update(injectable=True, kind="reflected", target=action, field=field)
+                            ctx.evidence.update(injectable=True, kind="reflected", target=action, field=field,
+                                                payload=inject)   # record WHICH vector fired -> reproducible audit
                             return True  # reflected unescaped in an HTML (executable) context -> XSS
                     except (httpx.HTTPError, httpx.InvalidURL):
                         continue
@@ -634,7 +647,7 @@ def xss_injectable(ctx, probe) -> bool | None:
                 try:
                     _xss_send(c, "post", action, {fn: inject for fn in fields})
                     if _reflects(c.get(action), detect):
-                        ctx.evidence.update(injectable=True, kind="stored", target=action)
+                        ctx.evidence.update(injectable=True, kind="stored", target=action, payload=inject)
                         return True  # persisted across a fresh request -> stored XSS
                 except (httpx.HTTPError, httpx.InvalidURL):
                     pass
@@ -1735,11 +1748,21 @@ def csrf_missing(ctx, probe) -> bool | None:
                 # a redirect to login/auth/error is a CSRF REJECTION, not an accepted state change
                 if any(h in resp.headers.get("location", "").lower() for h in _CSRF_REJECT_HINTS):
                     continue
-                ctx.evidence.update(vulnerable=True, form=form.action)
+                ctx.evidence.update(vulnerable=True, form=form.action, method=method, status=resp.status_code)
                 return True
             if resp.status_code < 400:
-                ctx.evidence.update(vulnerable=True, form=form.action)
-                return True  # state-changing, no token, accepted cross-site -> CSRF
+                # a 2xx that just returns the served PAGE isn't a state change — an SPA answers 200 with its
+                # shell to ANY method/route (a form whose action defaults to '/'). Require the accepted response
+                # to DIFFER from a plain GET of the same path; near-identical HTML => the shell, not a mutation.
+                if "html" in resp.headers.get("content-type", "").lower():
+                    try:
+                        page = client.get(form.action)
+                        if abs(len(resp.text) - len(page.text)) < max(96, int(len(page.text) * 0.02)):
+                            continue   # response ≈ the served page -> SPA shell, not a real cross-site state change
+                    except (httpx.HTTPError, httpx.InvalidURL):
+                        pass
+                ctx.evidence.update(vulnerable=True, form=form.action, method=method, status=resp.status_code)
+                return True  # state-changing, no token, accepted cross-site AND response differs from the page -> CSRF
         ctx.evidence.update(vulnerable=False, forms_tested=real_tested)
         return False if real_tested else None  # every candidate was a phantom shell -> couldn't test -> N/A
     finally:

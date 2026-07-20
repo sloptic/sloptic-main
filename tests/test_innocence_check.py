@@ -108,6 +108,35 @@ def test_csrf_reads_na_on_a_catch_all_shell():
     assert _run(_CatchAll, prof, csrf_missing, headers={"Cookie": "sid=abc"}) is None
 
 
+class _RootFormShell(http.server.BaseHTTPRequestHandler):
+    """Honest 404s (so '/' is genuinely LIVE and the liveness gate PASSES), but a <form> whose action defaults
+    to '/' whose POST just RE-SERVES the homepage — an SPA/framework quirk, NOT a state change. The liveness
+    gate can't catch this (/ is a real endpoint); only the shell-diff (accepted 2xx == a plain GET of the path)."""
+    _HOME = b"<html><body>home" + b" x" * 300 + b"</body></html>"
+
+    def log_message(self, *a): pass
+
+    def _send(self, code, body):
+        self.send_response(code); self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+
+    def do_GET(self):
+        self._send(200, self._HOME) if urlparse(self.path).path == "/" else self._send(404, b"nf")
+
+    def do_POST(self):
+        try: self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
+        except Exception: pass
+        self._send(200, self._HOME) if urlparse(self.path).path == "/" else self._send(404, b"nf")
+
+
+def test_csrf_reads_na_on_a_form_that_just_reserves_the_homepage():
+    # the aesthesis/study-sync FP: a <form> whose action defaults to '/' whose POST RE-SERVES the homepage
+    # (SPA shell, not a state change). '/' is honestly live (its 404 sibling is distinct) so the liveness gate
+    # passes; only the shell-diff (accepted 2xx == a plain GET of the same path) rejects it as a non-mutation.
+    prof = Profile(base_url="x", forms=[Form(action="/", method="post", fields=["state", "connection"])])
+    assert _run(_RootFormShell, prof, csrf_missing, headers={"Cookie": "sid=abc"}) is not True
+
+
 def test_rate_limit_STILL_fires_on_an_honest_host():
     # the check must not cost recall: an honest /login that never throttles is real slop, must still fire
     prof = Profile(base_url="x", forms=[Form(action="/login", method="post", fields=["username", "password"])])
