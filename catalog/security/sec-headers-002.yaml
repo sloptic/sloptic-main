@@ -3,12 +3,14 @@ bundle: security
 category: security-headers
 pool: public
 evidence_model: provable
-penalty: 12   # risk=freq×sev: the master backstop for the whole XSS class (+ clickjacking / mixed-content /
-              # form-hijack). Conditional (needs another vuln to bite) so it stays a defense-in-depth tier —
-              # below the unconditional-misconfig tier (rate-limit/samesite 15) and the active-XSS probe (30) —
-              # but clearly ABOVE the charset/info-disclosure floor: it is not a chore header. Other security
-              # headers reviewed and held (nosniff 3 / HSTS 5 / clickjacking 5 / referrer 2 / x-powered-by 2):
-              # genuinely narrow, conditional, low-severity mitigations.
+penalty: 8    # risk=freq×sev: the master backstop for the whole XSS class (+ clickjacking / mixed-content /
+              # form-hijack). CONDITIONAL (needs another vuln to bite) -> defense-in-depth tier. Re-priced
+              # 12->8: a corpus audit found missing-headers is near-universal (fires ~90%) and, being a single
+              # one-config-block fix, was dominating the score (headers+csp = 22% of total / 71% of the
+              # security axis). Trimming the top header keeps it clearly ABOVE the charset/info-disclosure
+              # floor and the other headers, but below the unconditional-misconfig tier (rate-limit 15) — so a
+              # one-commit header fix no longer buys back a quarter of the score. Other headers held
+              # (nosniff 3 / HSTS 5 / clickjacking 5 / referrer 2 / x-powered-by 2): narrow, conditional.
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:

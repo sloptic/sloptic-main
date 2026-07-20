@@ -1,10 +1,12 @@
 id: sec-csp-001
 bundle: security
-category: csp
+category: security-headers   # same category as the missing-header probes so a CSP problem DECAYS with the
+                             # rest of the header stack (one config-block concern) instead of adding a separate
+                             # csp-category term on top — part of the header re-price (see sec-headers-002).
 pool: public
 evidence_model: provable
-penalty: 8   # a CSP present but toothless ('unsafe-inline' / wildcard script source, no nonce) — a false sense
-             # of XSS safety; priced below a MISSING header (partial CSP may still restrict frame-ancestors etc.)
+penalty: 5   # a CSP present but toothless ('unsafe-inline' / wildcard script source, no nonce) — a false sense
+             # of XSS safety; priced below a MISSING backstop header (8) and re-priced 8->5 with the header trim.
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:
