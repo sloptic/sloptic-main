@@ -67,6 +67,23 @@ def test_ignores_public_by_design():
     assert not response_leaks_secret(_Resp('const config = { api: "/api" };'))
 
 
+def test_xss_reflects_rejects_escaped_json_and_non_html():
+    # XSS reflection must be EXECUTABLE, not merely present. A `" onmouseover=` that lands inside serialized
+    # JSON (Next.js __PAGE__ / RSC flight) is backslash-escaped (\") and can't break an attribute -> NOT XSS
+    # (verified live on mekong-watch). A JSON API body echoing the payload isn't HTML -> NOT XSS either.
+    from hacklet_runner.probes import _reflects
+
+    class R:
+        def __init__(self, text, ctype="text/html"):
+            self.text, self.headers = text, {"content-type": ctype}
+    d = '" onmouseover=hlx123'
+    assert _reflects(R('<input value="" onmouseover=hlx123 x="">'), d)          # unescaped attr breakout -> XSS
+    assert not _reflects(R('{"location":"\\" onmouseover=hlx123 x=\\""}'), d)   # escaped in JSON flight -> not XSS
+    assert not _reflects(R('{"x":"<script>hlx</script>"}', "application/json"), '<script>hlx</script>')  # JSON body
+    # an escaped occurrence must not mask a LATER executable one:
+    assert _reflects(R('x=\\" onmouseover=hlx123 zzz <b>" onmouseover=hlx123</b>'), d)
+
+
 def test_weak_csp_fires_on_toothless_policies():
     csp = lambda v: _resp(200, {"content-security-policy": v})   # noqa: E731
     assert response_csp_weak(csp("default-src 'self'; script-src 'self' 'unsafe-inline'"))  # inline runs
