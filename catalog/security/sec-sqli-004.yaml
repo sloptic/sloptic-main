@@ -3,10 +3,15 @@ bundle: security
 category: sql-injection
 pool: public
 evidence_model: provable
-penalty: 40   # error-based SQLi in an API parameter -> data exfiltration / auth bypass
+penalty: 40   # SQLi in an API parameter -> data exfiltration / auth bypass
 applicability:
   # the OpenAPI-discovered API surface counts as text input, so this applies to a form-less JSON API
   requires: [any_endpoint_accepts_text_input]
 probe:
+  # SCORED oracles are causally specific to SQL (an AI-app corpus confounds fuzzy differentials): ERROR
+  # (a DB-specific error string a proxy/LLM can't emit) primary, and a strict BOOLEAN differential gated
+  # against the endpoint's own noise floor (suppressed on content-reflective LLM/TTS/proxy endpoints).
+  # TIME is advisory/off-score (multi-dose scaling; a slow upstream isn't the app's SQL). UNION is cut
+  # (an LLM quotes the marker back as content). Upstream-vendor-error bodies (NewsAPI/OpenStates) suppress.
   predicate: api_sqli
   max_attempts: 150   # injectable slots to test (declared + common-param guesses) before stopping

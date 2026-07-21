@@ -101,34 +101,73 @@ def test_sqli_boolean_technique(jsonapi):
     assert api_sqli(_only(jsonapi, "/api/bsearch"), _Probe()) is True
 
 
-def test_sqli_union_technique(jsonapi):
-    # /api/usearch: a UNION-concatenated marker executes (appears only if the SQL ran)
-    assert api_sqli(_only(jsonapi, "/api/usearch"), _Probe()) is True
+def test_union_technique_retired_from_score(jsonapi):
+    # UNION is CUT: its oracle (a concatenated marker in the body) is unsalvageable on an LLM corpus — the app
+    # quotes the marker back as generated content. /api/usearch, which ONLY answers a union, is now clean.
+    assert api_sqli(_only(jsonapi, "/api/usearch"), _Probe()) is False
 
 
-def test_sqli_time_technique(jsonapi):
-    # /api/tsearch: fully blind — only a SLEEP payload's measurable delay reveals it
-    assert api_sqli(_only(jsonapi, "/api/tsearch"), _Probe()) is True
+def test_time_technique_is_advisory_not_scored(jsonapi):
+    # TIME is advisory/off-score: /api/tsearch (blind, sleep-only) must NOT score, but records the advisory
+    # for human review — a proxy's latency is not the app's SQL, so it never enters the slop number.
+    ctx = _only(jsonapi, "/api/tsearch")
+    assert api_sqli(ctx, _Probe()) is not True                     # never scored
+    assert "time-based" in (ctx.evidence.get("advisory") or "")    # but flagged for review
+    assert ctx.evidence.get("advisory_repro", {}).get("url")       # with a replayable request
 
 
-def test_time_technique_needs_dose_response_not_bare_latency(monkeypatch):
-    # the favicon FP guard: a SLOW but non-injectable endpoint (fixed latency, ignores the payload) must read
-    # CLEAN — the differential (injected − baseline) is ~0 — while a PROPORTIONAL sleep still fires. This is the
-    # live-URL latency false positive (a 2.5MB favicon flagged SQL-injectable under a congested concurrent batch).
-    import time as _t
+def test_time_advisory_needs_dose_scaling_not_bare_latency(monkeypatch):
+    # multi-dose: a FIXED-latency endpoint (ignores the sleep argument — a slow upstream/proxy) shows no
+    # scaling between SLEEP(d) and SLEEP(3d) -> no advisory; a real sleep that TRACKS the argument does.
+    # Uses a fake clock so the test is fast + deterministic (no real sleeping).
+    import re as _re
     from hacklet_runner import probes
+    clock = {"t": 0.0}
+    monkeypatch.setattr(probes.time, "perf_counter", lambda: clock["t"])
     reqfn = lambda v: v                                                        # the "request" IS the payload  # noqa: E731
-    monkeypatch.setattr(probes, "_do", lambda c, m, payload: _t.sleep(0.25))   # fixed slow, ignores the payload
-    assert probes._tech_time(None, "GET", reqfn, delay=1) is False             # slow but not injectable -> clean
-    monkeypatch.setattr(probes, "_do",                                         # sleeps ONLY for the SLEEP payload
-        lambda c, m, payload: _t.sleep(1) if "sleep(1)" in payload.lower() else None)
-    assert probes._tech_time(None, "GET", reqfn, delay=1) is True              # real dose-response -> fires
+
+    def fixed(c, m, payload):
+        clock["t"] += 0.3                                                      # fixed latency, ignores the arg
+    monkeypatch.setattr(probes, "_do", fixed)
+    assert probes._tech_time(None, "GET", reqfn, delay=1) is False             # no scaling -> not injectable
+
+    def scaling(c, m, payload):
+        mt = _re.search(r"\((\d+)\)", payload)                                 # latency TRACKS the sleep argument
+        clock["t"] += int(mt.group(1)) if mt else 0
+    monkeypatch.setattr(probes, "_do", scaling)
+    assert probes._tech_time(None, "GET", reqfn, delay=1) is True              # SLEEP(3)-SLEEP(1)=2 >= 1.4 -> fires
+
+
+def test_boolean_noise_floor_suppresses_content_reflective(monkeypatch):
+    # the AI-app FP: two DIFFERENT benign values already diverge (an LLM/TTS/proxy varies output with input),
+    # so the noise-floor gate must suppress BEFORE the true/false comparison -> no boolean fire.
+    from hacklet_runner import probes
+    monkeypatch.setattr(probes, "_do",
+        lambda c, m, v: httpx.Response(200, text="x" * (500 if v == probes._SQLI_NOISE_B else 40)))
+    assert probes._tech_boolean(None, "GET", lambda v: v) is False   # benign noise diverges -> confounded -> suppress
+
+
+def test_boolean_fires_on_stable_endpoint_with_true_false_split(monkeypatch):
+    # a real SQL result set: benign values are stable, the always-TRUE payload opens the gate to a large
+    # result while FALSE stays small, and the split reproduces -> boolean fires.
+    from hacklet_runner import probes
+    monkeypatch.setattr(probes, "_do",
+        lambda c, m, v: httpx.Response(200, text="x" * (900 if v == probes._SQLI_TRUE else 40)))
+    assert probes._tech_boolean(None, "GET", lambda v: v) is True
+
+
+def test_upstream_error_regex_matches_the_proxy_fp_bodies():
+    # the two proxy FPs (the-angle NewsAPI 429, oversightusa OpenStates 504) must be suppressed by naming an
+    # upstream vendor error; a real DB result must NOT match.
+    from hacklet_runner.probes import _UPSTREAM_ERROR
+    assert _UPSTREAM_ERROR.search("NewsAPI 429 — You have made too many requests recently")
+    assert _UPSTREAM_ERROR.search("OpenStates API error: 504 - Gateway Time-out")
+    assert not _UPSTREAM_ERROR.search('{"results": [{"id": 1, "name": "widget"}]}')
 
 
 def test_sqli_evidence_records_the_specific_technique(jsonapi):
-    # auditability: the fire records WHICH technique fired (not a merged "error/boolean" / "union/time"), and
-    # an ERROR fire carries the leaked DB-error signature, so an audit is reproducible without re-guessing the
-    # discovered field set. This is the sqli analog of xss recording its payload.
+    # auditability: a fire records WHICH scored technique fired (error vs boolean); an ERROR fire carries the
+    # leaked DB-error signature so an audit is reproducible. (union is cut; time is advisory, tested above.)
     err = _only(jsonapi, "/api/search")             # error-leaking endpoint (a lone quote -> sqlite3 error)
     assert api_sqli(err, _Probe()) is True
     assert err.evidence["via"] == "error" and "sqlite3.OperationalError" in (err.evidence.get("sql_error") or "")
@@ -136,10 +175,6 @@ def test_sqli_evidence_records_the_specific_technique(jsonapi):
     b = _only(jsonapi, "/api/bsearch")              # blind boolean endpoint (no error leaked)
     assert api_sqli(b, _Probe()) is True
     assert b.evidence["via"] == "boolean" and not b.evidence.get("sql_error")
-
-    u = _only(jsonapi, "/api/usearch")              # union-marker endpoint
-    assert api_sqli(u, _Probe()) is True
-    assert u.evidence["via"] == "union"
 
 
 def test_sqli_clean_on_parameterized_reflecting_endpoint(jsonapi):
