@@ -379,6 +379,63 @@ def _do(c, method, req):
     return c.request(method, path, params=query or None, json=body)
 
 
+# --- reproducibility: a paste-into-Burp record of the EXACT request that triggered a finding -------------
+# An auditor can't verify a finding they can't replay. Each attack probe records `repro` = the request with
+# the payload embedded verbatim (method / full url / relevant headers / body) plus the response side that
+# confirmed it (status / latency / matched snippet). scripts/stats.py --audit renders it as a curl command.
+_REPRO_HEADERS = ("authorization", "apikey", "cookie", "content-type", "origin", "referer",
+                  "host", "x-forwarded-host", "x-forwarded-for")
+
+
+def _repro(method: str, url: str, *, headers=None, body=None, status=None, ms=None, matched=None) -> dict:
+    """A replayable record of the request that fired a finding — the payload is embedded in the url/body, so
+    it pastes straight into Burp/curl. status/ms/matched capture the response that confirmed it (audit context)."""
+    rec = {"method": method.upper(), "url": url}
+    hdr = {k: v for k, v in (headers or {}).items()
+           if k.lower() in _REPRO_HEADERS or k.lower().startswith("x-")}
+    if hdr:
+        rec["headers"] = hdr
+    if body:
+        rec["body"] = body if isinstance(body, str) else json.dumps(body)
+    if status is not None:
+        rec["status"] = status
+    if ms is not None:
+        rec["ms"] = ms
+    if matched:
+        rec["matched"] = str(matched)[:200]
+    return rec
+
+
+def _repro_from_resp(resp, matched=None) -> dict:
+    """_repro built from a completed httpx response — the resolved ABSOLUTE request url, its headers/body, the
+    response status, and measured latency. A one-liner for any probe that holds the response that fired."""
+    req = resp.request
+    body = req.content.decode("utf-8", "replace") if req.content else None
+    try:
+        ms = round(resp.elapsed.total_seconds() * 1000)
+    except (RuntimeError, AttributeError):
+        ms = None
+    return _repro(req.method, str(req.url), headers=dict(req.headers),
+                  body=(body[:600] if body else None), status=resp.status_code, ms=ms, matched=matched)
+
+
+def _sqli_repro(ctx, method, reqfn, payload, matched=None) -> dict:
+    """_repro for a SQLi fire: reqfn(payload) yields the exact (path, query, body) the probe sent, which we
+    render as an absolute url with the injection in place — the auditor replays THAT request in Burp."""
+    path, query, body = reqfn(payload)
+    url = ctx.base_url.rstrip("/") + path + ("?" + urllib.parse.urlencode(query) if query else "")
+    return _repro(method, url, body=(json.dumps(body) if body else None), matched=matched)
+
+
+def _form_repro(ctx, method, action, data, matched=None) -> dict:
+    """_repro for a form/query-param send (mirrors _xss_send): GET puts the payload dict in the query, POST
+    in a form-encoded body — so injection probes that hold the (method, action, data) can render the request."""
+    base = ctx.base_url.rstrip("/") + action
+    if (method or "get").lower() == "get":
+        return _repro("GET", base + "?" + urllib.parse.urlencode(data), matched=matched)
+    return _repro("POST", base, body=urllib.parse.urlencode(data), matched=matched)
+
+
 _PREFIX_SENTINEL = "__hl_nx_9z1x__"   # a guaranteed-nonexistent path segment (fixed -> deterministic)
 
 
@@ -520,8 +577,10 @@ def api_sqli(ctx, probe) -> bool | None:
                 try:
                     err = _tech_error(c, method, reqfn)
                     if err or _tech_boolean(c, method, reqfn):
+                        pay = _SQLI_PAYLOAD if err else _SQLI_TRUE   # the injected value that revealed it
                         ctx.evidence.update(injectable=True, via=("error" if err else "boolean"), param=slot,
-                                            endpoint=ep.raw_path, sql_error=err, techniques_tried=techs)
+                                            endpoint=ep.raw_path, sql_error=err, techniques_tried=techs,
+                                            repro=_sqli_repro(ctx, method, reqfn, pay, matched=err))
                         return True
                 except (httpx.HTTPError, httpx.InvalidURL):
                     continue
@@ -533,8 +592,10 @@ def api_sqli(ctx, probe) -> bool | None:
             try:
                 union = _tech_union(c, method, reqfn)
                 if union or _tech_time(c, method, reqfn, delay):
+                    pay = ("1' UNION SELECT %s -- " % _UNION_MARK) if union else _TIME_PAYLOADS[0].format(d=delay)
                     ctx.evidence.update(injectable=True, via=("union" if union else "time"), param=slot,
-                                        endpoint=path, techniques_tried=techs)
+                                        endpoint=path, techniques_tried=techs,
+                                        repro=_sqli_repro(ctx, method, reqfn, pay))
                     return True
             except (httpx.HTTPError, httpx.InvalidURL):
                 continue
@@ -644,9 +705,11 @@ def xss_injectable(ctx, probe) -> bool | None:
                     budget -= 1
                     data = {fn: (inject if fn == field else _XSS_FILLER) for fn in fields}
                     try:
-                        if _reflects(_xss_send(c, method, action, data), detect):
+                        rr = _xss_send(c, method, action, data)
+                        if _reflects(rr, detect):
                             ctx.evidence.update(injectable=True, kind="reflected", via="reflection",
-                                                target=action, field=field, payload=inject)
+                                                target=action, field=field, payload=inject,
+                                                repro=_repro_from_resp(rr, matched="unescaped reflection of " + inject[:60]))
                             return True  # reflected unescaped in an HTML (executable) context -> XSS
                     except (httpx.HTTPError, httpx.InvalidURL):
                         continue
@@ -657,10 +720,11 @@ def xss_injectable(ctx, probe) -> bool | None:
                 budget -= 1
                 inject, detect = payloads[0]
                 try:
-                    _xss_send(c, "post", action, {fn: inject for fn in fields})
+                    sent = _xss_send(c, "post", action, {fn: inject for fn in fields})
                     if _reflects(c.get(action), detect):
                         ctx.evidence.update(injectable=True, kind="stored", via="reflection",
-                                            target=action, payload=inject)
+                                            target=action, payload=inject,
+                                            repro=_repro_from_resp(sent, matched="payload persists; GET %s reflects it" % action))
                         return True  # persisted across a fresh request -> stored XSS
                 except (httpx.HTTPError, httpx.InvalidURL):
                     pass
@@ -674,8 +738,10 @@ def xss_injectable(ctx, probe) -> bool | None:
         for action, gfields in by_action.items():
             if browser.dom_xss_executes(ctx.base_url, [action], params=tuple(gfields),
                                         payloads=browser._XSS_EXEC_PAYLOADS, headers=ctx.headers):
+                exurl = ctx.base_url.rstrip("/") + action + "?" + urllib.parse.urlencode({gfields[0]: browser._XSS_PAYLOAD})
                 ctx.evidence.update(injectable=True, kind="reflected", via="execution",
-                                    target=action, fields=gfields)   # executed in a real DOM -> provable XSS
+                                    target=action, fields=gfields,   # executed in a real DOM -> provable XSS
+                                    repro=_repro("GET", exurl, matched="payload executed in a headless browser"))
                 return True
     ctx.evidence.update(injectable=False, fields_tested=checked, payload_shapes=len(payloads),
                         get_candidates_unconfirmed=len(get_candidates))
@@ -752,7 +818,9 @@ def command_injection(ctx, probe) -> bool | None:
                 # delta vs THIS slot's baseline (the host command itself may be slow, e.g. ping) so a
                 # naturally-slow endpoint can't false-positive; confirm twice to reject jitter
                 if all(_elapsed(c, method, action, data) - base_time >= delay * 0.7 for _ in range(2)):
-                    ctx.evidence.update(injectable=True, via="time-based", target=action, field=field)
+                    ctx.evidence.update(injectable=True, via="time-based", target=action, field=field,
+                                        repro=_form_repro(ctx, method, action, data,
+                                                          matched="response delayed ~%ds (blind command injection)" % delay))
                     return True
     ctx.evidence.update(injectable=False, fields_tested=checked,
                         techniques=["separator", "substitution", "time-based"])
@@ -1367,7 +1435,8 @@ def content_type_mismatch(ctx, probe) -> bool | None:
         checked = True
         reason = _declared_type_contradicted(resp.headers.get("content-type", ""), resp.text)
         if reason:
-            ctx.evidence.update(endpoint=path, declared=resp.headers.get("content-type", ""), reason=reason)
+            ctx.evidence.update(endpoint=path, declared=resp.headers.get("content-type", ""), reason=reason,
+                                repro=_repro_from_resp(resp, matched=reason))
             return True
     ctx.evidence.update(checked=checked)
     return False if checked else None
@@ -1383,7 +1452,8 @@ def debug_mode_enabled(ctx, probe) -> bool | None:
     for r in _induce_error_responses(ctx):
         inspected = True
         if _DEBUG_FINGERPRINT.search(r.text):
-            ctx.evidence.update(status=r.status_code, debug_ui=True)
+            ctx.evidence.update(status=r.status_code, debug_ui=True,
+                                repro=_repro_from_resp(r, matched="framework debug UI fingerprint"))
             return True
     # Werkzeug/Flask debug ships an interactive debugger reachable WITHOUT an error: it serves its own JS
     # resource. A normal app 404s or returns HTML here; only a live debugger answers with javascript --
@@ -1589,7 +1659,8 @@ def _supabase_readable(client, base: str, keys: list[str], tables: list[str]):
             if isinstance(rows, list) and rows:       # non-empty -> RLS off/permissive
                 columns = sorted(rows[0]) if isinstance(rows[0], dict) else []
                 if _sensitive_leak(table, columns):   # gate out intentionally-public tables
-                    return {"table": table, "rows": len(rows), "columns": columns[:8]}
+                    return {"table": table, "rows": len(rows), "columns": columns[:8],
+                            "repro": _repro_from_resp(r, matched="%d row(s) readable to anon" % len(rows))}
     return None if reached else "unreachable"
 
 
@@ -1636,7 +1707,8 @@ def _firestore_readable(client, base: str, project: str, api_key: str, collectio
                 continue
             if isinstance(docs, list) and docs:   # real documents to the public key -> world-readable rules
                 fields = sorted((docs[0].get("fields") or {}).keys())[:8]
-                return {"collection": coll, "documents": len(docs), "fields": fields}
+                return {"collection": coll, "documents": len(docs), "fields": fields,
+                        "repro": _repro_from_resp(r, matched="%d document(s) readable" % len(docs))}
     return None if reached else "unreachable"
 
 
@@ -1660,14 +1732,16 @@ def exposed_backend_readable(ctx, probe) -> bool | None:
             hit = _supabase_readable(ext, base, keys, _supabase_tables(blob))
             if isinstance(hit, dict):
                 ctx.evidence.update(backend="supabase", host=base, table=hit["table"],
-                                    rows_readable=hit["rows"], columns=hit["columns"])
+                                    rows_readable=hit["rows"], columns=hit["columns"], repro=hit["repro"])
                 return True
             reached = reached or hit != "unreachable"
         if fm:
-            data = _firebase_readable(ext, "https://" + fm.group(1) + "/.json")
+            url = "https://" + fm.group(1) + "/.json"
+            data = _firebase_readable(ext, url)
             if isinstance(data, (dict, list)) and data:
                 ctx.evidence.update(backend="firebase-rtdb", host=fm.group(1),
-                                    sample_keys=sorted(data)[:8] if isinstance(data, dict) else len(data))
+                                    sample_keys=sorted(data)[:8] if isinstance(data, dict) else len(data),
+                                    repro=_repro("GET", url, status=200, matched="RTDB readable to anon"))
                 return True
             reached = reached or data != "unreachable"
         if fs_used:
@@ -1676,7 +1750,7 @@ def exposed_backend_readable(ctx, probe) -> bool | None:
                                       _firestore_collections(blob))
             if isinstance(hit, dict):
                 ctx.evidence.update(backend="firestore", project=proj, collection=hit["collection"],
-                                    documents_readable=hit["documents"], fields=hit["fields"])
+                                    documents_readable=hit["documents"], fields=hit["fields"], repro=hit["repro"])
                 return True
             reached = reached or hit != "unreachable"
     ctx.evidence.update(checked=True, reachable=reached, world_readable=False)
@@ -1789,7 +1863,8 @@ def login_no_rate_limit(ctx, probe) -> bool | None:
     if not saw_auth:
         return None  # no attempt looked like a real auth rejection -> client-side / static / platform login,
                      # no server auth of the app's to rate-limit (a phantom finding otherwise)
-    ctx.evidence.update(throttled=False, attempts=attempts, via="html-form")
+    ctx.evidence.update(throttled=False, attempts=attempts, via="html-form",
+                        repro=_repro_from_resp(resp, matched="no 429/423 after %d wrong-password logins" % attempts))
     return True  # N attempts, never throttled -> no rate limiting -> slop
 
 
@@ -1812,7 +1887,9 @@ def _login_rate_limit_json(ctx, probe) -> bool | None:
             if r.status_code in (429, 423):
                 ctx.evidence.update(throttled=True, via="json-login")
                 return False
-    ctx.evidence.update(throttled=False, attempts=attempts, via="json-login")
+    ctx.evidence.update(throttled=False, attempts=attempts, via="json-login",
+                        repro=_repro("POST", ctx.base_url.rstrip("/") + path, body=json.dumps(creds),
+                                     matched="no 429/423 after %d attempts" % attempts))
     return True
 
 
@@ -1906,7 +1983,8 @@ def csrf_missing(ctx, probe) -> bool | None:
                             continue   # response ≈ the served page -> SPA shell, not a real cross-site state change
                     except (httpx.HTTPError, httpx.InvalidURL):
                         pass
-                ctx.evidence.update(vulnerable=True, form=form.action, method=method, status=resp.status_code)
+                ctx.evidence.update(vulnerable=True, form=form.action, method=method, status=resp.status_code,
+                                    repro=_repro_from_resp(resp, matched="cross-site %s accepted with no CSRF token" % method))
                 return True  # state-changing, no token, accepted cross-site AND response differs from the page -> CSRF
         ctx.evidence.update(vulnerable=False, forms_tested=real_tested)
         return False if real_tested else None  # every candidate was a phantom shell -> couldn't test -> N/A
@@ -2155,7 +2233,8 @@ def open_redirect(ctx, probe) -> bool:
                 continue
             if resp.is_redirect and urllib.parse.urlparse(
                     resp.headers.get("location", "")).hostname == _REDIRECT_PROBE_HOST:
-                ctx.evidence.update(vulnerable=True, endpoint=path)
+                ctx.evidence.update(vulnerable=True, endpoint=path,
+                                    repro=_repro_from_resp(resp, matched="Location: " + resp.headers.get("location", "")))
                 return True
     ctx.evidence.update(vulnerable=False, endpoints_tested=len(seen))
     return False
@@ -2929,10 +3008,11 @@ def crash_resistance(ctx, probe) -> bool | None:
                     tested = True
                     data = {fn: (val if fn == field else "1") for fn in fields}
                     try:
-                        st = _xss_send(c, method, action, data).status_code
-                        if st >= 500:
+                        cr = _xss_send(c, method, action, data)
+                        if cr.status_code >= 500:
                             ctx.evidence.update(crashed=True, via="malformed-field", target=action,
-                                                field=field, payload=str(val)[:60], status=st)
+                                                field=field, payload=str(val)[:60], status=cr.status_code,
+                                                repro=_repro_from_resp(cr, matched="unhandled %d on malformed input" % cr.status_code))
                             return True                    # malformed input -> unhandled 5xx
                     except (httpx.HTTPError, httpx.InvalidURL):
                         continue
@@ -3066,7 +3146,8 @@ def host_header_injection(ctx, probe) -> bool:
                 except (httpx.HTTPError, httpx.InvalidURL):
                     continue
                 if marker in r.headers.get("location", "") or marker in r.text:
-                    ctx.evidence.update(reflected=True, via=hdr, target=path)
+                    ctx.evidence.update(reflected=True, via=hdr, target=path,
+                                        repro=_repro_from_resp(r, matched="injected Host '%s' reflected" % marker))
                     return True
     ctx.evidence.update(reflected=False, targets=len(targets))
     return False
@@ -3101,7 +3182,8 @@ def http_response_splitting(ctx, probe) -> bool | None:
                 except (httpx.HTTPError, httpx.InvalidURL):
                     continue
                 if r.headers.get("hlsplit") == marker:
-                    ctx.evidence.update(split=True, target=action, field=field)
+                    ctx.evidence.update(split=True, target=action, field=field,
+                                        repro=_repro_from_resp(r, matched="CRLF -> injected header 'Hlsplit: %s'" % marker))
                     return True
     ctx.evidence.update(split=False, fields_tested=checked)
     return False if tested else None

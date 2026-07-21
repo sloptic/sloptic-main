@@ -60,6 +60,9 @@ def test_vulnerable_app_accrues_slop():
     assert all(x.outcome == "clean" for x in header_hits if (x.evidence.get("status") or 0) >= 500)
     # header-depth probes check the homepage once (global headers); HSTS is https-only -> N/A over http:
     assert o["sec-headers-002"] == "slop_detected"   # missing Content-Security-Policy
+    # every declarative fire carries a replayable `repro` (the request that matched) -> Burp-reproducible
+    hdr = next(x for x in report.outcomes if x.probe_id == "sec-headers-002" and x.outcome == "slop_detected")
+    assert hdr.evidence.get("repro", {}).get("method") == "GET" and hdr.evidence["repro"]["url"].endswith("/")
     assert o["sec-headers-004"] == "slop_detected"   # no X-Frame-Options and no CSP frame-ancestors
     assert o["sec-headers-005"] == "slop_detected"   # missing Referrer-Policy
     assert o["sec-headers-003"] == "not_applicable"  # HSTS meaningless over plain http

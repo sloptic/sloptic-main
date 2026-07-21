@@ -95,8 +95,21 @@ def _histogram(scores, bins=10, width=44):
     return out
 
 
+def _curl(repro):
+    """Render a repro record as a copy-pasteable curl command (Burp Repeater: 'Paste from curl'). Every
+    single-quoted field is shell-escaped so a payload's own quote can't break the command."""
+    esc = lambda s: str(s).replace("'", "'\\''")   # noqa: E731
+    parts = ["curl -sS -i -X %s '%s'" % (repro.get("method", "GET"), esc(repro.get("url", "")))]
+    for k, v in (repro.get("headers") or {}).items():
+        parts.append("-H '%s: %s'" % (k, esc(v)))
+    if repro.get("body"):
+        parts.append("--data '%s'" % esc(repro["body"]))
+    return " ".join(parts)
+
+
 def audit(recs, probe_id):
-    """Every app where PROBE fired, with target + evidence — makes a fire-frequency number auditable."""
+    """Every app where PROBE fired, with target + the REPRO request (paste into Burp) + evidence — makes a
+    fire-frequency number auditable AND every finding reproducible."""
     print(f"\n=== audit: {probe_id} ===")
     hits = 0
     for r in recs:
@@ -104,11 +117,20 @@ def audit(recs, probe_id):
             if f["probe_id"] == probe_id:
                 hits += 1
                 ev = {k: v for k, v in (f.get("evidence") or {}).items()}
+                repro = ev.pop("repro", None)   # pulled out so it renders as a curl, not raw JSON
                 print(f"  {r['repo']}")
                 print(f"      target={f.get('target') or '—'}  penalty={f['penalty']}  reason={f['reason'][:70]}")
-                if ev:
-                    print(f"      evidence={json.dumps(ev)[:200]}")
-    print(f"\n  {probe_id} fired in {hits} app(s).")
+                if repro:
+                    print(f"      $ {_curl(repro)}")
+                    resp = [f"{k}={repro[k]}" for k in ("status", "ms") if k in repro]
+                    if repro.get("matched"):
+                        resp.append(f"matched={repro['matched']!r}")
+                    if resp:
+                        print(f"        -> {' · '.join(resp)}")
+                if ev:   # measurements (cwv/dos timings, a11y rules, ...) — the observational-probe "repro"
+                    print(f"      evidence={json.dumps(ev)[:400]}")
+    print(f"\n  {probe_id} fired in {hits} app(s)."
+          f"{'' if any(True for r in recs for f in r.get('findings', []) if f['probe_id'] == probe_id and (f.get('evidence') or {}).get('repro')) else '  (no repro records — re-grade to capture replayable requests)'}")
 
 
 def main():

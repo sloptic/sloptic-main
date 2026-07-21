@@ -16,7 +16,7 @@ from .aggregate import compute_axis_slop, compute_slop_score, coverage_metrics
 from .deploy import Deployer
 from .discovery import discover, surface_metrics
 from .net import make_client
-from .probes import MATCHERS, PREDICATES, describe
+from .probes import MATCHERS, PREDICATES, _repro_from_resp, describe
 from .schema import Form, Outcome, Probe, Profile, Report
 
 
@@ -165,10 +165,13 @@ def _run_probe(probe: Probe, ctx: _Ctx, client: httpx.Client, profile: Profile) 
         if na_if_absent and resp.status_code in (404, 405, 501):
             continue
         slop = _matches(probe, resp)
+        ev = {"status": resp.status_code, "elapsed_ms": round(resp.elapsed.total_seconds() * 1000)}
+        if slop:
+            ev["repro"] = _repro_from_resp(resp)   # the request that matched -> replayable in Burp (all
+            #     declarative probes at once: missing-header / .env-exposure / soft-404 / content-type ...)
         produced.append(_outcome(
             probe, "slop_detected" if slop else "clean", probe.penalty if slop else 0, label,
-            reason=describe(probe) if slop else "",
-            evidence={"status": resp.status_code, "elapsed_ms": round(resp.elapsed.total_seconds() * 1000)},
+            reason=describe(probe) if slop else "", evidence=ev,
         ))
     if not produced:  # no targets, every fetch failed, or endpoint absent -> inconclusive
         return [_outcome(probe, "not_applicable", 0, target)]
