@@ -1,5 +1,6 @@
-"""SEO/meta — objective presence checks for viewport + description. Fires when either is missing; clean
-when both are present; N/A on a non-HTML response."""
+"""SEO/meta — fires when the viewport meta is missing (near-universally static in the framework template,
+so its absence is real). The description meta is recorded but NOT scored: it's commonly JS-injected
+(react-helmet / next-head), so raw HTML under-detects it on a client-rendered SPA. N/A on a non-HTML response."""
 import http.server
 import threading
 
@@ -57,9 +58,14 @@ def _ctx(url):
     return type("C", (), {"base_url": url, "headers": None, "client": None, "evidence": {}})()
 
 
-@pytest.mark.parametrize("mode", ["missing_viewport", "missing_desc"])
-def test_seo_fires_when_a_meta_is_missing(server, mode):
-    assert seo_meta_missing(_ctx(server(mode)), _Probe()) is True
+def test_seo_fires_when_viewport_missing(server):
+    assert seo_meta_missing(_ctx(server("missing_viewport")), _Probe()) is True
+
+
+def test_seo_clean_when_viewport_present_even_if_description_missing(server):
+    # description is JS-injectable (react-helmet / next-head) -> raw-HTML-missing-description is the audit's
+    # SPA false positive: recorded as evidence, but NOT scored. Viewport present -> clean.
+    assert seo_meta_missing(_ctx(server("missing_desc")), _Probe()) is False
 
 
 def test_seo_clean_when_both_present(server):

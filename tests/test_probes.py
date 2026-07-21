@@ -20,14 +20,41 @@ def _resp(status, headers=None):
     return httpx.Response(status, headers=headers or {}, request=httpx.Request("GET", "http://t/"))
 
 
+def _resp_host(status, host, headers=None):
+    return httpx.Response(status, headers=headers or {}, request=httpx.Request("GET", "https://%s/" % host))
+
+
 def test_header_policy_matchers_ignore_server_errors():
     # a missing/leaked header on a 200 is a real config finding; on a 500 (env-var-dead endpoint's error
     # page) it isn't the app's policy — counting it manufactures findings from a broken endpoint
     assert response_missing_header(_resp(200, {}), "x-content-type-options") is True
     assert response_missing_header(_resp(500, {}), "x-content-type-options") is False
     assert response_missing_header(_resp(404, {}), "x-content-type-options") is True   # 4xx is still real
-    assert response_has_header(_resp(200, {"x-powered-by": "Express"}), "x-powered-by") is True
-    assert response_has_header(_resp(503, {"x-powered-by": "Express"}), "x-powered-by") is False
+    assert response_has_header(_resp(200, {"x-powered-by": "PHP/8.1"}), "x-powered-by") is True   # version disclosure
+    assert response_has_header(_resp(503, {"x-powered-by": "PHP/8.1"}), "x-powered-by") is False  # 5xx -> not policy
+
+
+def test_hsts_suppressed_on_preloaded_platform_subdomains():
+    # sec-headers-003: a missing HSTS header on an ephemeral platform subdomain whose HSTS-preloaded apex
+    # already browser-enforces HTTPS for all subdomains is no real exposure -> suppress (upside-only). On a
+    # custom domain it's a genuine omission and still fires.
+    assert response_missing_header(_resp_host(200, "foo.vercel.app"), "strict-transport-security") is False
+    assert response_missing_header(_resp_host(200, "my-app.netlify.app"), "strict-transport-security") is False
+    assert response_missing_header(_resp_host(200, "svc.onrender.com"), "strict-transport-security") is False
+    assert response_missing_header(_resp_host(200, "app.example.com"), "strict-transport-security") is True
+    assert response_missing_header(_resp_host(200, "notvercel.app"), "strict-transport-security") is True  # no dot sep
+    # scoped to HSTS only: OTHER header probes still fire on a platform subdomain
+    assert response_missing_header(_resp_host(200, "foo.vercel.app"), "x-content-type-options") is True
+
+
+def test_x_powered_by_fires_only_on_version_disclosure():
+    # sec-headers-006: a bare framework name (Express's default, a proxy/edge banner) leaks only the stack
+    # FAMILY -> not worth a finding; a version token (PHP/8.1, Express/4.18) or ASP.NET is real disclosure.
+    assert response_has_header(_resp(200, {"x-powered-by": "Express"}), "x-powered-by") is False       # bare
+    assert response_has_header(_resp(200, {"x-powered-by": "PleskLin"}), "x-powered-by") is False      # bare, no ver
+    assert response_has_header(_resp(200, {"x-powered-by": "PHP/8.1"}), "x-powered-by") is True         # version
+    assert response_has_header(_resp(200, {"x-powered-by": "Express/4.18.2"}), "x-powered-by") is True  # version
+    assert response_has_header(_resp(200, {"x-powered-by": "ASP.NET"}), "x-powered-by") is True         # known stack
 
 
 def test_csrf_candidates_exclude_password_change_forms():
@@ -207,3 +234,34 @@ def test_declared_constraint_values_and_acceptance():
     assert _submission_accepted(R(302, "/dashboard"), "/register") is True     # POST-redirect-GET success
     assert _submission_accepted(R(302, "/register"), "/register") is False     # redirect back to form = re-show
     assert _submission_accepted(R(400), "/register") is False                  # explicit rejection
+
+
+def test_declared_constraint_uses_a_valid_vs_invalid_body_differential():
+    # qa-input-001 must fire ONLY when the invalid value is accepted the SAME as the valid baseline. A 200
+    # status alone isn't acceptance: an app that validates commonly re-renders a 200 with an inline error or
+    # returns 200 {ok:false,"error":...} — those are REJECTIONS and must NOT fire.
+    from hacklet_runner.probes import _same_success
+
+    class R:
+        def __init__(self, text, status=200, loc=""):
+            self.text, self.status_code, self.headers = text, status, {"location": loc}
+
+    action = "/register"
+    good, bad = {"email": "hl.probe@example.com"}, {"email": "hlnotanemail"}
+    base = R("<html><body>Saved hl.probe@example.com. Thanks!</body></html>")
+    # genuinely unenforced: the invalid value is accepted and echoed back the same way -> MUST fire
+    echoed = R("<html><body>Saved hlnotanemail. Thanks!</body></html>")
+    assert _same_success(base, echoed, action, good, bad) is True
+    # validates but signals it with a 200 + an inline error banner -> a rejection -> must NOT fire
+    banner = R("<html><body><p class='error-message'>Please enter a valid email address.</p></body></html>")
+    assert _same_success(base, banner, action, good, bad) is False
+    # SPA API returns 200 {ok:false,"error":...} -> a rejection -> must NOT fire
+    assert _same_success(base, R('{"ok":false,"error":"email is not valid"}'), action, good, bad) is False
+    # a 200 that diverges from the baseline with no error vocabulary (a different page) -> rejection
+    assert _same_success(base, R("<html><body>Registration is closed for maintenance.</body></html>"),
+                         action, good, bad) is False
+    # clean-rejection handling preserved: 4xx and 3xx-back-to-action are not acceptance
+    assert _same_success(base, R("nope", 400), action, good, bad) is False
+    assert _same_success(base, R("", 302, "/register"), action, good, bad) is False
+    # a redirect AWAY (POST-redirect-GET success) has no body to diff -> acceptance
+    assert _same_success(base, R("", 302, "/dashboard"), action, good, bad) is True

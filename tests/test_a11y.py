@@ -22,6 +22,13 @@ FAULTS = {
     "contrast": CLEAN.replace("<h1>hi</h1>",
                               '<h1>hi</h1><p style="color:#999;background:#aaa">low contrast</p>'),
 }
+# an <img>/<input> with no accessible name that only APPEARS inside a <script> string (an inlined bundle /
+# JSON-LD) or an HTML comment is never rendered -> must NOT count as a barrier. CLEAN's real <img> and
+# <input> keep their names, so the document stays clean once the non-rendered regions are stripped.
+NONVISIBLE = CLEAN.replace(
+    "<body>",
+    "<body><script>var tpl = '<img src=\"x.png\"><input name=\"z\">';</script>"
+    "<!-- <img src=\"y.png\"> a commented-out image with no alt -->")
 
 
 def _handler(body):
@@ -69,3 +76,8 @@ def test_a11y_fires_on_each_hard_fail(serve, fault):
 
 def test_a11y_clean_on_accessible_document(serve):
     assert a11y_hard_fails(_ctx(serve(CLEAN)), _Probe()) is False
+
+
+def test_a11y_ignores_barriers_inside_nonrendered_regions(serve):
+    # <img>/<input> without a name inside <script> / <!-- --> is not rendered -> stripped -> stays clean
+    assert a11y_hard_fails(_ctx(serve(NONVISIBLE)), _Probe()) is False

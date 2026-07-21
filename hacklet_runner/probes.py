@@ -112,8 +112,26 @@ def _policy_applies(resp) -> bool:
     return resp.status_code < 500
 
 
+# sec-headers-003 (HSTS) scope ONLY: ephemeral platform subdomains whose apex is HSTS-preloaded with
+# includeSubDomains -> HTTPS is ALREADY browser-enforced for every *.<suffix>, so a missing per-app HSTS
+# header is no real exposure. Suppression only ever REMOVES a penalty (upside-only), so a conservative
+# known-suffix list is safe; a custom domain is never suppressed.
+_HSTS_PRELOADED_SUFFIXES = (
+    ".vercel.app", ".netlify.app", ".onrender.com", ".pages.dev", ".web.app", ".firebaseapp.com",
+)
+
+
 def response_missing_header(resp, arg) -> bool:
-    return _policy_applies(resp) and str(arg) not in resp.headers  # httpx headers are case-insensitive
+    if not _policy_applies(resp) or str(arg) in resp.headers:   # httpx headers are case-insensitive
+        return False
+    if str(arg).lower() == "strict-transport-security":         # HSTS probe only — other header probes unchanged
+        try:
+            host = (resp.url.host or "").lower()
+        except Exception:
+            host = ""
+        if host.endswith(_HSTS_PRELOADED_SUFFIXES):
+            return False                                        # preloaded-apex subdomain -> HTTPS already enforced
+    return True
 
 
 def response_missing_clickjacking_defense(resp, arg=None) -> bool:
@@ -182,8 +200,20 @@ def response_uncompressed(resp, arg=1024) -> bool:
     return len(resp.content) > int(arg)
 
 
+# sec-headers-006 (X-Powered-By) scope: presence is only a MEANINGFUL leak when the VALUE discloses more
+# than the stack FAMILY. A version token (any digit -> "Express/4.18", "PHP/8.1") enables a targeted CVE
+# lookup; "ASP.NET" pinpoints the IIS/.NET stack even without a digit. A BARE framework name (Express's
+# framework default, a proxy/edge banner) leaks only the family and isn't worth a finding -> suppress
+# (precision over recall). Other headers routed through this matcher keep the presence-is-slop contract.
+_XPB_DISCLOSURE = re.compile(r"\d|asp\.net", re.IGNORECASE)
+
+
 def response_has_header(resp, arg) -> bool:
-    return _policy_applies(resp) and str(arg) in resp.headers  # presence is slop (X-Powered-By leaks stack)
+    if not _policy_applies(resp) or str(arg) not in resp.headers:   # presence is slop (leaks stack)
+        return False
+    if str(arg).lower() == "x-powered-by":                          # value-inspect: fire only on real disclosure
+        return bool(_XPB_DISCLOSURE.search(resp.headers.get(str(arg), "")))
+    return True
 
 
 def response_is_aws_credentials(resp, arg=None) -> bool:
@@ -2725,8 +2755,19 @@ def http_soft_404(ctx, probe) -> bool:
             except (httpx.HTTPError, httpx.InvalidURL):
                 continue
             if 200 <= r.status_code < 300:
+                # A soft-404 is the app SHELL served for a nonexistent asset (an SPA catch-all serving
+                # index.html). A GENERATED 200 image/svg/font from a root dynamic-asset route (avatar /
+                # OG-image / placeholder answering /<anything>.svg|.png) is a REAL asset, not a soft-404:
+                # require the 2xx to be the HTML shell — consistent with the discovery-side catch-all
+                # detectors, which also gate on "html" in content-type — and, when the root-shell
+                # signature is computable, require the body to match it.
+                if "html" not in r.headers.get("content-type", "").lower():
+                    continue                         # a generated image/svg/font asset -> not a soft-404 shell
+                sig = _catch_all_sig(ctx)
+                if sig and _body_sig(r.text) != sig:
+                    continue                         # HTML, but not the root shell the host serves everywhere
                 ctx.evidence.update(soft_404=True, ext=ext, status=r.status_code)
-                return True                          # nonexistent asset served as success -> soft-404
+                return True                          # nonexistent asset served as the shell -> soft-404
     ctx.evidence.update(soft_404=False, exts_tested=len(_SOFT404_EXT))
     return False
 
@@ -2738,6 +2779,15 @@ def http_soft_404(ctx, probe) -> bool:
 _A11Y_NAMED_ATTR = ("aria-label", "aria-labelledby", "title")
 _LABELABLE = re.compile(r"<(input|select|textarea)\b([^>]*)>", re.IGNORECASE)
 _SKIP_INPUT_TYPES = ("hidden", "submit", "button", "image", "reset")
+# Only VISIBLE, rendered markup can host an accessibility barrier. A string that merely LOOKS like an
+# <img>/<input>/inline-style but lives inside an inlined JS bundle, a JSON-LD blob, a <template>/<noscript>,
+# or an HTML comment is never rendered, so scanning it false-fires (img-missing-alt is the most exposed).
+# Strip those regions before the img / control-name / inline-contrast checks; the <html lang> and <title>
+# checks still read the full document (they live in <head>, outside these regions).
+_A11Y_NONVISIBLE = re.compile(
+    r"<script\b[^>]*>.*?</script>|<style\b[^>]*>.*?</style>|<template\b[^>]*>.*?</template>|"
+    r"<noscript\b[^>]*>.*?</noscript>|<!--.*?-->",
+    re.IGNORECASE | re.DOTALL)
 _NAMED_COLORS = {"black": (0, 0, 0), "white": (255, 255, 255), "red": (255, 0, 0), "lime": (0, 255, 0),
                  "green": (0, 128, 0), "blue": (0, 0, 255), "gray": (128, 128, 128), "grey": (128, 128, 128),
                  "silver": (192, 192, 192), "yellow": (255, 255, 0), "navy": (0, 0, 128), "maroon": (128, 0, 0)}
@@ -2789,20 +2839,21 @@ def a11y_hard_fails(ctx, probe) -> bool | None:
     if "html" not in r.headers.get("content-type", "").lower():
         return None
     doc = r.text
+    visible = _A11Y_NONVISIBLE.sub(" ", doc)                       # non-rendered regions can't host a barrier
     fails: list[str] = []                                         # every distinct barrier, not the first
-    m = re.search(r"<html\b([^>]*)>", doc, re.IGNORECASE)          # 1. <html> missing lang
+    m = re.search(r"<html\b([^>]*)>", doc, re.IGNORECASE)          # 1. <html> missing lang (full doc)
     if m and not re.search(r"\blang\s*=", m.group(1), re.IGNORECASE):
         fails.append("missing-lang")
-    if any(not re.search(r"\balt\s*=", tag, re.IGNORECASE)        # 2. <img> missing alt
-           for tag in re.findall(r"<img\b[^>]*>", doc, re.IGNORECASE)):
+    if any(not re.search(r"\balt\s*=", tag, re.IGNORECASE)        # 2. <img> missing alt (rendered only)
+           for tag in re.findall(r"<img\b[^>]*>", visible, re.IGNORECASE)):
         fails.append("img-missing-alt")
-    tm = re.search(r"<title\b[^>]*>(.*?)</title>", doc, re.IGNORECASE | re.DOTALL)  # 3. missing/empty <title>
+    tm = re.search(r"<title\b[^>]*>(.*?)</title>", doc, re.IGNORECASE | re.DOTALL)  # 3. missing/empty <title> (full doc)
     if not tm or not tm.group(1).strip():
         fails.append("missing-title")
-    label_fors = set(re.findall(r"""<label\b[^>]*\bfor\s*=\s*["']?([^"'>\s]+)""", doc, re.IGNORECASE))
-    label_spans = [(mm.start(), mm.end())                          # 4. control with no accessible name
-                   for mm in re.finditer(r"<label\b.*?</label>", doc, re.IGNORECASE | re.DOTALL)]
-    for mm in _LABELABLE.finditer(doc):
+    label_fors = set(re.findall(r"""<label\b[^>]*\bfor\s*=\s*["']?([^"'>\s]+)""", visible, re.IGNORECASE))
+    label_spans = [(mm.start(), mm.end())                          # 4. control with no accessible name (rendered only)
+                   for mm in re.finditer(r"<label\b.*?</label>", visible, re.IGNORECASE | re.DOTALL)]
+    for mm in _LABELABLE.finditer(visible):
         attrs = mm.group(2)
         tt = _tag_attr("type", attrs)
         if mm.group(1).lower() == "input" and tt and tt.group(1).lower() in _SKIP_INPUT_TYPES:
@@ -2817,7 +2868,7 @@ def a11y_hard_fails(ctx, probe) -> bool | None:
         fails.append("control-no-accessible-name")
         break                                                     # one unlabeled control -> the barrier exists
     for mm in re.finditer(r"""<([a-z0-9]+)\b[^>]*\bstyle\s*=\s*["']([^"']*)["'][^>]*>(.*?)</\1>""",
-                          doc, re.IGNORECASE | re.DOTALL):         # 5. inline-style contrast < 3:1 floor
+                          visible, re.IGNORECASE | re.DOTALL):     # 5. inline-style contrast < 3:1 floor (rendered only)
         style = mm.group(2)
         if not re.sub(r"<[^>]+>", "", mm.group(3)).strip():
             continue
@@ -2924,7 +2975,11 @@ def mixed_content(ctx, probe) -> bool | None:
 # strong one (without it a mobile browser renders at desktop width -> tiny, unusable); description feeds
 # the search snippet. Canonical is deliberately NOT checked: it's correctly absent on single-URL pages.
 def seo_meta_missing(ctx, probe) -> bool | None:
-    """Fire when the homepage lacks a viewport meta or a description meta. N/A on a non-HTML page."""
+    """Fire when the homepage lacks a viewport meta. N/A on a non-HTML page. The description meta is
+    RECORDED but NOT scored: it is commonly injected at runtime (react-helmet / vue-meta / next/head), so it
+    is absent from the RAW HTML we fetch on a client-rendered SPA even when the rendered <head> has it —
+    scoring raw-missing-description false-fires on SPAs. Viewport is near-universally static in the framework
+    template, so its absence is a real, causally-specific finding."""
     with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
         try:
             r = c.get(_home_path(ctx, probe))
@@ -2935,8 +2990,8 @@ def seo_meta_missing(ctx, probe) -> bool | None:
     doc = r.text
     has_viewport = re.search(r"""<meta\b[^>]*\bname\s*=\s*["']?viewport\b""", doc, re.IGNORECASE)
     has_desc = re.search(r"""<meta\b[^>]*\bname\s*=\s*["']?description\b""", doc, re.IGNORECASE)
-    ctx.evidence.update(viewport=bool(has_viewport), description=bool(has_desc))
-    return not (has_viewport and has_desc)
+    ctx.evidence.update(viewport=bool(has_viewport), description=bool(has_desc))   # description = advisory only
+    return not has_viewport
 
 
 # HTTP conformance — an HTML response served with no declared charset: the browser must GUESS the
@@ -3093,6 +3148,44 @@ def _submission_accepted(resp, action: str) -> bool:
     return False
 
 
+# A 200 status is NOT proof of acceptance: an app that DOES validate commonly signals rejection with a 200
+# carrying an inline error — a re-rendered form with an error banner, or an SPA API 200 {ok:false,"error":...}.
+# These markers (the classic validation-error vocabulary + common CSS/ARIA field-error classes) flag such a
+# 200 as a REJECTION so declared_constraint_unenforced doesn't false-fire on an app that is enforcing.
+_VALIDATION_ERROR_SIG = re.compile(
+    r"\binvalid\b|must be|please enter|not a valid|is required|\brequired\b|"
+    r"is-invalid|has-error|field-error|error-message|invalid-feedback|aria-invalid|\berror\b",
+    re.IGNORECASE)
+
+
+def _strip_values(body: str, data: dict) -> str:
+    """Remove the SUBMITTED field values from a response body, so an app that merely ECHOES its inputs (a
+    re-render reflecting what you typed) still compares equal to the baseline — only a genuine branch (an
+    added error banner, a different page) then makes the bodies diverge. Short values (<3 chars, e.g. a
+    number field's "5") are left in place: replacing them would over-strip and risk a false match."""
+    for v in data.values():
+        v = str(v)
+        if len(v) >= 3:
+            body = body.replace(v, "")
+    return body
+
+
+def _same_success(base, resp, action: str, good: dict, bad: dict) -> bool:
+    """True when the invalid-field submission `resp` is the SAME success the valid baseline `base` got — not
+    merely a 2xx/redirect. A 4xx or a 3xx back to the action stays a clean rejection (via _submission_accepted).
+    A 200 is treated as a REJECTION when it carries a validation-error signature OR its (value-neutralized)
+    body diverges from the valid baseline — the server branched into an error/re-render path. Only a 200 that
+    matches the baseline's success (or a redirect AWAY) counts as 'accepted the invalid value'."""
+    if not _submission_accepted(resp, action):
+        return False                                              # 4xx / 3xx-back-to-action -> clean rejection
+    if 300 <= resp.status_code < 400:
+        return True                                               # redirect AWAY -> success, no body to diff
+    body = resp.text
+    if _VALIDATION_ERROR_SIG.search(body):
+        return False                                              # inline validation error in a 200 -> rejected
+    return _body_sig(_strip_values(body, bad)) == _body_sig(_strip_values(base.text, good))
+
+
 def declared_constraint_unenforced(ctx, probe) -> bool | None:
     """The server accepts a value that violates the app's OWN declared field constraint (HTML5 type=email/
     number/url/date) — client-only validation, so garbage bypasses the browser straight into the app. The
@@ -3126,7 +3219,7 @@ def declared_constraint_unenforced(ctx, probe) -> bool | None:
                     r = _xss_send(c, method, form.action, bad)
                 except (httpx.HTTPError, httpx.InvalidURL):
                     continue
-                if _submission_accepted(r, form.action):
+                if _same_success(base, r, form.action, good, bad):   # a bare 2xx with an inline error is NOT
                     ctx.evidence.update(action=form.action, field=field, declared=cons.get("type"),
                                         invalid=str(invalid_val)[:40], valid_status=base.status_code,
                                         invalid_status=r.status_code)
