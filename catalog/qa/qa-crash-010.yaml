@@ -3,8 +3,12 @@ bundle: qa
 category: crash-resistance
 pool: public
 evidence_model: provable
-penalty: 32   # unhandled 5xx on malformed input; every wrong-order user hits it. ~32% of
-              # users churn after ONE bad experience (PwC 2018) -> near the qa/perf top.
+penalty: 16   # ungraceful error handling: a 500 (uncaught exception) instead of a graceful 400 on
+              # malformed input. Re-framed + re-priced 32->16: the server didn't CRASH (it returned an
+              # error page), it just skipped input validation — a real robustness gap but near-universal on
+              # hackathon serverless APIs and not catastrophic, so a QA-hygiene tier, not the crash tier.
+              # The SEVERE variants are scored elsewhere: a leaked stack trace -> qa-errhyg / sec-debug;
+              # a 5xx UNDER LOAD -> perf-load. The reproduce-confirm guard keeps out transient 5xxs.
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:

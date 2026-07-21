@@ -476,6 +476,18 @@ def _tech_error(c, method, reqfn):
 
 _SQLI_TRUE = "1' OR '1'='1' -- "
 _SQLI_FALSE = "1' OR '1'='2' -- "   # SAME length as TRUE; differs only in the boolean's truth value
+_SQLI_NOISE_A = "hlqa7k3m9pd2"      # two DIFFERENT inert benign values (no SQL semantics) that establish the
+_SQLI_NOISE_B = "hlzb2w8x4rn6"      # endpoint's own NOISE FLOOR: if THESE already diverge, its output is
+                                    # content-driven (an LLM/TTS/proxy echoes the input), not a SQL result set.
+
+# --- causal-specificity invariant (sits next to intent-independence + shape-independence) ---------------
+# On an AI-app corpus, ANY oracle keying on a time delta, an error, or a marker reflection shares one
+# confound: an LLM / media generator / API proxy passthrough can emit the signal with NO vulnerability — a
+# slow upstream looks like SLEEP, an echoed marker looks like a UNION, per-input output looks like a boolean
+# split. So an oracle must key on evidence CAUSALLY SPECIFIC to the vuln: a ground-truth state change (auth
+# bypass), a DB-specific error string, or a differential controlled against the endpoint's OWN noise floor —
+# never a signal any proxy/LLM passthrough can produce. And suppress when the response names an upstream
+# vendor error (its output/latency track the upstream, not the app's DB). See _UPSTREAM_ERROR.
 
 
 def _diverges(a, b) -> bool:
@@ -488,51 +500,53 @@ def _diverges(a, b) -> bool:
 
 
 def _tech_boolean(c, method, reqfn) -> bool:
-    """An always-true vs always-false condition (same-length payloads) changes the result set on an
-    otherwise-stable endpoint — visible or blind boolean injection."""
-    f1 = _do(c, method, reqfn(_SQLI_FALSE))
-    f2 = _do(c, method, reqfn(_SQLI_FALSE))
-    if _diverges(f1, f2):
-        return False  # output not stable across identical calls -> a true/false diff isn't attributable
-    return _diverges(_do(c, method, reqfn(_SQLI_TRUE)), f1)
+    """Strict boolean-blind, gated on the endpoint's own NOISE FLOOR. First send two DIFFERENT inert benign
+    values; if THEY already diverge, the output is content-driven (an LLM/TTS/proxy varies with the input),
+    not a SQL result set, so a true/false split is meaningless -> suppress (error-based still runs). Only on a
+    stable endpoint: fire when the structurally-identical TRUE vs FALSE pair (one boolean apart) diverges AND
+    the split REPRODUCES on a second independent pair (rejects one-off flakiness). This is the differential-
+    control form of the causal-specificity invariant above — a content-reflective endpoint can't fake it."""
+    if _diverges(_do(c, method, reqfn(_SQLI_NOISE_A)), _do(c, method, reqfn(_SQLI_NOISE_B))):
+        return False   # content-reflective / non-deterministic endpoint -> the differential oracle is confounded
+    if not _diverges(_do(c, method, reqfn(_SQLI_TRUE)), _do(c, method, reqfn(_SQLI_FALSE))):
+        return False
+    return _diverges(_do(c, method, reqfn(_SQLI_TRUE)), _do(c, method, reqfn(_SQLI_FALSE)))  # reproduce the split
 
 
-_UNION_MARK = "HLuok42"                                          # the CONCATENATION result; a literal
-_UNION_COLS = ("'HLu'||'ok'||'42'", "CONCAT('HLu','ok','42')")  # echo of the payload can't produce it
-
-
-def _tech_union(c, method, reqfn) -> bool:
-    """A UNION SELECT of a concatenated marker executes — the marker appears only if the SQL ran, not
-    from reflecting the payload literal. Tries ANSI `||` and MySQL CONCAT across column counts."""
-    for expr in _UNION_COLS:
-        for n in range(1, 7):
-            cols = ",".join([expr] + ["NULL"] * (n - 1))
-            if _UNION_MARK in _do(c, method, reqfn("1' UNION SELECT %s -- " % cols)).text:
-                return True
-    return False
-
+# UNION is CUT from api_sqli: its oracle (a concatenated marker appears in the body) is unsalvageable on an
+# LLM corpus — the app quotes the marker back as generated content, so the reflection isn't causally specific
+# to a UNION executing. Retired from the score with no advisory (per the causal-specificity invariant above).
 
 _TIME_PAYLOADS = ("1' OR SLEEP({d}) -- ", "1'||pg_sleep({d})-- ",
                   "1'); SELECT pg_sleep({d})-- ", "1' AND SLEEP({d})=0 -- ")
 
 
 def _tech_time(c, method, reqfn, delay) -> bool:
-    """A time-delay payload slows the response by ~delay RELATIVE TO A BENIGN BASELINE, confirmed on two
-    trials. Dose-response, not absolute latency: the DIFFERENTIAL (injected − baseline) cancels uniform
-    network/load latency, so a slow or concurrently-graded endpoint can't fake it — a static 2.5MB favicon
-    that ignores the param shows ~0 delta and stays clean, whereas a real SLEEP tracks `delay`. Requiring
-    it on BOTH trials rejects a one-off jitter spike. Fully blind: nothing observable changes but the SQL ran."""
+    """ADVISORY only (never scored — see api_sqli). A blind time-delay that SCALES with the injected sleep
+    argument: inject SLEEP(delay) and SLEEP(3*delay) — a real sleep makes the response-time DELTA track the
+    dose (the 3x adds ~2*delay), whereas a slow upstream/proxy has a FIXED latency that ignores the argument.
+    Confirmed on both trials. Reported as 'possible blind sqli (unverified)' for human review: a proxy's
+    latency is not the app's SQL, so absolute or single-dose timing can't be causally specific."""
     def elapsed(v):
         t0 = time.perf_counter()
         _do(c, method, reqfn(v))
         return time.perf_counter() - t0
     for tmpl in _TIME_PAYLOADS:
-        payload = tmpl.format(d=delay)
-        # injected − baseline must approach `delay` on both trials; a bare `elapsed >= delay` false-fires
-        # on any slow/noisy endpoint (network, load, a huge asset), which is how a favicon read as injectable.
-        if all(elapsed(payload) - elapsed(_SQLI_BENIGN) >= delay * 0.7 for _ in range(2)):
+        # the 3x dose must add ~2*delay of latency on BOTH trials (linear scaling), not a fixed offset:
+        # a NewsAPI/OpenStates proxy's latency doesn't track the SLEEP argument, a real sleep does.
+        if all(elapsed(tmpl.format(d=delay * 3)) - elapsed(tmpl.format(d=delay)) >= delay * 1.4
+               for _ in range(2)):
             return True
     return False
+
+
+# An upstream-vendor error in the body means the endpoint PROXIES a third-party API — its output and latency
+# track that upstream, not the app's own DB, so every differential SQLi oracle is confounded there. Suppress
+# it (grade the app's DB, never its passthrough). Concrete tells: "NewsAPI 429 …", "OpenStates API error:
+# 504 - Gateway Time-out", rate-limit / quota / bad-gateway bodies. See the causal-specificity invariant.
+_UPSTREAM_ERROR = re.compile(
+    r"gateway time-?out|bad gateway|\bupstream\b|\b\w*api (?:error|\d{3}|rate|key|quota)|"
+    r"too many requests|rate.?limit(?:ed|ing)?|quota exceeded", re.I)
 
 
 _DEEP_SLOTS = 6  # UNION + time are expensive/blind -> run them on at most this many slots
@@ -553,8 +567,8 @@ def api_sqli(ctx, probe) -> bool | None:
     slots_tested = 0
     eps_tested: list = []
     deep: list = []  # slots deferred to the UNION/time (blind, last-resort) pass
-    techs = ["error", "boolean", "union", "time"]
-    with make_client(ctx.base_url, ctx.headers, timeout=max(15.0, delay + 8),
+    techs = ["error", "boolean"]   # SCORED. time is advisory/off-score; union is cut (causal-specificity)
+    with make_client(ctx.base_url, ctx.headers, timeout=max(15.0, delay * 3 + 8),
                      follow_redirects=False) as c:
         for ep in targets:
             method = ep.method.upper()
@@ -564,6 +578,8 @@ def api_sqli(ctx, probe) -> bool | None:
                 continue
             if _SQL_ERROR.search(base.text):
                 continue  # baseline already errors for unrelated reasons -> can't attribute injection
+            if _UPSTREAM_ERROR.search(base.text):
+                continue  # proxies a third-party API -> latency/output track the upstream, not a DB (confounded)
             if not _endpoint_is_live(ctx, c, ep.raw_path, method, base):
                 continue  # phantom endpoint (root or per-prefix catch-all shell) -> not a real SQL sink
             eps_tested.append(ep.raw_path)
@@ -588,15 +604,14 @@ def api_sqli(ctx, probe) -> bool | None:
                     deep.append((method, reqfn, ep.raw_path, slot))
             if budget <= 0:
                 break
-        for method, reqfn, path, slot in deep:
+        for method, reqfn, path, slot in deep:   # blind TIME pass -> ADVISORY only, never scored
             try:
-                union = _tech_union(c, method, reqfn)
-                if union or _tech_time(c, method, reqfn, delay):
-                    pay = ("1' UNION SELECT %s -- " % _UNION_MARK) if union else _TIME_PAYLOADS[0].format(d=delay)
-                    ctx.evidence.update(injectable=True, via=("union" if union else "time"), param=slot,
-                                        endpoint=path, techniques_tried=techs,
-                                        repro=_sqli_repro(ctx, method, reqfn, pay))
-                    return True
+                if _tech_time(c, method, reqfn, delay):
+                    ctx.evidence.setdefault("advisory", "possible blind sqli (time-based, unverified — human review)")
+                    ctx.evidence.setdefault("advisory_param", slot)
+                    ctx.evidence.setdefault("advisory_endpoint", path)
+                    ctx.evidence.setdefault("advisory_repro",
+                                            _sqli_repro(ctx, method, reqfn, _TIME_PAYLOADS[0].format(d=delay)))
             except (httpx.HTTPError, httpx.InvalidURL):
                 continue
     ctx.evidence.update(injectable=False, endpoints_tested=len(eps_tested),
@@ -3009,10 +3024,12 @@ def crash_resistance(ctx, probe) -> bool | None:
                     data = {fn: (val if fn == field else "1") for fn in fields}
                     try:
                         cr = _xss_send(c, method, action, data)
-                        if cr.status_code >= 500:
+                        # require the 5xx to REPRODUCE on a resend -> a transient cold-start/timeout/upstream
+                        # blip isn't the app crashing on our input (the causal-specificity discipline)
+                        if cr.status_code >= 500 and _xss_send(c, method, action, data).status_code >= 500:
                             ctx.evidence.update(crashed=True, via="malformed-field", target=action,
                                                 field=field, payload=str(val)[:60], status=cr.status_code,
-                                                repro=_repro_from_resp(cr, matched="unhandled %d on malformed input" % cr.status_code))
+                                                repro=_repro_from_resp(cr, matched="unhandled %d on malformed input, reproduced" % cr.status_code))
                             return True                    # malformed input -> unhandled 5xx
                     except (httpx.HTTPError, httpx.InvalidURL):
                         continue
@@ -3034,19 +3051,22 @@ def crash_resistance(ctx, probe) -> bool | None:
                 budget -= 1
                 tested = True
                 try:
-                    st = c.post(path, content=body, headers={"Content-Type": "application/json"}).status_code
-                    if st >= 500:
+                    hdr = {"Content-Type": "application/json"}
+                    cr = c.post(path, content=body, headers=hdr)
+                    if cr.status_code >= 500 and c.post(path, content=body, headers=hdr).status_code >= 500:
                         ctx.evidence.update(crashed=True, via="malformed-json", target=path,
-                                            payload=body[:60].decode("utf-8", "replace"), status=st)
+                                            payload=body[:60].decode("utf-8", "replace"), status=cr.status_code,
+                                            repro=_repro_from_resp(cr, matched="unhandled %d on malformed JSON, reproduced" % cr.status_code))
                         return True
                 except (httpx.HTTPError, httpx.InvalidURL):
                     continue
         for p in _CRASH_PATHS:                             # 3. decode-crashing paths (naive router -> 500)
             tested = True
             try:
-                st = c.get(p).status_code
-                if st >= 500:
-                    ctx.evidence.update(crashed=True, via="decode-path", target=p, status=st)
+                cr = c.get(p)
+                if cr.status_code >= 500 and c.get(p).status_code >= 500:
+                    ctx.evidence.update(crashed=True, via="decode-path", target=p, status=cr.status_code,
+                                        repro=_repro_from_resp(cr, matched="unhandled %d on a decode-crashing path, reproduced" % cr.status_code))
                     return True
             except (httpx.HTTPError, httpx.InvalidURL):
                 continue
