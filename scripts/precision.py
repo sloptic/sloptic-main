@@ -18,6 +18,7 @@ to harden (the fix is a catch-all/liveness GATE in discovery so the phantom surf
 """
 import argparse
 import json
+import random
 from collections import Counter, defaultdict
 
 # Probes that require a REAL server-side endpoint or state change — hallucinated on a catch-all/broken shell.
@@ -49,6 +50,16 @@ _SIGNAL_SENSITIVE = {"perf-cwv-001", "perf-cwv-002", "perf-loadtime-001", "perf-
 
 def _phantom_sensitive(pid):
     return pid.startswith(_PHANTOM_SENSITIVE)
+
+
+def _audited(pid):
+    """True iff precision.py has an ACTUAL rule that inspects this probe (phantom/catch-all, signal-
+    instability, or the exposure/secret guard). When False, a `_suspect()==None` verdict means NO OPINION
+    — the finding is UNAUDITED, not verified. The unaudited surface (a11y / headers / seo / perf-requests /
+    web-vitals-count / …) is the MAJORITY of the score and exactly where scope & attribution FPs hide (the
+    asi1 perf-requests fire is here: real signal, correct probe, live endpoint, wrong owner — every rule
+    the audit owns says 'real'). Only a hand-sample (--sample) can vouch for it. See [[fuzz-runner]]."""
+    return _phantom_sensitive(pid) or pid in _SIGNAL_SENSITIVE or pid.startswith("sec-secret")
 
 
 def _page_state(r):
@@ -123,6 +134,9 @@ def analyze(recs):
     gated = [r for r in have_score if _gated(r)]          # correctly DNF'd by the gate -> not a precision problem
     scored = [r for r in have_score if not _gated(r)]     # the apps that ACTUALLY count toward the score
     per_probe = defaultdict(lambda: [0, 0])              # pid -> [fires, FALSE-positives]
+    unaudited = defaultdict(lambda: [0, 0])              # pid -> [fires, penalty] the audit has NO rule for
+    vouched = 0                                          # fires where a real precision rule ran and passed
+    scored_penalty = 0                                   # total penalty across scored fires (for the share)
     fp_reasons, adv_reasons, unconf_reasons = Counter(), Counter(), Counter()
     flagged, advisories, unconfirmed = [], [], []        # (repo, pid, penalty, count, reason)
     catchall_apps = 0
@@ -131,9 +145,16 @@ def analyze(recs):
         catchall_apps += bool(catch_all)
         for f in r.get("findings", []):
             pid = f["probe_id"]
+            pen = f.get("penalty", 0) * f.get("count", 1)
             per_probe[pid][0] += 1
+            scored_penalty += pen
             res = _suspect(f, catch_all)
-            if not res:
+            if not res:                                  # `looks real` forks: a rule vouched for it, OR no rule
+                if _audited(pid):                        # exists and the audit simply has no opinion (unaudited)
+                    vouched += 1
+                else:
+                    unaudited[pid][0] += 1
+                    unaudited[pid][1] += pen
                 continue
             klass, why = res
             row = (r.get("repo", ""), pid, f.get("penalty", 0), f.get("count", 1), why)
@@ -150,16 +171,95 @@ def analyze(recs):
     return {"scored": scored, "gated": gated, "gated_slop": sum(r.get("slop_score") or 0 for r in gated),
             "per_probe": per_probe, "fp_reasons": fp_reasons, "adv_reasons": adv_reasons,
             "unconf_reasons": unconf_reasons, "unconfirmed": unconfirmed,
+            "vouched": vouched, "unaudited": dict(unaudited), "scored_penalty": scored_penalty,
             "flagged": flagged, "advisories": advisories, "catchall_apps": catchall_apps}
+
+
+def _wilson(k, n, z=1.96):
+    """95% Wilson score interval for a binomial proportion. Unlike the normal approximation it stays inside
+    [0,1] and does not collapse to a fake-tight band at k=0 (0/30 hand-audited is NOT '0% FP, done' — Wilson
+    reports it as ~0–11%, which is the honest read on a small sample). This is the whole point of the CI."""
+    if n == 0:
+        return (0.0, 0.0)
+    p = k / n
+    d = 1 + z * z / n
+    c = (p + z * z / (2 * n)) / d
+    h = z * ((p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5) / d
+    return (max(0.0, c - h), min(1.0, c + h))
+
+
+def _fire_target(f):
+    ev = f.get("evidence") or {}
+    return ev.get("endpoint") or ev.get("target") or ev.get("path") or ""
+
+
+def _sample_worksheet(recs, n, seed):
+    """Emit N random SCORED fires as a hand-audit worksheet (TSV). The human fills the `verdict` column
+    (fp | ok), then `precision.py --tally FILE` turns it into a real FP rate + 95% CI — the ground-truth
+    number the heuristic audit structurally cannot produce (it has no oracle; this IS the oracle)."""
+    a = analyze(recs)
+    fires = [(r.get("repo", ""), f) for r in a["scored"] for f in r.get("findings", [])]
+    random.Random(seed).shuffle(fires)                   # seeded -> the draw is reproducible / auditable
+    pick = fires[: min(n, len(fires))]
+    print(f"# hand-audit worksheet — {len(pick)} of {len(fires)} scored fires (seed={seed}). Reproduce each")
+    print(f"# and set VERDICT = fp (false positive) | ok (real) | blank to skip. Then:")
+    print(f"#   uv run python scripts/precision.py --tally THIS_FILE")
+    print("verdict\trepo\tprobe_id\tpenalty\ttarget\trepro")
+    for repo, f in pick:
+        repro = " ".join(str((f.get("evidence") or {}).get("repro") or "").split())[:200]
+        print(f"\t{repo}\t{f.get('probe_id', '')}\t{f.get('penalty', 0)}\t{_fire_target(f)}\t{repro}")
+
+
+def _tally(path):
+    """Read a filled worksheet and print the hand-audited FP rate + 95% Wilson CI over the resolved verdicts."""
+    k = n = 0
+    per_probe = defaultdict(lambda: [0, 0])              # pid -> [audited, fp]
+    for line in open(path):
+        if line.startswith("#") or line.startswith("verdict\t"):
+            continue
+        cols = line.rstrip("\n").split("\t")
+        v = (cols[0].strip().lower() if cols else "")
+        if v not in ("fp", "ok"):
+            continue                                     # blank / unresolved -> not counted either way
+        n += 1
+        k += (v == "fp")
+        pid = cols[2] if len(cols) > 2 else "?"
+        per_probe[pid][0] += 1
+        per_probe[pid][1] += (v == "fp")
+    if not n:
+        print("no resolved verdicts (fill the `verdict` column with fp/ok, then re-run --tally)")
+        return
+    lo, hi = _wilson(k, n)
+    print(f"\n═══ hand-audited precision — {n} fires resolved, {k} false positive(s) ═══")
+    print(f"    FP rate    {k / n * 100:5.1f}%     95% CI  {lo * 100:4.1f}% – {hi * 100:4.1f}%")
+    print(f"    precision  {(1 - k / n) * 100:5.1f}%     95% CI  {(1 - hi) * 100:4.1f}% – {(1 - lo) * 100:4.1f}%")
+    print(f"    -> at n={n}, the TRUE FP rate is plausibly as high as {hi * 100:.1f}%. Widen the draw to tighten it.")
+    worst = sorted(((pid, c, fp) for pid, (c, fp) in per_probe.items() if fp), key=lambda x: -x[2])
+    if worst:
+        print("    by probe (only those with an FP):")
+        for pid, c, fp in worst:
+            print(f"      {fp}/{c}  {pid}")
+    print()
 
 
 def main():
     ap = argparse.ArgumentParser(description="Audit a results JSONL for likely false positives (precision).")
-    ap.add_argument("results")
+    ap.add_argument("results", nargs="?", help="results JSONL (or a filled worksheet, with --tally)")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--show", type=int, default=20, help="how many flagged findings to list")
+    ap.add_argument("--sample", type=int, metavar="N", help="emit N random fires as a hand-audit worksheet (TSV)")
+    ap.add_argument("--tally", action="store_true", help="treat `results` as a filled worksheet -> FP rate + 95%% CI")
+    ap.add_argument("--seed", type=int, default=0, help="RNG seed for --sample (reproducible draw)")
     args = ap.parse_args()
+    if not args.results:
+        ap.error("a results JSONL (or worksheet, with --tally) is required")
+    if args.tally:                                        # the OTHER half: ground-truth from resolved verdicts
+        _tally(args.results)
+        return
     recs = load(args.results)
+    if args.sample:                                       # emit the worksheet the human resolves
+        _sample_worksheet(recs, args.sample, args.seed)
+        return
     a = analyze(recs)
     scored = a["scored"]
     total_fires = sum(v[0] for v in a["per_probe"].values())
@@ -168,14 +268,21 @@ def main():
     adv_apps = len({x[0] for x in a["advisories"]})
     total_unconf = len(a["unconfirmed"])
     unconf_apps = len({x[0] for x in a["unconfirmed"]})
-    verified = total_fires - total_fp - len(a["advisories"]) - total_unconf   # only ROBUST-signal fires
+    vouched = a["vouched"]
+    unaudited = a["unaudited"]                            # pid -> [fires, penalty]
+    unaudited_fires = sum(v[0] for v in unaudited.values())
+    unaudited_pen = sum(v[1] for v in unaudited.values())
+    pen_share = (unaudited_pen / a["scored_penalty"] * 100) if a["scored_penalty"] else 0.0
 
     if args.json:
         print(json.dumps({
             "n_scored": len(scored), "n_gated_dnf": len(a["gated"]), "gated_slop": a["gated_slop"],
             "scored_fires": total_fires, "false_positive_fires": total_fp, "fp_apps": fp_apps,
             "advisory_fires": len(a["advisories"]), "advisory_apps": adv_apps, "catchall_apps": a["catchall_apps"],
-            "verified_fires": verified, "unconfirmed_fires": total_unconf, "unconfirmed_apps": unconf_apps,
+            "vouched_fires": vouched, "unaudited_fires": unaudited_fires,
+            "unaudited_penalty_pct": round(pen_share, 1),
+            "unaudited_by_probe": {pid: v[0] for pid, v in sorted(unaudited.items(), key=lambda x: -x[1][1])},
+            "unconfirmed_fires": total_unconf, "unconfirmed_apps": unconf_apps,
             "unconfirmed_reasons": dict(a["unconf_reasons"].most_common()),
             "per_probe_precision": {pid: {"fires": v[0], "false_positives": v[1],
                                           "precision_pct": round((v[0] - v[1]) / v[0] * 100, 1) if v[0] else None}
@@ -186,21 +293,31 @@ def main():
         return
 
     print(f"\n═══ precision audit — {len(scored)} SCORED apps  ({len(a['gated'])} DNF'd by the gate, excluded) ═══")
-    print(f"\n(0) DNF GATE — {len(a['gated'])} apps flagged broken/not-an-app -> ranked DNF-class, EXCLUDED from "
-          f"scoring\n    ({a['gated_slop']} slop the gate correctly kept OUT of the distribution — not a precision gap).")
-    print(f"\n(1) SIGNAL-CLASSIFIED PRECISION — what the audit CAN and CANNOT vouch for (no blanket '0 FP')")
-    print(f"    {verified}/{total_fires} VERIFIED  — robust content / header / structure signals; stand behind these.")
+    print(f"\n⚠  NOT a true-precision number. This audit recognizes a FIXED list of FP classes (catch-all")
+    print(f"   phantom · vendor-reflection · signal-instability) and has NO ground-truth oracle. It is blind")
+    print(f"   to scope/attribution FPs — a REAL finding on the wrong owner's page (the asi1 perf case). For")
+    print(f"   the real number, hand-sample:  python scripts/precision.py {args.results} --sample 30 > w.tsv")
+
+    print(f"\n(0) DNF GATE — {len(a['gated'])} apps broken/not-an-app -> DNF-class, EXCLUDED "
+          f"({a['gated_slop']} slop correctly kept out of the distribution; not a precision gap).")
+
+    print(f"\n(1) WHAT THE AUDIT CAN / CANNOT VOUCH FOR")
+    print(f"    {vouched:>5} / {total_fires} VOUCHED     — a precision rule ran and passed (liveness-gate / "
+          f"catch-all / vendor-field).")
+    print(f"    {unaudited_fires:>5} / {total_fires} UNAUDITED   — NO rule exists; neither confirmed nor suspect. "
+          f"{pen_share:.0f}% of scored penalty. Hand-sample these:")
+    for pid, (fires, pen) in sorted(unaudited.items(), key=lambda x: -x[1][1])[:12]:
+        print(f"            {fires:>5} fires · {pen:>6} pen   {pid}")
     if total_unconf:
-        print(f"    {total_unconf}/{total_fires} UNCONFIRMED  ({unconf_apps} apps) — TIMING / load-induced-error "
-              f"signals; clean IF graded in isolation, else re-fire to confirm. NOT counted clean:")
+        print(f"    {total_unconf:>5} / {total_fires} UNCONFIRMED — timing / load-induced-error ({unconf_apps} apps); "
+              f"re-fire in isolation to resolve:")
         for why, n in a["unconf_reasons"].most_common():
-            print(f"      {n:>4}  {why}")
-    if a["fp_reasons"]:
-        print(f"    {total_fp}/{total_fires} LIKELY FALSE POSITIVES  ({fp_apps} apps):")
-        for why, n in a["fp_reasons"].most_common():
-            print(f"      {n:>4}  {why}")
-    else:
-        print(f"    {total_fp}/{total_fires} likely false positives (catch-all class).")
+            print(f"            {n:>5}  {why}")
+    print(f"    {total_fp:>5} / {total_fires} KNOWN-CLASS FP ({fp_apps} apps) — only the classes this audit can see:")
+    for why, n in a["fp_reasons"].most_common():
+        print(f"            {n:>5}  {why}")
+    if not a["fp_reasons"]:
+        print(f"            (none of the KNOWN classes survived — this says NOTHING about the unaudited surface above)")
 
     if a["advisories"]:
         print(f"\n(1b) OWNERSHIP-FLAGGED — REAL findings on live endpoints, NOT false positives")
@@ -208,7 +325,8 @@ def main():
         for why, n in a["adv_reasons"].most_common():
             print(f"      {n:>4}  {why}")
 
-    print(f"\n(2) PER-PROBE PRECISION  (phantom-sensitive probes, SCORED apps only; [gated] = liveness-vetted)")
+    print(f"\n(2) PER-PROBE CATCH-ALL/PHANTOM PRECISION  (audited probes only — NOT the whole surface; "
+          f"[gated] = liveness-vetted)")
     rows = [(pid, v[0], v[1]) for pid, v in a["per_probe"].items() if _phantom_sensitive(pid) and v[0]]
     for pid, fires, fp in sorted(rows, key=lambda x: -x[2]) or [(None, 0, 0)]:
         if pid is None:
@@ -216,7 +334,7 @@ def main():
             break
         prec = (fires - fp) / fires * 100
         tag = " [gated]" if pid in _GATE_VETTED else ""
-        print(f"    {pid:20} {fires:>4} fires · {fp:>4} FP · precision {prec:5.0f}% {'█' * int(round(prec / 5))}{tag}")
+        print(f"    {pid:20} {fires:>4} fires · {fp:>4} FP · {prec:5.0f}% not-phantom {'█' * int(round(prec / 5))}{tag}")
 
     combined = [("   ", *x) for x in a["flagged"]] + [("[A]", *x) for x in a["advisories"]]
     if combined:

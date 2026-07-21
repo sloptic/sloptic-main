@@ -4,7 +4,7 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
-from precision import analyze  # noqa: E402
+from precision import analyze, _audited, _wilson  # noqa: E402
 
 
 def _f(pid, pen=10, bundle="security", evidence=None):
@@ -63,3 +63,30 @@ def test_disputed_broken_is_scored_not_gated_and_fires_not_auto_flagged():
     assert {r["repo"] for r in a["scored"]} == {"gh/disputed"}
     assert {r["repo"] for r in a["gated"]} == {"gh/broken"}
     assert not any(repo == "gh/disputed" for repo, *_ in a["flagged"])   # its real fires aren't flagged as FPs
+
+
+def test_unaudited_surface_is_split_from_vouched_not_counted_verified():
+    # the anti-"0 FP is a lie" fix: a probe with NO precision rule (a11y / headers / perf-requests) is
+    # UNAUDITED, not silently 'verified'. Only a gate-vetted probe that passed a real check is VOUCHED.
+    recs = [_rec("gh/app", 128, [
+        _f("qa-a11y-001", 26, "qa"),                     # no rule -> unaudited
+        _f("sec-headers-002", 12),                       # no rule -> unaudited (real signal, unknown owner)
+        _f("perf-requests-001", 10, "performance"),      # no rule -> unaudited (the asi1 attribution-FP class)
+        _f("sec-csrf-001", 40),                          # gate-vetted, non-signal rule passed -> vouched
+        _f("sec-sqli-004", 40),                          # gate-vetted BUT signal-sensitive -> unconfirmed, not vouched
+    ], page_state="working")]
+    a = analyze(recs)
+    assert set(a["unaudited"]) == {"qa-a11y-001", "sec-headers-002", "perf-requests-001"}
+    assert a["unaudited"]["perf-requests-001"] == [1, 10]        # [fires, penalty]
+    assert a["vouched"] == 1                                      # sec-csrf-001 only
+    assert len(a["unconfirmed"]) == 1                             # sec-sqli-004: signal-sensitive beats gate-vetted
+    assert a["scored_penalty"] == 26 + 12 + 10 + 40 + 40
+    assert not a["flagged"]                                       # unaudited != flagged; the audit has no opinion
+
+
+def test_audited_predicate_and_wilson_keeps_an_honest_upper_bound():
+    assert _audited("sec-sqli-004") and _audited("perf-cwv-001") and _audited("sec-secret-006")
+    assert not (_audited("perf-requests-001") or _audited("qa-a11y-001") or _audited("sec-headers-002"))
+    lo, hi = _wilson(0, 30)                                       # 0/30 is NOT "0% FP, done"
+    assert lo == 0.0 and 0.08 < hi < 0.14                         # honest ceiling ~11%
+    assert _wilson(0, 0) == (0.0, 0.0)
