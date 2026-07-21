@@ -34,7 +34,8 @@ import tempfile
 import textwrap
 import threading
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -928,27 +929,69 @@ _PLATFORM_PAGE_HOST = re.compile(
     r"agentverse\.ai|asi1\.ai|"                            # fetch.ai agent marketplace / shared-chat pages
     r"(?:[a-z0-9-]+\.)?itch\.io|"                          # itch.io game pages (the game runs in an iframe)
     r"explorer\.solana\.com|solscan\.io|"                  # blockchain explorers (third-party)
-    r"(?:[a-z0-9-]+\.)*arcgis\.com"                        # ArcGIS map viewer (third-party)
+    r"(?:[a-z0-9-]+\.)*arcgis\.com|"                       # ArcGIS map viewer (third-party)
+    r"(?:[a-z0-9-]+\.)*worldlabs\.ai"                      # World Labs 3D world viewer (marble.worldlabs.ai/world/<uuid>)
     r")", re.I)
 
 
-def _non_app_url(url: str):
+def _host_of(url: str) -> str:
+    """The FULL host of a URL — netloc, lowercased, port-stripped. urlsplit keeps the WHOLE host incl. the
+    subdomain, so team1.vercel.app and team2.vercel.app are DIFFERENT hosts. The single source of truth for
+    'which host is this', shared by the scope-out check (_non_app_url) and the frequency count below."""
+    return urlsplit(url).netloc.lower().split(":")[0]
+
+
+# A DATA-DRIVEN backstop to the ENUMERATED _PLATFORM_PAGE_HOST list (an enumerated host list always lags new
+# platforms). A platform reveals itself STATISTICALLY: the SAME full host recurs across many submissions,
+# because teams CANNOT share a deployment host — each team gets its OWN subdomain (team1.vercel.app), so a
+# full host (netloc, incl. subdomain) seen many times is the platform's own content domain, not a team's app.
+# K=3: low enough to catch a small platform cluster (asi1.ai across 5 shared-chat links), high enough that two
+# teams who happen to collide on one host aren't scoped out. Keyed on the FULL host ONLY — NEVER the
+# registrable domain: web.app / vercel.app / netlify.app / base44.app / github.io are popular, but each team's
+# SUBDOMAIN under them is distinct (count 1 each), so a common registrable domain never triggers this.
+_CORPUS_PLATFORM_MIN_COUNT = 3
+
+
+def _corpus_platform_hosts(urls, min_count=_CORPUS_PLATFORM_MIN_COUNT):
+    """Infer platform hosts from the BATCH's own URL distribution — the backstop to _PLATFORM_PAGE_HOST. Any
+    FULL host (netloc) appearing across >= min_count submissions is a shared third-party platform (teams can't
+    share a deployment host), so its URLs are scoped out with the SAME DNF path as an enumerated match (feed
+    the returned set to _non_app_url / _dead_url_reason). Returns the set of inferred platform hosts; prints
+    one line per host — scoping submissions out of scoring is never silent (a silent scope-cut is a bug)."""
+    counts = Counter(h for h in (_host_of(u) for u in urls) if h)
+    inferred = set()
+    for host, n in sorted(counts.items()):   # sorted -> deterministic log order across runs
+        if n >= min_count:
+            inferred.add(host)
+            print(f"host {host} appeared {n} times across submissions -> inferred platform, "
+                  f"excluding {n} url(s) from scoring")
+    return inferred
+
+
+def _non_app_url(url: str, platform_hosts=None):
     """A source / notebook / doc / video link OR a third-party platform's own content page rather than the
-    team's deployed app -> reason (else None). *.github.io is a deployed GitHub Pages site -> gradeable."""
-    host = url.split("://", 1)[-1].split("/", 1)[0].lower().split(":")[0]
+    team's deployed app -> reason (else None). *.github.io is a deployed GitHub Pages site -> gradeable.
+    `platform_hosts`: an optional set of corpus-inferred platform hosts (from _corpus_platform_hosts) — a URL
+    whose full host is in it is scoped out with the SAME reason-string DNF path as an enumerated
+    _PLATFORM_PAGE_HOST match, so the two platform sources (enumerated + inferred) compose, not diverge."""
+    host = _host_of(url)
     if host == "github.io" or host.endswith(".github.io"):
         return None
+    if platform_hosts and host in platform_hosts:
+        return (f"corpus-inferred platform host ({host} recurs across submissions), "
+                "not the team's deployed app")
     if _PLATFORM_PAGE_HOST.match(url):
         return "third-party platform's own page (agentverse/itch/explorer/...), not the team's deployed app"
     return "source / notebook / doc link, not a deployed app" if _NON_APP_HOST.match(url) else None
 
 
-def _dead_url_reason(url: str, render=None, timeout: float = 10.0):
+def _dead_url_reason(url: str, render=None, timeout: float = 10.0, platform_hosts=None):
     """Returns a reason string if `url` is NOT a working deployment, else None. A NOTE, not a grade — so a
     dead demo link is counted honestly instead of grading a 404 page or crashing the batch child. Catches:
-    a source/notebook/doc link (not a deployed app), unreachable / 4xx-5xx entry / host placeholder shell /
+    a source/notebook/doc link (not a deployed app), a third-party / corpus-inferred platform page
+    (`platform_hosts`, see _corpus_platform_hosts), unreachable / 4xx-5xx entry / host placeholder shell /
     coming-soon-maintenance splash (static), and — with `render` — a client-side 404 or rendered placeholder."""
-    non_app = _non_app_url(url)
+    non_app = _non_app_url(url, platform_hosts)
     if non_app:
         return non_app
     try:
@@ -1076,6 +1119,9 @@ def main():
     ap.add_argument("--meta", metavar="JSON", default="",
                     help="metadata to merge into the record, e.g. from devpost_repos --json "
                          "('{\"hackathon\":\"x\",\"project\":\"...\",\"winner\":true}')")
+    ap.add_argument("--platform-host", action="append", dest="inferred_platform_hosts", metavar="HOST",
+                    help="a corpus-inferred platform host (from run_batch's host-frequency detector) to DNF, "
+                         "exactly like an enumerated _PLATFORM_PAGE_HOST match. Repeatable; url-ingest only.")
     args = ap.parse_args()
     if args.browser and not os.environ.get("HL_BROWSER_PREFLIGHTED"):   # single-app: fail loud too, unless
         ok, detail = browser.browser_preflight()                        # run_batch already preflighted (env set)
@@ -1110,7 +1156,8 @@ def main():
                           stack="live app (url-ingest)", stack_profile={"routing": "url-ingest"})
             # link-rot is common -> don't grade a dead deployment's 404 shell. With the browser on, this
             # also catches a client-side 404 (SPA renders 'not found' at HTTP 200) via a one-route render.
-            dead = _dead_url_reason(url, render=(browser.render_routes if args.browser else None))
+            dead = _dead_url_reason(url, render=(browser.render_routes if args.browser else None),
+                                    platform_hosts=set(args.inferred_platform_hosts or []))
             if dead:
                 result["dead_url"] = True                         # counted as "url does not work" (deployed=False)
                 result["deploy_error"] = f"URL DEAD — {dead}"

@@ -9,9 +9,9 @@ import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
 from deploy_and_grade import (  # noqa: E402
-    CloneError, _broken_verdict, _dead_shell_reason, _dead_url_reason, _inject_build_cache,
-    _looks_like_client_404, _looks_like_source_dump, _non_app_url, _record_plan_meta, _surface_skeleton,
-    _trigger_str, audit_coverage, clone)
+    CloneError, _CORPUS_PLATFORM_MIN_COUNT, _broken_verdict, _corpus_platform_hosts, _dead_shell_reason,
+    _dead_url_reason, _inject_build_cache, _looks_like_client_404, _looks_like_source_dump, _non_app_url,
+    _record_plan_meta, _surface_skeleton, _trigger_str, audit_coverage, clone)
 
 
 def test_non_app_url_rejects_source_and_notebook_links_but_keeps_deployed_pages():
@@ -25,12 +25,68 @@ def test_non_app_url_rejects_source_and_notebook_links_but_keeps_deployed_pages(
               "https://agentverse.ai/agents/details/agent1q2nehsy/profile",   # agentverse's /api/cookie-consent
               "https://asi1.ai/shared-chat/abc", "https://nunnyu.itch.io/mygame",
               "https://explorer.solana.com/tx/xyz?cluster=devnet",
-              "https://bucas.maps.arcgis.com/apps/mapviewer/index.html"):
+              "https://bucas.maps.arcgis.com/apps/mapviewer/index.html",
+              "https://marble.worldlabs.ai/world/abc123"):   # World Labs 3D world viewer (marble.* subdomain)
         assert _non_app_url(u), u                                  # rejected -> DNF, not graded
     for u in ("https://t-hasic.github.io/ChatMIT/", "https://mammothedu.github.io/",
               "https://myapp.vercel.app/", "https://lifelineapp.site",
               "https://x.base44.app", "https://dnav-f39ac.web.app"):   # no-code + Firebase Hosting = team's app
         assert _non_app_url(u) is None, u                          # a real deployed app -> gradeable
+
+
+def test_corpus_platform_hosts_infers_a_shared_host_from_frequency():
+    # a platform reveals itself STATISTICALLY: the SAME full host recurs across submissions (teams can't share
+    # a deployment host). 5 different asi1.ai paths = ONE host, count 5 -> inferred platform, excluded.
+    urls = [f"https://asi1.ai/ai/agent-{i}" for i in range(5)]
+    inferred = _corpus_platform_hosts(urls)
+    assert inferred == {"asi1.ai"}
+    for u in urls:                                    # composes with the DNF path, exactly like _PLATFORM_PAGE_HOST
+        assert _non_app_url(u, inferred), u           # a full host in the set -> a reason -> excluded from scoring
+    # the backstop catches a host we have NOT enumerated, too — the COUNT flags it, not the deny-list
+    novel = [f"https://newvibeplatform.xyz/app/{i}" for i in range(3)]
+    assert _corpus_platform_hosts(novel) == {"newvibeplatform.xyz"}
+    assert _non_app_url(novel[0]) is None             # not on any enumerated list on its own ...
+    assert _non_app_url(novel[0], {"newvibeplatform.xyz"})   # ... but the corpus frequency scopes it out
+
+
+def test_corpus_platform_hosts_keys_on_full_host_not_registrable_domain():
+    # CRITICAL: team1.vercel.app and team2.vercel.app are DIFFERENT full hosts (count 1 each) -> NOT flagged,
+    # even though vercel.app is a very common registrable domain. Never key on the registrable domain.
+    urls = ([f"https://team{i}.vercel.app/" for i in range(6)]
+            + ["https://alpha.base44.app", "https://beta.web.app",
+               "https://gamma.netlify.app", "https://delta.github.io"])
+    inferred = _corpus_platform_hosts(urls)
+    assert inferred == set()                          # every full host is unique -> nothing inferred
+    for u in urls:
+        assert _non_app_url(u, inferred) is None, u   # all still gradeable (a popular domain is not a platform)
+
+
+def test_corpus_platform_hosts_count_boundary_is_k():
+    # K = 3 (the single module-level knob): a host at count 2 is NOT a platform; at count 3 it IS.
+    assert _CORPUS_PLATFORM_MIN_COUNT == 3
+    two = ["https://maybe.example.com/a", "https://maybe.example.com/b"]
+    assert _corpus_platform_hosts(two) == set()                        # count 2 -> below threshold, gradeable
+    assert _corpus_platform_hosts(two + ["https://maybe.example.com/c"]) == {"maybe.example.com"}  # 3 -> inferred
+
+
+def test_run_batch_forwards_inferred_platform_hosts_to_url_children_only():
+    # WIRING: run_batch computes the corpus-inferred platform set once, then _build_cmd forwards it to each
+    # URL child via --platform-host (repeatable) so the child DNFs it through the SAME reason path as an
+    # enumerated match. Repo children never url-ingest -> they get none.
+    import types
+
+    from run_batch import _build_cmd
+    args = types.SimpleNamespace(
+        results="r.jsonl", grade_timeout=60, browser=True, audit_coverage=False, proactive=False,
+        recon=False, browser_auth=False, llm_reasoning=False, headers=None, model=None,
+        attempts=3, build_timeout=480, inferred_platform_hosts=["asi1.ai", "marble.worldlabs.ai"])
+    rec = {"hackathon": "h", "project": "p", "winner": False}
+    ckpt = pathlib.Path("/tmp/hl-ckpt.json")
+    url_cmd = _build_cmd({"rec": rec, "target": "https://asi1.ai/ai/x", "source": "url"}, args, ckpt)
+    assert url_cmd.count("--platform-host") == 2                        # one flag per inferred host
+    assert "asi1.ai" in url_cmd and "marble.worldlabs.ai" in url_cmd
+    repo_cmd = _build_cmd({"rec": rec, "target": "gh/x", "source": "repo"}, args, ckpt)
+    assert "--platform-host" not in repo_cmd                            # repo child never url-ingests -> no need
 
 
 def test_surface_skeleton_extracts_interactive_surface_not_scripts():

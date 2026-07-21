@@ -250,6 +250,8 @@ def _build_cmd(j, args, ckpt):
                     {"hackathon": rec.get("hackathon"), "project": rec.get("project"), "winner": rec.get("winner")})]
     if source == "url":            # live app: grade raw, no clone/plan/Docker deploy
         cmd += ["--url"]
+        for h in getattr(args, "inferred_platform_hosts", None) or ():   # corpus-inferred platforms -> child DNFs
+            cmd += ["--platform-host", h]
     else:
         cmd += ["--attempts", str(args.attempts), "--build-timeout", str(args.build_timeout), "--checkpoint", str(ckpt)]
     if not args.browser:
@@ -482,6 +484,12 @@ def main():
     mode = ("whatsoever" if args.no_repeat_whatsoever else
             "no_repeat_repo" if args.no_repeat_repo else "default")
     jobs = _only(_plan_jobs(records), args.only)   # --repo-only / --url-only cohort filter (None = both)
+    sys.path.insert(0, str(_HERE))                 # import the sibling script's pure corpus-platform helper
+    from deploy_and_grade import _corpus_platform_hosts   # noqa: E402  (lazy: keeps --help off the grade engine)
+    # a full host recurring across many submissions is a PLATFORM (teams can't share a deployment host) -> DNF
+    # those, the data-driven backstop to the enumerated _PLATFORM_PAGE_HOST. Count over ALL url jobs (resume-
+    # invariant, not just to_run), then forward the inferred set to each url child via --platform-host.
+    args.inferred_platform_hosts = sorted(_corpus_platform_hosts([j["target"] for j in jobs if j["source"] == "url"]))
     to_run = _pending(jobs, args.results, mode)
     if not args.no_interleave:
         to_run = _interleave(to_run)   # breadth-first across slugs -> any partial run stays balanced
