@@ -10,8 +10,10 @@ penalty: 35   # XSS is the #1 serious vuln in AI-generated code and a real explo
 applicability:
   requires: [any_endpoint_accepts_text_input]
 probe:
-  # comprehensive reflected+stored XSS: each field gets every payload shape (script / img / svg /
-  # javascript-URI / attribute-breakout / script-breakout / case-varied); fires once on unescaped
-  # reflection of a unique marker. dom_xss (sec-domxss-001) covers execution in a rendered DOM.
+  # comprehensive reflected+stored XSS. A cheap server-side pre-filter (unescaped reflection of a unique
+  # marker) narrows the surface; a GET reflection is then CONFIRMED BY EXECUTION in a headless browser
+  # (the payload actually runs across body/attribute/script contexts) — presence of the string is NOT the
+  # signal, which kills the RSC/JSON flight-data FP class. POST/stored (and no-browser mode) fall back to
+  # the hardened unescaped-reflection heuristic. dom_xss (sec-domxss-001) covers pure DOM-sink execution.
   predicate: xss_injectable
   max_attempts: 150

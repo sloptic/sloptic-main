@@ -402,6 +402,74 @@ def test_dom_xss_detects_sink(serve):
     assert browser.dom_xss_executes(serve("hardened"), ["/dom"]) is False
 
 
+def test_dom_xss_broad_payloads_confirm_reflection_and_reject_inert(serve):
+    # reflected XSS is confirmed by EXECUTION across contexts (body/attr/script breakout), not string
+    # presence. vulnerable /search reflects q RAW into the HTML body -> an executing payload runs;
+    # hardened html.escape()s it -> inert. This is the anchorable pair for sec-xss-001's execution gate.
+    assert browser.dom_xss_executes(serve("vulnerable"), ["/search"], params=("q",),
+                                    payloads=browser._XSS_EXEC_PAYLOADS) is True
+    assert browser.dom_xss_executes(serve("hardened"), ["/search"], params=("q",),
+                                    payloads=browser._XSS_EXEC_PAYLOADS) is False
+
+
+def test_dom_xss_execution_rejects_present_but_inert_reflection():
+    # the Next.js RSC / JSON flight-data FP class: the payload is PRESENT in the response but embedded in a
+    # <script> JSON blob with '<' unicode-escaped (<) exactly as SPA frameworks serialize state, so it
+    # never executes. Execution confirmation must return False DESPITE the raw string being in the body —
+    # this is precisely the mekong-watch false positive the research says to kill by execution, not regex.
+    import http.server
+    import json
+    import threading
+    from urllib.parse import parse_qs, urlparse
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            q = parse_qs(urlparse(self.path).query).get("q", [""])[0]
+            blob = json.dumps({"q": q}).replace("<", "\\u003c")   # framework-style inert serialization
+            body = ("<!doctype html><html><body><div id=app></div>"
+                    "<script>window.__DATA__=" + blob + "</script></body></html>").encode()
+            self.send_response(200); self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        assert browser.dom_xss_executes(base, ["/"], params=("q",),
+                                        payloads=browser._XSS_EXEC_PAYLOADS) is False
+    finally:
+        srv.shutdown()
+
+
+def test_xss_injectable_fires_via_execution_not_reflection(serve):
+    # end-to-end: with a browser, sec-xss-001 confirms a GET reflection by EXECUTION. vulnerable /search
+    # runs the payload -> fires with via='execution'; hardened reflects the (alphanumeric) marker but the
+    # payload never executes -> clean. This is the FP-killing upgrade over string-presence matching.
+    from hacklet_runner.net import make_client
+    from hacklet_runner.probes import xss_injectable
+    from hacklet_runner.schema import Form, Profile
+
+    class _P:
+        probe = {"max_attempts": 150}
+
+    def _ctx(url):
+        prof = Profile(base_url=url, forms=[Form("/search", "get", ["q"])],
+                       capabilities={"browser": True, "any_endpoint_accepts_text_input": True})
+        return type("C", (), {"base_url": url, "profile": prof, "headers": None,
+                              "client": make_client(url, None, timeout=10.0, follow_redirects=True),
+                              "evidence": {}})()
+
+    v = _ctx(serve("vulnerable"))
+    assert xss_injectable(v, _P()) is True
+    assert v.evidence.get("via") == "execution"   # fired because the payload RAN, not because it echoed
+
+    h = _ctx(serve("hardened"))
+    assert xss_injectable(h, _P()) is False        # marker reflects but nothing executes -> clean
+
+
 def test_cwv_detects_slow_paint(serve):
     # vulnerable /slow injects content late (high FCP); hardened has it in the initial HTML (fast)
     slow = browser.first_contentful_paint(serve("vulnerable") + "/slow")

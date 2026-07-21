@@ -19,6 +19,16 @@ import urllib.parse
 # for both reflected-that-executes and DOM-sink XSS. The marker is read back from window.
 _XSS_PAYLOAD = "<img src=x onerror=\"window.__hl_domxss='hl-domxss-9a2b'\">"
 _XSS_MARKER = "hl-domxss-9a2b"
+# Executing payloads across reflection CONTEXTS (each sets the marker when it RUNS) — used to CONFIRM a
+# server-reflected XSS candidate by real browser execution, covering the contexts the single DOM-sink
+# payload can't reach (attribute-value and <script>-block breakout). A candidate that reflects the marker
+# but runs NONE of these is inert (framework-escaped / JSON RSC-flight data) — present, not executable.
+_XSS_EXEC_PAYLOADS = (
+    _XSS_PAYLOAD,                                                          # HTML body: <img> onerror handler
+    "<svg onload=\"window.__hl_domxss='%s'\">" % _XSS_MARKER,             # HTML body: <svg> onload handler
+    "\"><svg onload=\"window.__hl_domxss='%s'\">" % _XSS_MARKER,         # break OUT of an attribute value
+    "</script><svg onload=\"window.__hl_domxss='%s'\">" % _XSS_MARKER,    # break OUT of a <script> block
+)
 
 
 def browser_available() -> bool:
@@ -813,11 +823,14 @@ def web_vitals(url: str, headers=None, timeout: float = 25.0, samples: int = 3) 
 
 
 def dom_xss_executes(base_url: str, paths, params=("q",), max_attempts: int = 24,
-                     total_timeout: float = 45.0, headers=None) -> bool:
+                     total_timeout: float = 45.0, headers=None, payloads=None) -> bool:
     """Inject an executing payload into candidate query params of each path, render, and return True
     if it ran (the payload's JS set a window global) — i.e. XSS that *executes* in the DOM, which a
     source-only reflection check misses (reflected-that-executes and DOM-sink XSS). False if no
-    browser or nothing executed."""
+    browser or nothing executed. `payloads` overrides the default single DOM-sink payload with a
+    broader per-context set (_XSS_EXEC_PAYLOADS) to CONFIRM a server-reflected candidate by real
+    execution across attribute/script contexts; each goto is a fresh document, so the marker resets."""
+    payloads = payloads or (_XSS_PAYLOAD,)
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -834,15 +847,16 @@ def dom_xss_executes(base_url: str, paths, params=("q",), max_attempts: int = 24
                 deadline = time.monotonic() + total_timeout  # overall wall-clock cap: a slow-loris
                 for path in paths:                            # target that stalls each goto can't tie
                     for param in params:                      # up the probe (24 x 8s would be ~3 min)
-                        if attempts >= max_attempts or time.monotonic() > deadline:
-                            return False
-                        attempts += 1
-                        url = f"{base_url.rstrip('/')}{path}?{param}={urllib.parse.quote(_XSS_PAYLOAD)}"
-                        with contextlib.suppress(Exception):
-                            page.goto(url, timeout=8000, wait_until="load")
-                            page.wait_for_timeout(150)
-                            if page.evaluate("() => window.__hl_domxss") == _XSS_MARKER:
-                                return True  # fresh document each goto, so a hit is this page's
+                        for payload in payloads:
+                            if attempts >= max_attempts or time.monotonic() > deadline:
+                                return False
+                            attempts += 1
+                            url = f"{base_url.rstrip('/')}{path}?{param}={urllib.parse.quote(payload)}"
+                            with contextlib.suppress(Exception):
+                                page.goto(url, timeout=8000, wait_until="load")
+                                page.wait_for_timeout(150)
+                                if page.evaluate("() => window.__hl_domxss") == _XSS_MARKER:
+                                    return True  # fresh document each goto, so a hit is this page's
                 return False
             finally:
                 b.close()
