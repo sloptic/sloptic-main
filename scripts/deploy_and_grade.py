@@ -918,13 +918,28 @@ _NON_APP_HOST = re.compile(
     r"youtube\.com|youtu\.be|loom\.com|vimeo\.com"                                       # demo videos
     r")", re.I)
 
+# Third-party PLATFORM content pages: the submitted URL is the platform's OWN page (an agent listing, a game
+# page whose game runs in an iframe, a blockchain explorer, a map viewer) — grading it grades the platform's
+# UI + endpoints (agentverse's /api/cookie-consent, itch's chrome), penalizing many teams for one platform's
+# bugs. DNF at ingestion, like source/doc links. NOTE: base44.app / *.web.app / *.vercel.app etc. are the
+# TEAM's deployed app (kept gradeable) — only platform CONTENT-page hosts belong here.
+_PLATFORM_PAGE_HOST = re.compile(
+    r"^https?://(?:www\.)?(?:"
+    r"agentverse\.ai|asi1\.ai|"                            # fetch.ai agent marketplace / shared-chat pages
+    r"(?:[a-z0-9-]+\.)?itch\.io|"                          # itch.io game pages (the game runs in an iframe)
+    r"explorer\.solana\.com|solscan\.io|"                  # blockchain explorers (third-party)
+    r"(?:[a-z0-9-]+\.)*arcgis\.com"                        # ArcGIS map viewer (third-party)
+    r")", re.I)
+
 
 def _non_app_url(url: str):
-    """A source / notebook / doc / video link rather than a deployed app -> reason (else None). *.github.io is a
-    deployed GitHub Pages site -> gradeable."""
+    """A source / notebook / doc / video link OR a third-party platform's own content page rather than the
+    team's deployed app -> reason (else None). *.github.io is a deployed GitHub Pages site -> gradeable."""
     host = url.split("://", 1)[-1].split("/", 1)[0].lower().split(":")[0]
     if host == "github.io" or host.endswith(".github.io"):
         return None
+    if _PLATFORM_PAGE_HOST.match(url):
+        return "third-party platform's own page (agentverse/itch/explorer/...), not the team's deployed app"
     return "source / notebook / doc link, not a deployed app" if _NON_APP_HOST.match(url) else None
 
 

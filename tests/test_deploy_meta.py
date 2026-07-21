@@ -20,10 +20,16 @@ def test_non_app_url_rejects_source_and_notebook_links_but_keeps_deployed_pages(
     for u in ("https://github.com/user/repo", "https://github.iu.edu/adiharin/mana.ai",
               "https://github.gatech.edu/nnayar32/HackGT-12", "https://gitlab.com/u/r",
               "https://colab.research.google.com/drive/1abc", "https://devpost.com/software/x",
-              "https://youtu.be/abc"):
+              "https://youtu.be/abc",
+              # third-party PLATFORM content pages: grading them grades the platform, not the team's app
+              "https://agentverse.ai/agents/details/agent1q2nehsy/profile",   # agentverse's /api/cookie-consent
+              "https://asi1.ai/shared-chat/abc", "https://nunnyu.itch.io/mygame",
+              "https://explorer.solana.com/tx/xyz?cluster=devnet",
+              "https://bucas.maps.arcgis.com/apps/mapviewer/index.html"):
         assert _non_app_url(u), u                                  # rejected -> DNF, not graded
     for u in ("https://t-hasic.github.io/ChatMIT/", "https://mammothedu.github.io/",
-              "https://myapp.vercel.app/", "https://lifelineapp.site", "https://x.base44.app"):
+              "https://myapp.vercel.app/", "https://lifelineapp.site",
+              "https://x.base44.app", "https://dnav-f39ac.web.app"):   # no-code + Firebase Hosting = team's app
         assert _non_app_url(u) is None, u                          # a real deployed app -> gradeable
 
 
