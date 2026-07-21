@@ -27,13 +27,15 @@ def _handler(mode):
             raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
             gz = "gzip" in self.headers.get("Content-Encoding", "").lower()
             if gz and mode != "nodecomp":                # nodecomp: ignore the encoding (safe, no bomb)
-                if mode == "capped":
+                if mode in ("capped", "capped400"):
                     d = zlib.decompressobj(16 + zlib.MAX_WBITS)
                     raw = d.decompress(raw, 1_000_000)
-                    if d.unconsumed_tail:
-                        return self._end(413)            # over the cap -> reject before expanding
+                    if d.unconsumed_tail:                # over the cap -> reject before expanding
+                        return self._end(413 if mode == "capped" else 400)   # capped400: a size refusal, not a 413
                 else:
                     raw = gzip.decompress(raw)           # uncapped -> a bomb expands unchecked
+                    if mode == "crash5xx" and len(raw) > 1_000_000:
+                        return self._end(500)            # decompressed the whole 50MB, then choked on the SIZE
             try:
                 json.loads(raw)
                 self._end(200)
@@ -76,3 +78,15 @@ def test_dos_clean_when_capped(server):
 
 def test_dos_na_when_no_decompression(server):
     assert decompression_bomb(_ctx(server("nodecomp")), _Probe()) is None
+
+
+def test_dos_clean_when_rejected_with_400(server):
+    # a 400 is INCONCLUSIVE (a size cap OR a post-decompression content failure) -> not scored
+    # (precision-favoring; FN is the safe error). This is the false positive the old 413-only rule created.
+    assert decompression_bomb(_ctx(server("capped400")), _Probe()) is not True
+
+
+def test_dos_fires_on_size_driven_5xx(server):
+    # provable exhaustion: the 50MB body 500s the app while a 10KB control (same shape) returns 200 -> the
+    # SIZE crashed it, not a broken gzip handler.
+    assert decompression_bomb(_ctx(server("crash5xx")), _Probe()) is True

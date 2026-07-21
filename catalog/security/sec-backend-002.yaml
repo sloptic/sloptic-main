@@ -1,0 +1,20 @@
+id: sec-backend-002
+bundle: security
+category: access-control
+pool: public
+evidence_model: oracle
+penalty: 40   # catastrophic Broken Access Control (OWASP A01:2025, the #1 risk): any logged-in user reads
+              # every OTHER user's data — RLS/Rules present but over-permissive (`using(authenticated)` /
+              # `if request.auth != null`). The IDOR equivalent on a BaaS SPA — an attacker just signs up.
+              # Same catastrophic tier as anon-open (sec-backend-001) and classic BOLA/IDOR.
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  # Mine the client bundle for the Supabase/Firebase config, obtain ONE throwaway identity (Firebase
+  # ANONYMOUS auth = no persistent account; Supabase throwaway signup, N/A when email confirmation is
+  # required), then read as it. DIFFERENTIAL: fire only where ANON is denied but a FRESH authed user (who
+  # created nothing) sees SENSITIVE rows/docs — anon-open is sec-backend-001; a correct per-user policy
+  # returns [] to a fresh user. Read-only on app data (one throwaway identity is the only side effect).
+  # N/A when no config / no obtainable auth / unreachable. Lights up the OWASP-A01 surface the classic
+  # register-2-accounts IDOR probes can't reach on an off-origin BaaS app.
+  predicate: authenticated_backend_readable

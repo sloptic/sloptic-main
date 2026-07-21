@@ -172,6 +172,120 @@ def test_firestore_unreachable_is_na():
         assert probes._firestore_readable(c, "http://127.0.0.1:1", "p", "k", ["users"]) == "unreachable"
 
 
+def _serve_authed(rules):
+    """Local mock keyed off the Authorization Bearer token: rules(path, bearer) -> (code, body_bytes). For
+    the authenticated-tier differential (anon vs a fresh JWT/idToken); handles GET + POST (signup)."""
+    class _H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _do(self):
+            bearer = (self.headers.get("Authorization") or "").replace("Bearer ", "")
+            code, body = rules(self.path, bearer)
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        do_GET = _do
+        do_POST = _do
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def test_supabase_authed_only_fires_on_authenticated_rls_bypass():
+    # broken RLS: anon is denied ([]), but a FRESH authed user (created nothing) sees everyone's rows ->
+    # `using (auth.role() = 'authenticated')` -> the IDOR equivalent. Sensitive table+columns -> fires.
+    ANON, JWT = "eyJanon", "eyJfreshuser"
+
+    def rules(path, bearer):
+        if "/rest/v1/messages" in path:
+            return (200, json.dumps([{"id": 1, "email": "a@x.com", "body": "private"}]).encode()) \
+                if bearer == JWT else (200, b"[]")   # anon -> RLS blocks -> empty
+        return 200, b"[]"
+    srv = _serve_authed(rules)
+    base = "http://127.0.0.1:%d" % srv.server_address[1]
+    try:
+        with httpx.Client(timeout=5) as c:
+            hit = probes._supabase_authed_only(c, base, ANON, JWT, ["messages"])
+        assert hit and hit["table"] == "messages" and "email" in hit["columns"]
+    finally:
+        srv.shutdown()
+
+
+def test_supabase_authed_only_clean_on_correct_per_user_rls():
+    # correct per-user policy: a FRESH user sees [] too (created nothing) -> not the authenticated-tier bug
+    srv = _serve_authed(lambda path, bearer: (200, b"[]"))
+    base = "http://127.0.0.1:%d" % srv.server_address[1]
+    try:
+        with httpx.Client(timeout=5) as c:
+            assert probes._supabase_authed_only(c, base, "eyJanon", "eyJfresh", ["messages"]) is None
+    finally:
+        srv.shutdown()
+
+
+def test_supabase_authed_only_skips_anon_open_table():
+    # anon ALSO sees the rows -> sec-backend-001's anon-open finding, NOT the authenticated tier -> clean here
+    srv = _serve_authed(lambda path, bearer: (200, json.dumps([{"id": 1, "email": "a@x.com"}]).encode()))
+    base = "http://127.0.0.1:%d" % srv.server_address[1]
+    try:
+        with httpx.Client(timeout=5) as c:
+            assert probes._supabase_authed_only(c, base, "eyJanon", "eyJfresh", ["users"]) is None
+    finally:
+        srv.shutdown()
+
+
+def test_supabase_signup_jwt_when_autoconfirm_else_none():
+    ok = _serve_authed(lambda path, bearer: (200, json.dumps({"access_token": "eyJnew"}).encode()))
+    conf = _serve_authed(lambda path, bearer: (200, json.dumps({"user": {"id": "x"}, "session": None}).encode()))
+    try:
+        with httpx.Client(timeout=5) as c:
+            assert probes._supabase_signup(c, "http://127.0.0.1:%d" % ok.server_address[1], "eyJanon") == "eyJnew"
+            # confirmation required -> no access_token -> N/A (can't obtain an authed identity)
+            assert probes._supabase_signup(c, "http://127.0.0.1:%d" % conf.server_address[1], "eyJanon") is None
+    finally:
+        ok.shutdown(); conf.shutdown()
+
+
+def test_firebase_anon_token_obtained_or_none_when_disabled():
+    ok = _serve_authed(lambda path, bearer: (200, json.dumps({"idToken": "fbTok", "localId": "anon1"}).encode()))
+    off = _serve_authed(lambda path, bearer: (400, json.dumps({"error": {"message": "ADMIN_ONLY_OPERATION"}}).encode()))
+    try:
+        with httpx.Client(timeout=5) as c:
+            assert probes._firebase_anon_token(c, "http://127.0.0.1:%d" % ok.server_address[1], "AIzaK") == "fbTok"
+            assert probes._firebase_anon_token(c, "http://127.0.0.1:%d" % off.server_address[1], "AIzaK") is None
+    finally:
+        ok.shutdown(); off.shutdown()
+
+
+def test_firestore_authed_only_fires_when_fresh_user_sees_docs():
+    TOK = "fbTok"
+
+    def rules(path, bearer):
+        if "/documents/users" in path and bearer == TOK:   # anon (no bearer) sees nothing; authed sees data
+            return 200, json.dumps({"documents": [
+                {"name": "p/databases/(default)/documents/users/1",
+                 "fields": {"email": {"stringValue": "a@x.com"}}}]}).encode()
+        return 200, b"{}"
+    srv = _serve_authed(rules)
+    base = "http://127.0.0.1:%d" % srv.server_address[1]
+    try:
+        with httpx.Client(timeout=5) as c:
+            hit = probes._firestore_authed_only(c, base, "proj", "AIzaK", TOK, ["posts", "users"])
+        assert hit and hit["collection"] == "users" and "email" in hit["fields"]
+    finally:
+        srv.shutdown()
+
+
+def test_authenticated_backend_na_when_no_config():
+    ctx = type("C", (), {"client": httpx.Client(base_url="http://127.0.0.1:1"),
+                         "profile": Profile(base_url="http://127.0.0.1:1", routes=["/"]), "evidence": {}})()
+    assert probes.authenticated_backend_readable(ctx, type("P", (), {"probe": {}})()) is None
+
+
 def test_predicate_na_when_no_backend_config():
     # a firewalled Tier-A app embeds no Supabase/Firebase config -> nothing to test -> N/A
     ctx = type("C", (), {"client": httpx.Client(base_url="http://127.0.0.1:1"),

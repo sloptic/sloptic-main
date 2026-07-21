@@ -1772,6 +1772,145 @@ def exposed_backend_readable(ctx, probe) -> bool | None:
     return False if reached else None   # reached-but-protected = clean; unreachable = N/A (egress blocked)
 
 
+# --- authenticated-tier BaaS access control (sec-backend-002) ----------------------------------------
+# The IDOR equivalent on an off-origin BaaS SPA — OWASP A01 (Broken Access Control, the #1 risk): RLS/Rules
+# are PRESENT but over-permissive, so ANY logged-in user reads EVERYTHING (Supabase `using
+# (auth.role()='authenticated')`, Firebase `allow read: if request.auth != null`) — the most common
+# critical access-control finding (CVE-2025-48757 / the Lovable class). Classic register-2-accounts IDOR is
+# dead here (no app backend), so we drive the BaaS auth directly: obtain ONE throwaway identity, then read
+# as it. DIFFERENTIAL: fire only where ANON is denied but a FRESH authed user (who created nothing) sees
+# SENSITIVE rows — anon-open is sec-backend-001's job, and a correct per-user policy returns [] to a fresh
+# user. Read-only on app DATA; Firebase uses ANONYMOUS auth (no persistent account), Supabase a throwaway
+# signup (one obvious-test-email auth.users row) — N/A when auth can't be obtained (closed signup / email
+# confirmation / anonymous-auth-off). One throwaway identity is the only side effect; never a data write.
+
+
+def _firebase_anon_token(client, base: str, api_key: str):
+    """A throwaway Firebase ANONYMOUS-auth idToken (no persistent account, no PII) — or None if anonymous
+    sign-in is disabled on the project. Zero side effect: an anonymous session isn't a real user record."""
+    try:
+        r = client.post(base + "/v1/accounts:signUp", params={"key": api_key},
+                        json={"returnSecureToken": True}, timeout=6.0)
+        return r.json().get("idToken") if r.status_code == 200 else None
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError):
+        return None
+
+
+def _firestore_docs(resp):
+    try:
+        d = resp.json().get("documents") if resp.status_code == 200 else None
+    except (ValueError, AttributeError):
+        return []
+    return d if isinstance(d, list) else []
+
+
+def _firestore_authed_only(client, base, project, api_key, id_token, collections):
+    """A collection a FRESH authenticated user reads but ANON cannot -> `allow read: if request.auth != null`
+    (any logged-in user reads everything). Returns {collection,...} for the first sensitive such collection,
+    'unreachable', or None. Read-only."""
+    reached = False
+    for coll in collections:
+        url = "%s/v1/projects/%s/databases/(default)/documents/%s" % (base, project, coll)
+        try:
+            anon = client.get(url, params={"key": api_key, "pageSize": "1"}, timeout=6.0)
+            authed = client.get(url, params={"key": api_key, "pageSize": "3"},
+                                headers={"Authorization": "Bearer " + id_token}, timeout=6.0)
+        except (httpx.HTTPError, httpx.InvalidURL):
+            continue
+        reached = True
+        docs = _firestore_docs(authed)
+        if not _firestore_docs(anon) and docs:   # anon denied, a fresh authed user sees documents
+            fields = sorted((docs[0].get("fields") or {}).keys())[:8]
+            if _sensitive_leak(coll, fields):
+                return {"collection": coll, "documents": len(docs), "fields": fields,
+                        "repro": _repro_from_resp(authed, matched="%d doc(s) readable by ANY authed user" % len(docs))}
+    return None if reached else "unreachable"
+
+
+def _supabase_signup(client, base: str, anon_key: str):
+    """A throwaway Supabase Auth access-token (JWT) — or None when signup is closed OR requires email
+    confirmation (no immediate session). Creates ONE obvious test account (auth.users); never writes app
+    data. Signup is public-by-design, so this is a low, identifiable side effect."""
+    body = {"email": "hlrlstest+%s@example.com" % secrets.token_hex(4),
+            "password": "hlRls-" + secrets.token_hex(8)}
+    try:
+        r = client.post(base + "/auth/v1/signup", headers={"apikey": anon_key}, json=body, timeout=6.0)
+        return r.json().get("access_token") if r.status_code in (200, 201) else None
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError):
+        return None
+
+
+def _supabase_authed_only(client, base, anon_key, user_jwt, tables):
+    """A table a FRESH authenticated user reads but ANON cannot -> a broken `authenticated` RLS policy (any
+    logged-in user reads all rows). Differential + sensitivity gated; read-only. {table,...} / 'unreachable' / None."""
+    def read(table, jwt, lim):
+        r = client.get(base + "/rest/v1/" + table, params={"select": "*", "limit": lim},
+                       headers={"apikey": anon_key, "Authorization": "Bearer " + jwt}, timeout=6.0)
+        try:
+            j = r.json() if r.status_code == 200 else None
+        except ValueError:
+            j = None
+        return (j if isinstance(j, list) else None), r
+    reached = False
+    for table in tables[:16]:
+        try:
+            anon_rows, _ = read(table, anon_key, "1")
+            authed_rows, authed_resp = read(table, user_jwt, "3")
+        except (httpx.HTTPError, httpx.InvalidURL):
+            continue
+        reached = True
+        if not anon_rows and authed_rows:   # anon denied/empty, a fresh authed user sees rows
+            columns = sorted(authed_rows[0]) if isinstance(authed_rows[0], dict) else []
+            if _sensitive_leak(table, columns):
+                return {"table": table, "rows": len(authed_rows), "columns": columns[:8],
+                        "repro": _repro_from_resp(authed_resp, matched="%d row(s) readable by ANY authed user" % len(authed_rows))}
+    return None if reached else "unreachable"
+
+
+def authenticated_backend_readable(ctx, probe) -> bool | None:
+    """Authenticated-tier RLS/Rules bypass — the IDOR equivalent on a BaaS SPA (OWASP A01). A FRESH
+    authenticated identity reads rows/documents it didn't create: the 'any logged-in user reads everything'
+    misconfiguration. Differential vs anon (anon-open is sec-backend-001's) + sensitivity gated + read-only
+    on app data. N/A when no Supabase/Firestore config, no throwaway auth is obtainable (closed signup /
+    confirmation / anonymous-auth-off), or the host is unreachable."""
+    blob = _client_bundle(ctx)
+    sm = _SUPABASE_URL.search(blob)
+    proj_m = _FIREBASE_PROJECT.search(blob)
+    key_m = _FIREBASE_APIKEY.search(blob)
+    fs_used = bool(_FIRESTORE_SIGNAL.search(blob) and proj_m and key_m)
+    if not sm and not fs_used:
+        return None   # no probeable per-user BaaS data plane embedded
+    reached = False
+    with httpx.Client(timeout=8.0, follow_redirects=True, verify=False) as ext:
+        if fs_used:
+            token = _firebase_anon_token(ext, "https://identitytoolkit.googleapis.com", key_m.group(0))
+            if token:
+                hit = _firestore_authed_only(ext, "https://firestore.googleapis.com", proj_m.group(1),
+                                             key_m.group(0), token, _firestore_collections(blob))
+                if isinstance(hit, dict):
+                    ctx.evidence.update(backend="firestore", tier="authenticated", project=proj_m.group(1),
+                                        collection=hit["collection"], documents_readable=hit["documents"],
+                                        fields=hit["fields"], repro=hit["repro"])
+                    return True
+                reached = reached or hit != "unreachable"
+        if sm:
+            base = "https://" + sm.group(1) + ".supabase.co"
+            anon_key = next((m.group(0) for m in _JWT.finditer(blob)), None) or \
+                next(iter(_SUPABASE_PUB.findall(blob)), None)
+            if anon_key:
+                jwt = _supabase_signup(ext, base, anon_key)
+                if jwt:
+                    hit = _supabase_authed_only(ext, base, anon_key, jwt, _supabase_tables(blob))
+                    if isinstance(hit, dict):
+                        ctx.evidence.update(backend="supabase", tier="authenticated", host=base,
+                                            table=hit["table"], rows_readable=hit["rows"],
+                                            columns=hit["columns"], repro=hit["repro"])
+                        return True
+                    reached = reached or hit != "unreachable"
+    ctx.evidence.update(checked=True, reachable=reached, authenticated_bypass=False)
+    return False if reached else None
+
+
 def session_cookie_missing_flag(ctx, probe) -> bool | None:
     """Self-as-oracle: register an account, then inspect the session cookie it sets. Slop if it lacks
     the hardening flag named in the probe (httponly | samesite | secure). Returns None (-> N/A) when
@@ -3078,6 +3217,15 @@ def crash_resistance(ctx, probe) -> bool | None:
 _INGEST_PATHS = ("/ingest", "/upload", "/import", "/api/ingest", "/api/upload", "/api/import", "/webhook")
 
 
+def _dos_repro(ctx, path, matched):
+    """Repro NOTE for the decompression bomb — the body is a tiny gzip that expands to ~50MB, so we record
+    the request shape + the exact one-liner to rebuild it (not the binary body)."""
+    return _repro("POST", ctx.base_url.rstrip("/") + path,
+                  headers={"content-type": "application/json", "content-encoding": "gzip"},
+                  body="gzip.compress(b'{\"x\":\"' + b'A'*50_000_000 + b'\"}')  # ~50KB on the wire, 50MB decompressed",
+                  matched=matched)
+
+
 # Decompression-bomb (zip-bomb) resistance — an app that decompresses a `Content-Encoding: gzip` request
 # body WITHOUT a decompressed-size cap can be memory-exhausted by a tiny payload that expands to GB. We
 # detect the MISSING DEFENSE, never actually detonate: send a body that decompresses to ~50MB (safe on
@@ -3098,7 +3246,12 @@ def decompression_bomb(ctx, probe) -> bool | None:
         return None
     valid = b'{"x":"ok"}'
     gz_valid = gzip.compress(valid)
-    bomb = gzip.compress(b"\x00" * 50_000_000)   # ~50MB expanded, ~50KB on the wire
+    # VALID JSON payloads (not null garbage): so an UNCAPPED app that decompresses the 50MB body returns
+    # 2xx (accepted -> provably no size cap), while null garbage made EVERY app parse-fail to a 400 — and a
+    # 400 is inconclusive (a size cap OR the app decompressing 50MB then failing on the content: we can't
+    # tell). The 10KB `small` is the size control that isolates a SIZE-driven 5xx from a broken handler.
+    bomb = gzip.compress(b'{"x":"' + b"A" * 50_000_000 + b'"}')    # ~50MB expanded, tiny on the wire
+    small = gzip.compress(b'{"x":"' + b"A" * 10_000 + b'"}')       # SAME shape, ~10KB -> the size control
     json_ct = {"Content-Type": "application/json"}
     gz_ct = {"Content-Type": "application/json", "Content-Encoding": "gzip"}
     tested = False
@@ -3118,16 +3271,33 @@ def decompression_bomb(ctx, probe) -> bool | None:
                                                        # platform-edge artifact, not the app's (the g-ai-sigma FP)
             tested = True
             try:
+                s_small = c.post(path, content=small, headers=gz_ct).status_code   # 10KB content control
+            except (httpx.HTTPError, httpx.InvalidURL):
+                continue                               # control failed -> can't isolate the SIZE effect
+            try:
                 r = c.post(path, content=bomb, headers=gz_ct)
             except httpx.TimeoutException:
-                ctx.evidence.update(decompression_capped=False, endpoint=path, signal="timeout")
-                return True                            # hung decompressing the bomb
+                if s_small < 500:                      # 10KB fine, 50MB HUNG -> size-driven exhaustion (provable)
+                    ctx.evidence.update(decompression_capped=False, endpoint=path, signal="timeout",
+                                        control_status=s_small, expanded_mb=50,
+                                        repro=_dos_repro(ctx, path, "hung decompressing 50MB (10KB control -> %d)" % s_small))
+                    return True
+                continue                               # small also hung -> not size-driven -> inconclusive
             except (httpx.HTTPError, httpx.InvalidURL):
                 continue
-            if r.status_code == 413:
-                continue                               # rejected the over-limit decompressed body -> capped/defended
-            ctx.evidence.update(decompression_capped=False, endpoint=path, status=r.status_code, expanded_mb=50)
-            return True                                # decompresses (confirmed) with no size cap -> zip-bomb exhaustible
+            # Fire only on PROVABLE evidence. accepted (2xx): the app took a 50MB body -> no size cap <=50MB.
+            # exhausted (5xx a 10KB control doesn't trigger): the SIZE crashed it. A 4xx is NOT scored: 413 is
+            # a proven size cap (defended); a generic 400/422 is INCONCLUSIVE (a cap OR a post-decompression
+            # content failure — indistinguishable at a safe size), and we don't fire on inconclusive evidence
+            # (precision-favoring; FN is the safe error). This retires the old 413-only rule that fired on a 400.
+            exhausted = r.status_code >= 500 and s_small < 500
+            accepted = 200 <= r.status_code < 400
+            if exhausted or accepted:
+                ctx.evidence.update(decompression_capped=False, endpoint=path, status=r.status_code,
+                                    control_status=s_small, expanded_mb=50,
+                                    repro=_dos_repro(ctx, path, "50MB %s (10KB control -> %d) -> no size cap"
+                                                     % ("crashed the app" if exhausted else "accepted", s_small)))
+                return True
     ctx.evidence.update(decompression_capped=True, posts_tested=len(posts))
     return False if tested else None
 
@@ -3226,6 +3396,7 @@ PREDICATES = {
     "debug_mode_enabled": debug_mode_enabled,
     "leaks_error_detail": leaks_error_detail,
     "exposed_backend_readable": exposed_backend_readable,
+    "authenticated_backend_readable": authenticated_backend_readable,
     "bundle_leaks_secret": bundle_leaks_secret,
     "vulnerable_dependency": vulnerable_dependency,
     "source_map_exposed": source_map_exposed,
@@ -3300,6 +3471,7 @@ _PREDICATE_REASONS = {
     "debug_mode_enabled": "framework debug mode is on in production (interactive debugger / DEBUG page -> source, settings, env and an RCE console exposed)",
     "leaks_error_detail": "an induced server error leaked a stack trace or a database error to the user (info disclosure + a broken error path)",
     "exposed_backend_readable": "the app's managed backend (Supabase/Firebase) is world-readable with its own public key -> the whole database is exposed (missing row-level security)",
+    "authenticated_backend_readable": "any logged-in user reads every other user's data -> broken authenticated-tier RLS/Rules (the IDOR equivalent on a BaaS app; missing per-user row filtering)",
     "bundle_leaks_secret": "a hardcoded SECRET key (Stripe sk_ / OpenAI / AWS secret / GitHub PAT / private key) is shipped in the client JS bundle -> account/DB takeover (public anon/publishable keys are not flagged)",
     "vulnerable_dependency": "the app ships a client library with a KNOWN CVE (retire.js-style: jQuery / AngularJS / Bootstrap / Axios / Moment / Handlebars / DOMPurify) -> supply-chain risk the team chose; upgrade per the finding",
     "source_map_exposed": "a production JS bundle serves its .map -> the original source is reconstructable (business logic, hidden endpoints, and secrets a minified scan misses)",

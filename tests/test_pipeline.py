@@ -196,6 +196,7 @@ def test_minimal_app_resolves_surface_probes_na():
     assert o["sec-split-001"] == "not_applicable"  # no form/param surface to inject CRLF into
     assert o["sec-dos-001"] == "not_applicable"    # no endpoint decompresses a request body
     assert o["sec-backend-001"] == "not_applicable"  # no Supabase/Firebase config embedded in the client
+    assert o["sec-backend-002"] == "not_applicable"  # ditto — no BaaS auth surface for the authed-tier RLS probe
     assert o["sec-exposure-004"] == "clean"   # no /.aws/credentials served
     assert o["sec-headers-006"] == "clean"    # no X-Powered-By header
     assert o["sec-debug-001"] == "clean"      # no debug UI: /crash absent, no live Werkzeug debugger
