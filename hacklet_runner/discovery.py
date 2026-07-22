@@ -72,6 +72,12 @@ _BROWSER_ROUTE_CAP = 12  # max routes to browser-render for forms (one launch, b
 # explicitly ONLY when a login/signup trigger was seen but no password form captured, so the auth self-oracle
 # probes get a registerable form (Part 2). Skips OAuth (can't appear in self-contained apps).
 _AUTH_ROUTES = ["/login", "/signin", "/sign-in", "/signup", "/sign-up", "/register", "/auth"]
+# conventional POST-login landing/surface routes an SPA reaches by JS-router push AFTER login (no crawlable
+# href on the login page). Rendered explicitly ONLY when the crawl holds a session (auth_crawl authenticated
+# a throwaway account): the login page never links these, so an authenticated crawl otherwise has nowhere to
+# navigate and the authed surface (upload / CRUD / IDOR targets) stays invisible. Same trick as _AUTH_ROUTES.
+_AUTHED_ROUTES = ["/dashboard", "/home", "/app", "/account", "/profile",
+                  "/items", "/new", "/create", "/upload", "/admin"]
 # anti-bot widget tokens (Cloudflare Turnstile / reCAPTCHA / hCaptcha / ASP.NET AV) — NOT app-controlled
 # fields; injecting into them produced XSS false positives (the reflection is the vendor's, not the app's).
 _VENDOR_FIELD = re.compile(r"turnstile|recaptcha|h-?captcha|__requestverification|g-recaptcha", re.I)
@@ -545,8 +551,31 @@ def _drop_phantom_surface(base_url, headers, endpoints, forms):
         return False, endpoints, forms
 
 
+def _crawl_auth_headers(base_url: str, forms) -> dict:
+    """Register a THROWAWAY crawl account (httpx, the same flow the probes use) and return its session as
+    request headers a browser render can carry (a Cookie, or a Bearer Authorization) — so the crawl reaches
+    the surface an SPA hides behind login (upload, item CRUD) instead of only mapping the login page. Kept
+    SEPARATE from the probes' session_headers (they self-register fresh identities, incl. two for IDOR).
+    Returns {} when nothing establishes a session (no register API / email-verify / SSO / third-party auth)."""
+    from .auth import _has_session, register_account   # local: auth is only exercised under --browser-auth
+    acct = register_account(base_url, Profile(base_url=base_url, forms=list(forms)))
+    if not _has_session(acct):
+        if acct is not None:
+            acct.client.close()
+        return {}
+    out: dict = {}
+    cookies = "; ".join("%s=%s" % (c.name, c.value) for c in acct.client.cookies.jar)
+    if cookies:
+        out["Cookie"] = cookies
+    authz = acct.client.headers.get("Authorization")
+    if authz:
+        out["Authorization"] = authz
+    acct.client.close()
+    return out
+
+
 def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: int = MAX_DEPTH,
-             headers=None, seed_features=None, perceive=None) -> Profile:
+             headers=None, seed_features=None, perceive=None, auth_crawl=False) -> Profile:
     """`perceive(rendered_doms, observed)` (optional) — PROACTIVE discovery: an injected LLM reads the rendered
     pages and returns the probeable surface the crawl missed (perceive_surface output), merged in below via
     merge_perceived. LLM-agnostic here: the callback owns the model call; a None/failing one degrades to the
@@ -647,8 +676,17 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
         # in one reused browser session (bounded — each goto costs). render(base_url, paths, headers) ->
         # {path: DOM} is browser.render_routes; None/{} when no browser launched (browser probes read N/A).
         observed_net, observed_scripts = [], []  # xhr/fetch (the app's API surface) + runtime-loaded same-origin
-        rendered = render(base_url, [start_path], headers=headers,   # .js URLs (native ESM import() chunks a static
-                          net_sink=observed_net, script_sink=observed_scripts) or {}   # <script> scan can't see)
+        render_headers = headers   # the crawl inherits any provided (--header) session by default
+        if auth_crawl and not (headers and any(k.lower() == "cookie" for k in headers)):
+            # AUTHENTICATE THE CRAWL: an SPA hides its real surface (upload / item CRUD) behind login, so an
+            # unauthenticated render only maps the LOGIN page — file-upload / idor / backend go N/A for want of
+            # a target. Register a throwaway account and carry its session into the browser context (SEPARATE
+            # from the probes' session_headers, which stay fresh so IDOR still gets two distinct identities).
+            _auth = _crawl_auth_headers(base_url, forms)
+            if _auth:
+                render_headers = {**(headers or {}), **_auth}
+        rendered = render(base_url, [start_path], headers=render_headers,   # .js URLs (native ESM import() chunks a
+                          net_sink=observed_net, script_sink=observed_scripts) or {}   # static <script> scan can't see)
         if rendered:
             browser_ok = True  # a real render returned HTML -> the browser actually launched/works
             any_response = True
@@ -663,8 +701,12 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
             # auth route the CTA navigates to (JS router push, no href to crawl). Render those to find it (Part 2).
             if (auth[0] or auth[1]) and not any(any("pass" in n.lower() for n in f.fields) for f in forms):
                 extra += [p for p in _AUTH_ROUTES if p not in extra and p not in visited]
-            if extra:                               # phase 2: render the rest of the HTML surface
-                rendered.update(render(base_url, extra, headers=headers,
+            # the crawl authenticated (auth_crawl) but the login page links nothing behind login: land the
+            # session on the conventional authed routes so upload/CRUD/IDOR targets become discoverable.
+            if auth_crawl and any(k.lower() in ("cookie", "authorization") for k in (render_headers or {})):
+                extra += [p for p in _AUTHED_ROUTES if p not in extra and p not in visited]
+            if extra:                               # phase 2: render the rest of the HTML surface (authed too)
+                rendered.update(render(base_url, extra, headers=render_headers,
                                        net_sink=observed_net, script_sink=observed_scripts) or {})
             for path, dom in rendered.items():
                 _l, _s = _auth_triggers(dom)   # a SPA paints 'Sign in'/'Sign up' client-side, so scan the DOM too

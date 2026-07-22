@@ -780,7 +780,12 @@ def _grade_worker(url, use_browser, features, q, cached_profile=None, cache_key=
         report = run(RemoteDeployer(url, health_timeout=20), load_catalog(str(_ROOT / "catalog")),
                      render=render, on_progress=_grade_heartbeat, seed_features=features, headers=session_headers,
                      cached_profile=cached_profile, on_profile=on_profile, perceive=perceive,
-                     browser_register=browser_register, recon=recon)
+                     browser_register=browser_register, recon=recon,
+                     # authenticate the CRAWL (not just the probes): an SPA hides upload/item-CRUD behind login,
+                     # so an unauthenticated render only maps the login page. Register a throwaway crawl session
+                     # and carry it into the browser context. Only under --browser-auth, and not when the user
+                     # already supplied a --header session (used for the crawl directly).
+                     auth_crawl=(browser_auth and use_browser and not session_headers))
         q.put(("ok", report))
     except BaseException as e:   # report ANY failure back to the parent instead of dying silently
         q.put(("err", f"{type(e).__name__}: {e}"))
