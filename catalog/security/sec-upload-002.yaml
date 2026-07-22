@@ -1,0 +1,15 @@
+id: sec-upload-002
+bundle: security
+category: file-upload
+pool: public
+evidence_model: provable
+penalty: 35   # stored XSS: user-uploaded active content served executable in-origin runs on every viewer.
+              # Anchored to sec-xss-001 (reflected XSS) — same impact class, a distinct upload-persisted vector.
+applicability:
+  requires: [any_endpoint_accepts_text_input]
+probe:
+  # The non-PHP counterpart to sec-upload-001 (which only proves server-side RCE). Upload .html/.svg carrying
+  # a unique marker script; fetch the STORED file back; fire ONLY when it is served with an EXECUTABLE
+  # content-type (text/html / image/svg+xml / ...) INLINE — not attachment/plain/octet-stream (the app
+  # defending itself). Provable + intent-independent. Collapses to ONE finding across forms/variants.
+  predicate: upload_stored_xss

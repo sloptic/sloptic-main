@@ -1093,6 +1093,10 @@ def path_traversal(ctx, probe) -> bool | None:
 # proves server-side execution (the stored SOURCE shows "(7*7)", never "49") -> RCE, not mere storage.
 _UPLOAD_MARK = "hlup49x"
 _UPLOAD_PHP = b"<?php echo 'hlup'.(7*7).'x'; ?>"
+# same executed-arithmetic marker in the two other server-side scripting languages a hackathon might run,
+# so the ONE RCE oracle (marker present in the fetched file) catches a Java/.NET host too, not just PHP.
+_UPLOAD_JSP = b'<% out.print("hlup"+7*7+"x"); %>'   # JSP (Java) -> hlup49x when a servlet container runs it
+_UPLOAD_ASPX = b'<%= "hlup"+(7*7)+"x" %>'           # ASP.NET (C#) -> hlup49x when the .NET runtime runs it
 _GIF_MAGIC = b"GIF89a"                     # a real image magic header to defeat content-sniffing
 _UPLOAD_DIRS = ("", "uploads/", "upload/", "files/", "file/", "images/", "img/", "media/",
                 "hackable/uploads/", "assets/uploads/", "static/uploads/", "tmp/", "data/uploads/")
@@ -1108,6 +1112,9 @@ def _upload_variants():
         ("hlshell.phtml", "image/jpeg", _UPLOAD_PHP),                    # alternate PHP extension
         ("hlshell.php\x00.jpg", "image/jpeg", _UPLOAD_PHP),             # null-byte truncation
         ("hlshell.php", "image/gif", _GIF_MAGIC + b"\n" + _UPLOAD_PHP),  # magic-byte spoof + PHP
+        ("hlshell.jsp", "image/jpeg", _UPLOAD_JSP),                     # Java servlet container (non-PHP RCE)
+        ("hlshell.jspx", "image/jpeg", _UPLOAD_JSP),                    # JSP XML-syntax extension
+        ("hlshell.aspx", "image/jpeg", _UPLOAD_ASPX),                  # ASP.NET (non-PHP RCE)
     ]
 
 
@@ -1147,6 +1154,75 @@ def file_upload(ctx, probe) -> bool | None:
                     except (httpx.HTTPError, httpx.InvalidURL):
                         continue
     ctx.evidence.update(rce=False, forms=len(forms), variants=len(_upload_variants()))
+    return False if tested else None
+
+
+# Stored XSS via file upload — the non-PHP counterpart to the RCE probe above. Most hackathon apps don't
+# run PHP, but an app that STORES a user-uploaded .html/.svg and serves it back with an EXECUTABLE
+# content-type INLINE (not forced to download) runs attacker script in its own origin for every viewer.
+# Provable black-box: we plant a unique marker in the file, fetch the STORED copy, and read the served
+# Content-Type + Content-Disposition. Intent-independent: serving user active content in-origin is wrong
+# regardless of the app's purpose. Distinct vector from reflected xss_injectable (upload-persisted, hits
+# every viewer, no reflection needed) -> its own finding.
+_UPLOAD_XSS_MARK = "hlupxss49"   # unique token our uploaded active content carries (distinct from _UPLOAD_MARK)
+_UPLOAD_XSS_HTML = ('<!doctype html><html><body><script>window.name="%s"</script>%s</body></html>'
+                    % (_UPLOAD_XSS_MARK, _UPLOAD_XSS_MARK)).encode()
+_UPLOAD_XSS_SVG = ('<svg xmlns="http://www.w3.org/2000/svg"><script>window.name="%s"</script>'
+                   '<text>%s</text></svg>' % (_UPLOAD_XSS_MARK, _UPLOAD_XSS_MARK)).encode()
+# content-type substrings a browser will EXECUTE as active content when the URL is opened top-level
+_EXECUTABLE_CTYPES = ("text/html", "application/xhtml", "image/svg", "application/xml", "text/xml",
+                      "application/javascript", "text/javascript")
+
+
+def _upload_xss_variants():
+    """(filename, content_type, body): active content a browser runs in-origin if served inline."""
+    return [
+        ("hlxss.html", "text/html", _UPLOAD_XSS_HTML),        # direct HTML
+        ("hlxss.svg", "image/svg+xml", _UPLOAD_XSS_SVG),      # SVG carries <script> (runs when opened top-level)
+        ("hlxss.html", "image/png", _UPLOAD_XSS_HTML),        # content-type spoof: fires only if the server re-serves it executable
+    ]
+
+
+def _served_executable_inline(resp) -> bool:
+    """True when `resp` IS our uploaded file (marker present) AND the server serves it as active content
+    a browser would run in-origin: an executable Content-Type, NOT forced to download (attachment). An
+    attachment / text/plain / octet-stream response is the app defending itself -> not a finding."""
+    if _UPLOAD_XSS_MARK not in resp.text:                       # not our file coming back -> can't attribute
+        return False
+    if "attachment" in resp.headers.get("content-disposition", "").lower():
+        return False                                            # forced download -> never executes in-origin
+    ctype = resp.headers.get("content-type", "").lower()
+    return any(t in ctype for t in _EXECUTABLE_CTYPES)
+
+
+def upload_stored_xss(ctx, probe) -> bool | None:
+    """Stored XSS via file upload: upload an .html/.svg carrying a unique marker script, fetch the STORED
+    file back, and fire only when it is served with an EXECUTABLE content-type INLINE. N/A when there's no
+    file-upload form; clean (False) when uploads are accepted but served safely (download/plain/non-exec)."""
+    forms = [f for f in ctx.profile.forms if f.file_fields]
+    if not forms:
+        return None
+    tested = False
+    with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
+        for f in forms:
+            for filename, ctype, body in _upload_xss_variants():
+                tested = True
+                files = {ff: (filename, body, ctype) for ff in f.file_fields}
+                data = {fn: _XSS_FILLER for fn in f.fields if fn not in f.file_fields}
+                try:
+                    resp = c.request((f.method or "post").upper(), f.action, files=files, data=data)
+                except (httpx.HTTPError, httpx.InvalidURL):
+                    continue
+                for url in _locate_upload(resp.text, filename):
+                    try:
+                        got = c.get(url)
+                    except (httpx.HTTPError, httpx.InvalidURL):
+                        continue
+                    if _served_executable_inline(got):
+                        ctx.evidence.update(stored_xss=True, form=f.action, filename=filename,
+                                            served_as=got.headers.get("content-type", ""))
+                        return True  # user-uploaded active content served executable in-origin -> stored XSS
+    ctx.evidence.update(stored_xss=False, forms=len(forms))
     return False if tested else None
 
 
@@ -3515,6 +3591,7 @@ PREDICATES = {
     "xxe": xxe,
     "path_traversal": path_traversal,
     "file_upload": file_upload,
+    "upload_stored_xss": upload_stored_xss,
     "weak_session_id": weak_session_id,
     "api_bola": api_bola,
     "data_integrity_roundtrip": data_integrity_roundtrip,
@@ -3590,6 +3667,7 @@ _PREDICATE_REASONS = {
     "xxe": "the XML parser resolved an external entity to an attacker URL (XXE)",
     "path_traversal": "a filename param served a file outside the web root (path traversal / local file inclusion)",
     "file_upload": "an uploaded webshell was accepted and executed server-side (insecure file upload -> RCE)",
+    "upload_stored_xss": "an uploaded HTML/SVG file is served inline with an executable content-type (stored XSS via file upload)",
     "weak_session_id": "session identifiers are weak/predictable (short / numeric / sequential)",
     "api_bola": "one account's object (and its secret) was readable by another account (broken object-level auth)",
     "data_integrity_roundtrip": "a created object could not be read back afterward (non-durable write / silent data loss)",
