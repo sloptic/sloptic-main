@@ -165,6 +165,15 @@ def register_account(base_url: str, profile: Profile, suffix: str = "", browser_
     if _provided_session(headers):
         return _account_from_headers(base_url, headers)
     acct = _register_httpx(base_url, profile, suffix)
+    if not _has_session(acct) and _password_form(profile.forms) is not None:
+        # the HTML-form POST established NO session — on a SPA the form is a React onSubmit with a placeholder
+        # action, and the REAL registration is a JSON API (which _register_httpx only tries when there's no
+        # form). Try it before spending a browser launch (the Borrow-Tracker / Next.js case).
+        json_acct = _register_json(base_url, suffix, profile)
+        if _has_session(json_acct):
+            if acct is not None:
+                acct.client.close()
+            acct = json_acct
     if _has_session(acct) or browser_register is None:
         return acct
     caps = profile.capabilities
@@ -272,6 +281,14 @@ def _spec_auth_paths(profile, keywords) -> list[str]:
     return out
 
 
+def _auth_shaped(r: httpx.Response) -> bool:
+    """A real JSON-API register answers with JSON or an auth artifact (Set-Cookie / bearer) — NOT a static
+    SPA's 200 text/html shell, whose catch-all serves index.html for ANY POST and would otherwise read as a
+    successful registration on the first path tried (leaving a session-less account -> a silent N/A)."""
+    ct = r.headers.get("content-type", "").lower()
+    return "json" in ct or bool(r.headers.get_list("set-cookie")) or _bearer_token(r) is not None
+
+
 def _register_json(base_url: str, suffix: str, profile=None) -> Account | None:
     """Self-register via a JSON API (no HTML form): try register endpoints (spec-named first), then
     log in for an authed session — a bearer token (default Authorization header) or a session cookie."""
@@ -281,18 +298,34 @@ def _register_json(base_url: str, suffix: str, profile=None) -> Account | None:
     register_paths = list(dict.fromkeys(_spec_auth_paths(profile, _REGISTER_KW) + list(_JSON_REGISTER_PATHS)))
     login_paths = list(dict.fromkeys(_spec_auth_paths(profile, _LOGIN_KW) + list(_JSON_LOGIN_PATHS)))
     client = httpx.Client(base_url=base_url, timeout=15.0, follow_redirects=True)
-    body = {"email": email, "username": username, "password": password}
-    registered = False
+    # a SUPERSET body: many signup APIs require a display NAME and/or a confirm field beyond email+password
+    # (a bare {email,username,password} 500s a name-required API — the Borrow-Tracker / Next.js case). Extra
+    # keys are ignored by lenient APIs; the confirm variant is the fallback for the ones that validate it.
+    base = {"email": email, "username": username, "name": username, "password": password}
+    variants = (base, {**base, "password_confirmation": password, "confirmPassword": password, "password2": password})
+    reg = None
     for path in register_paths:
-        try:
-            registered = client.post(path, json=body).status_code in (200, 201)
-        except (httpx.HTTPError, httpx.InvalidURL):
-            continue
-        if registered:
+        for body in variants:
+            try:
+                r = client.post(path, json=body)
+            except (httpx.HTTPError, httpx.InvalidURL):
+                break   # transport error on this path -> next path
+            if r.status_code in (200, 201) and _auth_shaped(r):   # skip a static-SPA 200 text/html shell
+                reg = r
+                break
+        if reg is not None:
             break
-    if not registered:
+    if reg is None:
         client.close()
         return None
+    # the REGISTER itself may auto-establish the session (a Set-Cookie, or a bearer in its body) — the common
+    # SPA cookie-auth shape (Next.js). Use it directly; only fall to a separate login for APIs that split the two.
+    token = _bearer_token(reg)
+    if token:
+        client.headers["Authorization"] = "Bearer " + token
+        return Account(username=username, password=password, client=client, register_response=reg)
+    if session_cookie(reg) is not None or any(_is_session_cookie(c.name) for c in client.cookies.jar):
+        return Account(username=username, password=password, client=client, register_response=reg)
     for path in login_paths:
         for cred in ({"email": email, "password": password}, {"username": username, "password": password}):
             try:
