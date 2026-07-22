@@ -5,7 +5,9 @@ pool: public
 evidence_model: oracle
 penalty: 15   # a session cookie without Secure can transit in cleartext (HTTP downgrade / interception)
 applicability:
-  requires: [has_auth_entrypoint]
+  requires: [has_auth_entrypoint, served_over_https]   # Secure is unsettable/untestable over HTTP (the
+  # browser won't send a Secure cookie back over http:// -> it would break auth), so a missing Secure flag is
+  # only a real, judgeable flaw when the app is served over HTTPS. Mirrors sec-headers-003 (HSTS).
 probe:
   predicate: session_cookie_missing_flag
   flag: secure

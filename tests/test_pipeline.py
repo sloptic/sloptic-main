@@ -19,7 +19,7 @@ ALL_PROBES = [
     "sec-sqli-001", "sec-sqli-002", "sec-sqli-003",  # variant group
     "sec-xss-001", "sec-secrets-001",
     "sec-deps-001",  # supply-chain: ships jQuery 1.12.4 (known XSS CVE) in the client bundle
-    "sec-session-001", "sec-session-002", "sec-session-003",  # cookie hygiene: HttpOnly / SameSite / Secure
+    "sec-session-001", "sec-session-002",  # cookie hygiene: HttpOnly / SameSite (003=Secure is https-only -> N/A here)
     "sec-csrf-001", "sec-cors-001", "sec-ratelimit-001", "sec-redirect-001", "sec-hosthdr-001",
     "sec-split-001",  # HTTP response splitting (CRLF into a reflected header)
     "sec-dos-001",  # decompression-bomb: decompresses gzip request bodies with no size cap
@@ -79,8 +79,9 @@ def test_vulnerable_app_accrues_slop():
     assert o["sec-csrf-001"] == "slop_detected"
     # sec-cors-001: the app reflects an arbitrary Origin with credentials -> credentialed cross-origin reads:
     assert o["sec-cors-001"] == "slop_detected"
-    # sec-session-003: the session cookie lacks Secure -> can transit in cleartext:
-    assert o["sec-session-003"] == "slop_detected"
+    # sec-session-003 (Secure flag) is https-only -> N/A over the plain-http reference (mirrors HSTS): Secure
+    # is unsettable over http (the browser won't send it back), so a missing Secure flag isn't judgeable here.
+    assert o["sec-session-003"] == "not_applicable"
     # sec-ratelimit-001: N wrong-password logins, none throttled -> no brute-force protection:
     assert o["sec-ratelimit-001"] == "slop_detected"
     # sec-idor-001 (self-as-oracle, 2 accounts): B can read A's note -> broken access control:
@@ -143,8 +144,9 @@ def test_vulnerable_app_accrues_slop():
     # (frequency x severity, see the catalog): security holds its catastrophic per-instance ceiling (40),
     # while qa/perf are priced up for their every-user frequency. On this deliberately security-riddled
     # reference, security still dominates; a realistic janky app (references/qa-janky) leans qa/perf.
-    assert report.axis_slop == {"security": 435, "qa": 167, "performance": 68}
-    assert report.slop_score == 670   # security 439->435: header re-price (sec-headers-002 12->8). qa 183->167:
+    assert report.axis_slop == {"security": 429, "qa": 167, "performance": 68}
+    assert report.slop_score == 664   # security 435->429: sec-session-003 (Secure) is https-gated -> N/A over
+                                      # http (mirrors HSTS). qa 183->167:
                                       # crash re-price (qa-crash-010 32->16) — a 500-not-400 on malformed input
                                       # is ungraceful error handling (a QA-hygiene tier), not a server crash
     assert sum(report.axis_slop.values()) == report.slop_score
@@ -218,7 +220,7 @@ def test_cached_profile_freezes_surface_and_reproduces_score(monkeypatch):
     catalog = load_catalog(CATALOG)
     minted = []
     r1 = run(SubprocessDeployer(str(REFS / "vulnerable" / "app.py")), catalog, on_profile=minted.append)
-    assert len(minted) == 1 and r1.slop_score == 670          # cache MISS -> discovered once + handed back
+    assert len(minted) == 1 and r1.slop_score == 664          # cache MISS -> discovered once + handed back
 
     import hacklet_runner.pipeline as pipeline_mod            # PROVE the crawl is skipped on a cache HIT:
     monkeypatch.setattr(pipeline_mod, "discover",             # discover() must never be called with a cached profile
@@ -226,7 +228,7 @@ def test_cached_profile_freezes_surface_and_reproduces_score(monkeypatch):
     seen = []
     r2 = run(SubprocessDeployer(str(REFS / "vulnerable" / "app.py")), catalog,
              cached_profile=minted[0], on_profile=seen.append)
-    assert r2.slop_score == 670 and seen == []                # HIT -> same score, no re-crawl, no re-mint
+    assert r2.slop_score == 664 and seen == []                # HIT -> same score, no re-crawl, no re-mint
     assert r2.axis_slop == r1.axis_slop                       # identical per-axis decomposition too
 
 
