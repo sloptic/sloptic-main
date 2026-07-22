@@ -26,7 +26,11 @@ def test_non_app_url_rejects_source_and_notebook_links_but_keeps_deployed_pages(
               "https://asi1.ai/shared-chat/abc", "https://nunnyu.itch.io/mygame",
               "https://explorer.solana.com/tx/xyz?cluster=devnet",
               "https://bucas.maps.arcgis.com/apps/mapviewer/index.html",
-              "https://marble.worldlabs.ai/world/abc123"):   # World Labs 3D world viewer (marble.* subdomain)
+              "https://marble.worldlabs.ai/world/abc123",   # World Labs 3D world viewer (marble.* subdomain)
+              "https://challengepost.com/software/hackit",   # Devpost's old domain — submission page
+              "https://express.adobe.com/publishedV2/urn:aaid:sc:x",   # Adobe Express published page
+              "https://sites.google.com/view/visionapp/home",   # Google Sites
+              "https://snack.expo.dev/@batucoding/prizepicks"):   # Expo Snack playground (code in Expo's editor)
         assert _non_app_url(u), u                                  # rejected -> DNF, not graded
     for u in ("https://t-hasic.github.io/ChatMIT/", "https://mammothedu.github.io/",
               "https://myapp.vercel.app/", "https://lifelineapp.site",

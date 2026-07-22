@@ -930,7 +930,11 @@ _PLATFORM_PAGE_HOST = re.compile(
     r"(?:[a-z0-9-]+\.)?itch\.io|"                          # itch.io game pages (the game runs in an iframe)
     r"explorer\.solana\.com|solscan\.io|"                  # blockchain explorers (third-party)
     r"(?:[a-z0-9-]+\.)*arcgis\.com|"                       # ArcGIS map viewer (third-party)
-    r"(?:[a-z0-9-]+\.)*worldlabs\.ai"                      # World Labs 3D world viewer (marble.worldlabs.ai/world/<uuid>)
+    r"(?:[a-z0-9-]+\.)*worldlabs\.ai|"                     # World Labs 3D world viewer (marble.worldlabs.ai/world/<uuid>)
+    r"challengepost\.com|"                                 # Devpost's old domain — submission/hosting pages
+    r"express\.adobe\.com|"                                # Adobe Express published pages
+    r"sites\.google\.com|"                                 # Google Sites
+    r"snack\.expo\.dev"                                    # Expo Snack playground (the team's code IS in Expo's editor)
     r")", re.I)
 
 

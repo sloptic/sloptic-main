@@ -18,8 +18,13 @@ to harden (the fix is a catch-all/liveness GATE in discovery so the phantom surf
 """
 import argparse
 import json
+import pathlib
 import random
+import sys
 from collections import Counter, defaultdict
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+from hacklet_runner.aggregate import CATEGORY_DECAY  # noqa: E402  (the ONE scoring decay — never re-declare)
 
 # Probes that require a REAL server-side endpoint or state change — hallucinated on a catch-all/broken shell.
 _PHANTOM_SENSITIVE = ("sec-sqli", "sec-csrf", "sec-cmdi", "sec-ssti", "sec-lfi", "sec-hosthdr",
@@ -45,6 +50,9 @@ _VENDOR_FIELDS = ("cf-turnstile-response", "g-recaptcha-response", "h-captcha-re
 # the audit never again counts a concurrency-sensitive fire as verified-clean. (sqli-004's TIME technique is now
 # dose-response-hardened and load-robust, but its error technique and crash can still ride a load-induced 500.)
 _SIGNAL_SENSITIVE = {"perf-cwv-001", "perf-cwv-002", "perf-loadtime-001", "perf-ttfb-001",
+                     "perf-load-001",   # a 12-connection concurrent BURST -> under a --concurrency batch the
+                                        # grader's own ~96 simultaneous conns can DROP (counted as failure);
+                                        # only trustworthy graded in ISOLATION. Was missing -> false "verified".
                      "qa-crash-010", "sec-sqli-004"}
 
 
@@ -60,6 +68,35 @@ def _audited(pid):
     asi1 perf-requests fire is here: real signal, correct probe, live endpoint, wrong owner — every rule
     the audit owns says 'real'). Only a hand-sample (--sample) can vouch for it. See [[fuzz-runner]]."""
     return _phantom_sensitive(pid) or pid in _SIGNAL_SENSITIVE or pid.startswith("sec-secret")
+
+
+def _damped_by_probe(findings, decay=CATEGORY_DECAY):
+    """Per-probe DAMPED penalty for one app — what each fire actually COSTS in the score, not the raw
+    `penalty x count` this tool used to report. Mirrors aggregate._damped_total: a variant group counts once
+    (its highest-penalty member), then per-category diminishing returns (sorted desc, penalty * decay**i).
+    Raw sums badly over-state a fan-out probe: sec-headers-001 fires per-ROUTE, so its raw mass looked like
+    ~25k on the corpus while its damped cost collapses to near-zero behind the higher-penalty header fires."""
+    items = []                                    # expand a fan-out finding back into its per-target outcomes
+    for f in findings:
+        pid, grp = f.get("probe_id", ""), f.get("group")
+        cat, pen = (f.get("category") or ""), f.get("penalty", 0)
+        items.extend([(pid, cat, grp, pen)] * max(1, f.get("count", 1)))
+    groups, singles = {}, []
+    for it in items:
+        if it[2]:                                 # variant group -> only its highest-penalty member counts
+            cur = groups.get(it[2])
+            if cur is None or it[3] > cur[3]:
+                groups[it[2]] = it
+        else:
+            singles.append(it)
+    by_cat = defaultdict(list)
+    for it in (*singles, *groups.values()):
+        by_cat[it[1]].append(it)
+    out = defaultdict(float)
+    for cat_items in by_cat.values():
+        for i, it in enumerate(sorted(cat_items, key=lambda x: -x[3])):
+            out[it[0]] += it[3] * (decay ** i)    # the worst counts full; each additional decays
+    return out
 
 
 def _page_state(r):
@@ -143,9 +180,10 @@ def analyze(recs):
     for r in scored:                                     # measure precision ONLY on what's actually scored
         catch_all = _soft404(r) or bool((r.get("observed_surface") or {}).get("catch_all"))
         catchall_apps += bool(catch_all)
+        damped = _damped_by_probe(r.get("findings") or [])   # REAL in-score cost, not raw penalty*count
         for f in r.get("findings", []):
             pid = f["probe_id"]
-            pen = f.get("penalty", 0) * f.get("count", 1)
+            pen = damped.get(pid, 0.0)
             per_probe[pid][0] += 1
             scored_penalty += pen
             res = _suspect(f, catch_all)
@@ -305,9 +343,9 @@ def main():
     print(f"    {vouched:>5} / {total_fires} VOUCHED     — a precision rule ran and passed (liveness-gate / "
           f"catch-all / vendor-field).")
     print(f"    {unaudited_fires:>5} / {total_fires} UNAUDITED   — NO rule exists; neither confirmed nor suspect. "
-          f"{pen_share:.0f}% of scored penalty. Hand-sample these:")
+          f"{pen_share:.0f}% of DAMPED in-score penalty. Hand-sample these:")
     for pid, (fires, pen) in sorted(unaudited.items(), key=lambda x: -x[1][1])[:12]:
-        print(f"            {fires:>5} fires · {pen:>6} pen   {pid}")
+        print(f"            {fires:>5} fires · {pen:>7.0f} in-score pen   {pid}")
     if total_unconf:
         print(f"    {total_unconf:>5} / {total_fires} UNCONFIRMED — timing / load-induced-error ({unconf_apps} apps); "
               f"re-fire in isolation to resolve:")

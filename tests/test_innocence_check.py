@@ -11,7 +11,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from hacklet_runner.net import make_client  # noqa: E402
 from hacklet_runner.pipeline import _Ctx  # noqa: E402
 from hacklet_runner.probes import (  # noqa: E402
-    _endpoint_is_live, api_sqli, crash_resistance, csrf_missing, login_no_rate_limit)
+    _endpoint_is_live, _same_resource_redirect, api_sqli, crash_resistance, csrf_missing, login_no_rate_limit)
 from hacklet_runner.schema import Endpoint, Form, Profile  # noqa: E402
 
 _SHELL = b"<html><body>App shell - client-side routing, nothing here server-side</body></html>"
@@ -135,6 +135,53 @@ def test_csrf_reads_na_on_a_form_that_just_reserves_the_homepage():
     # passes; only the shell-diff (accepted 2xx == a plain GET of the same path) rejects it as a non-mutation.
     prof = Profile(base_url="x", forms=[Form(action="/", method="post", fields=["state", "connection"])])
     assert _run(_RootFormShell, prof, csrf_missing, headers={"Cookie": "sid=abc"}) is not True
+
+
+class _HttpsUpgradeForm(http.server.BaseHTTPRequestHandler):
+    """'/' and '/pay' are honestly live (their 404 siblings are distinct, so the liveness gate passes), but a
+    cross-site POST to /pay gets a 308 to the https version of the SAME path — a transport upgrade the app never
+    PROCESSED, not an accepted state change (the covermypharma/passtheplate FP: an http:// url 30x-upgrades)."""
+    def log_message(self, *a): pass
+
+    def _send(self, code, body=b"", loc=None):
+        self.send_response(code); self.send_header("Content-Type", "text/html")
+        if loc: self.send_header("Location", loc)
+        self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+
+    def do_GET(self):
+        p = urlparse(self.path).path
+        self._send(200, b"page " + p.encode()) if p in ("/", "/pay") else self._send(404, b"nf")
+
+    def do_POST(self):
+        try: self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
+        except Exception: pass
+        p = urlparse(self.path).path
+        if p == "/pay":
+            self._send(308, loc="https://%s/pay" % self.headers.get("Host", "x"))   # transport upgrade, not a mutation
+        else:
+            self._send(404, b"nf")
+
+
+def test_same_resource_redirect_flags_transport_not_real_acceptance():
+    assert _same_resource_redirect("http://x.com/pay", "https://x.com/pay")           # http->https upgrade
+    assert _same_resource_redirect("http://x.com/pay", "https://x.com/pay/")          # + trailing slash
+    assert _same_resource_redirect("http://x.com/", "https://www.x.com/")             # + www
+    assert not _same_resource_redirect("http://x.com/", "https://x.com/dashboard")    # different resource -> real
+    assert not _same_resource_redirect("http://x.com/", "")                           # no Location
+
+
+def test_csrf_does_not_fire_on_a_get_form():
+    # a GET is un-adjudicable black-box (mutation vs search both return a differing 200), so we skip it — the
+    # missed state-changing-GET CSRF is the accepted FN (AfroSecured/passtheplate: GET '/' -> 30x nav)
+    prof = Profile(base_url="x", forms=[Form(action="/pay", method="get", fields=["amount"])])
+    assert _run(_HttpsUpgradeForm, prof, csrf_missing, headers={"Cookie": "sid=abc"}) is not True
+
+
+def test_csrf_does_not_fire_on_an_http_to_https_upgrade_redirect():
+    # covermypharma/passtheplate FP: a cross-site POST to an http:// url gets a 308 to https (SAME resource) —
+    # a transport upgrade the app never processed, must NOT be read as 'state change accepted'.
+    prof = Profile(base_url="x", forms=[Form(action="/pay", method="post", fields=["amount", "to"])])
+    assert _run(_HttpsUpgradeForm, prof, csrf_missing, headers={"Cookie": "sid=abc"}) is not True
 
 
 def test_rate_limit_STILL_fires_on_an_honest_host():

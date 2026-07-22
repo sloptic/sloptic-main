@@ -7,8 +7,11 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts
 from precision import analyze, _audited, _wilson  # noqa: E402
 
 
-def _f(pid, pen=10, bundle="security", evidence=None):
-    return {"probe_id": pid, "penalty": pen, "bundle": bundle, "evidence": evidence or {}, "count": 1}
+def _f(pid, pen=10, bundle="security", evidence=None, category=None, count=1, group=None):
+    # category defaults to the probe id so each fixture finding sits in its OWN category -> no cross-probe
+    # damping unless a test deliberately shares one (see the damped-attribution test).
+    return {"probe_id": pid, "penalty": pen, "bundle": bundle, "evidence": evidence or {},
+            "count": count, "category": category or pid, "group": group}
 
 
 def _rec(repo, slop, findings, page_state=None):
@@ -82,6 +85,40 @@ def test_unaudited_surface_is_split_from_vouched_not_counted_verified():
     assert len(a["unconfirmed"]) == 1                             # sec-sqli-004: signal-sensitive beats gate-vetted
     assert a["scored_penalty"] == 26 + 12 + 10 + 40 + 40
     assert not a["flagged"]                                       # unaudited != flagged; the audit has no opinion
+
+
+def test_damped_penalty_attribution_matches_the_scoring_decay():
+    # the audit must report REAL in-score cost, not raw penalty*count: within ONE category the worst fire
+    # counts full and each additional decays by CATEGORY_DECAY (0.6). A fan-out probe (sec-headers-001 fires
+    # per-ROUTE) is exactly what raw sums over-state — 3 routes read as 30 raw but cost 19.6 in-score.
+    recs = [_rec("gh/app", 50, [
+        _f("qa-a11y-001", 30, "qa", category="a11y"),
+        _f("sec-headers-001", 10, category="security-headers", count=3),
+    ], page_state="working")]
+    a = analyze(recs)
+    assert round(a["unaudited"]["qa-a11y-001"][1], 4) == 30            # alone in its category -> full penalty
+    assert round(a["unaudited"]["sec-headers-001"][1], 4) == 19.6      # 10 + 10*.6 + 10*.36, NOT the raw 30
+    assert round(a["scored_penalty"], 4) == 49.6
+
+
+def test_variant_group_counts_once_in_the_damped_attribution():
+    # probes sharing a variant_group_id are one logical flaw -> only the highest-penalty member is charged
+    recs = [_rec("gh/app", 30, [
+        _f("qa-a11y-001", 30, "qa", category="a11y", group="qa-a11y"),
+        _f("qa-a11y-002", 18, "qa", category="a11y", group="qa-a11y"),
+    ], page_state="working")]
+    a = analyze(recs)
+    assert round(a["scored_penalty"], 4) == 30                         # the 18 variant is NOT added
+    assert round(a["unaudited"]["qa-a11y-001"][1], 4) == 30
+    assert a["unaudited"]["qa-a11y-002"][1] == 0                       # collapsed into its group's max
+
+
+def test_perf_load_is_unconfirmed_not_verified():
+    # a 12-connection concurrent burst run under a --concurrency batch is grader-load-confoundable ->
+    # UNCONFIRMED (re-fire in isolation), never silently counted clean.
+    a = analyze([_rec("gh/app", 10, [_f("perf-load-001", 10, "performance")], page_state="working")])
+    assert len(a["unconfirmed"]) == 1 and a["vouched"] == 0
+    assert not a["flagged"] and not a["unaudited"]
 
 
 def test_audited_predicate_and_wilson_keeps_an_honest_upper_bound():

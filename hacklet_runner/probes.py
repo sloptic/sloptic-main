@@ -2120,6 +2120,22 @@ def _csrf_candidates(profile):
     return out
 
 
+def _same_resource_redirect(from_url: str, location: str) -> bool:
+    """A redirect that just NORMALIZES the same resource — http->https upgrade, www, a trailing slash — so the
+    app never processed the request. NOT the acceptance of a cross-site state change (the dominant CSRF FP: a
+    cross-site POST to an http:// URL gets a 308 to https and was counted as 'accepted')."""
+    if not location:
+        return False
+    try:
+        a = urllib.parse.urlsplit(from_url)
+        b = urllib.parse.urlsplit(urllib.parse.urljoin(from_url, location))
+    except ValueError:
+        return False
+    same_path = (a.path.rstrip("/") or "/") == (b.path.rstrip("/") or "/")
+    same_host = a.netloc.lower().removeprefix("www.") == b.netloc.lower().removeprefix("www.")
+    return same_path and same_host   # scheme may differ (http->https); same resource -> transport redirect only
+
+
 def csrf_missing(ctx, probe) -> bool | None:
     """A state-changing request accepted cross-site with no CSRF token and no SameSite cookie -> no
     CSRF defense. Works with a provided --header session OR a self-registered one. Skips forms that
@@ -2145,6 +2161,13 @@ def csrf_missing(ctx, probe) -> bool | None:
         real_tested = 0
         for form in candidates:
             method = (form.method or "post").upper()
+            if method in ("GET", "HEAD", "OPTIONS"):
+                # NOT because CSRF is POST-only — a state-changing GET (GET /delete?id=) IS a real, easier CSRF.
+                # But a GET is UN-ADJUDICABLE black-box: a differing 200 could be a mutation OR a search/filter
+                # (a read), indistinguishable from outside, and a GET redirect is navigation. So a GET form gives
+                # no reliable 'state change accepted' signal -> skip it. The missed state-changing-GET is the
+                # accepted FN (SameSite=Lax, the browser default, already blocks the <img>-based GET-CSRF it needs).
+                continue
             data = {f: ("password" if "pass" in f.lower() else "hl-csrf") for f in form.fields}
             kw = {"params": data} if method == "GET" else {"data": data}
             try:
@@ -2156,8 +2179,13 @@ def csrf_missing(ctx, probe) -> bool | None:
                 continue  # a catch-all phantom endpoint (root or per-prefix) -> nothing really accepted it
             real_tested += 1
             if resp.is_redirect:
+                loc = resp.headers.get("location", "")
                 # a redirect to login/auth/error is a CSRF REJECTION, not an accepted state change
-                if any(h in resp.headers.get("location", "").lower() for h in _CSRF_REJECT_HINTS):
+                if any(h in loc.lower() for h in _CSRF_REJECT_HINTS):
+                    continue
+                # a transport/normalization redirect (http->https, www, trailing slash) never processed the
+                # request -> not acceptance (the dominant FP: a cross-site POST to an http:// URL -> 308 https)
+                if _same_resource_redirect(str(resp.url), loc):
                     continue
                 ctx.evidence.update(vulnerable=True, form=form.action, method=method, status=resp.status_code)
                 return True
