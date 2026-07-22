@@ -215,7 +215,14 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
             for i, probe in enumerate(catalog):
                 if on_progress:
                     on_progress(i, total, probe, None)              # starting probe i (0-indexed)
-                probe_outcomes = _run_probe(probe, ctx, client, profile)
+                try:
+                    probe_outcomes = _run_probe(probe, ctx, client, profile)
+                except Exception:   # a single probe must NEVER DNF the whole grade: run() accumulates outcomes
+                    # and only commits them at the end, so one uncaught edge case (e.g. a multipart repro's
+                    # RequestNotRead — a StreamError, not an httpx.HTTPError, so the declarative fetch guard
+                    # misses it) would abort the loop and discard EVERY finding (179/1043 apps DNF'd this way).
+                    # Degrade the one probe to N/A; the suite is the backstop for a probe that ALWAYS raises.
+                    probe_outcomes = [_outcome(probe, "not_applicable", 0, probe.probe.get("target", ""))]
                 outcomes.extend(probe_outcomes)
                 if on_progress:
                     on_progress(i + 1, total, probe, probe_outcomes)  # done: i+1 probes completed

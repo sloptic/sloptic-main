@@ -28,6 +28,18 @@ def test_repro_from_resp_captures_absolute_request():
     assert r["status"] == 200 and r["matched"] == "3 rows"
 
 
+def test_repro_from_resp_survives_a_streaming_multipart_request():
+    # a file-upload probe sends a multipart (files=) request; the send consumes the stream, so req.content
+    # raises httpx.RequestNotRead — a StreamError, NOT an httpx.HTTPError, so it escaped the pipeline's fetch
+    # guard and DNF'd the whole grade (179/1043 apps in the v6 corpus). _repro_from_resp must degrade, not raise.
+    req = httpx.Request("POST", "https://h/upload",
+                        files={"f": ("shell.php", b"<?php echo 1;", "application/octet-stream")}, data={"g": "h"})
+    r = _repro_from_resp(httpx.Response(200, request=req), matched="uploaded webshell executed")
+    assert r["method"] == "POST" and r["url"] == "https://h/upload"   # method/url/headers still captured
+    assert "body" not in r                                            # unreadable stream body -> omitted, no crash
+    assert r["status"] == 200 and r["matched"] == "uploaded webshell executed"
+
+
 def test_curl_is_pasteable_and_shell_escapes_the_payload_quote():
     r = _repro("GET", "https://h/x?q=1%27", headers={"apikey": "k"}, matched="hit")
     c = _curl(r)

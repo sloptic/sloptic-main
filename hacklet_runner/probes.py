@@ -440,7 +440,12 @@ def _repro_from_resp(resp, matched=None) -> dict:
     """_repro built from a completed httpx response — the resolved ABSOLUTE request url, its headers/body, the
     response status, and measured latency. A one-liner for any probe that holds the response that fired."""
     req = resp.request
-    body = req.content.decode("utf-8", "replace") if req.content else None
+    try:
+        body = req.content.decode("utf-8", "replace") if req.content else None
+    except httpx.StreamError:   # a streaming/multipart request (a file-upload form) whose body the send already
+        body = None             # consumed -> not inline-replayable. RequestNotRead is a StreamError, NOT an
+                                # httpx.HTTPError, so it escaped the pipeline's fetch guard and DNF'd the whole
+                                # grade (179/1043 apps). Keep method/url/headers so the record still helps.
     try:
         ms = round(resp.elapsed.total_seconds() * 1000)
     except (RuntimeError, AttributeError):
