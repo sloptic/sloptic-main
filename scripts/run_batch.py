@@ -264,6 +264,8 @@ def _build_cmd(j, args, ckpt):
         cmd += ["--recon"]
     if args.browser_auth:
         cmd += ["--browser-auth"]
+    if args.controlled_deploy:
+        cmd += ["--controlled-deploy"]
     if args.llm_reasoning:
         cmd += ["--llm-reasoning"]
     for h in (args.headers or []):
@@ -410,6 +412,10 @@ def main():
                     help="forward to deploy_and_grade: SPA auth — when httpx self-registration gets no session, "
                          "drive the browser to fill+submit the signup so the app's JS registers, and use the "
                          "cookie/token it sets (wakes session/idor on self-hosted SPAs; opt-in, extra browser launch).")
+    ap.add_argument("--controlled-deploy", action="store_true", dest="controlled_deploy",
+                    help="forward to deploy_and_grade: the HackLet profile — the deploy is OURS, so authenticate the "
+                         "crawl by default (register a throwaway account, land its session on the authed surface). "
+                         "Reliable because a 24-min build has no email confirmation; degrades safely otherwise.")
     ap.add_argument("--header", action="append", dest="headers", metavar="'Name: Value'",
                     help="forward to deploy_and_grade (repeatable): a request header sent on the whole run — the "
                          "Option-B auth fallback (--header 'Cookie: …' or --header 'Authorization: Bearer …') so "
