@@ -1,0 +1,14 @@
+id: qa-integrity-002
+variant_group_id: data-durability   # same 'silent data loss' flaw as qa-integrity-001 (read-by-id) -> one finding
+bundle: qa
+category: data-integrity
+pool: public
+evidence_model: oracle
+penalty: 34   # silent data loss on save -> terminal for user trust. Same tier as qa-integrity-001;
+              # the variant group means only one of the two counts (its max), never both.
+probe:
+  predicate: data_integrity_list_roundtrip
+  # The SPA-shape counterpart to qa-integrity-001: many apps have UUID keys and NO GET /items/{id} route, so
+  # the read-by-id round-trip is N/A even when writes silently fail. Create an object with a unique marker,
+  # then GET the COLLECTION (the create path's sibling) and confirm the marker is present. Fires when the
+  # create reports 2xx but the object is absent from its own list. N/A when there's no JSON create+collection.

@@ -439,6 +439,98 @@ def register_in_browser(base_url: str, headers=None, timeout: float = 12.0, tota
     return out
 
 
+# ---- stale UI after a save (qa-staleui-001) ------------------------------------------------------
+# The "it said nothing happened, but a refresh shows it saved" bug: the write IS durable but the SPA never
+# refetched/optimistically-rendered, so the user thinks their save was lost. Provable black-box because the
+# RELOAD is the ground truth — post-reload presence proves the write persisted; pre-reload absence proves the
+# UI didn't reflect it. Read via inner_text (NOT content()): an input still holding the marker isn't DISPLAYED,
+# so it can't masquerade as a reflected item.
+_CREATE_ROUTES = ["/", "/dashboard", "/app", "/home", "/items", "/new", "/create", "/notes", "/tasks", "/posts", "/todos"]
+_CREATE_SUBMIT = re.compile(r"\b(add|create|save|post|submit|new|send|share)\b", re.I)
+
+
+def _fill_create_form(page, marker) -> bool:
+    """Fill ONE visible text input/textarea with `marker` and submit a create — NOT a login/signup (skips
+    password/email/file) and NOT a destructive action (_NO_CLICK). True iff a field was filled and submitted."""
+    filled = False
+    with contextlib.suppress(Exception):
+        for el in page.query_selector_all("textarea, input"):
+            with contextlib.suppress(Exception):
+                if not el.is_visible():
+                    continue
+                typ = (el.get_attribute("type") or "text").lower()
+                if typ not in ("text", "search", "url", ""):      # skip password/email/file/checkbox/number/etc.
+                    continue
+                hint = ((el.get_attribute("name") or "") + (el.get_attribute("placeholder") or "")
+                        + (el.get_attribute("aria-label") or "")).lower()
+                if any(h in hint for h in ("search", "email", "pass", "user", "login", "query")):
+                    continue                                       # a search box / auth field, not a create field
+                el.fill(marker)
+                filled = True
+                break
+    if not filled:
+        return False
+    with contextlib.suppress(Exception):
+        for btn in page.query_selector_all("button, input[type=submit], [role=button]"):
+            lbl = ((btn.inner_text() or "") + " " + (btn.get_attribute("value") or "")).strip().lower()[:60]
+            if _CREATE_SUBMIT.search(lbl) and not _NO_CLICK.search(lbl) and btn.is_visible():
+                btn.click(timeout=2500)
+                return True
+    with contextlib.suppress(Exception):
+        page.keyboard.press("Enter")                              # fallback: submit the focused field's form
+        return True
+    return False
+
+
+def check_create_reflection(base_url, marker, headers=None, timeout: float = 12.0):
+    """Submit a create form (a text field filled with `marker`), then check whether the app reflects the new
+    item in the DOM WITHOUT a reload. Returns 'stale' (absent live, present after reload -> the bug),
+    'reflected' (present live -> clean), 'not_saved' (absent both -> not durable — data-integrity's finding),
+    or 'inconclusive' (no create form reachable / no browser). `headers` authenticate the usually-gated page."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return "inconclusive"
+    try:
+        with sync_playwright() as pw:
+            b = _launch(pw)
+            if b is None:
+                return "inconclusive"
+            try:
+                page = b.new_page()
+                _apply_auth(page, base_url, headers)
+                landed = None
+                for route in _CREATE_ROUTES:                       # find a page that has a create form
+                    with contextlib.suppress(Exception):
+                        page.goto(base_url.rstrip("/") + route, timeout=timeout * 1000, wait_until="load")
+                        if _fill_create_form(page, marker):
+                            landed = base_url.rstrip("/") + route
+                            break
+                if landed is None:
+                    return "inconclusive"
+                with contextlib.suppress(Exception):
+                    page.wait_for_load_state("networkidle", timeout=6000)   # let the app refetch/re-render
+                    page.wait_for_timeout(800)                              # brief settle for a client re-render
+                live = ""
+                with contextlib.suppress(Exception):
+                    live = page.inner_text("body")     # displayed text only -> a marker lingering in an input
+                    #                                    field is NOT counted as reflected
+                if marker in live:
+                    return "reflected"
+                with contextlib.suppress(Exception):      # not shown live -> RELOAD and see if it actually saved
+                    page.goto(landed, timeout=timeout * 1000, wait_until="load")
+                    page.wait_for_load_state("networkidle", timeout=6000)
+                after = ""
+                with contextlib.suppress(Exception):
+                    after = page.inner_text("body")
+                return "stale" if marker in after else "not_saved"
+            finally:
+                with contextlib.suppress(Exception):
+                    b.close()
+    except Exception:
+        return "inconclusive"
+
+
 # ---- dead / inert controls (qa-deadctrl-001) -----------------------------------------------------
 # The AI-shell tell: a control that RENDERS but is wired to nothing — no handler, or one that no-ops. The
 # interactive analogue of a broken link. Detected by OBSERVED BEHAVIOR, not static handler presence (event

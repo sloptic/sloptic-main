@@ -1,4 +1,5 @@
 id: qa-race-001
+variant_group_id: race-id-alloc   # same non-atomic-id-allocation flaw as qa-race-002 (JSON API) -> one finding
 bundle: qa
 category: race-condition
 pool: public

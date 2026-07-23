@@ -1,4 +1,5 @@
 id: qa-integrity-001
+variant_group_id: data-durability   # same 'silent data loss' flaw as qa-integrity-002 (list round-trip) -> one finding
 bundle: qa
 category: data-integrity
 pool: public

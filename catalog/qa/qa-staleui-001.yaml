@@ -1,0 +1,16 @@
+id: qa-staleui-001
+bundle: qa
+category: stale-ui
+pool: public
+evidence_model: provable
+penalty: 20   # the write IS durable (recoverable by refresh), so below silent-data-loss (34) — but a
+              # significant trust defect: the UI shows nothing, so the user believes their save was LOST.
+applicability:
+  requires: [browser]   # must render + submit + reload to observe reflection; N/A without --browser
+probe:
+  predicate: stale_ui_after_create
+  # Client-reflection correctness, DISTINCT from data durability (qa-integrity, which asks 'did the SERVER
+  # save it'). Here: did the CLIENT reflect it without a manual refresh? Submit a create form with a unique
+  # marker in the browser; fire ONLY when the marker is ABSENT from the live DOM but PRESENT after a reload —
+  # the reload is the ground-truth oracle (post-reload presence proves the write was durable; pre-reload
+  # absence proves the UI didn't reflect it). 'not_saved' (absent both) is data-integrity's finding, not this.

@@ -1603,6 +1603,84 @@ def data_integrity_roundtrip(ctx, probe) -> bool | None:
         client.close()
 
 
+def data_integrity_list_roundtrip(ctx, probe) -> bool | None:
+    """Persistence correctness on a JSON API with NO read-by-{id} route — the common SPA shape
+    data_integrity_roundtrip can't test (UUID keys / list-only API). Create an object carrying a unique
+    marker, then GET the COLLECTION (the create path's sibling) and confirm the marker is present. Fire when
+    a create reports success (2xx) but the object is absent from its own list -> silent data loss. N/A when
+    there's no JSON create endpoint whose collection returns an array, or no create succeeds. Variant group
+    data-durability with qa-integrity-001 (read-by-id) -> the two collapse to one data-loss finding."""
+    creates = [e for e in ctx.profile.endpoints if e.method.lower() == "post" and e.body_fields]
+    if not creates:
+        ctx.evidence["na_reason"] = "no JSON create endpoint to round-trip through its collection"
+        return None
+    account = ctx.register()   # some creates are auth-gated; None -> fall back to an anon client
+    client = (account.client if account
+              else make_client(ctx.base_url, ctx.headers, timeout=10.0, follow_redirects=True))
+    tested = False
+    try:
+        for c in creates:
+            collection = (c.raw_path or c.path).split("?")[0].rstrip("/") or "/"   # the list is the create path
+            marker = "hldm" + secrets.token_hex(6)
+            body = {f: marker + secrets.token_hex(2) for f in c.body_fields}   # marker in every field
+            try:
+                created = client.post(c.path, json=body)
+                if created.status_code not in (200, 201):
+                    continue   # create didn't succeed -> nothing durable to read back on this endpoint
+                objs = _json_objects(client.get(collection))
+            except (httpx.HTTPError, httpx.InvalidURL):
+                continue
+            if objs is None:
+                continue   # the collection GET didn't return a JSON array -> can't verify durability here
+            tested = True
+            if not any(marker in json.dumps(o) for o in objs):   # the created marker never landed in the list
+                ctx.evidence.update(create_status=created.status_code, endpoint=collection, durable=False,
+                                    repro=_repro_from_resp(created, matched="created 2xx but absent from its collection"))
+                return True   # server acknowledged the create but the object isn't in its own list -> data lost
+        if not tested:
+            ctx.evidence["na_reason"] = "no create accepted a write whose collection could be read back"
+            return None
+        ctx.evidence.update(tested=True, durable=True)
+        return False
+    finally:
+        client.close()
+
+
+def stale_ui_after_create(ctx, probe) -> bool | None:
+    """Client-reflection correctness — DISTINCT from data durability (qa-integrity): after a successful create,
+    does the SPA show the new item WITHOUT a manual refresh? Submit a create form with a unique marker in the
+    browser, then read the DOM before and after a reload. Fire when the marker is ABSENT live but PRESENT after
+    reload -> the write was durable (reload proves it) yet the UI didn't reflect it ('it said nothing happened,
+    but a refresh shows it saved' — the UI lied). N/A without a create form or a browser; clean when the item
+    showed live (reflected) or never persisted (not_saved -> that's data-integrity's finding, not this one)."""
+    form = auth.create_form(ctx.profile.forms)
+    if form is None:
+        ctx.evidence["na_reason"] = "no create form to submit-and-observe"
+        return None
+    account = ctx.register(suffix="_sui")   # the create form usually lives behind login -> authenticate the page
+    hdrs = dict(ctx.headers or {})
+    if account is not None and not account.provided:
+        cookie = "; ".join("%s=%s" % (c.name, c.value) for c in account.client.cookies.jar)
+        if cookie:
+            hdrs["Cookie"] = cookie
+        authz = account.client.headers.get("Authorization")
+        if authz:
+            hdrs["Authorization"] = authz
+    marker = "hlsui" + secrets.token_hex(4)
+    try:
+        verdict = browser.check_create_reflection(ctx.base_url, marker, headers=hdrs or None)
+    finally:
+        if account is not None:
+            account.client.close()
+    ctx.evidence.update(verdict=verdict, marker=marker, form=form.action)
+    if verdict == "stale":
+        return True
+    if verdict in ("reflected", "not_saved"):
+        return False   # UI reflected it (clean), or it never saved (data-integrity's finding, not this one)
+    ctx.evidence["na_reason"] = "couldn't submit a create form / observe the DOM (browser inconclusive)"
+    return None
+
+
 def _declared_type_contradicted(ctype: str, body: str) -> str | None:
     """Does the body's actual format contradict its declared Content-Type? Returns a short reason for the
     unambiguous, harmful cases only, else None. The headline case is JSON served as text/html: a browser
@@ -2762,6 +2840,64 @@ def race_resource_ids(ctx, probe) -> bool | None:
         account.client.close()
 
 
+def _concurrent_create_ids(base_url, path, cookies, base_body, headers=None, n: int = 8):
+    """Fire n concurrent JSON POST-creates; return each response's assigned id (or None). The JSON-API analog
+    of _concurrent_creates (which compares redirect URLs) — here the id comes from the response body. Each
+    create gets a slightly-distinct body so a unique-column constraint can't mask the id-allocation race."""
+    def create():
+        body = {k: (v + secrets.token_hex(2) if isinstance(v, str) else v) for k, v in base_body.items()}
+        try:
+            with httpx.Client(base_url=base_url, timeout=12.0, follow_redirects=True,
+                              cookies=cookies, headers=headers, verify=False) as c:
+                r = c.post(path, json=body)
+                return _created_id(r) if r.status_code in (200, 201) else None
+        except Exception:
+            return None
+    return _fanout(create, n)
+
+
+def race_resource_ids_api(ctx, probe) -> bool | None:
+    """Race on a JSON API — the SPA shape race_resource_ids can't see (creates are JSON fetches, not form-POST
+    redirects, so there's no per-resource URL to compare). Fire N concurrent POST-creates and inspect the ids
+    the RESPONSES assign; a duplicate id across concurrent creates means id allocation isn't atomic -> a race.
+    Reproduced across bursts (>= min_collisions) for computational reproducibility. N/A when there's no JSON
+    create endpoint, self-registration isn't reachable, or creates don't return comparable ids (UUID/opaque ->
+    no observable collision). Variant group race-id-alloc with qa-race-001 -> one race finding."""
+    creates = [e for e in ctx.profile.endpoints if e.method.lower() == "post" and e.body_fields]
+    if not creates:
+        ctx.evidence["na_reason"] = "no JSON create endpoint to race"
+        return None
+    account = ctx.register(suffix="_race")
+    if account is None:
+        ctx.evidence["na_reason"] = "self-registration not reachable black-box (SDK/email-confirm/captcha signup)"
+        return None
+    bursts = probe.probe.get("bursts", 3)
+    need = probe.probe.get("min_collisions", 2)
+    ep = creates[0]
+    base_body = {f: "hl-race" for f in ep.body_fields}
+    try:
+        cookies = {c.name: c.value for c in account.client.cookies.jar}
+        authz = account.client.headers.get("Authorization")
+        hdrs = {"Authorization": authz} if authz else None
+        observed_ids = False
+        collided = 0
+        for _ in range(bursts):
+            ids = [i for i in _concurrent_create_ids(ctx.base_url, ep.path, cookies, base_body, headers=hdrs, n=8)
+                   if i is not None]
+            if len(ids) < 2:
+                continue   # <2 creates returned an id this burst -> nothing to compare
+            observed_ids = True
+            if len(set(ids)) < len(ids):   # a duplicate id among concurrent creates -> non-atomic allocation
+                collided += 1
+        if not observed_ids:
+            ctx.evidence["na_reason"] = "creates don't return comparable ids (UUID/opaque id, or no id in response)"
+            return None
+        ctx.evidence.update(bursts=bursts, collided_bursts=collided, min_collisions=need)
+        return collided >= need
+    finally:
+        account.client.close()
+
+
 def _concurrent_get(base_url, path, n: int = 20, headers=None):
     def get():
         try:
@@ -3703,6 +3839,9 @@ PREDICATES = {
     "api_bola": api_bola,
     "api_bola_collection": api_bola_collection,
     "data_integrity_roundtrip": data_integrity_roundtrip,
+    "data_integrity_list_roundtrip": data_integrity_list_roundtrip,
+    "race_resource_ids_api": race_resource_ids_api,
+    "stale_ui_after_create": stale_ui_after_create,
     "content_type_mismatch": content_type_mismatch,
     "debug_mode_enabled": debug_mode_enabled,
     "leaks_error_detail": leaks_error_detail,
@@ -3780,6 +3919,9 @@ _PREDICATE_REASONS = {
     "api_bola": "one account's object (and its secret) was readable by another account (broken object-level auth)",
     "api_bola_collection": "an auth-gated list endpoint returns every user's objects, not just the caller's (broken object-level auth at the collection)",
     "data_integrity_roundtrip": "a created object could not be read back afterward (non-durable write / silent data loss)",
+    "data_integrity_list_roundtrip": "a created object was absent from its own collection right after a successful create (silent data loss)",
+    "race_resource_ids_api": "concurrent API creates were assigned duplicate ids (non-atomic id allocation — a race)",
+    "stale_ui_after_create": "a saved item did not appear until a manual page refresh (durable write, stale UI — the app looked like it lost the data)",
     "content_type_mismatch": "a response's body contradicts its declared Content-Type (e.g. JSON served as text/html -> client breakage / reflected-JSON XSS)",
     "debug_mode_enabled": "framework debug mode is on in production (interactive debugger / DEBUG page -> source, settings, env and an RCE console exposed)",
     "leaks_error_detail": "an induced server error leaked a stack trace or a database error to the user (info disclosure + a broken error path)",

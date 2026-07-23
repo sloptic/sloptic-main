@@ -1,0 +1,16 @@
+id: qa-race-002
+variant_group_id: race-id-alloc   # same non-atomic-id-allocation flaw as qa-race-001 (form redirects) -> one finding
+bundle: qa
+category: race-condition
+pool: public
+evidence_model: oracle
+penalty: 30   # data corruption / lost updates under concurrency. Same tier as qa-race-001; the variant
+              # group means only one of the two counts, never both.
+probe:
+  predicate: race_resource_ids_api
+  bursts: 3
+  min_collisions: 2   # a collision must REPRODUCE across bursts -> a strong race fires every re-grade
+  # The SPA-shape counterpart to qa-race-001: an SPA create is a JSON fetch, not a form-POST that redirects
+  # to /notes/1, so there's no per-resource URL to compare. Fire N concurrent POST-creates and inspect the
+  # ids the RESPONSES assign; a duplicate id across concurrent creates = id allocation isn't atomic. N/A when
+  # there's no JSON create endpoint, self-registration isn't reachable, or ids are UUID/opaque (no collision).
