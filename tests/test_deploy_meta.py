@@ -82,7 +82,7 @@ def test_run_batch_forwards_inferred_platform_hosts_to_url_children_only():
     from run_batch import _build_cmd
     args = types.SimpleNamespace(
         results="r.jsonl", grade_timeout=60, browser=True, audit_coverage=False, proactive=False,
-        recon=False, browser_auth=False, llm_reasoning=False, headers=None, model=None,
+        recon=False, browser_auth=False, controlled_deploy=False, llm_reasoning=False, headers=None, model=None,
         attempts=3, build_timeout=480, inferred_platform_hosts=["asi1.ai", "marble.worldlabs.ai"])
     rec = {"hackathon": "h", "project": "p", "winner": False}
     ckpt = pathlib.Path("/tmp/hl-ckpt.json")
