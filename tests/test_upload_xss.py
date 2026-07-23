@@ -88,6 +88,8 @@ def test_fires_when_uploaded_active_content_served_inline_html(app):
     ctx = _ctx(app)
     assert upload_stored_xss(ctx, _Probe()) is True
     assert ctx.evidence.get("stored_xss") is True
+    repro = ctx.evidence.get("repro")                 # (A) the deciding GET is captured, replayable in Burp
+    assert repro and repro["method"] == "GET" and "hlxss" in repro["url"]
 
 
 def test_fires_when_served_as_inline_svg(app):

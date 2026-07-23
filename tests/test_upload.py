@@ -67,7 +67,10 @@ def _ctx(url, action):
 
 
 def test_file_upload_executes_webshell(app):
-    assert file_upload(_ctx(app, "/upload"), _Probe()) is True
+    ctx = _ctx(app, "/upload")
+    assert file_upload(ctx, _Probe()) is True
+    repro = ctx.evidence.get("repro")                 # the executing fetch is captured, replayable in Burp
+    assert repro and repro["method"] == "GET"
 
 
 def test_file_upload_clean_when_served_as_source(app):

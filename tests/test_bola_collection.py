@@ -84,6 +84,9 @@ class _Probe:
     probe = {}
 
 
+_LAST_EVIDENCE = {}
+
+
 def _run(mode, endpoints=None):
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _make_app(mode))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -93,7 +96,10 @@ def _run(mode, endpoints=None):
     ctx = _Ctx(url, make_client(url, None, timeout=10.0, follow_redirects=True),
                Profile(base_url=url, forms=[], endpoints=eps), None)
     try:
-        return api_bola_collection(ctx, _Probe())
+        result = api_bola_collection(ctx, _Probe())
+        _LAST_EVIDENCE.clear()
+        _LAST_EVIDENCE.update(ctx.evidence)
+        return result
     finally:
         ctx.client.close()
         srv.shutdown()
@@ -101,6 +107,8 @@ def _run(mode, endpoints=None):
 
 def test_fires_when_list_leaks_every_owner_to_a_stranger():
     assert _run("broken") is True            # auth-gated list returns >=2 owners' objects to two strangers
+    repro = _LAST_EVIDENCE.get("repro")      # (A) the cross-user GET is captured, replayable in Burp
+    assert repro and repro["method"] == "GET" and "/api/items" in repro["url"]
 
 
 def test_clean_when_list_is_owner_scoped():

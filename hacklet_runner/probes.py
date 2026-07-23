@@ -1148,9 +1148,11 @@ def file_upload(ctx, probe) -> bool | None:
                     continue
                 for url in _locate_upload(resp.text, filename):
                     try:
-                        if _UPLOAD_MARK in c.get(url).text:
-                            ctx.evidence.update(rce=True, form=f.action, filename=filename)
-                            return True  # the uploaded PHP executed server-side -> RCE via upload
+                        got = c.get(url)
+                        if _UPLOAD_MARK in got.text:
+                            ctx.evidence.update(rce=True, form=f.action, filename=filename,
+                                                repro=_repro_from_resp(got, matched="uploaded script executed server-side (marker returned)"))
+                            return True  # the uploaded webshell executed server-side -> RCE via upload
                     except (httpx.HTTPError, httpx.InvalidURL):
                         continue
     ctx.evidence.update(rce=False, forms=len(forms), variants=len(_upload_variants()))
@@ -1220,7 +1222,9 @@ def upload_stored_xss(ctx, probe) -> bool | None:
                         continue
                     if _served_executable_inline(got):
                         ctx.evidence.update(stored_xss=True, form=f.action, filename=filename,
-                                            served_as=got.headers.get("content-type", ""))
+                                            served_as=got.headers.get("content-type", ""),
+                                            repro=_repro_from_resp(got, matched="served %s inline (not attachment)"
+                                                                   % got.headers.get("content-type", "")))
                         return True  # user-uploaded active content served executable in-origin -> stored XSS
     ctx.evidence.update(stored_xss=False, forms=len(forms))
     return False if tested else None
@@ -1442,7 +1446,9 @@ def api_bola_collection(ctx, probe) -> bool | None:
                 # not owner-scoped: each unrelated account sees >=2 owners AND they share a real object
                 if len(owners_a) >= 2 and len(owners_b) >= 2 and shared:
                     ctx.evidence.update(bola_collection=True, endpoint=path,
-                                        distinct_owners=len(owners_a), shared_objects=len(shared))
+                                        distinct_owners=len(owners_a), shared_objects=len(shared),
+                                        repro=_repro_from_resp(rb, matched="%d distinct owners / %d shared objects visible to a 2nd account"
+                                                               % (len(owners_a), len(shared))))
                     return True   # a private-by-declaration list returns >=2 owners' objects to strangers
         ctx.evidence.update(bola_collection=False, paths_tested=len(paths))
         return False if tested else None
