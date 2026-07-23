@@ -87,7 +87,25 @@ def test_trace_is_bounded(app, monkeypatch):
     with make_client(app, None, timeout=5.0) as c:
         for _ in range(6):
             c.get("/x")
-    assert len(sink) == 3                      # capped, not unbounded
+    assert len(sink) == 3                      # global backstop: capped, not unbounded
+
+
+def test_per_probe_cap_keeps_later_probes_from_being_starved(app, monkeypatch):
+    # the bug this fixes: a global cap let a fan-out probe eat the whole budget, zeroing every later probe
+    monkeypatch.setattr(net, "_TRACE_PER_PROBE_CAP", 2)
+    sink = start_trace(True)
+    set_trace_probe("fanout")                  # a high-fan-out probe (cmdi/lfi) runs first
+    with make_client(app, None, timeout=5.0) as c:
+        for _ in range(6):
+            c.get("/x")
+    set_trace_probe("later")                   # a probe that runs AFTER it (e.g. sec-upload-002)
+    with make_client(app, None, timeout=5.0) as c:
+        for _ in range(3):
+            c.get("/y")
+    from collections import Counter
+    counts = Counter(e["probe"] for e in sink)
+    assert counts["fanout"] == 2               # the fan-out is capped to a sample
+    assert counts["later"] == 2                # and the later probe is STILL recorded, not starved to 0
 
 
 def test_body_is_truncated(app, monkeypatch):

@@ -17,17 +17,23 @@ import httpx
 # just findings. Held in a ContextVar (not a global) so it's scoped to the grade's process and leaks nothing
 # between runs; None (the default) means make_client installs no hook -> zero overhead on a normal grade.
 _trace_sink: contextvars.ContextVar = contextvars.ContextVar("hl_trace_sink", default=None)
+_trace_counts: contextvars.ContextVar = contextvars.ContextVar("hl_trace_counts", default=None)
 _trace_probe: contextvars.ContextVar = contextvars.ContextVar("hl_trace_probe", default="")
-_TRACE_CAP = 800        # bound the trace: a fan-out probe (SQLi/XSS) must not grow it without limit
-_TRACE_BODY_CAP = 2048  # truncate a large/binary body (a multipart upload) so the record stays readable
+# The cap is PER PROBE, not global: a global cap lets a high-fan-out probe (cmdi/lfi/crash send 100s of
+# requests) monopolize the budget and STARVE every probe later in the catalog to zero — which defeats the
+# whole point (you couldn't inspect the clean probe you cared about). Per-probe keeps EVERY probe represented.
+_TRACE_PER_PROBE_CAP = 40  # requests recorded per probe (a representative sample of a big fan-out's payloads)
+_TRACE_CAP = 4000          # global backstop only (per-probe cap x ~80 probes) — bounds total record size
+_TRACE_BODY_CAP = 2048     # truncate a large/binary body (a multipart upload) so the record stays readable
 
 
 def start_trace(enabled: bool = True) -> list | None:
     """(Re)set request recording for this grade and return the sink (None when disabled). ALWAYS resets the
-    ContextVar, so a trace=False run after a trace=True one in the same process records into nothing, not a
+    ContextVars, so a trace=False run after a trace=True one in the same process records into nothing, not a
     stale sink from the prior run."""
     sink: list | None = [] if enabled else None
     _trace_sink.set(sink)
+    _trace_counts.set({} if enabled else None)
     return sink
 
 
@@ -37,10 +43,17 @@ def set_trace_probe(probe_id: str) -> None:
 
 
 def _trace_response(response) -> None:
-    """httpx response hook: append the request that produced `response` to the active trace sink."""
+    """httpx response hook: append the request that produced `response` to the active trace sink, subject to a
+    PER-PROBE cap (so a fan-out probe can't starve later probes) and a global backstop."""
     sink = _trace_sink.get()
     if sink is None or len(sink) >= _TRACE_CAP:
         return
+    counts = _trace_counts.get()
+    probe = _trace_probe.get()
+    if counts is not None:
+        if counts.get(probe, 0) >= _TRACE_PER_PROBE_CAP:   # this probe already has its sample -> keep room for others
+            return
+        counts[probe] = counts.get(probe, 0) + 1
     req = response.request
     try:
         body = req.content.decode("utf-8", "replace") if req.content else None

@@ -133,7 +133,9 @@ def audit(recs, probe_id):
     # not just the finding that fired. Every request as a copy-pasteable curl + its status.
     traced = [(r, t) for r in recs for t in (r.get("trace") or []) if t.get("probe") == probe_id]
     if traced:
-        print(f"\n  --- request trace: {len(traced)} request(s) {probe_id} sent (--trace runs) ---")
+        # per-probe cap (net._TRACE_PER_PROBE_CAP): a big fan-out is sampled, not shown in full — say so
+        capped = " (capped sample — a big fan-out sends more)" if len(traced) >= 40 else ""
+        print(f"\n  --- request trace: {len(traced)} request(s) {probe_id} recorded{capped} (--trace runs) ---")
         for r, t in traced:
             print(f"      $ {_curl(t)}   -> {t.get('status')}")
     print(f"\n  {probe_id} fired in {hits} app(s)."
