@@ -1,0 +1,17 @@
+id: sec-xss-002
+bundle: security
+category: xss   # same category as sec-xss-001 -> the composition damper treats reflected + stored as
+               # 'breadth of the XSS class' (worst full, the second decayed), not two independent full hits
+pool: public
+evidence_model: provable
+penalty: 35   # stored XSS runs on every viewer of the feed — the #1 serious vuln class. Same tier as
+              # sec-xss-001 (reflected) and sec-upload-002 (stored-via-file).
+applicability:
+  requires: [browser]   # must render to CONFIRM execution; N/A without --browser
+probe:
+  predicate: stored_xss_api
+  # The JSON-API/SPA sink that reflected xss_injectable (HTML-response reflection) and dom_xss (URL-param
+  # sink) both miss. POST an executing payload into a create endpoint's body, then RENDER the app and fire
+  # ONLY when it EXECUTES (window marker set) — proving the stored value was reflected UNESCAPED into the
+  # DOM, not merely stored. An app that escapes on output (React {value}) never fires. Self-decides N/A:
+  # no JSON create endpoint, no browser, or (gated create) no session.

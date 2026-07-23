@@ -1,0 +1,15 @@
+id: qa-backnav-001
+bundle: qa
+category: ui-honesty   # the UI-state-honesty bundle: does what the interface does match what the user expects
+pool: public
+evidence_model: provable
+penalty: 12   # a UX-functional defect (the back button is dead), widespread on SPAs — moderate severity,
+              # priced like qa-deadctrl-001; a common+moderate class shouldn't swamp the score.
+applicability:
+  requires: [browser]   # must render + click + go-back to observe; N/A without --browser
+probe:
+  predicate: back_nav_broken
+  # Navigate IN-APP (click a same-origin router link — NOT a fresh goto the browser would always restore),
+  # fire the browser BACK button, assert the entry view returns. Fires when the SPA router hijacked history
+  # without a pushState so BACK doesn't restore the prior view. Binary (no threshold), intent-independent,
+  # no create flow. Self-N/A: no in-app navigation to exercise (single-view app / no router link).

@@ -1,0 +1,14 @@
+id: qa-chunk-001
+bundle: qa
+category: ui-honesty   # the UI-state-honesty bundle
+pool: public
+evidence_model: provable
+penalty: 30   # a HARD FAIL, not a UX nit — the app's own HTML points at a bundle it cannot load, so it
+              # literally cannot render. Priced high (near the qa-integrity data-loss tier), per the
+              # frequency(moderate) x severity(total failure) rule.
+probe:
+  predicate: dead_bundle_chunk
+  # Parse <script src> from the served '/', request each SAME-ORIGIN script, and fire on any that 404s OR
+  # (on a catch-all/SPA host that never 404s) is served the HTML shell instead of JavaScript — the classic
+  # post-redeploy failure where cached HTML references a previous deploy's bundle hash. Most objective probe
+  # in the bundle (the app cannot render). Self-N/A when the HTML references no same-origin script bundle.

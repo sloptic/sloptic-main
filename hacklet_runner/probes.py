@@ -815,6 +815,107 @@ def xss_injectable(ctx, probe) -> bool | None:
     return False if tested else None
 
 
+def stored_xss_api(ctx, probe) -> bool | None:
+    """Stored XSS via a JSON API + client render — the SPA sink xss_injectable (reflection into an HTML
+    response) and dom_xss (URL-param sink) both miss. POST an EXECUTING payload into a create endpoint's body
+    field(s), then RENDER the app in a browser and fire if it EXECUTES: the stored value was reflected
+    UNESCAPED into the DOM and ran. Provable (browser execution, not mere storage) + intent-independent (an
+    app that escapes on output — React {value} — never fires). The text analog of upload-002 (stored XSS via
+    file). N/A without a JSON create endpoint, a browser, or (when the create is gated) a session."""
+    creates = [e for e in ctx.profile.endpoints if e.method.lower() in ("post", "put", "patch") and e.body_fields]
+    if not creates:
+        ctx.evidence["na_reason"] = "no JSON create endpoint to store an XSS payload through"
+        return None
+    account = ctx.register()   # the create is usually auth-gated; a provided --header/--login session is used directly
+    client = account.client if account is not None else make_client(ctx.base_url, ctx.headers,
+                                                                     timeout=10.0, follow_redirects=True)
+    payload = browser._XSS_PAYLOAD
+    stored = False
+    try:
+        for e in creates:
+            try:
+                r = client.post(e.path, json={f: payload for f in e.body_fields})   # payload in every field
+                if r.status_code in (200, 201):
+                    stored = True
+            except (httpx.HTTPError, httpx.InvalidURL):
+                continue
+        if not stored:
+            ctx.evidence["na_reason"] = "no create accepted the stored-XSS write to render back"
+            return None
+        hdrs = dict(ctx.headers or {})   # render as the SAME identity so the stored item is on the authed feed
+        if account is not None and not account.provided:
+            cookie = "; ".join("%s=%s" % (c.name, c.value) for c in account.client.cookies.jar)
+            if cookie:
+                hdrs["Cookie"] = cookie
+            authz = account.client.headers.get("Authorization")
+            if authz:
+                hdrs["Authorization"] = authz
+        routes = [r for r in ctx.profile.routes
+                  if not r.startswith("/_next/") and not r.split("?")[0].endswith((".js", ".css", ".png",
+                                                                                    ".svg", ".ico", ".woff2"))][:20] or ["/"]
+        if browser.stored_xss_executes(ctx.base_url, routes, headers=hdrs or None):
+            ctx.evidence.update(stored_xss=True, endpoints=[e.path for e in creates][:5])
+            return True   # a stored API value executed unescaped in the DOM -> stored XSS
+        ctx.evidence.update(stored_xss=False, creates_tested=len(creates))
+        return False
+    finally:
+        client.close()
+
+
+def back_nav_broken(ctx, probe) -> bool | None:
+    """Broken back button (UI-state honesty): after an in-app navigation, the browser BACK button doesn't
+    restore the prior view — the SPA router hijacked history without a pushState. Binary, intent-independent
+    (no app wants a dead back button), needs no create flow, applies to nearly any SPA with in-app links.
+    N/A without a browser or an in-app route link to exercise."""
+    verdict = browser.back_button_broken(ctx.base_url, headers=ctx.headers)
+    if verdict == "broken":
+        ctx.evidence.update(back_broken=True)
+        return True   # BACK did not restore the entry view -> broken history handling
+    if verdict == "ok":
+        ctx.evidence.update(back_broken=False)
+        return False
+    ctx.evidence["na_reason"] = "no in-app navigation to test (single-view app / no router link / no browser)"
+    return None
+
+
+_SCRIPT_SRC = re.compile(r"""<script\b[^>]*\bsrc=["']([^"']+)["']""", re.I)
+
+
+def dead_bundle_chunk(ctx, probe) -> bool | None:
+    """Stale/dead bundle chunk (UI-state honesty, a hard-fail): the served HTML references a JS bundle URL
+    that no longer resolves — cached HTML pointing at a PREVIOUS deploy's bundle hash — so the app literally
+    cannot render. Parse <script src> from '/', request each SAME-ORIGIN script, and fire on any that 404s OR
+    (on a catch-all/SPA host that never 404s) is served the HTML shell instead of JavaScript. N/A when the
+    served HTML references no same-origin script bundle."""
+    with make_client(ctx.base_url, ctx.headers, timeout=10.0, follow_redirects=True) as c:
+        try:
+            html = c.get("/").text
+        except (httpx.HTTPError, httpx.InvalidURL):
+            return None
+        host = urllib.parse.urlparse(ctx.base_url).netloc
+        checked = 0
+        for src in _SCRIPT_SRC.findall(html):
+            pu = urllib.parse.urlparse(urllib.parse.urljoin(ctx.base_url.rstrip("/") + "/", src.strip()))
+            if pu.netloc and pu.netloc != host:
+                continue   # a CDN/vendor script -> not the app's own bundle
+            try:
+                r = c.get(pu.path)
+            except (httpx.HTTPError, httpx.InvalidURL):
+                continue
+            checked += 1
+            ct = r.headers.get("content-type", "").lower()
+            # dead = an honest 404/410/5xx, OR a catch-all host serving the HTML shell where JS should be
+            if r.status_code in (404, 410) or r.status_code >= 500 or ("html" in ct and "javascript" not in ct):
+                ctx.evidence.update(dead_chunk=True, url=pu.path, status=r.status_code,
+                                    served_ct=ct, repro=_repro_from_resp(r, matched="the app's own <script src> does not resolve to JS"))
+                return True   # the served HTML points at a bundle the app can't load -> can't render
+        if checked == 0:
+            ctx.evidence["na_reason"] = "the served HTML references no same-origin script bundle"
+            return None
+        ctx.evidence.update(dead_chunk=False, scripts_checked=checked)
+        return False
+
+
 # OS command injection — comprehensive coverage: shell separators (; | || && newline), command
 # substitution ($(...) and backticks), and a blind time-based fallback; one finding. Precision: the
 # marker is the RESULT of a shell-evaluated arithmetic expr (13*13 -> 169) — it appears ONLY if a shell
@@ -874,7 +975,10 @@ def command_injection(ctx, probe) -> bool | None:
                             return True  # a shell evaluated echo hlci$((13*13)) -> hlci169 -> injectable
                     except (httpx.HTTPError, httpx.InvalidURL):
                         continue
-                if len(deep) < _DEEP_SLOTS:
+                if len(deep) < _DEEP_SLOTS and method != "postjson":
+                    # the blind TIME-BASED fallback is NOT causally specific (a slow JSON endpoint's latency
+                    # variance ~= the sqli-FP failure mode) -> keep it OFF JSON API sinks; the deterministic
+                    # computed-output oracle (hlci169) still runs on them, and it IS causally specific.
                     deep.append((action, method, fields, field))
             if budget <= 0:
                 break
@@ -3852,6 +3956,9 @@ PREDICATES = {
     "path_traversal": path_traversal,
     "file_upload": file_upload,
     "upload_stored_xss": upload_stored_xss,
+    "stored_xss_api": stored_xss_api,
+    "back_nav_broken": back_nav_broken,
+    "dead_bundle_chunk": dead_bundle_chunk,
     "weak_session_id": weak_session_id,
     "api_bola": api_bola,
     "api_bola_collection": api_bola_collection,
@@ -3932,6 +4039,9 @@ _PREDICATE_REASONS = {
     "path_traversal": "a filename param served a file outside the web root (path traversal / local file inclusion)",
     "file_upload": "an uploaded webshell was accepted and executed server-side (insecure file upload -> RCE)",
     "upload_stored_xss": "an uploaded HTML/SVG file is served inline with an executable content-type (stored XSS via file upload)",
+    "stored_xss_api": "a value stored via the JSON API executed unescaped when the page rendered it (stored XSS)",
+    "back_nav_broken": "the browser back button did not return to the prior in-app view (broken SPA history handling)",
+    "dead_bundle_chunk": "the served HTML references a JS bundle that doesn't resolve — the app can't render (stale/dead chunk)",
     "weak_session_id": "session identifiers are weak/predictable (short / numeric / sequential)",
     "api_bola": "one account's object (and its secret) was readable by another account (broken object-level auth)",
     "api_bola_collection": "an auth-gated list endpoint returns every user's objects, not just the caller's (broken object-level auth at the collection)",

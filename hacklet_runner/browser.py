@@ -954,3 +954,106 @@ def dom_xss_executes(base_url: str, paths, params=("q",), max_attempts: int = 24
                 b.close()
     except Exception:
         return False
+
+
+def _view_fp(page) -> frozenset:
+    """A coarse fingerprint of the currently-DISPLAYED view: the set of 4+ char word tokens in the body text.
+    Lets back-nav tell whether BACK restored the prior view's CONTENT, not just its URL — the common SPA bug
+    is the URL popping back while the app, lacking a popstate handler, keeps showing the new view."""
+    with contextlib.suppress(Exception):
+        return frozenset(re.findall(r"[a-z0-9]{4,}", (page.inner_text("body") or "").lower()))
+    return frozenset()
+
+
+def back_button_broken(base_url: str, headers=None, timeout: float = 12.0) -> str:
+    """Navigate IN-APP from the entry view to another route (click a same-origin router link — NOT a fresh
+    goto, which the browser's own history would always restore), fire the browser BACK button, and check the
+    app returns — by URL AND displayed content. Returns 'broken' (BACK did not restore the entry view — the
+    SPA router hijacked history / has no popstate handler), 'ok', or 'inconclusive' (no in-app navigation to
+    test / no browser). Binary, intent-independent (no app wants a dead back button), no create flow."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return "inconclusive"
+    try:
+        with sync_playwright() as pw:
+            b = _launch(pw)
+            if b is None:
+                return "inconclusive"
+            try:
+                page = b.new_page()
+                _apply_auth(page, base_url, headers)
+                page.goto(base_url.rstrip("/") + "/", timeout=timeout * 1000, wait_until="load")
+                url_a, fa = page.url.rstrip("/"), _view_fp(page)
+                host = urllib.parse.urlparse(base_url).netloc
+                link = None
+                with contextlib.suppress(Exception):
+                    for a in page.query_selector_all("a[href]"):
+                        href = (a.get_attribute("href") or "").strip()
+                        if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
+                            continue
+                        pu = urllib.parse.urlparse(urllib.parse.urljoin(page.url, href))
+                        if pu.netloc and pu.netloc != host:
+                            continue                                    # external link
+                        if urllib.parse.urljoin(page.url, href).rstrip("/") == url_a \
+                                or _NO_CLICK.search((a.inner_text() or "")[:60].lower()):
+                            continue                                    # same page, or logout/destructive
+                        if a.is_visible():
+                            link = a
+                            break
+                if link is None:
+                    return "inconclusive"                               # no in-app route link to exercise
+                with contextlib.suppress(Exception):
+                    link.click(timeout=3000)
+                    page.wait_for_load_state("networkidle", timeout=5000)
+                    page.wait_for_timeout(300)
+                url_b, fb = page.url.rstrip("/"), _view_fp(page)
+                a_only, b_only = fa - fb, fb - fa
+                if url_b == url_a and not b_only:
+                    return "inconclusive"                               # the click didn't change the view
+                with contextlib.suppress(Exception):
+                    page.go_back(timeout=5000)
+                    page.wait_for_load_state("load", timeout=5000)
+                    page.wait_for_timeout(300)
+                url_c, fc = page.url.rstrip("/"), _view_fp(page)
+                # restored = the entry URL is back AND A's distinctive content returned (not still showing B's)
+                restored = url_c == url_a and len(fc & a_only) >= len(fc & b_only)
+                return "ok" if restored else "broken"
+            finally:
+                b.close()
+    except Exception:
+        return "inconclusive"
+
+
+def stored_xss_executes(base_url: str, paths, headers=None, total_timeout: float = 45.0, max_pages: int = 20) -> bool:
+    """Render each path PLAIN — NO injection, because an XSS payload was already STORED server-side via an API
+    write — and return True if it EXECUTES: the app reflected the stored value unescaped into the DOM and it
+    ran (window.__hl_domxss == the marker). The stored-XSS counterpart to dom_xss_executes (which injects into
+    a query param). False if no browser or nothing executed; `headers` authenticate the (usually gated) feed
+    so the stored item is actually on the page. Each goto is a fresh document, so a hit is that page's own."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return False
+    try:
+        with sync_playwright() as pw:
+            b = _launch(pw)
+            if b is None:
+                return False
+            try:
+                page = b.new_page()
+                _apply_auth(page, base_url, headers)
+                deadline = time.monotonic() + total_timeout
+                for path in list(paths)[:max_pages]:
+                    if time.monotonic() > deadline:
+                        break
+                    with contextlib.suppress(Exception):
+                        page.goto(base_url.rstrip("/") + path, timeout=8000, wait_until="load")
+                        page.wait_for_timeout(200)   # let a client-rendered feed paint the stored value
+                        if page.evaluate("() => window.__hl_domxss") == _XSS_MARKER:
+                            return True
+                return False
+            finally:
+                b.close()
+    except Exception:
+        return False
