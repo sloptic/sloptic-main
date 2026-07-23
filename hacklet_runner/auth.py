@@ -154,6 +154,68 @@ def _account_from_headers(base_url: str, headers) -> Account:
                    register_response=httpx.Response(200, request=httpx.Request("GET", base_url)), provided=True)
 
 
+def _session_from_client(client: httpx.Client, response: httpx.Response) -> dict:
+    """The live session established on `client` (+ its login `response`) as REPLAYABLE headers: a Cookie of
+    the session cookies in the jar (fall back to all cookies), and/or a Bearer from the response body/header."""
+    out: dict = {}
+    session = [(c.name, c.value) for c in client.cookies.jar if _is_session_cookie(c.name)]
+    jar = session or [(c.name, c.value) for c in client.cookies.jar]
+    if jar:
+        out["Cookie"] = "; ".join("%s=%s" % (n, v) for n, v in jar)
+    token = _bearer_token(response)
+    if token:
+        out["Authorization"] = "Bearer " + token
+    return out
+
+
+def login_with_credentials(base_url: str, email: str, password: str, profile: "Profile | None" = None) -> dict:
+    """Log in with CALLER-PROVIDED credentials (--login, a team's demo/test account) and return the session as
+    replayable headers ({"Cookie": ...} / {"Authorization": "Bearer ..."}), or {} if none was established. The
+    LOW-FRICTION handoff for gated apps (email-verify / captcha / SDK signup): the team hands us a login, we
+    authenticate, and every authed-surface probe runs as that identity — bypassing ALL signup gates at once,
+    which an email server (defeats only email-conf) can't. Self-contained (no discovery needed): tries JSON
+    login endpoints (spec-named first) then the HTML login form (parsed from '/'), so it can authenticate the
+    CRAWL too, not just the probes. `email` doubles as the username when the app keys on that."""
+    login_paths = list(dict.fromkeys(_spec_auth_paths(profile, _LOGIN_KW) + list(_JSON_LOGIN_PATHS)))
+    with httpx.Client(base_url=base_url, timeout=15.0, follow_redirects=True, verify=False) as c:
+        for path in login_paths:                                        # 1) JSON login endpoints
+            for body in ({"email": email, "password": password},
+                         {"username": email, "password": password},
+                         {"email": email, "username": email, "password": password}):
+                try:
+                    r = c.post(path, json=body)
+                except (httpx.HTTPError, httpx.InvalidURL):
+                    continue
+                if r.status_code in (200, 201) and _auth_shaped(r):
+                    hdrs = _session_from_client(c, r)
+                    if hdrs:
+                        return hdrs
+        forms = list(profile.forms) if profile is not None else _login_forms_at(base_url, c)
+        form = login_form(forms)                                        # 2) HTML login form
+        if form is not None:
+            data = {n: (password if "pass" in n.lower() else email) for n in form.fields}
+            try:
+                r = c.request((form.method or "post").upper(), form.action, data=data)
+                if r.status_code < 400:
+                    hdrs = _session_from_client(c, r)
+                    if hdrs:
+                        return hdrs
+            except (httpx.HTTPError, httpx.InvalidURL):
+                pass
+    return {}
+
+
+def _login_forms_at(base_url: str, client: httpx.Client) -> list:
+    """Fetch '/' and parse its <form>s (lazy discovery import, avoiding an import cycle) — so a provided-creds
+    login can find an HTML login form with no pre-built profile."""
+    try:
+        from .discovery import _FORM, _parse_forms
+        html = client.get("/").text
+        return _parse_forms(_FORM.findall(html), base_url, "/")
+    except Exception:
+        return []
+
+
 def register_account(base_url: str, profile: Profile, suffix: str = "", browser_register=None,
                      headers=None) -> Account | None:
     """Create a fresh account (self-as-oracle) for the authed-surface probes. httpx registration first (HTML

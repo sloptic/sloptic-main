@@ -180,7 +180,8 @@ def _run_probe(probe: Probe, ctx: _Ctx, client: httpx.Client, profile: Profile) 
 
 def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_progress=None,
         source_dir=None, seed_features=None, cached_profile=None, on_profile=None, perceive=None,
-        browser_register=None, recon: bool = False, auth_crawl: bool = False, trace: bool = False) -> Report:
+        browser_register=None, recon: bool = False, auth_crawl: bool = False, trace: bool = False,
+        login_creds=None) -> Report:
     """on_progress(done, total, probe, outcomes): called twice per probe — before it runs with
     outcomes=None (so a caller can show what's currently testing), and after with its outcomes.
 
@@ -190,6 +191,14 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
     skips discovery entirely (no crawl, no browser, no on_profile); a MISS discovers then hands it back."""
     try:
         handle = deployer.deploy()  # inside try so teardown runs even if deploy/health fails
+        # --login: authenticate with team-provided demo/test creds BEFORE the crawl, so BOTH discovery and the
+        # probes run as that identity (bypasses email-verify/captcha/SDK signup gates a self-register can't).
+        # Merged into `headers` -> exactly the --header path; a Cookie session also auto-suppresses auth_crawl.
+        if login_creds and not auth._provided_session(headers):
+            login_headers = auth.login_with_credentials(handle.base_url, login_creds[0], login_creds[1])
+            if login_headers:
+                headers = {**(headers or {}), **login_headers}
+                auth_crawl = False   # we hold a real session -> no throwaway self-register for the crawl
         if cached_profile is not None:
             # FROZEN surface: reuse the cached crawl, re-pointing only the origin at THIS deployment's
             # ephemeral URL (routes/forms/endpoints are relative paths; base_url is the sole absolute).

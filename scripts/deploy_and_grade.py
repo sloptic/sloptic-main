@@ -748,9 +748,18 @@ def _parse_headers(items) -> dict | None:
     return out or None
 
 
+def _parse_login(spec):
+    """--login 'email:password' -> (email, password), or None. Splits on the FIRST ':' so a password with a
+    colon survives; the email/identifier is whatever precedes it."""
+    if not spec:
+        return None
+    ident, sep, pw = spec.partition(":")
+    return (ident.strip(), pw) if sep and ident.strip() else None
+
+
 def _grade_worker(url, use_browser, features, q, cached_profile=None, cache_key=None, repo_url=None,
                   proactive=False, model=DEFAULT_MODEL, browser_auth=False, session_headers=None,
-                  llm_reasoning=False, recon=False, controlled_deploy=False, trace=False):
+                  llm_reasoning=False, recon=False, controlled_deploy=False, trace=False, login_creds=None):
     os.setsid()   # own process group so the parent can SIGKILL this child AND its headless chrome together
     try:
         render = browser.render_routes if use_browser else None
@@ -788,7 +797,8 @@ def _grade_worker(url, use_browser, features, q, cached_profile=None, cache_key=
                      # build, so register-then-crawl lands every time). Off when a --header session is supplied
                      # (used for the crawl directly). Degrades safely: no register session -> crawl stays login-only.
                      auth_crawl=((browser_auth or controlled_deploy) and use_browser and not session_headers),
-                     trace=trace)   # --trace: record every probe's requests (payloads/endpoints) into the record
+                     trace=trace,   # --trace: record every probe's requests (payloads/endpoints) into the record
+                     login_creds=login_creds)   # --login: authenticate with team-provided demo creds pre-crawl
         q.put(("ok", report))
     except BaseException as e:   # report ANY failure back to the parent instead of dying silently
         q.put(("err", f"{type(e).__name__}: {e}"))
@@ -807,7 +817,7 @@ def _hard_kill_group(p) -> None:
 def grade(url: str, use_browser: bool, timeout=None, features=None,
           cached_profile=None, cache_key=None, repo_url=None, proactive=False, model=DEFAULT_MODEL,
           browser_auth=False, session_headers=None, llm_reasoning=False, recon=False, controlled_deploy=False,
-          trace=False):
+          trace=False, login_creds=None):
     """Grade the running app in a CHILD PROCESS. A subprocess (not an in-process SIGALRM) because a signal
     can't interrupt a Playwright CPU-spin (the browser probes), but an EXTERNAL SIGKILL of the child + its
     chrome always works. `timeout` is the grading phase's OWN wall-clock budget (independent of deploy time,
@@ -818,7 +828,7 @@ def grade(url: str, use_browser: bool, timeout=None, features=None,
     q = ctx.Queue()
     p = ctx.Process(target=_grade_worker,
                     args=(url, use_browser, features, q, cached_profile, cache_key, repo_url, proactive, model,
-                          browser_auth, session_headers, llm_reasoning, recon, controlled_deploy, trace))
+                          browser_auth, session_headers, llm_reasoning, recon, controlled_deploy, trace, login_creds))
     p.start()
     try:
         result = q.get(timeout=timeout)              # timeout=None (direct run) blocks until the child reports
@@ -1092,6 +1102,11 @@ def main():
                          "record under `trace`, tagged by probe — so a clean/N/A probe's payloads+endpoints are "
                          "inspectable, not just findings. View with: stats.py <record> --audit <probe_id>. "
                          "Off by default (bloats the record); bounded to 800 requests, bodies truncated.")
+    ap.add_argument("--login", dest="login", metavar="'email:password'",
+                    help="team-provided demo/test account: log in with these creds (JSON login endpoint or HTML "
+                         "form), capture the session, and run every authed-surface probe as that identity. The "
+                         "low-friction handoff for gated apps (email-verify/captcha/SDK signup) — bypasses ALL "
+                         "signup gates at once. Lower-friction than --header (creds, not an extracted token).")
     ap.add_argument("--header", action="append", dest="headers", metavar="'Name: Value'",
                     help="a request header sent on the WHOLE run (repeatable) — the Option-B auth fallback for apps "
                          "we can't self-register (captcha / email-verify / SSO). Provide a live session and the "
@@ -1270,7 +1285,8 @@ def main():
                            cache_key=(None if args.no_cache else _sha), repo_url=args.repo,
                            proactive=args.proactive, model=args.model, browser_auth=args.browser_auth,
                            session_headers=_parse_headers(args.headers), llm_reasoning=args.llm_reasoning,
-                           recon=args.recon, controlled_deploy=args.controlled_deploy, trace=args.trace)
+                           recon=args.recon, controlled_deploy=args.controlled_deploy, trace=args.trace,
+                           login_creds=_parse_login(args.login))
         except GradeTimeout as e:
             timings["grade_s"] = round(time.monotonic() - _t, 1)
             result["grade_timeout"] = True         # deployed but ungradeable in budget (broken/pathological

@@ -266,6 +266,8 @@ def _build_cmd(j, args, ckpt):
         cmd += ["--browser-auth"]
     if args.controlled_deploy:
         cmd += ["--controlled-deploy"]
+    if getattr(args, "login", None):
+        cmd += ["--login", args.login]
     if args.llm_reasoning:
         cmd += ["--llm-reasoning"]
     for h in (args.headers or []):
@@ -416,6 +418,9 @@ def main():
                     help="forward to deploy_and_grade: the HackLet profile — the deploy is OURS, so authenticate the "
                          "crawl by default (register a throwaway account, land its session on the authed surface). "
                          "Reliable because a 24-min build has no email confirmation; degrades safely otherwise.")
+    ap.add_argument("--login", dest="login", metavar="'email:password'",
+                    help="forward to deploy_and_grade: log in with team-provided demo/test creds and run the "
+                         "authed-surface probes as that identity — the low-friction handoff for gated apps.")
     ap.add_argument("--header", action="append", dest="headers", metavar="'Name: Value'",
                     help="forward to deploy_and_grade (repeatable): a request header sent on the whole run — the "
                          "Option-B auth fallback (--header 'Cookie: …' or --header 'Authorization: Bearer …') so "
