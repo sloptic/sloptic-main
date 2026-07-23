@@ -25,6 +25,20 @@ from collections import Counter, defaultdict
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from hacklet_runner.aggregate import CATEGORY_DECAY  # noqa: E402  (the ONE scoring decay — never re-declare)
+from hacklet_runner.catalog import load_catalog  # noqa: E402
+
+
+def _unvalidated_probes(recs, min_penalty: int = 25) -> list:
+    """Catalog probes that fired 0x across `recs` — 0 fires is ABSENCE OF EVIDENCE, not precision (the corpus
+    is auth-dark for the authed-surface probes, so they never get to fire). Returns (id, penalty), high first,
+    so the report NEVER lets a never-fired high-penalty probe read as 'precise / 0 FP'."""
+    fired = {f["probe_id"] for r in recs for f in (r.get("findings") or [])}
+    try:
+        catalog = load_catalog(str(pathlib.Path(__file__).resolve().parent.parent / "catalog"))
+    except Exception:
+        return []
+    return sorted([(p.id, p.penalty) for p in catalog if p.id not in fired and p.penalty >= min_penalty],
+                  key=lambda x: -x[1])
 
 # Probes that require a REAL server-side endpoint or state change — hallucinated on a catch-all/broken shell.
 _PHANTOM_SENSITIVE = ("sec-sqli", "sec-csrf", "sec-cmdi", "sec-ssti", "sec-lfi", "sec-hosthdr",
@@ -318,6 +332,7 @@ def main():
             "scored_fires": total_fires, "false_positive_fires": total_fp, "fp_apps": fp_apps,
             "advisory_fires": len(a["advisories"]), "advisory_apps": adv_apps, "catchall_apps": a["catchall_apps"],
             "vouched_fires": vouched, "unaudited_fires": unaudited_fires,
+            "unvalidated_zero_fire": [{"id": pid, "penalty": pen} for pid, pen in _unvalidated_probes(recs)],
             "unaudited_penalty_pct": round(pen_share, 1),
             "unaudited_by_probe": {pid: v[0] for pid, v in sorted(unaudited.items(), key=lambda x: -x[1][1])},
             "unconfirmed_fires": total_unconf, "unconfirmed_apps": unconf_apps,
@@ -346,6 +361,13 @@ def main():
           f"{pen_share:.0f}% of DAMPED in-score penalty. Hand-sample these:")
     for pid, (fires, pen) in sorted(unaudited.items(), key=lambda x: -x[1][1])[:12]:
         print(f"            {fires:>5} fires · {pen:>7.0f} in-score pen   {pid}")
+    unval = _unvalidated_probes(recs)
+    if unval:
+        print(f"\n(1b) UNVALIDATED — {len(unval)} high-penalty probe(s) fired 0× on this corpus.")
+        print(f"     0 fires is ABSENCE OF EVIDENCE, not precision (corpus auth-dark / no applicable surface).")
+        print(f"     Do NOT read their 0 FP as 'precise' — unvalidated until they fire on real surface:")
+        for pid, pen in unval[:15]:
+            print(f"            pen {pen:>3}   {pid}")
     if total_unconf:
         print(f"    {total_unconf:>5} / {total_fires} UNCONFIRMED — timing / load-induced-error ({unconf_apps} apps); "
               f"re-fire in isolation to resolve:")
