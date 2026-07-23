@@ -1350,6 +1350,107 @@ def api_bola(ctx, probe) -> bool | None:
         b.client.close()
 
 
+# Broken object-level authorization at the COLLECTION endpoint — the complement to api_bola (which needs a
+# per-resource GET /{id}). Many apps have NO /{id} route (UUID keys, SPA client-render), yet expose a LIST
+# endpoint that is auth-gated but NOT owner-scoped: any logged-in user gets EVERY user's objects. Provable +
+# intent-independent on two self-declared contracts: the endpoint's own 401-when-unauthenticated declares the
+# data private, and the objects' own owner/user field declares per-object ownership. Two UNRELATED fresh
+# accounts seeing the SAME owned objects is the clincher (a team/relationship feed wouldn't overlap between
+# strangers; a single-owner shared catalog shows one owner, not >=2). Residual intent boundary: an app that
+# INTENDS a global feed behind login (social timeline) — rare in a CRUD-tracker corpus, documented in-catalog.
+_OWNER_ID_FIELD = re.compile(r"^(owner|user|author|account|creator)_?id$|^created_?by$|^owner$|^user$", re.I)
+_COLLECTION_WRAPPERS = ("items", "data", "results", "rows", "records", "list", "objects")
+
+
+def _json_objects(resp):
+    """The dict objects a collection response carries: a top-level JSON array, or one wrapped under a common
+    key ({"items":[...]}). None when the body isn't a JSON array of objects."""
+    try:
+        data = resp.json()
+    except (ValueError, httpx.HTTPError):
+        return None
+    if isinstance(data, dict):
+        data = next((data[k] for k in _COLLECTION_WRAPPERS if isinstance(data.get(k), list)), None)
+    if not isinstance(data, list):
+        return None
+    return [o for o in data if isinstance(o, dict)]
+
+
+def _obj_id(o):
+    """An object's stable id (id / _id / uuid / slug), stringified; None when it declares none."""
+    for k in ("id", "_id", "uuid", "slug"):
+        if isinstance(o.get(k), (str, int)):
+            return str(o[k])
+    return None
+
+
+def _owner_ids(objs) -> set:
+    """Distinct owner identities the objects DECLARE (owner_id / user_id / created_by / ...). A properly
+    owner-scoped list returns exactly ONE (the requester's); >=2 means it isn't scoped to the caller."""
+    vals = set()
+    for o in objs:
+        for k, v in o.items():
+            if isinstance(v, (str, int)) and _OWNER_ID_FIELD.match(k):
+                vals.add(str(v))
+    return vals
+
+
+def _collection_paths(endpoints) -> list:
+    """Candidate collection paths to GET: any non-templated endpoint path (a GET list, or the sibling of a
+    POST create on the same collection — the list is often an XHR discovery never captured as an endpoint).
+    Skips per-resource templates ({id}); that read-by-id case is api_bola's job."""
+    paths = []
+    for e in endpoints:
+        p = (e.raw_path or e.path or "").split("?")[0]
+        if p and "{" not in p and e.method.lower() in ("get", "post"):
+            p = p.rstrip("/") or "/"
+            if p not in paths:
+                paths.append(p)
+    return paths
+
+
+def api_bola_collection(ctx, probe) -> bool | None:
+    """Broken object-level authorization at the LIST endpoint: an auth-gated collection (401 unauthenticated)
+    that is NOT owner-scoped — two independent fresh accounts each receive objects declaring >=2 distinct
+    owners AND at least one object in COMMON. Fires only when the app itself gates the endpoint (its
+    private-by-declaration contract) yet leaks cross-user objects. N/A when there's no auth-gated JSON
+    collection or two accounts can't be minted."""
+    paths = _collection_paths(ctx.profile.endpoints)
+    if not paths:
+        ctx.evidence["na_reason"] = "no non-templated collection endpoint to test for cross-user leakage"
+        return None
+    a, b = _two_accounts(ctx)
+    if a is None:
+        return None   # na_reason set by _two_accounts
+    tested = False
+    try:
+        with make_client(ctx.base_url, None, timeout=10.0, follow_redirects=False) as anon:
+            for path in paths:
+                try:
+                    if anon.get(path).status_code not in (401, 403):
+                        continue   # the app doesn't gate it -> public by intent, not a BOLA
+                    ra = a.client.get(path)
+                    rb = b.client.get(path)
+                except (httpx.HTTPError, httpx.InvalidURL):
+                    continue
+                oa, ob = _json_objects(ra), _json_objects(rb)
+                if not oa or not ob:
+                    continue
+                tested = True
+                owners_a, owners_b = _owner_ids(oa), _owner_ids(ob)
+                shared = ({_obj_id(o) for o in oa} & {_obj_id(o) for o in ob}) - {None}
+                # not owner-scoped: each unrelated account sees >=2 owners AND they share a real object
+                if len(owners_a) >= 2 and len(owners_b) >= 2 and shared:
+                    ctx.evidence.update(bola_collection=True, endpoint=path,
+                                        distinct_owners=len(owners_a), shared_objects=len(shared))
+                    return True   # a private-by-declaration list returns >=2 owners' objects to strangers
+        ctx.evidence.update(bola_collection=False, paths_tested=len(paths))
+        return False if tested else None
+    finally:
+        a.client.close()
+        b.client.close()
+
+
 def idor_user_record(ctx, probe) -> bool | None:
     """Horizontal IDOR on a USER/ACCOUNT record — the canonical '/user/123 -> /user/124' case, read-only.
     Register two accounts A and B, then check whether B can read A's OWN account record by id. A's record id is
@@ -3594,6 +3695,7 @@ PREDICATES = {
     "upload_stored_xss": upload_stored_xss,
     "weak_session_id": weak_session_id,
     "api_bola": api_bola,
+    "api_bola_collection": api_bola_collection,
     "data_integrity_roundtrip": data_integrity_roundtrip,
     "content_type_mismatch": content_type_mismatch,
     "debug_mode_enabled": debug_mode_enabled,
@@ -3670,6 +3772,7 @@ _PREDICATE_REASONS = {
     "upload_stored_xss": "an uploaded HTML/SVG file is served inline with an executable content-type (stored XSS via file upload)",
     "weak_session_id": "session identifiers are weak/predictable (short / numeric / sequential)",
     "api_bola": "one account's object (and its secret) was readable by another account (broken object-level auth)",
+    "api_bola_collection": "an auth-gated list endpoint returns every user's objects, not just the caller's (broken object-level auth at the collection)",
     "data_integrity_roundtrip": "a created object could not be read back afterward (non-durable write / silent data loss)",
     "content_type_mismatch": "a response's body contradicts its declared Content-Type (e.g. JSON served as text/html -> client breakage / reflected-JSON XSS)",
     "debug_mode_enabled": "framework debug mode is on in production (interactive debugger / DEBUG page -> source, settings, env and an RCE console exposed)",

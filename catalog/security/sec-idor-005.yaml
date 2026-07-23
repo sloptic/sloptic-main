@@ -1,0 +1,19 @@
+id: sec-idor-005
+bundle: security
+category: access-control
+pool: public
+evidence_model: provable
+penalty: 40   # broken object-level authorization at the COLLECTION endpoint — OWASP API-Security #1.
+              # Same severity class as sec-idor-002/004 (BOLA); complements them (they need a GET /{id}).
+applicability:
+  requires: [has_auth_entrypoint]
+probe:
+  # The list-endpoint counterpart to api_bola. Many apps have UUID keys and no GET /{id} route, so the
+  # per-resource BOLA oracle finds nothing — yet their auth-gated LIST endpoint returns EVERY user's objects.
+  # Fires ONLY when: (1) the endpoint is 401/403 unauthenticated (the app declares it private), AND (2) two
+  # UNRELATED fresh accounts each receive objects declaring >=2 distinct owners AND share >=1 object (two
+  # strangers seeing the same owned object). Provable + intent-independent on the app's own two contracts
+  # (the 401 gate + the objects' owner field). Residual intent boundary: an app that genuinely INTENDS a
+  # global feed behind login (a social timeline) — rare in a CRUD-tracker corpus, and it still declared the
+  # data private. Self-decides N/A: no auth-gated JSON collection, or two accounts can't be minted.
+  predicate: api_bola_collection
