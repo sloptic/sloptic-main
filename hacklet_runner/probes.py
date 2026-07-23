@@ -463,9 +463,13 @@ def _sqli_repro(ctx, method, reqfn, payload, matched=None) -> dict:
 
 
 def _form_repro(ctx, method, action, data, matched=None) -> dict:
-    """_repro for a form/query-param send (mirrors _xss_send): GET puts the payload dict in the query, POST
-    in a form-encoded body — so injection probes that hold the (method, action, data) can render the request."""
+    """_repro for a form/query-param/json send (mirrors _xss_send): GET puts the payload dict in the query,
+    POST in a form-encoded body, postjson in a JSON body — so injection probes that hold the (method, action,
+    data) can render the request."""
     base = ctx.base_url.rstrip("/") + action
+    if method == "postjson":
+        return _repro("POST", base, headers={"content-type": "application/json"},
+                      body=json.dumps(data), matched=matched)
     if (method or "get").lower() == "get":
         return _repro("GET", base + "?" + urllib.parse.urlencode(data), matched=matched)
     return _repro("POST", base, body=urllib.parse.urlencode(data), matched=matched)
@@ -667,6 +671,17 @@ def _injectable_targets(profile):
     return forms + q_eps + s_eps
 
 
+def _json_body_targets(profile):
+    """(path, "postjson", body_field_names) over POST/PUT/PATCH JSON-API endpoints — the SPA injectable
+    surface the form/query enumeration (_injectable_targets) misses. The "postjson" sentinel routes
+    _xss_send / _elapsed / _form_repro to a JSON body. Consumed by the SUBSTRING-oracle injection probes
+    (command_injection / ssti_injectable / path_traversal), whose arithmetic-result / file-signature markers
+    are content-type-agnostic; NOT xss_injectable (a JSON echo isn't executable HTML — _reflects requires it)
+    or http_response_splitting (a header sink). Uses the concretized path ({id}->1), not the raw template."""
+    return [(e.path, "postjson", list(e.body_fields)) for e in profile.endpoints
+            if e.method.lower() in ("post", "put", "patch") and e.body_fields]
+
+
 # Reflected + stored XSS — comprehensive technique coverage of one flaw ("this input is echoed into
 # HTML unescaped"), collapsing to a single finding. Each payload targets a different reflection context;
 # detection is verbatim, unescaped reflection of a UNIQUE per-run marker (an escaping app encodes the
@@ -689,6 +704,8 @@ _XSS_FILLER = "hlxfill"  # benign value for the fields we're not currently injec
 
 
 def _xss_send(c, method, action, data):
+    if method == "postjson":
+        return c.request("POST", action, json=data)   # JSON API body — the SPA injectable surface
     if (method or "get").lower() == "get":
         return c.request("GET", action, params=data)
     return c.request("POST", action, data=data)  # HTML form -> form-encoded body
@@ -820,10 +837,10 @@ def _elapsed(c, method, action, data) -> float:
 
 
 def command_injection(ctx, probe) -> bool | None:
-    """OS command injection across forms + query params. Injects `<sep> echo <arith>` across shell
-    separators and command-substitution; fires when the arithmetic RESULT (not the literal) reflects —
-    proving a shell executed it. Falls back to blind time-based sleep. N/A when no input surface."""
-    targets = _injectable_targets(ctx.profile)
+    """OS command injection across forms + query params + JSON API bodies. Injects `<sep> echo <arith>`
+    across shell separators and command-substitution; fires when the arithmetic RESULT (not the literal)
+    reflects — proving a shell executed it. Falls back to blind time-based sleep. N/A when no input surface."""
+    targets = _injectable_targets(ctx.profile) + _json_body_targets(ctx.profile)
     if not targets:
         return None
     budget = probe.probe.get("max_attempts", 120)
@@ -899,7 +916,7 @@ def ssti_injectable(ctx, probe) -> bool | None:
     s = [(e.raw_path, "get", list(_COMMON_PARAMS)) for e in ctx.profile.endpoints
          if e.method.lower() == "get" and not e.query_params and not e.path_params
          and _SEARCHABLE.search(e.raw_path)]
-    targets = q + forms + s
+    targets = q + forms + s + _json_body_targets(ctx.profile)   # + JSON API bodies (SPA sink)
     if not targets:
         return None
     m = "hlssti" + secrets.token_hex(3)
@@ -1042,16 +1059,16 @@ _LFI_PAYLOADS = (
 
 
 def path_traversal(ctx, probe) -> bool | None:
-    """Path traversal / LFI across forms, discovered query params, and common filename params on
-    includable-looking GET routes. Injects absolute / relative / encoded / null-byte / php-wrapper
-    payloads for /etc/passwd and win.ini; fires on the file's content signature. N/A when no surface."""
+    """Path traversal / LFI across forms, discovered query params, common filename params on
+    includable-looking GET routes, and JSON API bodies. Injects absolute / relative / encoded / null-byte /
+    php-wrapper payloads for /etc/passwd and win.ini; fires on the file's content signature. N/A when no surface."""
     # LFI is a GET-filename vuln -> test query params + includable routes FIRST, forms last, so a large
     # form set can't exhaust the budget before the real vector (a ?page=/?file=) is reached.
     q = [(e.raw_path, "get", list(e.query_params)) for e in ctx.profile.endpoints
          if e.method.lower() == "get" and e.query_params]
     incl = [(rt, "get", list(_LFI_PARAMS)) for rt in ctx.profile.routes if _INCLUDABLE.search(rt)]
     forms = [(f.action, (f.method or "get").lower(), list(f.fields)) for f in ctx.profile.forms if f.fields]
-    targets = q + incl + forms
+    targets = q + incl + forms + _json_body_targets(ctx.profile)   # + JSON API bodies (SPA sink)
     if not targets:
         return None
     budget = probe.probe.get("max_attempts", 200)
