@@ -15,7 +15,7 @@ from . import auth, secretscan
 from .aggregate import compute_axis_slop, compute_slop_score, coverage_metrics
 from .deploy import Deployer
 from .discovery import discover, surface_metrics
-from .net import make_client
+from .net import make_client, set_trace_probe, start_trace
 from .probes import MATCHERS, PREDICATES, _repro_from_resp, describe
 from .schema import Form, Outcome, Probe, Profile, Report
 
@@ -180,7 +180,7 @@ def _run_probe(probe: Probe, ctx: _Ctx, client: httpx.Client, profile: Profile) 
 
 def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_progress=None,
         source_dir=None, seed_features=None, cached_profile=None, on_profile=None, perceive=None,
-        browser_register=None, recon: bool = False, auth_crawl: bool = False) -> Report:
+        browser_register=None, recon: bool = False, auth_crawl: bool = False, trace: bool = False) -> Report:
     """on_progress(done, total, probe, outcomes): called twice per probe — before it runs with
     outcomes=None (so a caller can show what's currently testing), and after with its outcomes.
 
@@ -210,9 +210,13 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
         # from it, but probes construct base_url + "/probe/path" and need the bare origin). profile.base_url
         # is already normalized to the origin by discover().
         origin = profile.base_url or handle.base_url
+        trace_sink = start_trace(trace)   # always reset (clears any stale sink); None when trace off. BEFORE
+        #                                   make_client so the shared declarative client is hooked too.
         with make_client(origin, headers, timeout=15.0, follow_redirects=True) as client:
             ctx = _Ctx(origin, client, profile, headers, browser_register=browser_register)
             for i, probe in enumerate(catalog):
+                if trace:
+                    set_trace_probe(probe.id)                  # tag every request this probe makes (fired or not)
                 if on_progress:
                     on_progress(i, total, probe, None)              # starting probe i (0-indexed)
                 try:
@@ -230,7 +234,7 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
             outcomes.append(_source_secret_outcome(source_dir))
         return Report(slop_score=compute_slop_score(outcomes), outcomes=outcomes,
                       axis_slop=compute_axis_slop(outcomes), surface=surface_metrics(profile),
-                      coverage=coverage_metrics(outcomes))
+                      coverage=coverage_metrics(outcomes), trace=trace_sink or [])
     finally:
         deployer.teardown()
 

@@ -129,6 +129,13 @@ def audit(recs, probe_id):
                         print(f"        -> {' · '.join(resp)}")
                 if ev:   # measurements (cwv/dos timings, a11y rules, ...) — the observational-probe "repro"
                     print(f"      evidence={json.dumps(ev)[:400]}")
+    # --trace runs carry a per-probe request log (fired OR clean OR n/a) — show what this probe actually SENT,
+    # not just the finding that fired. Every request as a copy-pasteable curl + its status.
+    traced = [(r, t) for r in recs for t in (r.get("trace") or []) if t.get("probe") == probe_id]
+    if traced:
+        print(f"\n  --- request trace: {len(traced)} request(s) {probe_id} sent (--trace runs) ---")
+        for r, t in traced:
+            print(f"      $ {_curl(t)}   -> {t.get('status')}")
     print(f"\n  {probe_id} fired in {hits} app(s)."
           f"{'' if any(True for r in recs for f in r.get('findings', []) if f['probe_id'] == probe_id and (f.get('evidence') or {}).get('repro')) else '  (no repro records — re-grade to capture replayable requests)'}")
 
