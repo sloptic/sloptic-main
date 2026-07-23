@@ -1025,6 +1025,121 @@ def back_button_broken(base_url: str, headers=None, timeout: float = 12.0) -> st
         return "inconclusive"
 
 
+def _fp_sim(a: frozenset, b: frozenset) -> float:
+    u = a | b
+    return len(a & b) / len(u) if u else 0.0
+
+
+def deep_link_broken(base_url: str, routes, headers=None, timeout: float = 12.0, max_routes: int = 8):
+    """FRESH-navigate (goto, not in-app) to a guaranteed-nonexistent route to capture the app's FALLBACK render
+    (home / 404 / blank), then fresh-navigate to each discovered route; return ('broken', route) for the first
+    that renders ~identically to the fallback (>= 0.92 word-set similarity -> no route-specific content, so a
+    shared/bookmarked link is dead), else ('ok', None) or ('inconclusive', None). Tests the bookmarked-link
+    path a catch-all host's 200 shell hides from an HTTP-only check."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return ("inconclusive", None)
+    try:
+        with sync_playwright() as pw:
+            b = _launch(pw)
+            if b is None:
+                return ("inconclusive", None)
+            try:
+                page = b.new_page()
+                _apply_auth(page, base_url, headers)
+                base = base_url.rstrip("/")
+                fp_bogus = frozenset()
+                with contextlib.suppress(Exception):
+                    page.goto(base + "/hl-nonexistent-9z1x-deeplink", timeout=timeout * 1000, wait_until="load")
+                    page.wait_for_timeout(400)
+                    fp_bogus = _view_fp(page)
+                if len(fp_bogus) < 3:
+                    return ("inconclusive", None)          # fallback renders nothing -> can't compare reliably
+                tested = 0
+                for route in list(routes)[:max_routes]:
+                    fp_r = frozenset()
+                    with contextlib.suppress(Exception):
+                        page.goto(base + route, timeout=timeout * 1000, wait_until="load")
+                        page.wait_for_timeout(400)
+                        fp_r = _view_fp(page)
+                    if len(fp_r) < 3:
+                        continue                            # this route rendered blank (slow load?) -> skip, conservative
+                    tested += 1
+                    if _fp_sim(fp_r, fp_bogus) >= 0.92:     # renders the same as a nonexistent route
+                        return ("broken", route)
+                return (("ok" if tested else "inconclusive"), None)
+            finally:
+                b.close()
+    except Exception:
+        return ("inconclusive", None)
+
+
+_ERROR_WORDS = re.compile(r"\b(error|failed|failure|invalid|try again|went wrong|unable|couldn'?t|"
+                          r"rejected|not saved|problem|oops|something went)\b", re.I)
+_ANALYTICS_PATH = re.compile(r"analytic|telemetr|/track|/beacon|/collect|/metric|/event\b|sentry|"
+                             r"segment|mixpanel|posthog|/pixel|/log\b", re.I)
+_ERROR_DOM_JS = """() => {
+  const sel = '[class*="error" i],[class*="danger" i],[class*="invalid" i],[role="alert"],'
+            + '[aria-invalid="true"],[class*="toast" i],[class*="notif" i],[class*="alert" i]';
+  for (const el of document.querySelectorAll(sel)) {
+    if (el.offsetParent !== null && (el.innerText || '').trim().length > 0) return true;   // a VISIBLE error UI
+  }
+  return false;
+}"""
+
+
+def silent_failure_on_action(base_url: str, headers=None, timeout: float = 12.0) -> str:
+    """Fill a create/save form, FORCE its submit request to fail (fulfill the same-origin POST/PUT/PATCH with
+    500), and check the app shows a failure indication. Returns 'silent' (the action's request failed but NO
+    error appeared in the DOM — the app silently lost the data or faked success), 'handled' (any error
+    indication appeared), or 'inconclusive' (no form / the submit fired no mutating request / no browser). The
+    forced failure makes the OUTCOME definitively failed (no silent-retry-succeeds to confuse it); analytics/
+    telemetry beacons are excluded, so only the runner-initiated ACTION is tested."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return "inconclusive"
+    try:
+        with sync_playwright() as pw:
+            b = _launch(pw)
+            if b is None:
+                return "inconclusive"
+            try:
+                page = b.new_page()
+                _apply_auth(page, base_url, headers)
+                host = urllib.parse.urlparse(base_url).netloc
+                fired = {"n": 0}
+
+                def _route(route):
+                    with contextlib.suppress(Exception):
+                        req = route.request
+                        pu = urllib.parse.urlparse(req.url)
+                        if req.method in ("POST", "PUT", "PATCH") and (not pu.netloc or pu.netloc == host) \
+                                and not _ANALYTICS_PATH.search(pu.path):
+                            fired["n"] += 1                       # the runner-initiated mutating action -> fail it
+                            return route.fulfill(status=500, content_type="application/json", body='{"error":"hl-forced"}')
+                    with contextlib.suppress(Exception):
+                        return route.continue_()
+
+                page.route("**/*", _route)                        # set BEFORE goto: page-load GETs pass through
+                with contextlib.suppress(Exception):
+                    page.goto(base_url.rstrip("/") + "/", timeout=timeout * 1000, wait_until="load")
+                if not _fill_create_form(page, "hlnoerr"):
+                    return "inconclusive"                         # no create form to submit
+                page.wait_for_timeout(1600)                       # settle: propagate the failure + render any error
+                if fired["n"] == 0:
+                    return "inconclusive"                         # the submit fired no mutating request -> nothing failed
+                shown = False
+                with contextlib.suppress(Exception):
+                    shown = bool(_ERROR_WORDS.search(page.inner_text("body") or "")) or bool(page.evaluate(_ERROR_DOM_JS))
+                return "handled" if shown else "silent"
+            finally:
+                b.close()
+    except Exception:
+        return "inconclusive"
+
+
 def stored_xss_executes(base_url: str, paths, headers=None, total_timeout: float = 45.0, max_pages: int = 20) -> bool:
     """Render each path PLAIN — NO injection, because an XSS payload was already STORED server-side via an API
     write — and return True if it EXECUTES: the app reflected the stored value unescaped into the DOM and it

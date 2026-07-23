@@ -1,0 +1,16 @@
+id: qa-deeplink-001
+bundle: qa
+category: ui-honesty   # the UI-state-honesty bundle
+pool: public
+evidence_model: provable
+penalty: 15   # every shared/bookmarked link is dead — the app works from home but not from a deep link.
+              # Moderate UX-functional severity (above a dead back button, below a total non-render).
+applicability:
+  requires: [browser]   # must render to see whether the client paints the route; N/A without --browser
+probe:
+  predicate: deep_link_shell
+  # The INVERSE of the fallback-host suppression: there we suppress firing on a correct 200 shell; here we
+  # check the 200 actually RESOLVES to the right view. REUSE _catch_all_sig (the same host profile) — only a
+  # catch-all/SPA host qualifies (a 200-status check can't see this; the route 'works' but the client never
+  # paints it). Render a guaranteed-nonexistent route as the fallback, render each discovered route, and fire
+  # when a real route renders ~identically to the fallback. Self-N/A on honest-404 hosts / no app route.

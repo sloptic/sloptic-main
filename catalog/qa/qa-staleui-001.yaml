@@ -1,6 +1,6 @@
 id: qa-staleui-001
 bundle: qa
-category: stale-ui
+category: ui-honesty   # the UI-state-honesty bundle (with qa-backnav/chunk/deeplink/noerror)
 pool: public
 evidence_model: provable
 penalty: 20   # the write IS durable (recoverable by refresh), so below silent-data-loss (34) — but a

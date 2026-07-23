@@ -916,6 +916,67 @@ def dead_bundle_chunk(ctx, probe) -> bool | None:
         return False
 
 
+def deep_link_shell(ctx, probe) -> bool | None:
+    """Broken deep link on an SPA (UI-state honesty): a client-side route requested DIRECTLY — a shared/
+    bookmarked link, fresh nav — renders only the app's shell/fallback, not its own content. ONLY on a
+    catch-all host (REUSE _catch_all_sig, not a second detector): it serves a 200 shell for any path, so an
+    HTTP-status check (broken-links) can't see this — the route 'works' at the HTTP layer but the client never
+    paints it. Render a guaranteed-nonexistent route as the fallback baseline + each discovered route; fire
+    when a real route renders ~identically to the fallback. N/A on an honest-404 host (broken-links covers
+    those), without a browser, or with no non-root app route."""
+    if _catch_all_sig(ctx) is None:
+        ctx.evidence["na_reason"] = "not a catch-all/SPA host — a broken deep link is an honest 404 (broken-links covers it)"
+        return None
+    routes = [r for r in ctx.profile.routes
+              if r not in ("/", "") and not r.startswith(("/_next/", "/static/", "/assets/"))
+              and not r.split("?")[0].endswith((".js", ".css", ".png", ".svg", ".ico", ".json", ".woff2", ".map"))]
+    if not routes:
+        ctx.evidence["na_reason"] = "no non-root app route to deep-link test"
+        return None
+    verdict, route = browser.deep_link_broken(ctx.base_url, routes, headers=ctx.headers)
+    if verdict == "broken":
+        ctx.evidence.update(broken_deeplink=True, route=route)
+        return True   # a direct load of a real route rendered only the shell/fallback -> the deep link is dead
+    if verdict == "ok":
+        ctx.evidence.update(broken_deeplink=False)
+        return False
+    ctx.evidence["na_reason"] = "couldn't render routes to compare (no browser / blank fallback / all routes blank)"
+    return None
+
+
+def no_error_state(ctx, probe) -> bool | None:
+    """Silent failure / no error state (UI-state honesty — the opposite failure mode of qa-errhyg's overshare):
+    a runner-initiated action (create/save form submit) whose request is FORCED to fail shows NO failure
+    indication in the DOM — the app silently lost the user's data and told them nothing (or faked success).
+    The forced failure makes the OUTCOME definitively failed, so a silent-retry-that-succeeds can't confuse it;
+    ANY indication (message / red field / toast) counts as handled — we grade that an apology exists, not its
+    quality. N/A without a browser or a create form whose submit fires a mutating request."""
+    if auth.create_form(ctx.profile.forms) is None:
+        ctx.evidence["na_reason"] = "no create/save form to submit-and-fail"
+        return None
+    hdrs = dict(ctx.headers or {})   # authenticate the page if we hold a session (the form is usually gated)
+    account = ctx.register(suffix="_noerr")
+    if account is not None and not account.provided:
+        cookie = "; ".join("%s=%s" % (c.name, c.value) for c in account.client.cookies.jar)
+        if cookie:
+            hdrs["Cookie"] = cookie
+        authz = account.client.headers.get("Authorization")
+        if authz:
+            hdrs["Authorization"] = authz
+    try:
+        verdict = browser.silent_failure_on_action(ctx.base_url, headers=hdrs or None)
+    finally:
+        if account is not None:
+            account.client.close()
+    ctx.evidence.update(verdict=verdict)
+    if verdict == "silent":
+        return True   # the action's request failed and the app showed the user nothing -> silent data loss
+    if verdict == "handled":
+        return False
+    ctx.evidence["na_reason"] = "no create form submitted a mutating request to fail (client-only / no browser)"
+    return None
+
+
 # OS command injection — comprehensive coverage: shell separators (; | || && newline), command
 # substitution ($(...) and backticks), and a blind time-based fallback; one finding. Precision: the
 # marker is the RESULT of a shell-evaluated arithmetic expr (13*13 -> 169) — it appears ONLY if a shell
@@ -3959,6 +4020,8 @@ PREDICATES = {
     "stored_xss_api": stored_xss_api,
     "back_nav_broken": back_nav_broken,
     "dead_bundle_chunk": dead_bundle_chunk,
+    "deep_link_shell": deep_link_shell,
+    "no_error_state": no_error_state,
     "weak_session_id": weak_session_id,
     "api_bola": api_bola,
     "api_bola_collection": api_bola_collection,
@@ -4042,6 +4105,8 @@ _PREDICATE_REASONS = {
     "stored_xss_api": "a value stored via the JSON API executed unescaped when the page rendered it (stored XSS)",
     "back_nav_broken": "the browser back button did not return to the prior in-app view (broken SPA history handling)",
     "dead_bundle_chunk": "the served HTML references a JS bundle that doesn't resolve — the app can't render (stale/dead chunk)",
+    "deep_link_shell": "a client-side route loaded directly renders only the app shell/fallback, not its content (broken deep link)",
+    "no_error_state": "a save/create action failed but the app showed no error — silent data loss (the UI told the user nothing)",
     "weak_session_id": "session identifiers are weak/predictable (short / numeric / sequential)",
     "api_bola": "one account's object (and its secret) was readable by another account (broken object-level auth)",
     "api_bola_collection": "an auth-gated list endpoint returns every user's objects, not just the caller's (broken object-level auth at the collection)",

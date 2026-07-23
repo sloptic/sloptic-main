@@ -1,0 +1,17 @@
+id: qa-noerror-001
+bundle: qa
+category: ui-honesty   # the UI-state-honesty bundle; the opposite failure mode of qa-errhyg-001 (overshare)
+pool: public
+evidence_model: provable
+penalty: 20   # silent data loss is worse than a stale display (which a refresh fixes) — the user's data is
+              # gone and they don't know. Priced like qa-staleui-001; note qa-errhyg-001 (overshare) is 14,
+              # lower on purpose — the overshare hurts the owner (recon), the undershare hurts the user.
+applicability:
+  requires: [browser]   # must submit an action + inspect the DOM; N/A without --browser
+probe:
+  predicate: no_error_state
+  # Fill a create/save form, FORCE its submit request to fail (fulfill same-origin POST/PUT/PATCH with 500 —
+  # analytics/telemetry excluded), and fire when NO failure indication appears in the DOM after a settle
+  # window (nothing changed, or a success-shaped state). Runner-initiated actions ONLY. The forced failure
+  # makes the OUTCOME definitively failed, so a silent-retry-that-succeeds can't confuse it; any indication
+  # (message / red field / toast) counts as handled — we grade that an apology EXISTS, not its quality.
