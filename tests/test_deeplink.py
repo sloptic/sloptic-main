@@ -75,3 +75,9 @@ def test_clean_when_route_renders_its_own_content():
 @browsermark
 def test_na_without_a_non_root_route():
     assert _run("broken", routes=()) is None      # only "/" -> nothing to deep-link test
+
+
+def test_na_when_routes_are_only_api_or_assets():
+    # /api/* and media aren't client VIEW routes (an API path renders the shell CORRECTLY) -> filtered out ->
+    # nothing left to deep-link test -> N/A, not a fire. No browser needed (filtered before the render).
+    assert _run("broken", routes=("/api/broadcast", "/v1/accounts", "/hero/clip.mp4")) is None

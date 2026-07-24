@@ -916,6 +916,12 @@ def dead_bundle_chunk(ctx, probe) -> bool | None:
         return False
 
 
+_DL_API_ROUTE = re.compile(r"^/(api|v\d+|rest|graphql|graphiql|oauth|rpc|trpc|webhook|\.well-known)(/|$)", re.I)
+_DL_NONVIEW_EXT = (".js", ".mjs", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico", ".json",
+                   ".woff", ".woff2", ".ttf", ".map", ".mp4", ".webm", ".mp3", ".wav", ".mov", ".avi",
+                   ".pdf", ".zip", ".xml", ".txt", ".csv")
+
+
 def deep_link_shell(ctx, probe) -> bool | None:
     """Broken deep link on an SPA (UI-state honesty): a client-side route requested DIRECTLY — a shared/
     bookmarked link, fresh nav — renders only the app's shell/fallback, not its own content. ONLY on a
@@ -927,9 +933,15 @@ def deep_link_shell(ctx, probe) -> bool | None:
     if _catch_all_sig(ctx) is None:
         ctx.evidence["na_reason"] = "not a catch-all/SPA host — a broken deep link is an honest 404 (broken-links covers it)"
         return None
+    # a client-side VIEW route only — NOT an API endpoint or an asset. profile.routes conflates all three:
+    # excluding discovered endpoints + /api-style prefixes + non-view extensions kills the FP where a bare
+    # API path (/api/broadcast, /v1/accounts) or a media asset (.mp4) renders the shell and looks "broken".
+    endpoint_paths = {(e.raw_path or e.path or "").split("?")[0].rstrip("/") for e in ctx.profile.endpoints}
     routes = [r for r in ctx.profile.routes
               if r not in ("/", "") and not r.startswith(("/_next/", "/static/", "/assets/"))
-              and not r.split("?")[0].endswith((".js", ".css", ".png", ".svg", ".ico", ".json", ".woff2", ".map"))]
+              and not _DL_API_ROUTE.search(r)                              # /api,/v1,/graphql,... = endpoint, not a view
+              and r.split("?")[0].rstrip("/") not in endpoint_paths        # discovered as an API endpoint -> not a view
+              and not r.split("?")[0].lower().endswith(_DL_NONVIEW_EXT)]    # a JS/media/doc asset, not a view
     if not routes:
         ctx.evidence["na_reason"] = "no non-root app route to deep-link test"
         return None
