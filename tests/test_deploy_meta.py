@@ -73,6 +73,19 @@ def test_corpus_platform_hosts_count_boundary_is_k():
     assert _corpus_platform_hosts(two + ["https://maybe.example.com/c"]) == {"maybe.example.com"}  # 3 -> inferred
 
 
+def test_anchor_target_is_exempt_from_platform_host_scope_out():
+    # an injected calibration anchor (VAmPI/OopsSec) sits on a shared localhost BY DESIGN — and _host_of strips
+    # the port, so :8084 and :8083 both collapse to host '127.0.0.1', which the corpus's own localhost demo
+    # links push over the frequency threshold. The anchor must be EXEMPT from that scope-out, else it DNFs.
+    inferred = {"127.0.0.1"}                                        # 127.0.0.1 inferred a platform (localhost demos)
+    vampi = "http://127.0.0.1:8084"
+    assert _non_app_url(vampi, inferred) is not None               # a plain url on that host -> scoped out (DNF)
+    assert _non_app_url(vampi, inferred, is_anchor=True) is None   # the anchor -> exempt, stays gradeable
+    # the exemption is ONLY the platform scope-out — reachability still bites, so a DOWN anchor is honestly
+    # dead (never scored as if alive):
+    assert _dead_url_reason("http://127.0.0.1:1/", timeout=3, is_anchor=True).startswith("unreachable")
+
+
 def test_run_batch_forwards_inferred_platform_hosts_to_url_children_only():
     # WIRING: run_batch computes the corpus-inferred platform set once, then _build_cmd forwards it to each
     # URL child via --platform-host (repeatable) so the child DNFs it through the SAME reason path as an

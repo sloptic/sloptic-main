@@ -991,12 +991,18 @@ def _corpus_platform_hosts(urls, min_count=_CORPUS_PLATFORM_MIN_COUNT):
     return inferred
 
 
-def _non_app_url(url: str, platform_hosts=None):
+def _non_app_url(url: str, platform_hosts=None, is_anchor=False):
     """A source / notebook / doc / video link OR a third-party platform's own content page rather than the
     team's deployed app -> reason (else None). *.github.io is a deployed GitHub Pages site -> gradeable.
     `platform_hosts`: an optional set of corpus-inferred platform hosts (from _corpus_platform_hosts) — a URL
     whose full host is in it is scoped out with the SAME reason-string DNF path as an enumerated
-    _PLATFORM_PAGE_HOST match, so the two platform sources (enumerated + inferred) compose, not diverge."""
+    _PLATFORM_PAGE_HOST match, so the two platform sources (enumerated + inferred) compose, not diverge.
+    `is_anchor`: an injected calibration anchor (project=anchor-*) is a KNOWN-GOOD target we placed on
+    purpose — deliberately on a shared host (localhost Docker), so the 'recurring host = platform' heuristic
+    must NOT scope it out. It stays subject to the reachability check in _dead_url_reason (a down anchor is
+    still honestly dead), just is never itself classified a 'non-app'."""
+    if is_anchor:
+        return None
     host = _host_of(url)
     if host == "github.io" or host.endswith(".github.io"):
         return None
@@ -1008,13 +1014,15 @@ def _non_app_url(url: str, platform_hosts=None):
     return "source / notebook / doc link, not a deployed app" if _NON_APP_HOST.match(url) else None
 
 
-def _dead_url_reason(url: str, render=None, timeout: float = 10.0, platform_hosts=None):
+def _dead_url_reason(url: str, render=None, timeout: float = 10.0, platform_hosts=None, is_anchor=False):
     """Returns a reason string if `url` is NOT a working deployment, else None. A NOTE, not a grade — so a
     dead demo link is counted honestly instead of grading a 404 page or crashing the batch child. Catches:
     a source/notebook/doc link (not a deployed app), a third-party / corpus-inferred platform page
     (`platform_hosts`, see _corpus_platform_hosts), unreachable / 4xx-5xx entry / host placeholder shell /
-    coming-soon-maintenance splash (static), and — with `render` — a client-side 404 or rendered placeholder."""
-    non_app = _non_app_url(url, platform_hosts)
+    coming-soon-maintenance splash (static), and — with `render` — a client-side 404 or rendered placeholder.
+    `is_anchor` exempts an injected calibration anchor from the platform-host scope-out (NOT the reachability
+    check — a down anchor still returns 'unreachable') — see _non_app_url."""
+    non_app = _non_app_url(url, platform_hosts, is_anchor)
     if non_app:
         return non_app
     try:
@@ -1171,6 +1179,10 @@ def main():
                      f"  or grade static-only (skips a11y/console/CWV/dead-controls/dom-xss):  add --no-browser")
 
     meta = json.loads(args.meta) if args.meta.strip() else {}
+    # an injected calibration anchor (project=anchor-*, e.g. VAmPI/OopsSec) sits on a shared localhost by
+    # design, so it skips the corpus 'recurring host = platform' scope-out — but stays subject to the
+    # reachability check (a down anchor is still honestly dead). See _non_app_url.
+    is_anchor = str(meta.get("project", "")).startswith("anchor-")
     # source: the LENS this grade is — "repo" (our controlled Docker deploy, dummy keys, powers the
     # reproducibility metric) vs "url" (their live deployment, real keys + full surface but their infra
     # headers). A submission can be graded BOTH ways; stats keep the two separate — never blended.
@@ -1197,7 +1209,7 @@ def main():
             # link-rot is common -> don't grade a dead deployment's 404 shell. With the browser on, this
             # also catches a client-side 404 (SPA renders 'not found' at HTTP 200) via a one-route render.
             dead = _dead_url_reason(url, render=(browser.render_routes if args.browser else None),
-                                    platform_hosts=set(args.inferred_platform_hosts or []))
+                                    platform_hosts=set(args.inferred_platform_hosts or []), is_anchor=is_anchor)
             if dead:
                 result["dead_url"] = True                         # counted as "url does not work" (deployed=False)
                 result["deploy_error"] = f"URL DEAD — {dead}"
