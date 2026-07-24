@@ -867,12 +867,12 @@ def back_nav_broken(ctx, probe) -> bool | None:
     restore the prior view — the SPA router hijacked history without a pushState. Binary, intent-independent
     (no app wants a dead back button), needs no create flow, applies to nearly any SPA with in-app links.
     N/A without a browser or an in-app route link to exercise."""
-    verdict = browser.back_button_broken(ctx.base_url, headers=ctx.headers)
+    verdict, detail = browser.back_button_broken(ctx.base_url, headers=ctx.headers)
     if verdict == "broken":
-        ctx.evidence.update(back_broken=True)
+        ctx.evidence.update(back_broken=True, **detail)   # nav_link + entry/after-click/after-back URLs -> auditable
         return True   # BACK did not restore the entry view -> broken history handling
     if verdict == "ok":
-        ctx.evidence.update(back_broken=False)
+        ctx.evidence.update(back_broken=False, **detail)
         return False
     ctx.evidence["na_reason"] = "no in-app navigation to test (single-view app / no router link / no browser)"
     return None

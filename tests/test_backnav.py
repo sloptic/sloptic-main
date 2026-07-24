@@ -53,7 +53,7 @@ def _run(mode):
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     url = "http://127.0.0.1:%d" % srv.server_address[1]
     try:
-        return browser.back_button_broken(url)
+        return browser.back_button_broken(url)[0]   # (verdict, detail) -> verdict
     finally:
         srv.shutdown()
 

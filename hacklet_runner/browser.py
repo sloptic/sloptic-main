@@ -965,64 +965,70 @@ def _view_fp(page) -> frozenset:
     return frozenset()
 
 
-def back_button_broken(base_url: str, headers=None, timeout: float = 12.0) -> str:
+def back_button_broken(base_url: str, headers=None, timeout: float = 12.0):
     """Navigate IN-APP from the entry view to another route (click a same-origin router link — NOT a fresh
     goto, which the browser's own history would always restore), fire the browser BACK button, and check the
-    app returns — by URL AND displayed content. Returns 'broken' (BACK did not restore the entry view — the
-    SPA router hijacked history / has no popstate handler), 'ok', or 'inconclusive' (no in-app navigation to
-    test / no browser). Binary, intent-independent (no app wants a dead back button), no create flow."""
+    app returns — by URL AND displayed content. Returns (verdict, detail): verdict is 'broken' (BACK did not
+    restore the entry view — the SPA router hijacked history / has no popstate handler), 'ok', or
+    'inconclusive' (no in-app navigation / no browser); detail carries the nav link + entry/after-click/
+    after-back URLs + the restore signals, so a fired result is AUDITABLE, not an opaque boolean."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
-        return "inconclusive"
+        return "inconclusive", {}
     try:
         with sync_playwright() as pw:
             b = _launch(pw)
             if b is None:
-                return "inconclusive"
+                return "inconclusive", {}
             try:
                 page = b.new_page()
                 _apply_auth(page, base_url, headers)
+                detail = {}
                 page.goto(base_url.rstrip("/") + "/", timeout=timeout * 1000, wait_until="load")
                 url_a, fa = page.url.rstrip("/"), _view_fp(page)
+                detail["entry_url"] = url_a
                 host = urllib.parse.urlparse(base_url).netloc
-                link = None
+                link, href_used = None, None
                 with contextlib.suppress(Exception):
                     for a in page.query_selector_all("a[href]"):
                         href = (a.get_attribute("href") or "").strip()
                         if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
                             continue
-                        pu = urllib.parse.urlparse(urllib.parse.urljoin(page.url, href))
+                        resolved = urllib.parse.urljoin(page.url, href)
+                        pu = urllib.parse.urlparse(resolved)
                         if pu.netloc and pu.netloc != host:
                             continue                                    # external link
-                        if urllib.parse.urljoin(page.url, href).rstrip("/") == url_a \
-                                or _NO_CLICK.search((a.inner_text() or "")[:60].lower()):
+                        if resolved.rstrip("/") == url_a or _NO_CLICK.search((a.inner_text() or "")[:60].lower()):
                             continue                                    # same page, or logout/destructive
                         if a.is_visible():
-                            link = a
+                            link, href_used = a, (pu.path or href)
                             break
                 if link is None:
-                    return "inconclusive"                               # no in-app route link to exercise
+                    return "inconclusive", detail                       # no in-app route link to exercise
+                detail["nav_link"] = href_used
                 with contextlib.suppress(Exception):
                     link.click(timeout=3000)
                     page.wait_for_load_state("networkidle", timeout=5000)
                     page.wait_for_timeout(300)
                 url_b, fb = page.url.rstrip("/"), _view_fp(page)
+                detail["after_click_url"] = url_b
                 a_only, b_only = fa - fb, fb - fa
                 if url_b == url_a and not b_only:
-                    return "inconclusive"                               # the click didn't change the view
+                    return "inconclusive", detail                       # the click didn't change the view
                 with contextlib.suppress(Exception):
                     page.go_back(timeout=5000)
                     page.wait_for_load_state("load", timeout=5000)
                     page.wait_for_timeout(300)
                 url_c, fc = page.url.rstrip("/"), _view_fp(page)
+                content_restored = len(fc & a_only) >= len(fc & b_only)
+                detail.update(after_back_url=url_c, url_restored=(url_c == url_a), content_restored=content_restored)
                 # restored = the entry URL is back AND A's distinctive content returned (not still showing B's)
-                restored = url_c == url_a and len(fc & a_only) >= len(fc & b_only)
-                return "ok" if restored else "broken"
+                return ("ok" if (url_c == url_a and content_restored) else "broken"), detail
             finally:
                 b.close()
     except Exception:
-        return "inconclusive"
+        return "inconclusive", {}
 
 
 def _fp_sim(a: frozenset, b: frozenset) -> float:
