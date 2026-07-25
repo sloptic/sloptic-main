@@ -118,6 +118,10 @@ _NO_CLICK = re.compile(
     r"send\b|publish|invite|download|share|tweet|facebook|instagram|external|https?://", re.I)
 
 
+_MAX_REVEALED = 120   # bound the appended fragment: with a[href] in the harvest, a link-heavy nav could
+#                       otherwise paste hundreds of elements onto every route's dom
+
+
 def _reveal_hidden_controls(page, max_clicks: int = 6, per_wait_ms: int = 350) -> str:
     """Click reveal-intent controls (login / upload / menu triggers) to surface INTERACTION-GATED forms
     and inputs a static render misses, and return the revealed <form>/modal HTML (appended to the route's
@@ -125,7 +129,12 @@ def _reveal_hidden_controls(page, max_clicks: int = 6, per_wait_ms: int = 350) -
     control (_NO_CLICK), so it opens UI without acting on the app; bounded by max_clicks + an Escape reset
     between clicks so one page can't loop or drift far from its initial state."""
     revealed, seen, clicked = [], set(), 0
-    _controls = "input, textarea, select, form"
+    # `a[href]` is here for a reason worth spelling out: harvesting only form controls made this pass blind to
+    # interaction-gated ROUTES. Measured on OopsSec, clicking the account menu reveals <a href="/wishlists">
+    # and <a href="/cart"> — live 200 pages — and dropping them broke the whole chain downstream: no route
+    # means no page chunk fetched, which means /api/wishlists is never mined, which means the IDOR family has
+    # no target and reports clean. Route discovery gates chunk discovery gates endpoint discovery.
+    _controls = "input, textarea, select, form, a[href]"
     with contextlib.suppress(Exception):   # baseline: controls already present -> append only NEWLY revealed
         for h in (page.eval_on_selector_all(_controls, "els => els.map(e => e.outerHTML)") or []):
             seen.add(h[:160])
@@ -156,7 +165,7 @@ def _reveal_hidden_controls(page, max_clicks: int = 6, per_wait_ms: int = 350) -
         with contextlib.suppress(Exception):   # controls that APPEARED since baseline (a revealed login/upload)
             for frag in (page.eval_on_selector_all(_controls, "els => els.map(e => e.outerHTML)") or []):
                 key = frag[:160]
-                if key not in seen:
+                if key not in seen and len(revealed) < _MAX_REVEALED:
                     seen.add(key)
                     revealed.append(frag)
         with contextlib.suppress(Exception):   # close a modal so the next trigger stays clickable
