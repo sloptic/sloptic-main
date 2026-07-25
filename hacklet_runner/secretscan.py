@@ -13,6 +13,8 @@ lockfiles, minified/binary, `*.example` configs, documented placeholders like AW
 """
 from __future__ import annotations
 
+import base64
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,7 +25,11 @@ from pathlib import Path
 _PROVIDER = [
     # require ACTUAL key material (base64 body + END) between the markers — a bare `-----BEGIN PRIVATE KEY-----`
     # is just a code constant in every crypto/PEM library (`indexOf("-----BEGIN PRIVATE KEY-----")`), NOT a leak.
-    ("private-key", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----[A-Za-z0-9+/=\s]{100,}-----END")),
+    # The body char class admits a literal BACKSLASH because a service-account PEM usually arrives inside JSON
+    # with escaped newlines: firebase-adminsdk-*.json / GCP service account keys store the key as
+    # "private_key": "-----BEGIN PRIVATE KEY-----\\nMIIE...". Without it we caught a PEM in a .pem file and were
+    # blind to the same key in the JSON form almost every app actually ships.
+    ("private-key", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----[A-Za-z0-9+/=\s\\]{100,}-----END")),
     ("aws-access-key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
     ("stripe-secret", re.compile(r"\b(?:sk|rk)_live_[0-9A-Za-z]{16,}\b")),
     ("stripe-test-secret", re.compile(r"\bsk_test_[0-9A-Za-z]{16,}\b")),
@@ -81,6 +87,29 @@ _PLACEHOLDER = re.compile(
 )
 
 
+# THE Supabase leak, and a regex cannot see it. An anon key and a service_role key are both JWTs beginning
+# `eyJ`, the same length, and visually identical — but the anon key is PUBLIC BY DESIGN (correctly excluded
+# above) while service_role bypasses Row Level Security entirely and hands an anonymous visitor full read/write
+# on the database. The difference lives in the base64 PAYLOAD: {"role":"anon"} vs {"role":"service_role"}.
+# Decoding is enough; no signature verification is needed, because we are reading the app's own claim about
+# which key it shipped. This is the flagship 2026 vibe-coding failure (RLS off + a service key in client JS).
+_JWT = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.([A-Za-z0-9_-]{8,})\.[A-Za-z0-9_-]{6,}")
+_PRIVILEGED_JWT_ROLES = {"service_role"}
+
+
+def _privileged_jwt(text: str) -> bool:
+    """A JWT in this text whose own payload claims a privileged backend role."""
+    for m in _JWT.finditer(text or ""):
+        seg = m.group(1)
+        try:
+            payload = json.loads(base64.urlsafe_b64decode(seg + "=" * (-len(seg) % 4)))
+        except Exception:
+            continue
+        if isinstance(payload, dict) and str(payload.get("role", "")).lower() in _PRIVILEGED_JWT_ROLES:
+            return True
+    return False
+
+
 def _looks_secret(v: str) -> bool:
     if _PLACEHOLDER.search(v) or "example" in v.lower():
         return False
@@ -132,6 +161,10 @@ def _scan_text(text: str, rel: str) -> list[SecretFinding]:
             if v and _looks_secret(v) and not (bare and _WORDY.match(bare)):
                 name = re.sub(r"[_-]", "_", m.group("name").lower())
                 out.append(SecretFinding(rel, i, "hardcoded-" + name, _mask(v)))
+        # a committed .env / config can hold the service_role key just as a bundle can, and _ASSIGN would
+        # only ever call it "hardcoded-key" without knowing it is the one that bypasses RLS entirely
+        if _privileged_jwt(line):
+            out.append(SecretFinding(rel, i, "supabase-service-role-key", _mask(line.strip()[:60])))
     return out
 
 
@@ -146,6 +179,8 @@ def scan_blob(text: str) -> list[str]:
         m = pat.search(text)
         if m and "example" not in m.group(0).lower():
             kinds.add(kind)
+    if _privileged_jwt(text):
+        kinds.add("supabase-service-role-key")
     return sorted(kinds)
 
 
