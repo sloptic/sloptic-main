@@ -66,6 +66,8 @@ def _results_index(results_path):
             continue
         with contextlib.suppress(json.JSONDecodeError):
             r = json.loads(line)
+            if not isinstance(r, dict):
+                continue   # a valid JSON scalar is not a record; .get would raise and abort the whole batch
             t = r.get("repo")
             if t is None:
                 continue
@@ -174,6 +176,24 @@ def _record_wedge(results, rec, secs, target, source, extra=None):
 _active: dict = {}                # pid -> Popen, so a KeyboardInterrupt can SIGKILL every in-flight child
 _active_lock = threading.Lock()
 _print_lock = threading.Lock()    # serialize a captured job's output block so concurrent logs don't garble
+_throttle_lock = threading.Lock()
+_next_start = [0.0]               # monotonic time the next job may START (see _throttle)
+
+
+def _throttle(delay: float) -> None:
+    """Space out job STARTS by `delay` seconds across ALL workers (a global minimum gap, so it throttles at
+    any --concurrency, not just 1). For a shared host — a benchmark, a platform, one team's many apps — the
+    grader's own volume is the problem: ~55 probes per app with injection fan-out is several hundred requests
+    a minute from one IP, which reads as an attack to a WAF (Vercel answers with a JS bot challenge our
+    client can't solve, so EVERY later request 403s and the run dies). Politeness, and self-preservation."""
+    if delay <= 0:
+        return
+    with _throttle_lock:
+        now = time.monotonic()
+        wait = max(0.0, _next_start[0] - now)
+        _next_start[0] = max(now, _next_start[0]) + delay
+    if wait:
+        time.sleep(wait)
 
 
 # --- --tldr: one compact line per app instead of the full grading dump -----------------------------------
@@ -268,6 +288,8 @@ def _build_cmd(j, args, ckpt):
         cmd += ["--controlled-deploy"]
     if getattr(args, "login", None):
         cmd += ["--login", args.login]
+    for pat in (getattr(args, "probe", None) or ()):   # subset the catalog per target (recall runs)
+        cmd += ["--probe", pat]
     if args.llm_reasoning:
         cmd += ["--llm-reasoning"]
     for h in (args.headers or []):
@@ -289,6 +311,7 @@ def _run_job(j, idx, total, args, capture, progress=None):
     and prints it as ONE block on completion (concurrent url jobs, so logs don't interleave); capture=False
     streams live (serial repo jobs). Under --tldr the buffered dump is dropped and ONE compact line is printed
     from the child's result record instead. A wedge or error is RECORDED, never fatal to the batch."""
+    _throttle(getattr(args, "delay", 0.0) or 0.0)   # politeness gap before this job's first request
     t0 = time.monotonic()
     rec, target, source = j["rec"], j["target"], j["source"]
     ckpt = pathlib.Path(tempfile.gettempdir()) / "hl-deploy-ckpt.json"
@@ -384,6 +407,18 @@ def main():
     ap.add_argument("--max-pages", type=int, default=25, dest="max_pages",
                     help="safety cap on gallery pages per hackathon (pages auto-fetched to fill --limit)")
     ap.add_argument("--limit", type=int, default=25, help="max repos to grade")
+    ap.add_argument("--probe", metavar="PATTERN", action="append", default=[],
+                    help="forward to deploy_and_grade: grade with ONLY these probes (id glob, "
+                         "bundle:security, category:xss). A recall run over labeled targets costs a "
+                         "fraction of the traffic a full battery does, which is what keeps a shared "
+                         "host's WAF out of the picture. Rows are marked probe_filter (subset score).")
+    ap.add_argument("--delay", type=float, default=0.0, metavar="SECONDS",
+                    help="minimum gap between job STARTS, across all workers — a politeness throttle for a "
+                         "run where every target shares ONE host (a benchmark like GapBench, a platform, one "
+                         "team's apps). A single app applies ~55 probes with injection fan-out = several "
+                         "hundred requests/min from one IP, which a WAF reads as an attack: Vercel answers "
+                         "with a JS bot challenge the grader can't solve, so every later request 403s and the "
+                         "rest of the run records URL DEAD. Irrelevant for a normal corpus (one host per app).")
     ap.add_argument("--no-interleave", dest="no_interleave", action="store_true",
                     help="grade slug-by-slug (drain each hackathon fully before the next) instead of the "
                          "default breadth-first round-robin. Default cycles across slugs so any partial/killed "
