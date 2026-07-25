@@ -23,7 +23,7 @@ _CATALOG = pathlib.Path(__file__).resolve().parent.parent / "catalog"
 def test_index_is_inverted_from_the_scorers_own_table():
     # one table for both directions, so a run can never test a class the scorer won't credit (or vice versa)
     from gapbench_score import _CWE_BY_CATEGORY
-    idx = build_index(_CATALOG)
+    idx, _nb, _na = build_index(_CATALOG)
     assert "CWE-89" in idx and any(p.startswith("sec-sqli-") for p in idx["CWE-89"])
     assert "CWE-79" in idx and any(p.startswith("sec-xss-") or p.startswith("sec-domxss") for p in idx["CWE-79"])
     assert "CWE-288" in idx and "sec-authbypass-001" in idx["CWE-288"]      # the probe override is honoured
@@ -31,7 +31,7 @@ def test_index_is_inverted_from_the_scorers_own_table():
 
 
 def test_declared_cwes_resolve_to_a_small_targeted_set():
-    idx = build_index(_CATALOG)
+    idx, _nb, _na = build_index(_CATALOG)
     sqli = probes_for_cwes(["CWE-89"], idx)
     assert sqli and all(p.startswith("sec-sqli-") for p in sqli)
     assert probes_for_cwes([], idx) == [] and probes_for_cwes(None, idx) == []
@@ -40,6 +40,20 @@ def test_declared_cwes_resolve_to_a_small_targeted_set():
     man = json.load(open(_CATALOG.parent / "validation/vuln-corpus/gapbench-manifest.json"))["scenarios"]
     sizes = sorted(len(probes_for_cwes(s.get("cwes"), idx)) for s in man)
     assert sizes[len(sizes) // 2] <= 6, sizes[len(sizes) // 2]              # median stays small
+
+
+def test_capability_sets_name_what_needs_a_browser_or_a_session():
+    # the render and the self-registration are the two most expensive things a grade does, so they are
+    # per-scenario decisions too, not blanket flags
+    _idx, needs_browser, needs_auth = build_index(_CATALOG)
+    assert "sec-domxss-001" in needs_browser and "sec-xss-002" in needs_browser
+    assert "sec-headers-001" not in needs_browser and "sec-exposure-001" not in needs_browser
+    # declared via has_auth_entrypoint ...
+    assert {"sec-session-001", "sec-idor-004"} <= needs_auth
+    # ... plus the ones that mint their OWN identities without declaring it (the catalog gate under-reports,
+    # and a missing session turns a real test into a silent N/A the scorer would score as a miss)
+    assert {"sec-idor-002", "sec-backend-002", "qa-integrity-001"} <= needs_auth
+    assert "sec-headers-001" not in needs_auth
 
 
 def test_the_estimate_reflects_the_measured_injection_cost():

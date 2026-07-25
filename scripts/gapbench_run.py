@@ -61,14 +61,31 @@ def probes_for_cwes(cwes, cwe2probe) -> list:
     return sorted({pid for w in (cwes or []) for pid in cwe2probe.get(w, ())})
 
 
-def build_index(catalog_dir) -> dict:
-    """CWE -> the probe ids that can evidence it, inverted from gapbench_score's category map (one table, so
-    the runner and the scorer can never disagree about what covers what)."""
+# Probes that need a SESSION but don't declare has_auth_entrypoint, because they mint their own identities
+# (two accounts for a cross-user read, a throwaway for the authed BaaS tier, a create to round-trip). The
+# catalog gate alone would under-report, and a missing session turns a real test into a silent N/A that the
+# scorer would count as a miss.
+_ALSO_NEEDS_AUTH = ("sec-idor-", "sec-backend-002", "qa-integrity-", "sec-upload-", "sec-xss-002")
+
+
+def build_index(catalog_dir):
+    """(cwe -> probe ids, probes needing the browser, probes needing a session).
+
+    The CWE map is inverted from gapbench_score's category table, so the runner and the scorer can never
+    disagree about what covers what. The other two drive per-scenario flags: the browser render and the
+    self-registration are the two most expensive things a grade can do, and most scenarios' selections need
+    neither, so paying for them everywhere is the same waste as running all 86 probes."""
     idx = collections.defaultdict(set)
+    needs_browser, needs_auth = set(), set()
     for p in load_catalog(catalog_dir):
         for w in (_PROBE_OVERRIDES.get(p.id) or _CWE_BY_CATEGORY.get(p.category, ())):
             idx[w].add(p.id)
-    return idx
+        requires = list(getattr(p.applicability, "requires", None) or [])
+        if "browser" in requires:
+            needs_browser.add(p.id)
+        if "has_auth_entrypoint" in requires or p.id.startswith(_ALSO_NEEDS_AUTH) or p.id in _ALSO_NEEDS_AUTH:
+            needs_auth.add(p.id)
+    return idx, needs_browser, needs_auth
 
 
 def already_done(results_path) -> set:
@@ -106,7 +123,7 @@ def main() -> None:
     args = ap.parse_args()
 
     scenarios = json.load(open(args.manifest))["scenarios"]
-    cwe2probe = build_index(args.catalog)
+    cwe2probe, needs_browser, needs_auth = build_index(args.catalog)
     done = already_done(args.results)
 
     plan, skipped, controls = [], [], []
@@ -136,7 +153,13 @@ def main() -> None:
     print(f"  skipped: {', '.join(skipped[:10])}{' ...' if len(skipped) > 10 else ''}\n")
     if args.dry_run:
         for sid, sel in jobs[:15]:
-            print(f"    {sid:<28} {len(sel) or 'FULL':>4}  {','.join(sel[:5])}")
+            caps = ("B" if (not sel) or set(sel) & needs_browser else "-") + \
+                   ("A" if (not sel) or set(sel) & needs_auth else "-")
+            print(f"    {sid:<28} {len(sel) or 'FULL':>4}p {caps}  {','.join(sel[:5])}")
+        nb = sum(1 for _s, sel in jobs if sel and not set(sel) & needs_browser)
+        na = sum(1 for _s, sel in jobs if sel and not set(sel) & needs_auth)
+        print(f"\n  capabilities: {nb} of {len(jobs)} skip the browser render, {na} skip self-registration"
+              f"  (B=browser, A=auth)")
         print("\n  (dry run — nothing sent)\n")
         return
 
@@ -147,6 +170,16 @@ def main() -> None:
                     "--meta", json.dumps({"project": f"anchor-gapbench-{sid}", "hackathon": "gapbench"})]
         for pid in sel:
             cmd += ["--probe", pid]
+        # LEAST PRIVILEGE for the two most expensive capabilities, not just for the probe list. A render costs
+        # every chunk the page loads; a self-registration costs a browser launch plus the signup round trip.
+        # A control (empty selection) keeps both, since it runs the full battery.
+        use_browser = (not sel) or bool(set(sel) & needs_browser)
+        use_auth = (not sel) or bool(set(sel) & needs_auth)
+        if not use_browser:
+            cmd += ["--no-browser"]
+        if use_auth:
+            cmd += ["--browser-auth"]
+        caps = ("B" if use_browser else "-") + ("A" if use_auth else "-")
         t0 = time.monotonic()
         try:
             subprocess.run(cmd, capture_output=True, text=True, timeout=args.grade_timeout + 120)
@@ -165,7 +198,8 @@ def main() -> None:
                         rec = r
         state = ("slop %s" % rec["slop_score"]) if rec and rec.get("slop_score") is not None else (
             str((rec or {}).get("deploy_error") or "no record")[:34])
-        print(f"  [{i}/{len(jobs)}] {sid:<28} {len(sel) or 'FULL':>4}p  {state:<36} ·{time.monotonic()-t0:5.0f}s",
+        print(f"  [{i}/{len(jobs)}] {sid:<28} {len(sel) or 'FULL':>4}p {caps}  {state:<34} "
+              f"·{time.monotonic()-t0:5.0f}s",
               flush=True)
         if i < len(jobs):
             time.sleep(args.delay)
