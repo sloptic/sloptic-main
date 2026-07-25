@@ -155,6 +155,26 @@ def _account_from_headers(base_url: str, headers) -> Account:
                    register_response=httpx.Response(200, request=httpx.Request("GET", base_url)), provided=True)
 
 
+def _carry_secure_cookies_over_http(base_url: str, client: httpx.Client) -> None:
+    """Re-send the jar's session cookies as an explicit Cookie header when the target is PLAINTEXT http.
+
+    httpx STORES a `Secure` cookie but never transmits it over http. So an app that (correctly) marks its
+    session cookie Secure authenticates us, `_has_session` sees the cookie in the jar, and then every authed
+    request goes out anonymous — measured on OopsSec over http://localhost:3000, where the client got 401 on
+    /api/wishlists while the identical cookie sent by hand got 200. Every probe reading the authed surface
+    then reports N/A or clean, which is the worst shape of wrong: invisible.
+
+    Retained is not sent — that distinction is the whole bug. Hoisted here from idor_horizontal /
+    race_resource_ids, which each hand-rolled this same re-send: it belongs to the session, not to a probe.
+    Only for http, so an https target keeps httpx's correct behaviour. sec-session-003 still reports a
+    MISSING Secure flag independently, because it reads the raw Set-Cookie header, not the jar."""
+    if not base_url.lower().startswith("http://") or client.headers.get("Cookie"):
+        return
+    jar = "; ".join("%s=%s" % (c.name, c.value) for c in client.cookies.jar if c.value is not None)
+    if jar:
+        client.headers["Cookie"] = jar
+
+
 def _session_from_client(client: httpx.Client, response: httpx.Response) -> dict:
     """The live session established on `client` (+ its login `response`) as REPLAYABLE headers: a Cookie of
     the session cookies in the jar (fall back to all cookies), and/or a Bearer from the response body/header."""
@@ -237,12 +257,18 @@ def register_account(base_url: str, profile: Profile, suffix: str = "", browser_
             if acct is not None:
                 acct.client.close()
             acct = json_acct
-    if _has_session(acct) or browser_register is None:
+    if _has_session(acct):
+        _carry_secure_cookies_over_http(base_url, acct.client)
+        return acct
+    if browser_register is None:
         return acct
     caps = profile.capabilities
     if _password_form(profile.forms) is None and not (caps.get("login_trigger") or caps.get("signup_trigger")):
         return acct   # no auth surface at all -> don't spend a browser launch
-    return _register_via_browser(base_url, browser_register) or acct
+    out = _register_via_browser(base_url, browser_register) or acct
+    if out is not None:
+        _carry_secure_cookies_over_http(base_url, out.client)   # the browser path lands a Secure cookie too
+    return out
 
 
 def _register_httpx(base_url: str, profile: Profile, suffix: str = "") -> Account | None:
@@ -285,8 +311,8 @@ def _register_httpx(base_url: str, profile: Profile, suffix: str = "") -> Accoun
 _JSON_LOGIN_PATHS = ("/rest/user/login", "/api/login", "/api/auth/login", "/api/sessions",
                      "/login", "/api/v1/login", "/auth/login", "/api/token", "/users/login",
                      "/api/user/login", "/api/authenticate")
-_JSON_REGISTER_PATHS = ("/api/users", "/api/register", "/api/auth/register", "/api/signup",
-                        "/register", "/api/v1/users", "/api/accounts", "/api/user")
+_JSON_REGISTER_PATHS = ("/api/users", "/api/register", "/api/auth/register", "/api/auth/signup",
+                        "/api/signup", "/register", "/api/v1/users", "/api/accounts", "/api/user")
 
 
 def _bearer_token(resp: httpx.Response) -> str | None:
@@ -344,6 +370,32 @@ def _spec_auth_paths(profile, keywords) -> list[str]:
     return out
 
 
+# A route the crawl DID observe names the auth namespace even when it names no auth action: OopsSec's surface
+# yields GET /api/auth/logout, from which /api/auth/signup follows. Inferring the sibling beats extending the
+# hardcoded list forever, because it works for whatever prefix an app chose (/api/v2/auth, /backend/auth).
+# Measured: registration on OopsSec failed for exactly one missing string, and every authed family went dark.
+_AUTH_LEAF = ("logout", "signout", "sign-out", "session", "me", "whoami", "refresh", "token",
+              "login", "signin", "sign-in", "register", "signup", "sign-up", "user")
+
+
+def _sibling_auth_paths(profile, keywords) -> list[str]:
+    """Candidate auth paths inferred from the namespace of an OBSERVED route/endpoint. A path whose parent is
+    `auth` (or whose leaf is a known auth action) implies its siblings, so `/api/auth/logout` yields
+    `/api/auth/signup` and `/api/auth/register`."""
+    parents: list[str] = []
+    seen_paths = [e.raw_path for e in getattr(profile, "endpoints", None) or []]
+    seen_paths += list(getattr(profile, "routes", None) or [])
+    for raw in seen_paths:
+        path = (raw or "").split("?")[0].rstrip("/")
+        segs = [s for s in path.split("/") if s]
+        if len(segs) < 2:
+            continue
+        parent, leaf = "/" + "/".join(segs[:-1]), segs[-1].lower()
+        if (segs[-2].lower() == "auth" or leaf in _AUTH_LEAF) and parent not in parents:
+            parents.append(parent)
+    return [p + "/" + k for p in parents for k in keywords]
+
+
 def _auth_shaped(r: httpx.Response) -> bool:
     """A real JSON-API register answers with JSON or an auth artifact (Set-Cookie / bearer) — NOT a static
     SPA's 200 text/html shell, whose catch-all serves index.html for ANY POST and would otherwise read as a
@@ -358,8 +410,13 @@ def _register_json(base_url: str, suffix: str, profile=None) -> Account | None:
     username = "hl_" + secrets.token_hex(5) + suffix
     password = "Hl-Probe-Passw0rd!"
     email = username + "@example.com"
-    register_paths = list(dict.fromkeys(_spec_auth_paths(profile, _REGISTER_KW) + list(_JSON_REGISTER_PATHS)))
-    login_paths = list(dict.fromkeys(_spec_auth_paths(profile, _LOGIN_KW) + list(_JSON_LOGIN_PATHS)))
+    # order: named in a spec -> inferred from an observed auth namespace -> the generic conventions
+    register_paths = list(dict.fromkeys(_spec_auth_paths(profile, _REGISTER_KW)
+                                        + _sibling_auth_paths(profile, _REGISTER_KW)
+                                        + list(_JSON_REGISTER_PATHS)))
+    login_paths = list(dict.fromkeys(_spec_auth_paths(profile, _LOGIN_KW)
+                                     + _sibling_auth_paths(profile, _LOGIN_KW)
+                                     + list(_JSON_LOGIN_PATHS)))
     client = httpx.Client(base_url=base_url, timeout=15.0, follow_redirects=True)
     # a SUPERSET body: many signup APIs require a display NAME and/or a confirm field beyond email+password
     # (a bare {email,username,password} 500s a name-required API — the Borrow-Tracker / Next.js case). Extra
