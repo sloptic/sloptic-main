@@ -22,7 +22,7 @@ fires on a false positive is worse than a missing check, because it poisons comp
    ```
    The two ignored files spin real Docker containers with reused names, so run them only when Docker is
    free. Browser tests need the browser group (see Run recipes). Without it, exclude `tests/test_browser.py`
-   and the other render dependent files. A green run is about 497 passing (535 with Docker and a browser).
+   and the other render dependent files. A green run is about 534 passing (572 with Docker and a browser).
 2. **One commit per change.** End every code writing turn with a ready to paste commit command.
    Conventional commit style, scope in parens, `+`-join related parts:
    `feat(discovery): infer field names for anonymous SPA inputs`. Put the why in the body.
@@ -88,7 +88,7 @@ back on. Export the key for a terminal session before a batch.
 | `catalog.py` | loads the probe YAMLs. |
 | `secretscan.py`, `openapi.py`, `jsmine.py`, `oob.py`, `perf.py`, `net.py`, `ingest.py` | source secret scan, OpenAPI ingest, JS route mining, out of band, perf sampling, net helpers, untrusted zip ingest (zip slip guarded). |
 
-**`catalog/`**, 72 probe YAMLs: `security/` (47), `qa/` (13), `performance/` (12).
+**`catalog/`**, 86 probe YAMLs: `security/` (53), `qa/` (21), `performance/` (12).
 **`scripts/`**, the deploy and batch pipeline plus the readers: `deploy_and_grade.py`, `run_batch.py`,
 `devpost_repos.py`, `stats.py`, `precision.py`, `parity.py`, `report_card.py`, `list_probes.py`. The LLM
 perception and audit passes live in `deploy_and_grade.py`.
