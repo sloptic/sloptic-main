@@ -455,6 +455,26 @@ _MINE_CHUNK_CAP = 40      # bound the fetches: a big app ships hundreds of chunk
 _MINE_VERIFY_CAP = 40     # bound the verification requests, same reason as _BASELINE_CAP
 
 
+def _under(app_root: str, path: str) -> str:
+    """`path` resolved under the app's own root. A bundle literal is written relative to the APP (Next.js
+    basePath is applied at runtime, not baked into the string), so a sub-path deployment's `/api/feedback` is
+    served at `/app/api/feedback` and verifying it at the origin gets a 404 — which reads as "does not exist"
+    on an endpoint that does. The same mistake as the pipeline's target rebasing, reintroduced in new code and
+    caught by a fixture that ships both serving variants. A root-served app is a no-op."""
+    root = (app_root or "/").rstrip("/")
+    if not root or path.startswith(root + "/"):
+        return path
+    return root + (path if path.startswith("/") else "/" + path)
+
+
+def _relative_to(app_root: str, path: str) -> str:
+    """`path` as the APP sees it, so shape tests (`/api/<collection>`) work on a sub-path deployment."""
+    root = (app_root or "/").rstrip("/")
+    if root and path.startswith(root):
+        return path[len(root):] or "/"
+    return path
+
+
 def _mine_api_literals(text: str) -> set:
     """Same-origin API path literals in one JS bundle. Static text only — no execution, no evaluation."""
     out = set()
@@ -471,7 +491,173 @@ def _mine_api_literals(text: str) -> set:
     return out
 
 
-def _mined_api_endpoints(base_url, headers, route_list, existing) -> list:
+# SCHEMA DISCOVERY. A path with no parameters is nearly useless to an injection probe: mining took OopsSec from
+# 13 to 24 endpoints and the re-grade was byte-identical, because sqli/xss/ssti had nothing to inject into.
+# Modern TS APIs answer a malformed body by NAMING their required fields, so the app hands over its own schema
+# for one request. Measured on OopsSec: POST /api/support {} ->
+#   {"error":"Invalid input","details":[{"path":"email",...},{"path":"title",...}]}
+# Parsers cover the shapes that cover the ecosystem: Zod (details/issues, path as string OR array — OopsSec
+# returns a string, Zod v3 returns an array), pydantic/FastAPI (detail[].loc), express-validator (errors[].param),
+# Rails/ActiveModel (errors as an object keyed by field), and a generic "<field> is required" sentence.
+# A WRONG field name costs one wasted injection attempt, never a false finding, so this is a cheap bet.
+_REQUIRED_SENTENCE = re.compile(r"['\"]?([A-Za-z_][A-Za-z0-9_]{1,30})['\"]?\s+(?:is|are)\s+required", re.I)
+_SCHEMA_NOISE = {"body", "query", "params", "data", "payload", "input", "request", "field", "value", "_"}
+_SCHEMA_CAP = 25          # bound the extra requests, same reason as _BASELINE_CAP
+
+
+def _schema_fields(resp) -> list:
+    """Field names a validation error named. JSON only — an HTML error page names nothing."""
+    if "json" not in (resp.headers.get("content-type") or "").lower():
+        return []
+    try:
+        doc = resp.json()
+    except Exception:
+        return []
+    out: list = []
+
+    def _add(name):
+        n = str(name or "").strip()
+        if n and n.lower() not in _SCHEMA_NOISE and len(n) <= 40 and n not in out:
+            out.append(n)
+
+    def _from_path(p):
+        if isinstance(p, str):
+            _add(p.split(".")[-1])
+        elif isinstance(p, list) and p:
+            _add(p[-1])                       # ["body","email"] / ["user","email"] -> the leaf is the field
+
+    if isinstance(doc, dict):
+        for key in ("details", "issues", "detail", "errors"):
+            node = doc.get(key)
+            if isinstance(node, list):
+                for item in node:
+                    if isinstance(item, dict):
+                        if "path" in item:
+                            _from_path(item["path"])
+                        elif "loc" in item:
+                            _from_path(item["loc"])
+                        elif "param" in item:
+                            _add(item["param"])
+                        elif "field" in item:
+                            _add(item["field"])
+            elif isinstance(node, dict):
+                for name in node:             # Rails: {"errors": {"email": ["can't be blank"]}}
+                    _add(name)
+    blob = json.dumps(doc) if not isinstance(doc, str) else doc
+    for m in _REQUIRED_SENTENCE.finditer(blob[:4000]):
+        _add(m.group(1))
+    return out
+
+
+def _schema_discovery(base_url, headers, endpoints) -> int:
+    """Ask each parameterless endpoint for its own schema by sending a body it must reject. Fills body_fields
+    in place; returns how many endpoints gained fields. Uses the crawl's session when there is one, because an
+    auth-gated route answers Unauthorized instead of describing itself."""
+    targets = [e for e in endpoints
+               if not e.body_fields and not e.query_params
+               and (e.method or "get").lower() in ("post", "put", "patch")][:_SCHEMA_CAP]
+    if not targets:
+        return 0
+    filled = 0
+    with make_client(base_url, headers, timeout=8.0, follow_redirects=True) as c:
+        for e in targets:
+            for body in ({}, {"hl": "probe"}):     # empty first; some APIs only validate a present object
+                try:
+                    r = c.post(e.path, json=body)
+                except (httpx.HTTPError, httpx.InvalidURL):
+                    break
+                fields = _schema_fields(r)
+                if fields:
+                    e.body_fields = fields
+                    filled += 1
+                    break
+    return filled
+
+
+# SEARCH ENDPOINTS. A collection's search sibling is usually built by string CONCATENATION in the client
+# (`fetch("/api/products/search?q=" + term)`), so no literal for it exists in the bundle and mining cannot see
+# it. Measured on OopsSec: mining found /api/products, the injectable endpoint is /api/products/search?q=, and
+# `q=test'` returns 500 while api_sqli fires on it instantly when handed the path. The app's own manifest names
+# the challenge `product-search-sql-injection`. One suffix guess reaches it.
+#
+# The PARAMETER is found by differential, not guessed: register only the name the endpoint demonstrably honours
+# (its response changes when the value does). Registering six speculative names would multiply every injection
+# probe's request count by six for five names the app ignores.
+_SEARCH_SUFFIXES = ("search", "query", "find")
+_SEARCH_PARAMS = ("q", "query", "search", "term", "keyword", "name")
+_SEARCH_COLLECTION_CAP = 8
+
+
+def _collection_token(client, collection: str) -> str | None:
+    """A distinctive word the collection itself returned, to search FOR. A length differential cannot find the
+    param on its own: measured on OopsSec, bare /api/products/search and ?q=test both answer
+    `{"products":[]}` — identical bytes — so a nonsense term proves nothing. Searching for a term the app just
+    handed us is the same self-as-oracle move _conventional_pairs uses for ids."""
+    try:
+        doc = client.get(collection).json()
+    except Exception:
+        return None
+    items = doc if isinstance(doc, list) else next(
+        (v for v in (doc or {}).values() if isinstance(v, list)), []) if isinstance(doc, dict) else []
+    for item in items[:3]:
+        if not isinstance(item, dict):
+            continue
+        for key in ("name", "title", "label", "productName"):
+            val = item.get(key)
+            if isinstance(val, str):
+                for word in re.findall(r"[A-Za-z]{5,}", val):
+                    return word
+    return None
+
+
+def _honoured_search_param(client, path: str, token: str) -> str | None:
+    """Which query param does this endpoint actually search on? The one that finds `token`."""
+    for param in _SEARCH_PARAMS:
+        try:
+            r = client.get(path, params={param: token})
+        except (httpx.HTTPError, httpx.InvalidURL):
+            continue
+        if r.status_code < 400 and token.lower() in (r.text or "").lower():
+            return param            # it searched and matched -> the param is real, not merely accepted
+    return None
+
+
+def _search_endpoints(base_url, headers, endpoints, app_root: str = "/", routes=()) -> list:
+    """`<collection>/search?<param>=` endpoints, verified and with the honoured param attached."""
+    seen = {(e.method, e.path) for e in endpoints}
+    # the shape test is on the APP-RELATIVE path: on a sub-path deployment every endpoint is /app/api/...,
+    # which starts with neither "/api/" nor carries two slashes, so the absolute form rejected everything.
+    # Collections come from ROUTES as well as endpoints. A crawl that finds /app/api/projects records it as a
+    # route (it is a URL it saw), and looking only at `endpoints` skipped the one collection this app exposes.
+    def _is_collection(path: str) -> bool:
+        rel = _relative_to(app_root, (path or "").split("?")[0])
+        return rel.startswith("/api/") and rel.rstrip("/").count("/") == 2
+    collections = [e.path.rstrip("/") for e in endpoints
+                   if (e.method or "get").lower() == "get" and not e.query_params and _is_collection(e.path)]
+    collections += [r.split("?")[0].rstrip("/") for r in (routes or ()) if _is_collection(r)]
+    collections = list(dict.fromkeys(collections))[:_SEARCH_COLLECTION_CAP]
+    out = []
+    if not collections:
+        return out
+    with make_client(base_url, headers, timeout=8.0, follow_redirects=True) as c:
+        for collection in dict.fromkeys(collections):
+            token = _collection_token(c, collection)
+            if not token:
+                continue          # nothing to search FOR -> cannot prove a param is honoured
+            for suffix in _SEARCH_SUFFIXES:
+                path = f"{collection}/{suffix}"
+                if ("get", path) in seen:
+                    continue
+                param = _honoured_search_param(c, path, token)
+                if param:
+                    out.append(Endpoint(path=path, raw_path=f"{path}?{param}=", method="get",
+                                        query_params=[param], baseline_status=200, origin="mined",
+                                        kind="search"))
+                    break            # one search sibling per collection is enough
+    return out
+
+
+def _mined_api_endpoints(base_url, headers, route_list, existing, app_root: str = "/") -> list:
     """Fetch the discovered .js chunks, mine their API path literals, and keep the ones the server confirms.
 
     Ordering matters: this runs BEFORE the LLM perception step so the model is told what we already found and
@@ -489,7 +675,8 @@ def _mined_api_endpoints(base_url, headers, route_list, existing) -> list:
             except (httpx.HTTPError, httpx.InvalidURL):
                 continue
         out = []
-        for path in sorted(candidates)[:_MINE_VERIFY_CAP]:
+        for literal in sorted(candidates)[:_MINE_VERIFY_CAP]:
+            path = _under(app_root, literal)     # a bundle literal is APP-relative, not origin-relative
             if ("get", path) in have or ("post", path) in have:
                 continue
             try:
@@ -912,11 +1099,24 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
             # is what keeps this from manufacturing phantoms — a string in a bundle is a claim, and only the
             # server settles it: 404 drops the candidate, 405 means it exists but is POST-only (exactly the
             # write surface the injection/integrity probes never get), 401/403 means it exists behind auth.
-            mined = _mined_api_endpoints(base_url, headers, list(routes), endpoints)
+            mined = _mined_api_endpoints(base_url, headers, list(routes), endpoints, start_path)
             if mined:
                 endpoints += mined
                 for e in mined:
                     routes.setdefault(e.path, None)
+
+            # A collection's search sibling is concatenated in the client, so mining cannot see it. Guess the
+            # suffix, verify it, and attach the param the endpoint demonstrably honours.
+            searches = _search_endpoints(base_url, render_headers, endpoints, start_path, list(routes))
+            if searches:
+                endpoints += searches
+                for e in searches:
+                    routes.setdefault(e.path, None)
+
+            # SCHEMA: a mined path arrives with no parameters, and an injection probe needs one. Ask the
+            # endpoint to reject a body so it names its own fields. render_headers carries the crawl's session
+            # when there is one, because an auth-gated route answers Unauthorized instead of describing itself.
+            _schema_discovery(base_url, render_headers, endpoints)
 
             # PROACTIVE discovery: the injected LLM perceives the RENDERED pages and returns the probeable
             # surface the crawl MISSED (client-rendered logins / uploads / action buttons a static crawl can't
