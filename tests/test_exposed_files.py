@@ -57,11 +57,11 @@ def _serve(files, catch_all=False):
     return srv
 
 
-def _run(files, catch_all=False, landing="/"):
+def _run(files, catch_all=False, landing="/", routes=("/",)):
     srv = _serve(files, catch_all)
     url = "http://127.0.0.1:%d" % srv.server_address[1]
     ctx = _Ctx(url, make_client(url, None, timeout=8.0, follow_redirects=True),
-               Profile(base_url=url, landing_path=landing, routes=["/"]), None)
+               Profile(base_url=url, landing_path=landing, routes=list(routes)), None)
     try:
         return exposed_sensitive_file(ctx, type("P", (), {"probe": {}})()), dict(ctx.evidence)
     finally:
@@ -112,16 +112,15 @@ def test_a_sub_path_deployment_is_probed_under_its_own_root():
     assert "/site/app/terraform.tfstate" in ev["repro"]["url"]
 
 
-def test_a_path_discovery_already_found_is_left_to_the_routes_probes():
-    # ONE leak must not be billed twice under two categories. /config.js on the vulnerable reference app is
-    # already sec-secrets-001's finding (it scans discovered routes), and firing here as well moved the
-    # calibration anchor from 664 to 673. What remains is precisely this probe's value: the files discovery
-    # never sees.
+def test_a_leak_another_probe_already_bills_is_left_to_that_probe():
+    # ONE leak must not be billed twice under two categories. /config.js on the vulnerable reference app
+    # carries a PROVIDER secret, so sec-secrets-001 already reports it and firing here too moved the
+    # calibration anchor from 664 to 673. Dedup is by CONTENT: this body is claimed, so we stay quiet.
     srv = _serve({"/config.js": _CONFIG_SECRET})
     url = "http://127.0.0.1:%d" % srv.server_address[1]
     try:
-        for routes, expected in ((["/", "/config.js"], False),   # discovered -> the routes probes own it
-                                 (["/"], True)):                 # missed by discovery -> ours to find
+        for routes, expected in ((["/", "/config.js"], False),   # discovered AND claimed -> theirs
+                                 (["/"], True)):                 # never discovered -> ours to find
             ctx = _Ctx(url, make_client(url, None, timeout=8.0, follow_redirects=True),
                        Profile(base_url=url, routes=routes), None)
             try:
@@ -130,3 +129,22 @@ def test_a_path_discovery_already_found_is_left_to_the_routes_probes():
                 ctx.client.close()
     finally:
         srv.shutdown()
+
+
+def test_discovering_a_sensitive_file_must_not_grant_it_immunity():
+    """THE inversion. Path-based dedup meant the same bytes on the same server flipped True -> False purely
+    because the crawl named the file, so an app whose sitemap exposed /.docker/config.json got a free pass
+    while one that hid it got caught. A registry auth blob carries no PROVIDER secret and no password field,
+    so NO other probe reports it, and skipping it just loses the finding."""
+    for routes in (["/", "/.dockercfg"], ["/"]):        # discovered or not, the verdict is the same
+        verdict, ev = _run({"/.dockercfg": _DOCKER}, routes=routes)
+        assert verdict is True, routes
+        assert ev["path"] == "/.dockercfg"
+
+
+def test_the_dedup_key_is_the_body_not_the_filename():
+    # terraform state carrying a DB password is claimed by sec-exposure-005 (credential material in a JSON
+    # response), so when discovery hands that route over it is theirs. Unfound, it is ours. Same file, same
+    # bytes, and the ONLY thing that decides is whether another probe actually reports it.
+    assert _run({"/terraform.tfstate": _TFSTATE}, routes=["/", "/terraform.tfstate"])[0] is False
+    assert _run({"/terraform.tfstate": _TFSTATE}, routes=["/"])[0] is True

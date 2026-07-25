@@ -2349,6 +2349,14 @@ _SENSITIVE_FILES = (
 )
 
 
+def _claimed_by_a_routes_probe(resp) -> bool:
+    """Would a routes-scanning probe already report THIS body? sec-secrets-001 fires on a provider secret,
+    sec-exposure-005 on credential material. Used to dedup by content instead of by path."""
+    with contextlib.suppress(Exception):
+        return bool(response_leaks_secret(resp) or response_leaks_credentials(resp))
+    return False
+
+
 def exposed_sensitive_file(ctx, probe) -> bool | None:
     """A sensitive file served to an anonymous visitor, beyond the .env/.git/.aws trio: terraform state, a SQL
     dump, docker registry auth, an npm/netrc credential, a private key, or a config carrying a real secret.
@@ -2358,15 +2366,16 @@ def exposed_sensitive_file(ctx, probe) -> bool | None:
     N/A when nothing matched AND nothing was even reachable, so a host that refused every request isn't scored
     as clean."""
     reached = False
-    # Skip anything discovery already found: the routes-scanning probes (sec-secrets-*, sec-exposure-005)
-    # cover those, and firing here too bills ONE leak twice under two categories. Measured: /config.js on the
-    # vulnerable reference app is already sec-secrets-001's finding, and double-counting moved the calibration
-    # anchor 664 -> 673. What is left is exactly the value here: the files discovery never sees.
+    # Dedup is CONTENT-based, not path-based. Skipping every path discovery happened to list was backwards:
+    # measured on the repro, the SAME bytes on the SAME server flipped True -> False purely because the crawl
+    # named the file, so an app whose sitemap exposes /.docker/config.json got a free pass while one that hid
+    # it got caught. What must not be double-billed is a leak another probe ALREADY reports, which is a fact
+    # about the BODY: sec-secrets-001 claims it when a provider secret is in there (that is the /config.js
+    # case that moved the anchor 664 -> 673) and sec-exposure-005 claims it when the body carries credential
+    # material. Absent both, no other probe fires on this file and skipping it just loses the finding.
     known = {(r or "").split("?")[0].rstrip("/") for r in getattr(ctx.profile, "routes", None) or []}
     with make_client(ctx.base_url, ctx.headers, timeout=8.0, follow_redirects=True) as c:
         for path, check in _SENSITIVE_FILES:
-            if path.rstrip("/") in known:
-                continue
             try:
                 r = c.get(_at(ctx, path))
             except (httpx.HTTPError, httpx.InvalidURL):
@@ -2374,6 +2383,8 @@ def exposed_sensitive_file(ctx, probe) -> bool | None:
             reached = True
             if _is_phantom_shell(ctx, r):
                 continue          # catch-all host echoing its shell -> not a served file
+            if path.rstrip("/") in known and _claimed_by_a_routes_probe(r):
+                continue          # a discovered path another probe already bills -> theirs, not ours
             with contextlib.suppress(Exception):
                 if check(r):
                     ctx.evidence.update(exposed=True, path=path, status=r.status_code,
