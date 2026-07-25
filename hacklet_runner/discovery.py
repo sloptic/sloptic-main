@@ -438,6 +438,74 @@ def _classify_hosts(observed, base_url) -> dict:
             "opaque_hosts": sorted(opaque)[:10]}
 
 
+# API paths mined from a code-split bundle. A framework-routed SPA keeps its whole write surface in per-route
+# chunks that only load when you reach that route, so an anonymous render observes a fraction of it. Measured on
+# OopsSec Store (Next.js App Router): the crawl found 13 endpoints, mining the homepage's chunks alone found 8
+# API paths, and mining the chunks of all 21 discovered routes found 27 — including /api/wishlists (the IDOR
+# target), /api/uploads/ on an app the grade reported as has_upload=false, /api/gift-cards/redeem (the coupon
+# race), /api/ai-assistant, /api/admin, and /api/auth/signup. With none of them, 27 of the app's 35 declared
+# vulnerabilities sat in classes whose probes ran against nothing and reported clean.
+_API_SEG = ("api", "rest", "graphql", "trpc", "v1", "v2")
+_API_LITERAL = re.compile(r"""["'`](/(?:[A-Za-z0-9._~\-]+/)*[A-Za-z0-9._~\-]*)["'`]""")
+# A literal carrying an interpolation or a route template is a TEMPLATE, not an endpoint: `/api/orders/${id}`
+# would be fetched verbatim and 404, and reading that as "absent" is worse than not guessing. The collection
+# path it hangs off is already mined separately, and the id-substitution machinery lives in _conventional_pairs.
+_API_TEMPLATE = re.compile(r"[$`{}\[\]%*]|\\")
+_MINE_CHUNK_CAP = 40      # bound the fetches: a big app ships hundreds of chunks
+_MINE_VERIFY_CAP = 40     # bound the verification requests, same reason as _BASELINE_CAP
+
+
+def _mine_api_literals(text: str) -> set:
+    """Same-origin API path literals in one JS bundle. Static text only — no execution, no evaluation."""
+    out = set()
+    for raw in _API_LITERAL.findall(text or ""):
+        path = (raw or "").rstrip("/") or "/"
+        if len(path) < 5 or len(path) > 80 or _API_TEMPLATE.search(path):
+            continue
+        segs = [s.lower() for s in path.split("/") if s]
+        if not segs or segs[0] not in _API_SEG:
+            continue          # anchored at the FIRST segment: /api/x is an endpoint, /img/api-logo.svg is not
+        if path.endswith((".js", ".css", ".map", ".json", ".svg", ".png", ".woff2", ".ico")):
+            continue
+        out.add(path)
+    return out
+
+
+def _mined_api_endpoints(base_url, headers, route_list, existing) -> list:
+    """Fetch the discovered .js chunks, mine their API path literals, and keep the ones the server confirms.
+
+    Ordering matters: this runs BEFORE the LLM perception step so the model is told what we already found and
+    spends its budget on what is genuinely missing, the same reason the observed-request harvest runs first.
+    """
+    chunks = [r for r in route_list if (r or "").split("?")[0].endswith(".js")][:_MINE_CHUNK_CAP]
+    if not chunks:
+        return []
+    have = {(e.method, e.path) for e in existing}
+    candidates: set = set()
+    with make_client(base_url, headers, timeout=10.0, follow_redirects=True) as c:
+        for path in chunks:
+            try:
+                candidates |= _mine_api_literals(c.get(path).text)
+            except (httpx.HTTPError, httpx.InvalidURL):
+                continue
+        out = []
+        for path in sorted(candidates)[:_MINE_VERIFY_CAP]:
+            if ("get", path) in have or ("post", path) in have:
+                continue
+            try:
+                r = c.get(path)
+            except (httpx.HTTPError, httpx.InvalidURL):
+                continue
+            if r.status_code == 404:
+                continue                      # the bundle names it, the server does not serve it -> not real
+            # 405 = "exists, wrong verb". Registering it as POST is the whole point: an app's writes are the
+            # surface the injection, integrity and race probes need and the anonymous render never triggers.
+            method = "post" if r.status_code == 405 else "get"
+            out.append(Endpoint(path=path, raw_path=path, method=method, query_params=[],
+                                baseline_status=r.status_code, origin="mined"))
+    return out
+
+
 def _endpoints_from_observed(observed, base_url) -> list:
     """Endpoints OBSERVED in the app's own same-origin xhr/fetch traffic during render+interaction — the
     ACCURATE endpoint surface (the app actually called these), which the deterministic crawl and the static
@@ -838,6 +906,16 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
                             e.baseline_status = None
                 endpoints += obs_eps
                 for e in obs_eps:
+                    routes.setdefault(e.path, None)
+
+            # BUNDLE MINE: read the per-route chunks for API path literals, then VERIFY each once. Verification
+            # is what keeps this from manufacturing phantoms — a string in a bundle is a claim, and only the
+            # server settles it: 404 drops the candidate, 405 means it exists but is POST-only (exactly the
+            # write surface the injection/integrity probes never get), 401/403 means it exists behind auth.
+            mined = _mined_api_endpoints(base_url, headers, list(routes), endpoints)
+            if mined:
+                endpoints += mined
+                for e in mined:
                     routes.setdefault(e.path, None)
 
             # PROACTIVE discovery: the injected LLM perceives the RENDERED pages and returns the probeable
