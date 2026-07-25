@@ -49,7 +49,7 @@ def _catch_all_sig(ctx):
     client = getattr(ctx, "client", None)
     if client is not None:
         try:
-            r = client.get(_CATCHALL_PROBE)
+            r = client.get(_at(ctx, _CATCHALL_PROBE))
             if r.status_code == 200 and "html" in r.headers.get("content-type", "").lower():
                 sig = _body_sig(r.text)
         except (httpx.HTTPError, httpx.InvalidURL):
@@ -1142,6 +1142,26 @@ _SSRF_PARAMS = ("url", "uri", "link", "src", "href", "callback", "webhook", "tar
                 "site", "feed", "proxy", "fetch", "load", "image", "img", "resource", "dest", "to",
                 "out", "open", "page", "path", "data", "ref", "u", "server", "remote")
 
+# IN-BAND fallback for the case OAST structurally cannot see: the server fetches the URL but its response
+# comes back to US instead of reaching our collaborator. That is not a benchmark quirk — it is any function
+# whose egress is filtered to the platform's own network, which is the normal state on the serverless hosts
+# our corpus deploys to. Measured: sec-ssrf-001 was 0-for-2 on GapBench's two SSRF scenarios (`ssrf-image-
+# proxy`, `gcp-metadata-ssrf`) because no callback could ever arrive, so the class was effectively dark.
+#
+# PRECISION RULE: every signature below is content the METADATA SERVICE returns and that never appears in
+# the URL we send, so an app merely echoing our payload back cannot match. `computeMetadata` would have been
+# the obvious GCP token to look for and is exactly wrong — it is in the request path.
+_SSRF_INBAND = (
+    ("http://169.254.169.254/computeMetadata/v1/?recursive=true",
+     re.compile(r'"numericProjectId"|"serviceAccounts"\s*:', re.I)),
+    # the identity document, not /iam/security-credentials/ — that one answers with a role NAME we cannot
+    # guess, while this answers with a fixed JSON shape we can recognise without a second round trip.
+    ("http://169.254.169.254/latest/dynamic/instance-identity/document",
+     re.compile(r'"accountId"|"imageId"\s*:|"SecretAccessKey"', re.I)),
+    ("http://169.254.169.254/metadata/instance?api-version=2021-02-01",
+     re.compile(r'"vmId"|"subscriptionId"\s*:', re.I)),
+)
+
 
 def ssrf(ctx, probe) -> bool | None:
     """Server-Side Request Forgery: inject a unique collaborator URL into URL-ish params (url/uri/link/
@@ -1175,11 +1195,40 @@ def ssrf(ctx, probe) -> bool | None:
                             continue
         _await_callback(collab, tokens, probe)
         fired = any(collab.received(t) for t in tokens)
-        ctx.evidence.update(callback_received=fired, url_params=sorted({f for _, _, uf, _ in targets for f in uf}),
-                            probes_sent=len(tokens))
-        return True if fired else False
+        url_params = sorted({f for _, _, uf, _ in targets for f in uf})
+        if fired:
+            ctx.evidence.update(callback_received=True, via="oast", url_params=url_params,
+                                probes_sent=len(tokens))
+            return True
+        inband = _ssrf_inband(ctx, targets)
+        if inband is not None:
+            ctx.evidence.update(callback_received=False, via="in-band", url_params=url_params, **inband)
+            return True
+        ctx.evidence.update(callback_received=False, url_params=url_params, probes_sent=len(tokens))
+        return False
     finally:
         collab.close()
+
+
+def _ssrf_inband(ctx, targets) -> dict | None:
+    """Ask the server to fetch a cloud metadata endpoint and look for the metadata service's OWN response
+    in the body. Returns evidence when a signature matches, else None. The signature is never a substring
+    of the URL we sent, so reflection cannot produce a hit."""
+    with make_client(ctx.base_url, ctx.headers, timeout=10.0, follow_redirects=True) as c:
+        for action, method, url_fields, all_fields in targets:
+            for field in url_fields:
+                for url, sig in _SSRF_INBAND:
+                    data = {fn: (url if fn == field else _XSS_FILLER) for fn in all_fields}
+                    try:
+                        r = _xss_send(c, method, action, data)
+                    except (httpx.HTTPError, httpx.InvalidURL):
+                        continue
+                    m = sig.search(r.text or "")
+                    if m:
+                        return {"target": action, "field": field, "fetched": url,
+                                "repro": _repro_from_resp(
+                                    r, matched="cloud metadata response in body: " + m.group(0))}
+    return None
 
 
 _XXE_PAYLOAD = '<?xml version="1.0"?><!DOCTYPE r [<!ENTITY xxe SYSTEM "%s">]><r>&xxe;</r>'
@@ -2001,6 +2050,20 @@ def _landing(ctx) -> str:
     return getattr(getattr(ctx, "profile", None), "landing_path", "/") or "/"
 
 
+def _at(ctx, path: str) -> str:
+    """`path` resolved under the APP's root. For a sub-path deployment the app's root is its landing path, so
+    anything we fetch by construction (a well-known file, the catch-all fingerprint probe, a stack sniff) lives
+    UNDER it; resolving against the origin probes the HOST instead and reports clean on the app. No-op when the
+    app is root-served, which is the whole normal corpus."""
+    landing = _landing(ctx).rstrip("/")
+    if not landing:
+        return path
+    if path in ("/", ""):
+        return landing      # address the entry page EXACTLY as _expand does, so the two never disagree
+        #     about which URL "the homepage" is (the catch-all fingerprint compares against it)
+    return landing + (path if path.startswith("/") else "/" + path)
+
+
 def _home_path(ctx, probe) -> str:
     """Resolve a homepage probe's target to a PATH: the 'target: /' homepage sentinel maps to the discovered
     landing page (_landing); an explicitly declared reference path (a perf/vulnerable reference route) is used
@@ -2056,7 +2119,8 @@ def debug_mode_enabled(ctx, probe) -> bool | None:
     # resource. A normal app 404s or returns HTML here; only a live debugger answers with javascript --
     # gating on the javascript content-type avoids false-firing on a 404 page that reflects the query.
     try:
-        r = ctx.client.get("/", params={"__debugger__": "yes", "cmd": "resource", "f": "debugger.js"})
+        r = ctx.client.get(_at(ctx, "/"),
+                           params={"__debugger__": "yes", "cmd": "resource", "f": "debugger.js"})
         inspected = True
         if (r.status_code == 200 and "javascript" in r.headers.get("content-type", "").lower()
                 and "werkzeug" in r.text.lower()):
@@ -2221,6 +2285,107 @@ def _observed_tables(ctx) -> list[str]:
     """Managed-backend tables the app itself read at runtime (discovery records them from observed traffic);
     empty without a browser render, in which case the probes fall back to bundle mining alone."""
     return list(getattr(getattr(ctx, "profile", None), "backend_tables", None) or [])
+
+
+# ---- sec-exposure-007: sensitive files the .env/.git list misses -------------------------------------------
+# Each path is paired with a CONTENT check, never "200 = finding": a catch-all host answers 200 for every path
+# (the same reason response_is_dotenv rejects an HTML shell), and a config.json is often legitimately public.
+# The body is the evidence. Measured on GapBench: config-leak serves config.json, terraform-state-leak serves
+# terraform.tfstate, docker-config-leak serves registry auth — we only ever checked .env/.git/.aws, so 8 of 10
+# probes applied and the app still read CLEAN. Guessing the wrong filename is indistinguishable from safety.
+_HTML_OPEN = ("<!doctype", "<html")
+
+
+def _not_html(resp) -> bool:
+    return (resp.status_code == 200 and "html" not in resp.headers.get("content-type", "").lower()
+            and not resp.text.lstrip()[:20].lower().startswith(_HTML_OPEN))
+
+
+def _f_terraform(resp) -> bool:
+    return _not_html(resp) and '"terraform_version"' in resp.text and '"resources"' in resp.text
+
+
+def _f_sql_dump(resp) -> bool:
+    return _not_html(resp) and bool(re.search(
+        r"CREATE TABLE|INSERT INTO|--\s*(?:MySQL|PostgreSQL|MariaDB)\b.*dump", resp.text[:20000], re.I))
+
+
+def _f_docker_auth(resp) -> bool:
+    return _not_html(resp) and '"auths"' in resp.text and '"auth"' in resp.text
+
+
+def _f_npmrc(resp) -> bool:
+    return _not_html(resp) and bool(re.search(r"_authToken\s*=|:_auth\s*=", resp.text[:8000]))
+
+
+def _f_netrc(resp) -> bool:
+    t = resp.text[:8000]
+    return _not_html(resp) and "machine" in t and "password" in t
+
+
+def _f_private_key(resp) -> bool:
+    return _not_html(resp) and bool(re.search(r"-----BEGIN [A-Z ]*PRIVATE KEY-----", resp.text[:8000]))
+
+
+def _f_config_secret(resp) -> bool:
+    """A config file is only a FINDING when it actually carries a secret. A public frontend config (api base
+    urls, feature flags, a publishable key) is normal and must not fire — so this defers to the same
+    secret-shape detector the source scan uses rather than treating the file's existence as the flaw."""
+    if not _not_html(resp):
+        return False
+    from . import secretscan
+    return bool(secretscan.scan_blob(resp.text[:200000]))
+
+
+_SENSITIVE_FILES = (
+    ("/terraform.tfstate", _f_terraform), ("/terraform.tfstate.backup", _f_terraform),
+    ("/backup.sql", _f_sql_dump), ("/dump.sql", _f_sql_dump), ("/db.sql", _f_sql_dump),
+    ("/database.sql", _f_sql_dump), ("/backup/db.sql", _f_sql_dump),
+    ("/.dockercfg", _f_docker_auth), ("/.docker/config.json", _f_docker_auth),
+    ("/.npmrc", _f_npmrc), ("/.netrc", _f_netrc),
+    ("/id_rsa", _f_private_key), ("/.ssh/id_rsa", _f_private_key), ("/private.key", _f_private_key),
+    ("/config.json", _f_config_secret), ("/config.js", _f_config_secret),
+    ("/static/config.js", _f_config_secret), ("/app/config.json", _f_config_secret),
+)
+
+
+def exposed_sensitive_file(ctx, probe) -> bool | None:
+    """A sensitive file served to an anonymous visitor, beyond the .env/.git/.aws trio: terraform state, a SQL
+    dump, docker registry auth, an npm/netrc credential, a private key, or a config carrying a real secret.
+
+    Fires on the FIRST path whose body proves it, so a repo that leaks three files is one finding. Paths are
+    resolved under the app root (_at), because a sub-path deployment's files live there and not at the origin.
+    N/A when nothing matched AND nothing was even reachable, so a host that refused every request isn't scored
+    as clean."""
+    reached = False
+    # Skip anything discovery already found: the routes-scanning probes (sec-secrets-*, sec-exposure-005)
+    # cover those, and firing here too bills ONE leak twice under two categories. Measured: /config.js on the
+    # vulnerable reference app is already sec-secrets-001's finding, and double-counting moved the calibration
+    # anchor 664 -> 673. What is left is exactly the value here: the files discovery never sees.
+    known = {(r or "").split("?")[0].rstrip("/") for r in getattr(ctx.profile, "routes", None) or []}
+    with make_client(ctx.base_url, ctx.headers, timeout=8.0, follow_redirects=True) as c:
+        for path, check in _SENSITIVE_FILES:
+            if path.rstrip("/") in known:
+                continue
+            try:
+                r = c.get(_at(ctx, path))
+            except (httpx.HTTPError, httpx.InvalidURL):
+                continue
+            reached = True
+            if _is_phantom_shell(ctx, r):
+                continue          # catch-all host echoing its shell -> not a served file
+            with contextlib.suppress(Exception):
+                if check(r):
+                    ctx.evidence.update(exposed=True, path=path, status=r.status_code,
+                                        bytes=len(r.content or b""),
+                                        repro=_repro("GET", str(r.url), status=r.status_code,
+                                                     matched=f"served {path}"))
+                    return True
+    if not reached:
+        ctx.evidence["na_reason"] = "no candidate path was reachable (host refused every request)"
+        return None
+    ctx.evidence.update(exposed=False, paths_checked=len(_SENSITIVE_FILES))
+    return False
 
 
 def _sensitive_leak(table: str, columns: list[str]) -> bool:
@@ -2710,7 +2875,7 @@ def _nextjs_signal(ctx) -> bool:
     """A Next.js fingerprint — x-middleware-subrequest is Next-specific, so gate the probe to Next apps
     (elsewhere it is an ignored header and a fire would be meaningless)."""
     with contextlib.suppress(Exception):
-        r = ctx.client.get("/")
+        r = ctx.client.get(_at(ctx, "/"))
         if "next" in r.headers.get("x-powered-by", "").lower():
             return True
         if "/_next/" in (r.text[:200000] or ""):
@@ -3109,9 +3274,15 @@ def dead_controls_present(ctx, probe) -> bool:
     return len(dead) > probe.probe.get("threshold", 0)
 
 
-_REDIRECT_PARAMS = ("next", "url", "redirect", "return", "dest", "continue", "to", "r")
+# `redirect_uri` is THE OAuth/OIDC parameter name and was the whole reason sec-redirect-001 fired on
+# GapBench's `open-redirect` scenario and stayed silent on `oauth-redirect`: same defect, different param.
+# Adding names is free — every param rides in ONE request below — and cannot cost precision, because the
+# verdict is "did Location's host become our foreign probe host", never "was the param accepted".
+_REDIRECT_PARAMS = ("next", "url", "redirect", "return", "dest", "continue", "to", "r",
+                    "redirect_uri", "redirect_url", "returnTo", "return_url", "callback_url")
 _REDIRECT_PROBE_HOST = "hacklet-redirect-probe.example"
-_REDIRECT_ENDPOINTS = ("/redirect", "/login", "/logout", "/go", "/out", "/auth/callback", "/sso")
+_REDIRECT_ENDPOINTS = ("/redirect", "/login", "/logout", "/go", "/out", "/auth/callback", "/sso",
+                       "/oauth/authorize", "/oauth/callback")
 
 
 def open_redirect(ctx, probe) -> bool:
@@ -3120,8 +3291,11 @@ def open_redirect(ctx, probe) -> bool:
     host is our foreign probe host. Tests discovered routes plus common redirect endpoints/params."""
     evil = {p: "https://" + _REDIRECT_PROBE_HOST + "/x" for p in _REDIRECT_PARAMS}
     seen = set()
+    # discovered routes already carry full paths; the CONSTRUCTED guesses are relative to the app root, so
+    # a sub-path deployment must be probed at /site/app/oauth/authorize, not at the origin's apex.
+    guesses = [_at(ctx, p) for p in _REDIRECT_ENDPOINTS]
     with make_client(ctx.base_url, ctx.headers, timeout=10.0, follow_redirects=False) as c:
-        for path in list(ctx.profile.routes) + list(_REDIRECT_ENDPOINTS):
+        for path in list(ctx.profile.routes) + guesses:
             if path in seen:
                 continue
             seen.add(path)
@@ -4263,6 +4437,7 @@ PREDICATES = {
     "weak_session_id": weak_session_id,
     "api_bola": api_bola,
     "api_bola_collection": api_bola_collection,
+    "exposed_sensitive_file": exposed_sensitive_file,
     "middleware_auth_bypass": middleware_auth_bypass,
     "data_integrity_roundtrip": data_integrity_roundtrip,
     "data_integrity_list_roundtrip": data_integrity_list_roundtrip,
@@ -4342,6 +4517,7 @@ _PREDICATE_REASONS = {
     "file_upload": "an uploaded webshell was accepted and executed server-side (insecure file upload -> RCE)",
     "upload_stored_xss": "an uploaded HTML/SVG file is served inline with an executable content-type (stored XSS via file upload)",
     "stored_xss_api": "a value stored via the JSON API executed unescaped when the page rendered it (stored XSS)",
+    "exposed_sensitive_file": "a sensitive file is served to anonymous visitors (terraform state / SQL dump / docker or npm credentials / private key / a config carrying a real secret)",
     "middleware_auth_bypass": "a protected route is reachable with no credentials via the Next.js x-middleware-subrequest header (auth bypass, CVE-2025-29927)",
     "back_nav_broken": "the browser back button did not return to the prior in-app view (broken SPA history handling)",
     "dead_bundle_chunk": "the served HTML references a JS bundle that doesn't resolve — the app can't render (stale/dead chunk)",

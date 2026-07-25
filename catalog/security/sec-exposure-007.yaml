@@ -1,0 +1,18 @@
+id: sec-exposure-007
+bundle: security
+category: exposure
+variant_group_id: exposed-sensitive-file   # a repo that leaks three of these has ONE problem, not three
+pool: public
+evidence_model: provable
+penalty: 35   # same tier as a served .env (sec-exposure-001): terraform state, a SQL dump, docker registry
+              # auth, an npm token or a private key all hand an anonymous visitor real credentials or the
+              # whole database. Provable by construction — the finding IS the file's own content.
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  # Widens the .env / .git / .aws trio to the files that leak just as badly and are missed just as silently.
+  # Each candidate path is paired with a CONTENT check in code, never "200 = finding": a catch-all host answers
+  # 200 for every path, and a public frontend config.json is normal — so a config only fires when the secret
+  # scanner finds a real secret in it. Paths resolve under the app root, so a sub-path deployment is probed
+  # where its files actually live.
+  predicate: exposed_sensitive_file
