@@ -42,17 +42,42 @@ _PROVIDER = [
 
 # A guarded generic assignment: a credential-ish NAME set to a non-placeholder VALUE (catches DB
 # passwords / bespoke API keys the provider list can't know). The value must survive _looks_secret.
+# The name may be QUOTED (JSON: `"password": "…"`) and the value may be BARE (YAML: `password: …`). Both
+# were misses: the old pattern required the name to sit immediately before the `:`, which a quoted JSON key
+# never does, and required the value to be quoted, which bare YAML never is. That blinded the source scan to
+# appsettings.json, firebase-adminsdk-*.json, serviceAccount.json, .docker/config.json, terraform.tfstate,
+# config.yaml, docker-compose.yml and values.yaml — the two most common config formats there are.
 _ASSIGN = re.compile(
     r"""(?ix)
-    \b(?P<name>secret|token|passwd|password|api[_-]?key|access[_-]?key|private[_-]?key|
-       client[_-]?secret|db[_-]?pass\w*|auth[_-]?token|encryption[_-]?key)
-    \s* [:=] \s* ['"](?P<val>[^'"\n]{12,120})['"]
+    # An UPPER_SNAKE prefix is not a word boundary, so `POSTGRES_PASSWORD` / `MYSQL_PASSWORD` /
+    # `ADMIN_PASSWORD` never matched — the compose-file spelling of a database password. The optional
+    # separator-terminated prefix admits them; the lookbehind plus the trailing \b still keep `oauth`
+    # and `author` out, which is what makes the bare `auth` alternative (docker registry config) safe.
+    # BOUNDED repetition on purpose: `(?:[A-Za-z0-9]+[_-])*` is the textbook catastrophic-backtracking
+    # shape, and a 4000-char underscore-heavy line with no credential name in it would hang the scanner.
+    (?<![A-Za-z0-9])["']? (?:[A-Za-z0-9]{1,32}[_-]){0,4}
+    (?P<name>secret|token|passwd|password|api[_-]?key|access[_-]?key|private[_-]?key|
+       client[_-]?secret|db[_-]?pass\w*|auth[_-]?token|auth|encryption[_-]?key)\b["']?
+    \s* [:=] \s*
+    (?: ['"](?P<val>[^'"\n]{12,120})['"]            # quoted value (JSON always, ini/py/js usually)
+      | (?P<bare>[^\s'"`,;}\])#]{12,120})(?=\s*(?:\#.*)?$)   # bare YAML scalar, to end of line
+    )
     """,
 )
+# A bare YAML value has no quotes to bound it, so the entropy bar is higher: all-lowercase words joined by
+# separators are prose or a placeholder (`see_the_docs_below`, `your-token-here`, `change-me-please`) and are
+# exactly the shape that false-fired on CSS class names before. A real credential carries a digit or a case
+# change, so requiring one costs nothing and removes the whole class.
+_WORDY = re.compile(r"[a-z]+(?:[_\-.][a-z]+)+\Z")
+# The bare WORDS need a right-hand boundary; without one, `an?` matched the leading "a" of any value, so
+# every real secret beginning with a/an/my/the was silently discarded as a placeholder — `aQ7zX2mKp9vLr4Tn`
+# read clean. Roughly one in thirteen credentials starts with an "a". The lookahead is applied ONLY to the
+# word alternatives: the dotted forms must stay prefix matches, since `env.SECRET_KEY` is followed by an
+# alphanumeric by definition and a blanket boundary would stop recognising it.
 _PLACEHOLDER = re.compile(
-    r"(?i)^(?:your|my|the|an?|example|sample|placeholder|change[_-]?me|xxx+|todo|dummy|test|fake|"
-    r"redacted|hidden|secret|password|passw0rd|none|null|undefined|foo|bar|abc|123|\.\.\.|"
-    r"<[^>]*>|\$\{[^}]*\}|%\([^)]*\)|process\.env|os\.environ|import\.meta|env\.)",
+    r"(?i)^(?:(?:your|my|the|an?|example|sample|placeholder|change[_-]?me|xxx+|todo|dummy|test|fake|"
+    r"redacted|hidden|secret|password|passw0rd|none|null|undefined|foo|bar|abc|123)(?![A-Za-z0-9])"
+    r"|\.\.\.|<[^>]*>|\$\{[^}]*\}|%\([^)]*\)|process\.env|os\.environ|import\.meta|env\.)",
 )
 
 
@@ -101,9 +126,12 @@ def _scan_text(text: str, rel: str) -> list[SecretFinding]:
             if m and "example" not in m.group(0).lower():   # AWS's AKIA…EXAMPLE et al. are docs placeholders
                 out.append(SecretFinding(rel, i, kind, _mask(m.group(0))))
         m = _ASSIGN.search(line)
-        if m and _looks_secret(m.group("val")):
-            name = re.sub(r"[_-]", "_", m.group("name").lower())
-            out.append(SecretFinding(rel, i, "hardcoded-" + name, _mask(m.group("val"))))
+        if m:
+            val, bare = m.group("val"), m.group("bare")
+            v = val if val is not None else bare
+            if v and _looks_secret(v) and not (bare and _WORDY.match(bare)):
+                name = re.sub(r"[_-]", "_", m.group("name").lower())
+                out.append(SecretFinding(rel, i, "hardcoded-" + name, _mask(v)))
     return out
 
 
