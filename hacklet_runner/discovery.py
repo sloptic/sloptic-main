@@ -103,9 +103,77 @@ _LOGOUT = re.compile(r"(?:^|[/_-])(?:logout|log-?out|log_?out|signout|sign-?out|
 _TEMPLATE_ARTIFACT = re.compile(r"\$\{|\{\{|\}\}|`")
 
 
+def _base_prefix(base_url: str) -> str:
+    """The target's own path PREFIX when it is deployed at a SUB-PATH (`https://host/site/app/` ->
+    '/site/app'), else '' for a root-hosted app (the common case, unaffected).
+
+    Same-origin is NOT the same app when a host serves many unrelated apps at sibling paths — a project
+    page host (`user.github.io/proj-a/` vs `/proj-b/`), a docs/demo host, a benchmark. Without this, one
+    app's grade IMPORTS its neighbours' routes, findings and headers: wrong attribution, and a clean app
+    inherits a sibling's vulns (measured: grading one GapBench scenario crawled all 104, so a true-negative
+    control picked up a path-traversal finding from a sibling scenario)."""
+    p = urlparse(base_url).path.rstrip("/")
+    return p if p not in ("", "/") else ""
+
+
+# Hosts whose convention is one app per FIRST path segment (`user.github.io/project/`) — there, even a
+# single-segment path is a distinct app, and its siblings belong to other projects.
+_PROJECT_PAGE_HOST = re.compile(r"\.github\.io$|\.gitlab\.io$", re.I)
+
+
+# Managed-backend data-plane reads in the app's OWN observed traffic: Supabase PostgREST (/rest/v1/<table>)
+# and Firestore (…/documents/<collection>). The table name is the one thing bundle-mining loses to a
+# minifier or a dynamically-built query — but the runtime request always carries it.
+_OBSERVED_BAAS_TABLE = re.compile(
+    r"//[^/]*\.supabase\.co/rest/v\d+/([A-Za-z_][A-Za-z0-9_]*)|"
+    r"//firestore\.googleapis\.com/[^?]*?/documents/([A-Za-z_][A-Za-z0-9_-]*)", re.I)
+
+
+def _observed_backend_tables(observed) -> list[str]:
+    """Managed-backend tables/collections the app ITSELF read at runtime — OBSERVED, never guessed, so this
+    can't hallucinate a table (a wrong name just 404s at the provider anyway). Feeds the RLS probes the names
+    a minified/dynamic query hides from the bundle scan."""
+    out: dict[str, None] = {}
+    for item in observed or ():
+        url = item[1] if isinstance(item, (tuple, list)) and len(item) > 1 else ""
+        m = _OBSERVED_BAAS_TABLE.search(url or "")
+        if m:
+            out.setdefault(m.group(1) or m.group(2), None)
+    return list(out)[:16]
+
+
+def _entry_scope(start_path: str, host: str = "") -> str:
+    """The target's own sub-path scope from the --target entry path ('/site/app' -> '/site/app'), or '' for
+    no confinement (today's behaviour). Confine when the path names an APP rather than a route:
+      - an explicit trailing slash ('this directory is the app'), or
+      - >=2 extension-less segments ('/site/app', '/u/alice/demo'), or
+      - a single segment on a project-page host ('user.github.io/project').
+    Do NOT confine a bare origin, a FILE/page target (bWAPP's '/sqli_1.php' — its siblings ARE its surface),
+    or a lone extension-less segment on an ordinary host: on a normal deployment '/login', '/dashboard' is
+    far more often a ROUTE of a root-hosted app than a sub-app, and confining there would under-crawl it.
+    NB the trailing slash alone can't be relied on — RemoteDeployer rstrips it before discover() sees it."""
+    p = (start_path or "/").split("?")[0]
+    explicit_dir = p.endswith("/")
+    segs = [s for s in p.split("/") if s]
+    if not segs:
+        return ""                                        # bare origin -> the whole host is the app
+    if "." in segs[-1] and not explicit_dir:
+        return ""                                        # a file/page target -> keep crawling its siblings
+    if explicit_dir or len(segs) >= 2 or _PROJECT_PAGE_HOST.search(host or ""):
+        return "/" + "/".join(segs)
+    return ""
+
+
+def _in_base_scope(path: str, base_url: str) -> bool:
+    """True when `path` belongs to the target itself (always, for a root-hosted app; inside its own prefix
+    for a sub-path one). Boundary-safe: '/site/app' and '/site/app/x' are in scope, '/site/app-other' is not."""
+    prefix = _base_prefix(base_url)
+    return not prefix or path == prefix or path.startswith(prefix + "/")
+
+
 def _same_origin_path(href: str, base_url: str, page_path: str) -> str | None:
-    """Resolve href against the current page; return its path if same-origin (and not a logout link),
-    else None."""
+    """Resolve href against the current page; return its path if it belongs to THIS target — same-origin,
+    inside the target's own sub-path prefix (see _base_prefix), and not a logout link — else None."""
     href = href.split("#")[0].strip()
     if not href or href.startswith(("mailto:", "javascript:", "tel:", "data:")):
         return None
@@ -115,6 +183,8 @@ def _same_origin_path(href: str, base_url: str, page_path: str) -> str | None:
     if target.netloc != base.netloc:
         return None
     path = target.path or "/"
+    if not _in_base_scope(path, base_url):
+        return None  # a SIBLING app on the same host -> not this target's surface (never attribute it here)
     if _LOGOUT.search(path):
         return None  # crawling logout would destroy the authenticated session
     if _TEMPLATE_ARTIFACT.search(path):
@@ -592,6 +662,11 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
     _parsed = urlparse(base_url)
     start_path = _parsed.path or "/"
     base_url = f"{_parsed.scheme}://{_parsed.netloc}" if _parsed.netloc else base_url
+    # SCOPE (origin + the target's own sub-path prefix, or just the origin) — passed to the same-origin
+    # filter so a sub-path target's crawl can't wander into a SIBLING app on the same host. Kept separate
+    # from base_url: the client/probes must stay origin-bound (see above), only ATTRIBUTION is confined.
+    entry_scope = _entry_scope(start_path, _parsed.netloc)
+    scope_url = base_url + entry_scope
     queue: list[tuple[str, int]] = [(start_path, 0)]
     any_response = False
     endpoints: list = []
@@ -617,21 +692,21 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
             _l, _s = _auth_triggers(html)   # login/signup as a button/link (a CTA a password-form check misses)
             auth[0] |= _l
             auth[1] |= _s
-            for form in _parse_forms(_FORM.findall(html), base_url, path):
+            for form in _parse_forms(_FORM.findall(html), scope_url, path):
                 key = _form_key(form)
                 if key not in seen_forms:
                     seen_forms.add(key)
                     forms.append(form)
                     routes.setdefault(form.action, None)
             for src in _SRC.findall(html):  # tag srcs (img/iframe/script/...) are scan targets, not crawled
-                p = _same_origin_path(src, base_url, path)
+                p = _same_origin_path(src, scope_url, path)
                 if p:
                     routes.setdefault(p, None)
                     if p.split("?")[0].endswith(".js"):
                         js_urls.append(p)
             if depth < max_depth:
                 for href in _LINK.findall(html):
-                    p = _same_origin_path(href, base_url, path)
+                    p = _same_origin_path(href, scope_url, path)
                     if p:
                         routes.setdefault(p, None)
                         # capture query-param NAMES from the link (?page=, ?id=, ...) so a reflected /
@@ -651,6 +726,13 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
         endpoints += [Endpoint(path=p, method="get", query_params=sorted(params), raw_path=p)
                       for p, params in link_params.items()]
         endpoints = _dedup_merge_endpoints(endpoints)   # MERGE inputs on collision (don't drop LLM params)
+        # The MINED sources above (served spec / JS-bundle paths / LLM features) never pass through
+        # _same_origin_path, so confine them here too — a host-wide spec or a SHARED JS bundle lists SIBLING
+        # apps' paths. Measured on GapBench: a mined /site/<other-scenario>/... made a true-negative control
+        # fire path-traversal (attributed to the control). Filtering before the baseline loop also spares
+        # those requests.
+        endpoints = [e for e in endpoints
+                     if _in_base_scope((e.path or "/").split("?")[0], scope_url)]
         # Baseline each endpoint with a well-formed (read-only GET) request: an env-var-gated endpoint
         # (dummy Supabase/API key) 500s on EVERYTHING, so a baseline 5xx marks it reached-but-DEAD. This
         # separates "healthy-observed" surface (parity's real denominator) from merely "reached", and lets
@@ -665,6 +747,7 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
             routes.setdefault(ep.path, None)
 
     browser_ok = False
+    backend_tables: list = []  # managed-backend tables the app's own runtime traffic read (RLS probe input)
     host_tiers: dict = {}     # off-score: where the app's runtime traffic goes (same-origin / BaaS / vendor /
     if render is not None:    # other off-origin) — populated from the observed net once the browser render runs
         # Browser-render the discovered HTML routes and harvest their client-rendered forms AND formless
@@ -692,7 +775,7 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
             any_response = True
             for dom in list(rendered.values()):     # phase 1: entry-page links -> route set
                 for ref in _SRC.findall(dom) + _LINK.findall(dom):
-                    p = _same_origin_path(ref, base_url, start_path)
+                    p = _same_origin_path(ref, scope_url, start_path)
                     if p:
                         routes.setdefault(p, None)
             extra = [r for r in routes if r != start_path and _renderable_route(r)]
@@ -712,7 +795,7 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
                 _l, _s = _auth_triggers(dom)   # a SPA paints 'Sign in'/'Sign up' client-side, so scan the DOM too
                 auth[0] |= _l
                 auth[1] |= _s
-                candidates = _parse_forms(_FORM.findall(dom), base_url, path)
+                candidates = _parse_forms(_FORM.findall(dom), scope_url, path)
                 formless = _formless_form(dom, path)   # SPA inputs with no <form> wrapper
                 if formless is not None:
                     candidates.append(formless)
@@ -723,15 +806,18 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
                         forms.append(form)
                         routes.setdefault(form.action, None)
                 for ref in _SRC.findall(dom) + _LINK.findall(dom):
-                    p = _same_origin_path(ref, base_url, path)
+                    p = _same_origin_path(ref, scope_url, path)
                     if p:
                         routes.setdefault(p, None)
 
             for u in observed_scripts:   # runtime-loaded same-origin .js (native ESM import() chunks / modulepreload)
-                p = _same_origin_path(u, base_url, start_path)   # that leave no <script src> tag -> fold into routes
+                p = _same_origin_path(u, scope_url, start_path)  # that leave no <script src> tag -> fold into routes
                 if p and p.split("?")[0].endswith(".js"):        # so the bundle probes (depscan / secret-scan /
                     routes.setdefault(p, None)                   # source-map) actually read the lazy chunk
 
+            # the app's OWN managed-backend reads name the real tables — bundle-mining loses them to a
+            # minifier or a dynamically-built query, so hand them to the RLS probes (sec-backend-001/002).
+            backend_tables = _observed_backend_tables(observed_net)
             host_tiers = _classify_hosts(observed_net, base_url)  # off-score: WHERE the traffic goes — same-origin
                                                                   # (probe-able) / managed BaaS (config-test lane) /
                                                                   # vendor (never the app's) / other off-origin (the
@@ -740,7 +826,7 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
             # same-origin xhr/fetch) -> the accurate endpoint surface. Ground truth the crawl + static JS-mine
             # miss when the path is built dynamically. Observed == real (no 404-verify); a GET baseline just
             # feeds the probes' health gate. Added BEFORE perception so the LLM is told these, not re-guessing.
-            obs_eps = [e for e in _endpoints_from_observed(observed_net, base_url)
+            obs_eps = [e for e in _endpoints_from_observed(observed_net, scope_url)
                        if not any(x.method == e.method and x.path == e.path for x in endpoints)
                        and not (e.method == "get" and not e.query_params and e.path in routes)]  # nav prefetch
             if obs_eps:
@@ -828,7 +914,13 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
     # host's "Site not found" page). Override ONLY when the root is dead AND the entry is live, so a
     # bare-origin target or a healthy root keeps landing_path = "/" (a no-op for the whole normal corpus).
     landing_path = "/"
-    if start_path != "/":
+    if entry_scope:
+        # a CONFINED sub-path target: the origin root belongs to the HOST (or another app), so the app's
+        # homepage is the entry itself — even when the root answers 200. Without this the homepage probes
+        # (a11y/seo/headers/perf) grade the host's index page and attribute it to this app (measured on
+        # GapBench: an a11y hard-fail on the benchmark's index landed on a true-negative control).
+        landing_path = start_path
+    elif start_path != "/":
         try:
             with make_client(base_url, headers, timeout=5.0, follow_redirects=True) as _lc:
                 if _lc.get("/").status_code >= 400 and _lc.get(start_path).status_code < 400:
@@ -836,7 +928,8 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
         except (httpx.HTTPError, httpx.InvalidURL):
             pass
     return Profile(base_url=base_url, landing_path=landing_path, routes=list(routes), forms=forms,
-                   capabilities=capabilities, endpoints=endpoints, host_tiers=host_tiers)
+                   capabilities=capabilities, endpoints=endpoints, host_tiers=host_tiers,
+                   backend_tables=backend_tables)
 
 
 def surface_metrics(profile: Profile) -> dict:

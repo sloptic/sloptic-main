@@ -70,6 +70,9 @@ class Profile:
     capabilities: dict[str, bool] = field(default_factory=dict)
     endpoints: list[Endpoint] = field(default_factory=list)  # API operations from an OpenAPI spec
     host_tiers: dict = field(default_factory=dict)          # off-score: where runtime traffic goes (classify_hosts)
+    backend_tables: list[str] = field(default_factory=list)  # managed-backend (Supabase/Firestore) collections the
+    #     app's OWN runtime traffic read — OBSERVED, so a minified or dynamically-built table name that never
+    #     appears as a bundle string literal is still testable by the RLS probes. Never guessed.
 
     @property
     def form_endpoints(self) -> list[str]:  # back-compat for predicates that target form actions
@@ -95,6 +98,7 @@ def profile_to_dict(profile: Profile) -> dict:
         "capabilities": dict(profile.capabilities),
         "endpoints": [asdict(e) for e in profile.endpoints],
         "host_tiers": dict(profile.host_tiers),   # off-score telemetry, frozen with the surface so a cached re-grade reports the same backend map
+        "backend_tables": list(profile.backend_tables),
     }
 
 
@@ -108,7 +112,8 @@ def profile_from_dict(d: dict) -> Profile:
     return Profile(base_url=d.get("base_url", ""), landing_path=d.get("landing_path") or "/",
                    routes=list(d.get("routes") or []), forms=forms,
                    capabilities=dict(d.get("capabilities") or {}), endpoints=endpoints,
-                   host_tiers=dict(d.get("host_tiers") or {}))
+                   host_tiers=dict(d.get("host_tiers") or {}),
+                   backend_tables=list(d.get("backend_tables") or []))
 
 
 @dataclass

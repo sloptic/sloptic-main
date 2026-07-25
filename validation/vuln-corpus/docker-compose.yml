@@ -25,3 +25,16 @@ services:
     environment: [vulnerable=1]
     ports: ["127.0.0.1:8084:5000"]
     restart: unless-stopped
+
+  oopssec:         # intentionally-vulnerable Next.js + React store (the MODERN SPA case) — SQLite auto-seeds
+    image: leogra/oss-oopssec-store   # on first start; self-registerable, 35 CTF challenges: XSS/CSRF/IDOR/JWT/
+    # Published on 3000, NOT a tidier 8085, and that is load-bearing. The image bakes
+    # NEXT_PUBLIC_BASE_URL=http://localhost:3000 into the CLIENT BUNDLE at build time, so the browser posts its
+    # registration to an ABSOLUTE http://localhost:3000/api/auth/signup. Publish it anywhere else and that POST
+    # lands on a dead address: signup silently fails, no session cookie comes back, and all eleven authed probes
+    # (IDOR x5, session x4, CSRF, upload x2) read N/A — the exact surface this anchor exists to exercise.
+    # Overriding the env instead does NOT work: NEXT_PUBLIC_* is inlined at build time so the bundle ignores it,
+    # while the Next SERVER reads it at runtime and tries to fetch the host port from inside the container
+    # (ECONNREFUSED -> the homepage 500s). Matching the baked default is the only fix that holds both sides.
+    ports: ["127.0.0.1:3000:3000"]
+    restart: unless-stopped

@@ -15,7 +15,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
 from gapbench_run import (_REQ_FULL_BATTERY, _est_requests, already_done, build_index,  # noqa: E402
-                          probes_for_cwes)
+                          child_cmd, probes_for_cwes)
 
 _CATALOG = pathlib.Path(__file__).resolve().parent.parent / "catalog"
 
@@ -84,3 +84,131 @@ def test_a_graded_row_that_later_went_dead_is_not_counted_done(tmp_path):
     f = tmp_path / "r.jsonl"
     f.write_text(json.dumps({"project": "anchor-gapbench-x", "slop_score": 10, "dead_url": True}) + "\n")
     assert already_done(f) == set()
+
+
+def test_child_cmd_stringifies_the_timeout_as_an_int():
+    # deploy_and_grade declares --grade-timeout type=int, so "300.0" is a hard argparse error. That killed
+    # every child instantly, and because the parent captured output it reported "no record" with no reason —
+    # an unattended run would have burned the whole night on it.
+    cmd = child_cmd("sqli-raw", ["sec-sqli-001"], "r.jsonl", 300.0, set(), set())
+    assert "--grade-timeout" in cmd and cmd[cmd.index("--grade-timeout") + 1] == "300"
+    assert "300.0" not in cmd
+
+
+def test_child_cmd_asks_only_for_the_capabilities_the_selection_needs():
+    nb, na = {"sec-domxss-001"}, {"sec-idor-002"}
+    cheap = child_cmd("x", ["sec-exposure-001"], "r.jsonl", 300, nb, na)
+    assert "--no-browser" in cheap and "--browser-auth" not in cheap
+    rendered = child_cmd("x", ["sec-domxss-001"], "r.jsonl", 300, nb, na)
+    assert "--no-browser" not in rendered and "--browser-auth" not in rendered
+    authed = child_cmd("x", ["sec-idor-002"], "r.jsonl", 300, nb, na)
+    assert "--browser-auth" in authed and "--no-browser" in authed
+    # a control runs the full battery, so it keeps BOTH: an FP can come from any probe, render-dependent ones
+    # included, and that is the entire purpose of a clean control
+    control = child_cmd("ref0", [], "r.jsonl", 300, nb, na)
+    assert "--no-browser" not in control and "--browser-auth" in control
+
+
+def test_child_cmd_targets_the_scenario_and_tags_it_for_the_scorer():
+    cmd = child_cmd("supabase-clone", ["sec-backend-001"], "r.jsonl", 300, set(), set())
+    assert "https://gapbench.vibe-eval.com/site/supabase-clone/" in cmd
+    meta = json.loads(cmd[cmd.index("--meta") + 1])
+    assert meta["project"] == "anchor-gapbench-supabase-clone"   # the anchor tag exempts the shared host
+    assert cmd[cmd.index("--probe") + 1] == "sec-backend-001"
+
+
+def test_wait_until_clear_waits_out_the_window_then_proceeds():
+    # the challenge clears on a rolling ~5-10 minute window, so waiting is the correct move: a scenario run
+    # while blocked is a LOST measurement, and 92 of them is a lost night
+    from gapbench_run import wait_until_clear
+    calls, slept = {"n": 0}, []
+
+    def blocked():
+        calls["n"] += 1
+        return calls["n"] <= 3          # blocked for three checks, then clear
+
+    import gapbench_run
+    real_sleep, gapbench_run.time.sleep = gapbench_run.time.sleep, lambda s: slept.append(s)
+    try:
+        assert wait_until_clear(60, 1800, log=lambda *_a: None, blocked=blocked) is True
+        assert slept == [60, 60, 60]     # waited exactly as long as it was blocked, no longer
+    finally:
+        gapbench_run.time.sleep = real_sleep
+
+
+def test_wait_until_clear_gives_up_rather_than_hanging_forever():
+    from gapbench_run import wait_until_clear
+    import gapbench_run
+    real_sleep, gapbench_run.time.sleep = gapbench_run.time.sleep, lambda s: None
+    try:
+        # a block that outlasts the budget must STOP the run, not spin: the caller's resume makes stopping free
+        assert wait_until_clear(60, 180, log=lambda *_a: None, blocked=lambda: True) is False
+    finally:
+        gapbench_run.time.sleep = real_sleep
+
+
+def test_is_blocked_treats_a_challenge_a_rate_limit_and_a_transport_error_alike():
+    import gapbench_run
+    import httpx as _httpx
+
+    class _R:
+        def __init__(self, code):
+            self.status_code = code
+
+    real_get = gapbench_run.httpx.get
+    try:
+        for code, expected in ((403, True), (429, True), (200, False), (404, False)):
+            gapbench_run.httpx.get = lambda *a, code=code, **k: _R(code)
+            assert gapbench_run.is_blocked() is expected, code
+        def boom(*a, **k):
+            raise _httpx.ConnectError("refused")
+        gapbench_run.httpx.get = boom
+        assert gapbench_run.is_blocked() is True     # what a block looks like mid-tighten
+    finally:
+        gapbench_run.httpx.get = real_get
+
+
+def test_verdict_separates_a_real_miss_from_an_untested_scenario():
+    # THE distinction that makes a recall number readable. A subset grade's slop is meaningless, so the line
+    # has to say whether the DECLARED class was caught -- and a miss only counts if the probes actually ran.
+    from gapbench_run import verdict
+    scen = {"id": "sqli-raw", "cwes": ["CWE-89"]}
+    hit = {"slop_score": 40, "coverage": {"applied": ["sec-sqli-004"]},
+           "findings": [{"probe_id": "sec-sqli-004", "category": "sql-injection"}]}
+    assert verdict(hit, scen, ["sec-sqli-004"])[0] == "HIT"
+    ran_clean = {"slop_score": 0, "coverage": {"applied": ["sec-sqli-004"]}, "findings": []}
+    assert verdict(ran_clean, scen, ["sec-sqli-004"])[0] == "miss"        # detector ran, found nothing
+    nothing_applied = {"slop_score": 0, "coverage": {"applied": []}, "findings": []}
+    assert verdict(nothing_applied, scen, ["sec-sqli-004"])[0] == "untested"   # reach problem, not recall
+    assert verdict({"slop_score": None, "dead_url": True}, scen, ["x"])[0] == "dead"
+    assert verdict(None, scen, ["x"])[0] == "dead"
+
+
+def test_verdict_does_not_credit_a_wrong_class_fire():
+    # firing SOMETHING is not catching the declared bug; an XSS hit on a traversal scenario is not recall
+    from gapbench_run import verdict
+    scen = {"id": "download-traversal", "cwes": ["CWE-22"]}
+    rec = {"slop_score": 35, "coverage": {"applied": ["sec-xss-001"]},
+           "findings": [{"probe_id": "sec-xss-001", "category": "xss"}]}
+    v, applied, fired = verdict(rec, scen, ["sec-xss-001"])
+    assert v == "miss" and applied == 1 and fired == ["sec-xss-001"]
+
+
+def test_a_control_gets_inverted_vocabulary_not_hit_miss():
+    # a control has nothing to catch: a fire is a FALSE POSITIVE and silence is the pass. Labelling that
+    # "miss" would read as failure when it is exactly the result we want, and it is how a precision signal
+    # gets mistaken for a recall one.
+    from gapbench_run import verdict
+    ctrl = {"id": "ref0", "vulnerability": "None (true-negative control)", "cwes": []}
+    quiet = {"slop_score": 25, "coverage": {"applied": ["sec-lfi-001", "sec-sqli-004"]}, "findings": []}
+    assert verdict(quiet, ctrl, [])[0] == "clean"
+    # hygiene on a control is not an FP: the benchmark's own edge omits those headers on every scenario
+    hygiene = {"slop_score": 25, "coverage": {"applied": ["sec-headers-001"]},
+               "findings": [{"probe_id": "sec-headers-001", "category": "security-headers"},
+                            {"probe_id": "qa-a11y-001", "category": "accessibility"}]}
+    assert verdict(hygiene, ctrl, [])[0] == "clean"
+    # a vulnerability CLAIM on a clean site is the precision failure we are hunting
+    bad = {"slop_score": 65, "coverage": {"applied": ["sec-lfi-001"]},
+           "findings": [{"probe_id": "sec-lfi-001", "category": "path-traversal"}]}
+    v, _n, fired = verdict(bad, ctrl, [])
+    assert v == "FP(1)" and fired == ["sec-lfi-001"]

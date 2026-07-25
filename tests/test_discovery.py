@@ -203,6 +203,90 @@ def test_path_bearing_target_crawls_the_entry_page_and_binds_to_origin():
         srv.shutdown()
 
 
+def _serve_two_apps():
+    # ONE host, TWO unrelated apps at sibling sub-paths (a project-page host / benchmark / platform), each
+    # linking to the shared index. Grading app-a must NEVER pick up app-b's surface.
+    pages = {
+        "/": b'<html><body><a href="/site/app-a/">A</a><a href="/site/app-b/">B</a></body></html>',
+        "/site/app-a/": b'<html><body><h1>App A</h1><a href="/site/app-a/inbox">inbox</a>'
+                        b'<a href="/site/app-b/">sibling app B</a><a href="/">index</a>'
+                        b'<script src="/site/app-a/shared.js"></script></body></html>',
+        "/site/app-a/inbox": b"<html><body>A inbox</body></html>",
+        # a SHARED bundle: app-a loads it, but it names app-b's API path — jsmine mines JS content, which
+        # never passes through the link filter, so this is a SECOND escape route (it made a clean GapBench
+        # control fire path-traversal on a sibling's endpoint).
+        "/site/app-a/shared.js": b'fetch("/site/app-b/api/steal?page=1"); fetch("/site/app-a/api/own");',
+        # the sibling: its own route + a form the crawler would otherwise attribute to app-a
+        "/site/app-b/": b'<html><body><h1>App B</h1><form action="/site/app-b/pay" method="post">'
+                        b'<input name="amount"></form></body></html>',
+        "/site/app-b/pay": b"<html><body>B pay</body></html>",
+        # a decoy whose path merely PREFIX-matches app-a (boundary check: must be out of scope)
+        "/site/app-a-other/": b"<html><body>different app</body></html>",
+    }
+
+    class _H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            p = self.path.split("?")[0]
+            body = pages.get(p) or pages.get(p + "/", b"not found")   # serve /x and /x/ alike, as a real host does
+            self.send_response(200 if body != b"not found" else 404)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def test_subpath_target_does_not_crawl_a_sibling_app_on_the_same_host():
+    # measured on GapBench: grading ONE /site/<scenario>/ crawled all 104, so a true-negative control
+    # inherited a sibling's path-traversal finding. Same-origin != same app on a multi-app host.
+    srv = _serve_two_apps()
+    try:
+        origin = "http://127.0.0.1:%d" % srv.server_address[1]
+        # NB no trailing slash: RemoteDeployer rstrips it before discover() sees it, so the real grader path
+        # is the SLASHLESS one — confinement must not depend on the slash surviving.
+        prof = discover(origin + "/site/app-a")
+        assert prof.base_url == origin                       # still origin-bound (probes build base_url+path)
+        assert "/site/app-a" in prof.routes                  # its own entry ...
+        assert "/site/app-a/inbox" in prof.routes            # ... and its own linked route
+        # the homepage probes must grade THIS app's entry, not the shared host index at "/"
+        assert prof.landing_path == "/site/app-a"
+        sibling = [r for r in prof.routes if "app-b" in r or r == "/" or "app-a-other" in r]
+        assert sibling == [], sibling                        # NO sibling route, shared index, or prefix decoy
+        assert all("app-b" not in f.action for f in prof.forms)   # and never the sibling's form
+        # ... and not via a MINED endpoint either (jsmine reads JS CONTENT, bypassing the link filter)
+        assert all("app-b" not in (e.path or "") for e in prof.endpoints), [e.path for e in prof.endpoints]
+    finally:
+        srv.shutdown()
+
+
+def test_root_hosted_target_is_unconfined_and_a_page_target_still_crawls_siblings():
+    # the confinement must NOT narrow the normal cases: a bare-origin target crawls the whole host, and a
+    # slashless page target (bWAPP's /sqli_1.php shape) keeps crawling its siblings — they ARE its surface.
+    from hacklet_runner.discovery import _entry_scope
+    assert _entry_scope("/") == "" and _entry_scope("") == ""            # bare origin -> unconfined
+    assert _entry_scope("/sqli_1.php") == "" and _entry_scope("/deep") == ""   # page/file target -> unconfined
+    assert _entry_scope("/site/app-a/") == "/site/app-a"                # explicit directory -> confined
+    assert _entry_scope("/site/app-a") == "/site/app-a"                 # ... and WITHOUT the slash (rstripped
+    assert _entry_scope("/site/app-a/?x=1") == "/site/app-a"            # upstream): >=2 segments -> confined
+    # one segment: a ROUTE of a root-hosted app on an ordinary host (don't confine — would under-crawl it),
+    # but a distinct APP on a project-page host (user.github.io/project)
+    assert _entry_scope("/login", "myapp.vercel.app") == ""
+    assert _entry_scope("/ChatMIT", "t-hasic.github.io") == "/ChatMIT"
+    srv = _serve_two_apps()
+    try:
+        origin = "http://127.0.0.1:%d" % srv.server_address[1]
+        prof = discover(origin)                                          # bare origin: sees both apps
+        assert any("app-a" in r for r in prof.routes) and any("app-b" in r for r in prof.routes)
+    finally:
+        srv.shutdown()
+
+
 # --- which routes get browser-rendered for forms (pure filter, no browser) ----------------------
 from hacklet_runner.discovery import _formless_form, _renderable_route  # noqa: E402
 

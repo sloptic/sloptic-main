@@ -46,7 +46,7 @@ from hacklet_runner import browser  # noqa: E402
 from hacklet_runner.jsonl import append_jsonl  # noqa: E402
 from hacklet_runner.scope import off_target  # noqa: E402
 from hacklet_runner.aggregate import CATEGORY_DECAY, _damped_total  # noqa: E402
-from hacklet_runner.catalog import load_catalog  # noqa: E402
+from hacklet_runner.catalog import load_catalog, select_probes  # noqa: E402
 from hacklet_runner.deploy import RemoteDeployer  # noqa: E402
 from hacklet_runner.pipeline import run  # noqa: E402
 from hacklet_runner.schema import profile_from_dict, profile_to_dict  # noqa: E402
@@ -759,7 +759,8 @@ def _parse_login(spec):
 
 def _grade_worker(url, use_browser, features, q, cached_profile=None, cache_key=None, repo_url=None,
                   proactive=False, model=DEFAULT_MODEL, browser_auth=False, session_headers=None,
-                  llm_reasoning=False, recon=False, controlled_deploy=False, trace=False, login_creds=None):
+                  llm_reasoning=False, recon=False, controlled_deploy=False, trace=False, login_creds=None,
+                  probe_filter=None):
     os.setsid()   # own process group so the parent can SIGKILL this child AND its headless chrome together
     try:
         render = browser.render_routes if use_browser else None
@@ -786,7 +787,8 @@ def _grade_worker(url, use_browser, features, q, cached_profile=None, cache_key=
         if cached_profile is None:   # a cache HIT reuses the frozen surface -> no discovery, no delay to explain
             _kinds = "crawl" + (" + browser-render" if use_browser else "") + (" + LLM perception" if proactive else "")
             print(f"  discovering surface ({_kinds}) — this runs before the first probe ...", flush=True)
-        report = run(RemoteDeployer(url, health_timeout=20), load_catalog(str(_ROOT / "catalog")),
+        report = run(RemoteDeployer(url, health_timeout=20),
+                     select_probes(load_catalog(str(_ROOT / "catalog")), probe_filter),
                      render=render, on_progress=_grade_heartbeat, seed_features=features, headers=session_headers,
                      cached_profile=cached_profile, on_profile=on_profile, perceive=perceive,
                      browser_register=browser_register, recon=recon,
@@ -817,7 +819,7 @@ def _hard_kill_group(p) -> None:
 def grade(url: str, use_browser: bool, timeout=None, features=None,
           cached_profile=None, cache_key=None, repo_url=None, proactive=False, model=DEFAULT_MODEL,
           browser_auth=False, session_headers=None, llm_reasoning=False, recon=False, controlled_deploy=False,
-          trace=False, login_creds=None):
+          trace=False, login_creds=None, probe_filter=None):
     """Grade the running app in a CHILD PROCESS. A subprocess (not an in-process SIGALRM) because a signal
     can't interrupt a Playwright CPU-spin (the browser probes), but an EXTERNAL SIGKILL of the child + its
     chrome always works. `timeout` is the grading phase's OWN wall-clock budget (independent of deploy time,
@@ -828,7 +830,8 @@ def grade(url: str, use_browser: bool, timeout=None, features=None,
     q = ctx.Queue()
     p = ctx.Process(target=_grade_worker,
                     args=(url, use_browser, features, q, cached_profile, cache_key, repo_url, proactive, model,
-                          browser_auth, session_headers, llm_reasoning, recon, controlled_deploy, trace, login_creds))
+                          browser_auth, session_headers, llm_reasoning, recon, controlled_deploy, trace,
+                          login_creds, probe_filter))
     p.start()
     try:
         result = q.get(timeout=timeout)              # timeout=None (direct run) blocks until the child reports
@@ -1115,6 +1118,13 @@ def main():
                          "form), capture the session, and run every authed-surface probe as that identity. The "
                          "low-friction handoff for gated apps (email-verify/captcha/SDK signup) — bypasses ALL "
                          "signup gates at once. Lower-friction than --header (creds, not an extracted token).")
+    ap.add_argument("--probe", metavar="PATTERN", action="append", default=[],
+                    help="grade with ONLY these probes (repeatable): an id glob (sec-sqli-*), or\n"
+                         "bundle:security / category:xss. Cuts a grade to the class you care about, "
+                         "which is how a labeled benchmark scenario gets tested without spending the "
+                         "whole battery's traffic on it (and how a WAF stays untripped). RECALL ONLY: "
+                         "the recorded slop is a SUBSET, marked probe_filter on the record so it is "
+                         "never mistaken for a full grade. A pattern matching nothing is fatal.")
     ap.add_argument("--header", action="append", dest="headers", metavar="'Name: Value'",
                     help="a request header sent on the WHOLE run (repeatable) — the Option-B auth fallback for apps "
                          "we can't self-register (captcha / email-verify / SSO). Provide a live session and the "
@@ -1183,10 +1193,15 @@ def main():
     # design, so it skips the corpus 'recurring host = platform' scope-out — but stays subject to the
     # reachability check (a down anchor is still honestly dead). See _non_app_url.
     is_anchor = str(meta.get("project", "")).startswith("anchor-")
+    # a --probe run grades a SUBSET, so its slop is not comparable to a full grade. Record the
+    # filter on the row: stats/percentile consumers can exclude it instead of silently averaging
+    # a partial score in as if the whole battery had run.
+    probe_filter = list(args.probe or [])
     # source: the LENS this grade is — "repo" (our controlled Docker deploy, dummy keys, powers the
     # reproducibility metric) vs "url" (their live deployment, real keys + full surface but their infra
     # headers). A submission can be graded BOTH ways; stats keep the two separate — never blended.
     result = {"repo": args.repo, "deployed": False, "attempts_used": 0, "browser": args.browser,
+              **({"probe_filter": probe_filter} if probe_filter else {}),
               "source": "url" if args.url_ingest else "repo", "model": args.model, "ts": time.time(), **meta}
 
     plan, url, error, repo = None, None, "", None
@@ -1298,7 +1313,7 @@ def main():
                            proactive=args.proactive, model=args.model, browser_auth=args.browser_auth,
                            session_headers=_parse_headers(args.headers), llm_reasoning=args.llm_reasoning,
                            recon=args.recon, controlled_deploy=args.controlled_deploy, trace=args.trace,
-                           login_creds=_parse_login(args.login))
+                           login_creds=_parse_login(args.login), probe_filter=args.probe)
         except GradeTimeout as e:
             timings["grade_s"] = round(time.monotonic() - _t, 1)
             result["grade_timeout"] = True         # deployed but ungradeable in budget (broken/pathological

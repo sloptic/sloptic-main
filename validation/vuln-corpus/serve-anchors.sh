@@ -35,7 +35,7 @@ apps=(
   "bWAPP|http://127.0.0.1:8082|bee / bug|wide PHP bug surface"
   "JuiceShop|http://127.0.0.1:8083|(self-register)|Angular SPA, JS-bundle-mined"
   "VAmPI|http://127.0.0.1:8084|name1 / pass1|REST API (BOLA/SQLi) — primary canary"
-  "OopsSec|http://127.0.0.1:8085|(self-register)|Next.js store (authed IDOR/XSS/JWT)"
+  "OopsSec|http://localhost:3000|(self-register)|Next.js store (authed IDOR/XSS/JWT)"
 )
 
 wait_up() {   # poll a url until it returns any HTTP status (containers take a bit to boot); ~60s cap

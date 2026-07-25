@@ -1,0 +1,32 @@
+# Recall + distribution ANCHORS for the corpus run.
+#
+# Grade these KNOWN targets alongside the scraped corpus so that:
+#   (1) the authed/recall probes that read N/A across the off-origin-backed Devpost corpus stay
+#       OBSERVABLY FIRING here (a canary: if VAmPI's known fires drop between runs, a probe regressed
+#       silently -- the 4k-app corpus alone can't tell you, because those probes are dark on it), and
+#   (2) the score distribution gets fixed reference PINS at the known-vulnerable end, so the percentile
+#       calibration has real landmarks and not just an internal median.
+#
+# Usage:  run_batch --hackathon <slugs> ... --urls validation/vuln-corpus/anchors.txt
+# Prereq: `docker compose up -d && bash setup.sh` in this dir FIRST (these are localhost targets).
+#         If the batch host has no Docker, the anchors simply record as dead_url -- harmless; skip them.
+# Tag:    project=anchor-* -> scripts/distribution.py filters anchors OUT of the peer distribution and
+#         plots them as SEPARATE reference lines (an anchor must never pollute the peer percentile).
+#
+# VAmPI is the primary canary: a JSON API, so it grades with no browser and no auth, and its fires are
+# deterministic (BOLA sec-idor-002, sec-sqli-004, sec-exposure-005, qa-crash-010). Juice Shop exercises
+# the browser/JS-bundle-mining path (uses the run's default-on browser). OopsSec Store is the MODERN
+# Next.js+React case: self-registerable, so it's the anchor that lights up the authed/IDOR/stored-XSS
+# probes that read N/A on the off-origin corpus. DVWA/bWAPP are login-gated and need a per-target
+# --header, so they don't fit this global --urls path -- grade them manually per the README.
+#
+# GapBench (vibe-eval's 104-scenario CWE-tagged benchmark) is REMOTE, so it lives in its own list --
+# validation/vuln-corpus/gapbench.txt (grade with --urls that file; its 7 controls are the clean pins).
+#
+# format: URL,project-tag   (no trailing inline comments -- _load_urls would fold them into the tag)
+http://127.0.0.1:8084,anchor-vampi
+http://127.0.0.1:8083,anchor-juiceshop
+http://localhost:3000,anchor-oopssec
+# CLEAN pin (optional, recommended): a real well-built app you OWN or are authorized to grade -- e.g.
+# your live HackLet League deployment -- anchors the CLEAN end of the distribution. Uncomment + fill in:
+# https://YOUR-LEAGUE-APP-URL,anchor-clean-league

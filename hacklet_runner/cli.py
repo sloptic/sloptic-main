@@ -16,7 +16,7 @@ from dataclasses import asdict
 
 from . import browser
 from .aggregate import CATEGORY_DECAY
-from .catalog import load_catalog
+from .catalog import ProbeSelectionError, load_catalog, select_probes
 from .deploy import DockerDeployer, RemoteDeployer, SubprocessDeployer
 from .ingest import SubmissionError, extract_submission
 from .pipeline import run
@@ -240,6 +240,13 @@ def main() -> None:
     src.add_argument("--target", metavar="URL", help="an already-running URL (dogfooding; no Docker)")
     src.add_argument("--app", metavar="PATH", help="a trusted reference app.py (subprocess; dev/CI)")
     ap.add_argument("--catalog", metavar="DIR", default=str(_ROOT / "catalog"), help="probe catalog dir")
+    ap.add_argument("--probe", metavar="PATTERN", action="append", default=[],
+                    help="run ONLY these probes (repeatable): an id glob (sec-sqli-004, sec-sqli-*, sec-*), "
+                         "or bundle:security / category:xss for groupings an id glob can't express. Answers "
+                         "'why didn't THIS probe fire here' in one fast run, and grades a target whose "
+                         "expected vulnerability class is known without spending the whole battery's traffic "
+                         "on it. RECALL ONLY: the score is a subset, not comparable to a full grade. A "
+                         "pattern that matches nothing is a fatal error, never an empty catalog.")
     ap.add_argument("--browser", action="store_true",
                     help="render pages with a headless browser (finds SPA/client-rendered forms)")
     ap.add_argument("--header", action="append", metavar="H", default=[],
@@ -262,7 +269,14 @@ def main() -> None:
     out.add_argument("-q", "--quiet", action="store_true", help="suppress the live progress bar")
     args = ap.parse_args()
 
-    catalog = load_catalog(args.catalog)
+    try:
+        catalog = select_probes(load_catalog(args.catalog), args.probe)
+    except ProbeSelectionError as e:
+        sys.exit(f"ERROR: {e}")
+    if args.probe:   # a subset run: say so, because the score is NOT a full grade
+        sys.stderr.write(f"  probe filter: {', '.join(args.probe)} -> {len(catalog)} of "
+                         f"{len(load_catalog(args.catalog))} probes. Recall check only; this score is a "
+                         f"SUBSET and is not comparable to a full grade.\n")
     render = browser.render_routes if args.browser else None
     source = args.app or args.target or args.submission
     auth_headers = {}
