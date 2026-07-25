@@ -1709,7 +1709,14 @@ def _json_objects(resp):
     except (ValueError, httpx.HTTPError):
         return None
     if isinstance(data, dict):
-        data = next((data[k] for k in _COLLECTION_WRAPPERS if isinstance(data.get(k), list)), None)
+        wrapped = next((data[k] for k in _COLLECTION_WRAPPERS if isinstance(data.get(k), list)), None)
+        if wrapped is None:
+            # A named wrapper list is not always one of the conventional seven: OopsSec answers /api/cart with
+            # {"cartItems":[...],"total":0}. Any single key holding a list OF OBJECTS is the collection —
+            # requiring dicts is what keeps a {"tags":["a","b"]} scalar list from being mistaken for one.
+            wrapped = next((v for v in data.values()
+                            if isinstance(v, list) and v and all(isinstance(o, dict) for o in v)), None)
+        data = wrapped
     if not isinstance(data, list):
         return None
     return [o for o in data if isinstance(o, dict)]
@@ -1938,6 +1945,124 @@ def data_integrity_roundtrip(ctx, probe) -> bool | None:
         client.close()
 
 
+# A create does not always live AT its collection. REST purists POST to /api/cart; a great many real apps POST
+# to /api/cart/add, /api/todos/create, /api/posts/new. Reading the list back at the CREATE path then fetches the
+# action endpoint instead of the collection, so the round-trip can never verify anything. Measured on OopsSec:
+# `POST /api/cart/add` (fields productId, quantity, from schema discovery) pairs with `GET /api/cart`, and
+# without this the data-integrity family stayed N/A on an app that has a perfectly good pair.
+_CREATE_ACTION_LEAF = ("add", "create", "new", "insert", "save", "submit", "store")
+
+# A create whose body is a marker string in EVERY field is rejected by any typed API, and a rejected create
+# means the whole data-integrity / race family reads N/A. Measured on OopsSec:
+#   {"productId":"hldm..","quantity":"hldm.."} -> 400 {"details":[{"path":"quantity","code":"invalid_type"}]}
+#   {"productId":<a real product id>,"quantity":1} -> 200 {"success":true}
+# The app names the offending field in its own rejection, so the create can CORRECT ITSELF instead of guessing
+# a schema up front: post, read which field was refused, coerce that one, retry. Bounded attempts, and the
+# marker still has to survive in at least one field or there is nothing to look for in the collection.
+_ID_FIELD = re.compile(r"^(.*?)_?id$", re.I)
+_CREATE_ATTEMPTS = 4
+
+
+def _reference_id(client, field: str, endpoints) -> str | None:
+    """A REAL id for a reference field, taken from the sibling collection it names: `productId` -> an id from
+    /api/products. Self-as-oracle again — the app supplies the value that makes its own create valid."""
+    m = _ID_FIELD.match(field)
+    base = (m.group(1) or "").lower() if m else ""
+    if not base:
+        return None
+    wanted = (base, base + "s", base + "es")
+    for e in endpoints:
+        if (e.method or "get").lower() != "get":
+            continue
+        leaf = (e.path or "").rstrip("/").rsplit("/", 1)[-1].lower()
+        if leaf not in wanted:
+            continue
+        with contextlib.suppress(Exception):
+            for obj in _json_objects(client.get(e.path)) or []:
+                oid = _obj_id(obj)
+                if oid:
+                    return str(oid)
+    return None
+
+
+def _accepted_create(client, endpoint, marker: str, endpoints):
+    """POST `endpoint` with a marker-bearing body, coercing whatever field the server refuses, until it accepts.
+    Returns (response, body) on a 2xx, else (last_response, body)."""
+    body = {f: marker + secrets.token_hex(2) for f in endpoint.body_fields}
+    for f in list(body):                       # reference fields never accept a marker -> seed them properly
+        if _ID_FIELD.match(f):
+            real = _reference_id(client, f, endpoints)
+            if real:
+                body[f] = real
+    resp = None
+    for _ in range(_CREATE_ATTEMPTS):
+        resp = client.post(endpoint.path, json=body)
+        if resp.status_code in (200, 201):
+            return resp, body
+        refused = [f for f in _schema_refused_fields(resp) if f in body]
+        if not refused:
+            break                              # not a field-level rejection -> retrying cannot help
+        progressed = False
+        for f in refused:
+            nxt = _coerce_next(body.get(f))
+            if nxt is not None:
+                body[f], progressed = nxt, True
+        if not progressed:
+            break
+    return resp, body
+
+
+def _schema_refused_fields(resp) -> list:
+    """Field names the server refused, from the same validation shapes discovery's schema pass reads."""
+    with contextlib.suppress(Exception):
+        doc = resp.json()
+        out = []
+        if isinstance(doc, dict):
+            for key in ("details", "issues", "detail", "errors"):
+                node = doc.get(key)
+                if isinstance(node, list):
+                    for item in node:
+                        if not isinstance(item, dict):
+                            continue
+                        p = item.get("path", item.get("loc", item.get("param", item.get("field"))))
+                        if isinstance(p, list) and p:
+                            out.append(str(p[-1]))
+                        elif isinstance(p, str):
+                            out.append(p.split(".")[-1])
+                elif isinstance(node, dict):
+                    out += [str(k) for k in node]
+        return out
+    return []
+
+
+def _is_json_ok(resp) -> bool:
+    """A collection read we can compare: 200 with a JSON body. Nothing about its shape — an empty collection
+    is a legitimate state and the whole point of the before/after comparison."""
+    return resp is not None and resp.status_code == 200 and "json" in (
+        resp.headers.get("content-type") or "").lower()
+
+
+def _coerce_next(current):
+    """The next type to try for a refused field: string -> number -> bool -> ISO date. None when exhausted."""
+    if isinstance(current, bool):
+        return "2026-01-01T00:00:00Z"
+    if isinstance(current, str):
+        return 1
+    if isinstance(current, int):
+        return True
+    return None
+
+
+def _create_collection(path: str) -> str:
+    """The collection a create endpoint writes into: its parent when the path ends in an action verb, else
+    the path itself (a REST-style POST to the collection)."""
+    clean = (path or "").split("?")[0].rstrip("/") or "/"
+    segs = [s for s in clean.split("/") if s]
+    if len(segs) >= 2 and segs[-1].lower() in _CREATE_ACTION_LEAF:
+        return "/" + "/".join(segs[:-1])
+    return clean
+
+
 def data_integrity_list_roundtrip(ctx, probe) -> bool | None:
     """Persistence correctness on a JSON API with NO read-by-{id} route — the common SPA shape
     data_integrity_roundtrip can't test (UUID keys / list-only API). Create an object carrying a unique
@@ -1955,23 +2080,36 @@ def data_integrity_list_roundtrip(ctx, probe) -> bool | None:
     tested = False
     try:
         for c in creates:
-            collection = (c.raw_path or c.path).split("?")[0].rstrip("/") or "/"   # the list is the create path
+            collection = _create_collection(c.raw_path or c.path)   # parent when the create is /add, /create...
             marker = "hldm" + secrets.token_hex(6)
-            body = {f: marker + secrets.token_hex(2) for f in c.body_fields}   # marker in every field
             try:
-                created = client.post(c.path, json=body)
-                if created.status_code not in (200, 201):
+                # snapshot BEFORE: a fully-typed create (productId + numeric quantity) leaves no marker to
+                # look for, so "did the collection change at all" is the oracle that still works. Comparing the
+                # whole body rather than a count also survives a MERGING create -- adding the same product
+                # twice bumps quantity on one line instead of adding a row, and a count check would read that
+                # correct behaviour as data loss.
+                before = client.get(collection)
+                if not _is_json_ok(before):
+                    continue      # the collection isn't a readable JSON resource -> can't verify here
+                created, body = _accepted_create(client, c, marker, ctx.profile.endpoints)
+                if created is None or created.status_code not in (200, 201):
                     continue   # create didn't succeed -> nothing durable to read back on this endpoint
-                objs = _json_objects(client.get(collection))
+                after = client.get(collection)
+                if not _is_json_ok(after):
+                    continue
+                # Compare RAW bodies, not parsed object lists: a fresh account's collection is legitimately
+                # EMPTY, and requiring a non-empty array of objects threw the before-snapshot away on exactly
+                # the apps this is meant to test.
+                tested = True
+                if marker not in (after.text or "") and (after.text or "") == (before.text or ""):
+                    ctx.evidence.update(create_status=created.status_code, endpoint=collection,
+                                        durable=False, verified_by="collection-unchanged",
+                                        repro=_repro_from_resp(
+                                            created, matched="created 2xx but its collection did not change"))
+                    return True
+                continue          # the write landed (marker present, or the collection moved) -> durable
             except (httpx.HTTPError, httpx.InvalidURL):
                 continue
-            if objs is None:
-                continue   # the collection GET didn't return a JSON array -> can't verify durability here
-            tested = True
-            if not any(marker in json.dumps(o) for o in objs):   # the created marker never landed in the list
-                ctx.evidence.update(create_status=created.status_code, endpoint=collection, durable=False,
-                                    repro=_repro_from_resp(created, matched="created 2xx but absent from its collection"))
-                return True   # server acknowledged the create but the object isn't in its own list -> data lost
         if not tested:
             ctx.evidence["na_reason"] = "no create accepted a write whose collection could be read back"
             return None
