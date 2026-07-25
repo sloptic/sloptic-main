@@ -99,13 +99,21 @@ def _expand(probe: Probe, profile: Profile):
     """Concrete (label, fetch) targets for a declarative probe: a selector fans across discovered
     surface; a literal path is a single target."""
     target = probe.probe.get("target", "/")
-    if target == "/":
-        target = profile.landing_path or "/"   # homepage sentinel -> the discovered landing page (sub-path
-        #     deploys whose origin root is a 404 shell grade the entry page, not the host's not-found shell)
+    # Discovered surface already carries full paths, so the fan-out sentinels need no rebasing.
     if target == "routes":
         return [(r, lambda c, r=r: _fetch_path(probe, c, r)) for r in profile.routes]
     if target == "forms":
         return [(f.action, lambda c, f=f: _fetch_form(probe, c, f)) for f in profile.forms]
+    # A LITERAL target is relative to the APP's root, which for a sub-path deployment is its landing path,
+    # not the origin. The client is origin-bound by design, so a declared `/.env` or `/.git/config` would
+    # otherwise probe the HOST: measured on GapBench, /.git/config 404s at the apex while the scenario serves
+    # it at /site/git-exposed/.git/config, so every path-guessing exposure probe silently tested nothing and
+    # reported clean. Same for any app at user.github.io/project/. No-op when landing_path is "/".
+    landing = (profile.landing_path or "/").rstrip("/")
+    if target == "/":
+        target = landing or "/"
+    elif landing:
+        target = landing + (target if target.startswith("/") else "/" + target)
     return [(target, lambda c: _fetch_path(probe, c, target))]
 
 
