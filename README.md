@@ -5,31 +5,53 @@ better, 0 is clean. Canonical design lives in [FUZZ_RUNNER_SPEC.md](FUZZ_RUNNER_
 
 > **New here (human or agent)?** Read **[CLAUDE.md](CLAUDE.md)** (operating manual),
 > **[STATE.md](STATE.md)** (where the project stands and what is next), and
-> **[PROJECT_LOG.md](PROJECT_LOG.md)** (how it got here). Current shape in one line: **72 probes** across
-> three bundles, discovery driven by a real browser, an LLM assisted deploy and grade pipeline plus a
-> batch orchestrator in `scripts/`, and a team facing report card. Validated on 1043 real hackathon apps
-> at about 1% residual false positives.
+> **[PROJECT_LOG.md](PROJECT_LOG.md)** (how it got here). Current shape in one line: **86 probes** across
+> three bundles (53 security, 21 qa, 12 performance), discovery driven by a real browser, an LLM assisted
+> deploy and grade pipeline plus a batch orchestrator in `scripts/`, and a team facing report card. Not
+> every probe applies to every app, and the ones that cannot reach a surface read N/A rather than clean:
+> across the 1110 apps scored in the most recent corpus pass, the median target had 53 of the 86 apply,
+> with a middle half of 45 to 57.
+
+## How it is calibrated
+
+Two reference apps with the same surface anchor the catalog: a **vulnerable** one that accrues slop and a
+**hardened** one that stays clean. The vulnerable app scores 664, the hardened app scores 0, and the test
+suite locks that gap, so a change that breaks discrimination fails CI. Every probe is guarded so it never
+fires on the hardened app. A probe that fires on both, or on neither, does not ship.
+
+Calibrated against real hackathon apps at scale, most recently 1110 scored across 60 collegiate events.
+That corpus surfaces false positive classes, but it cannot certify precision, because its ground truth is
+unknown. Precision is enforced against the paired reference
+apps in CI. For external labeled ground truth the runner is wired to
+[GapBench](https://gapbench.vibe-eval.com/), a public benchmark of 104 CWE tagged scenarios with 7 clean
+controls, and `scripts/gapbench_score.py` scores a run against its manifest: recall over the classes the
+catalog covers, and any fire on a clean control as a false positive.
 
 ## What it does
 
-The pipeline is `deploy → discover → applicability → execute → aggregate → report`. Two reference apps
-with the same surface anchor it: a **vulnerable** one that accrues slop and a **hardened** one that stays
-clean. The vulnerable app scores 642, the hardened app scores 0, and the test suite locks that gap so a
-change that breaks discrimination fails CI.
+The pipeline is `deploy → discover → applicability → execute → aggregate → report`.
 
 The catalog covers intent independent durability: injection (SQL, XSS, SSTI, LFI, command, SSRF, XXE),
 crash resistance on malformed input, security headers and CORS and CSP, exposed secrets and dotfiles and
 source maps, broken access control (IDOR and missing row level security on a managed backend), Core Web
 Vitals and load time and page weight, accessibility through axe-core, and HTTP correctness. Each vuln
-class runs many techniques that collapse to one finding, and every probe is guarded so it never fires on
-the hardened app.
+class runs many techniques that collapse to one finding, so breadth within a class raises confidence
+without inflating the score.
 
 ## Run it
 
 ```sh
 uv run pytest -q                                                          # the calibration suite
-uv run python -m hacklet_runner.cli --app references/vulnerable/app.py    # prints a slop report
+uv run python -m hacklet_runner.cli --app references/vulnerable/app.py    # prints a slop report, 664
 uv run python -m hacklet_runner.cli --app references/hardened/app.py      # slop_score 0
+```
+
+The browser probes (accessibility, Core Web Vitals, console errors, dead controls, DOM XSS, and the SPA
+discovery render) need playwright, which ships in an optional dependency group so the base install stays
+light. Without it those tests skip and the suite still reads green. Install it and the browser to run them:
+
+```sh
+uv sync --group browser && uv run playwright install chromium chromium-headless-shell
 ```
 
 ## Grade a submission
@@ -78,7 +100,7 @@ uv run python scripts/run_batch.py --hackathon hackharvard-2025 treehacks-2026 \
   --audit-coverage --proactive --browser-auth --url-only --tldr
 
 uv run python scripts/stats.py run.jsonl        # distribution, per probe fire counts, coverage
-uv run python scripts/precision.py run.jsonl    # residual false positive audit on scored apps
+uv run python scripts/precision.py run.jsonl    # audits the KNOWN false positive classes on scored apps
 uv run python scripts/parity.py run.jsonl       # observed vs expected surface, coverage per app
 ```
 
@@ -127,3 +149,9 @@ Create the egress blocked network once (`docker network create --internal hackle
 gVisor for `runtime="runsc"`. `tests/test_docker_hardened.py` verifies that hardening preserves the
 reference calibration and that the `--internal` network actually blocks egress. It manages its own
 throwaway network, so it needs no setup.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
+
+Only point this at targets you own or are authorized to test.

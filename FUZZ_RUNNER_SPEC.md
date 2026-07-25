@@ -17,7 +17,7 @@ Both modes share the same test format and execution semantics. They differ in wh
 
 The fuzz runner is **its own project**, a universal, stack blind, zero config black box resilience grader that the league *plugs into*. The competition is its primary consumer (enqueue a submission, get a slop report, feed scoring). Dogfooding any owned or authorized URL is a second. The boundary is the report contract, so the catalog and harness evolve independently of the platform, and could extract to their own repo.
 
-**Comprehensiveness is the goal**, scoped precisely. About 95% of the **intent independent, HTTP observable** surface the average web app faces: the OWASP aligned security classes, universal correctness, and the speed and resilience the catalog scope below maps (72 probes). The aim is *depth within the common classes*, not the exotic long tail (steganographic uploads, deserialization gadget chains, blind SSRF). That last 5% is where effort refights mature scanners for diminishing returns.
+**Comprehensiveness is the goal**, scoped precisely. About 95% of the **intent independent, HTTP observable** surface the average web app faces: the OWASP aligned security classes, universal correctness, and the speed and resilience the catalog scope below maps (86 probes). The aim is *depth within the common classes*, not the exotic long tail (steganographic uploads, deserialization gadget chains, blind SSRF). That last 5% is where effort refights mature scanners for diminishing returns.
 
 **Division of labor (the intent boundary).** The runner owns what is automatable and intent free. Humans own intent. The line is sharper than "security = runner". The two *biggest* real world slop classes, broken access control and secrets or crypto failures, each split, and the intent free halves are ours.
 
@@ -143,7 +143,7 @@ The split *method* matters more than the ratio:
 
 ### Catalog scope (target)
 
-As of 2026-07-15 the catalog ships **72 probes**: security 47, qa 13, performance 12. The full arsenal
+As of 2026-07-24 the catalog ships **86 probes**: security 53, qa 21, performance 12. The full arsenal
 targets roughly **130 to 200** across the three bundles, built one probe at a time, each landing with its
 three way reference calibration. The high frequency pilot core is done. The catalog grows over seasons,
 and qa and performance are the thinnest today with the most room to grow. The per-category targets below
@@ -393,7 +393,8 @@ on. The lever that works on this model is `reasoning: {enabled: false}`. The obv
 
 **Precision and the report card.** Two instruments sit around the score. `scripts/precision.py` audits a
 finished run for residual false positives on scored apps, the number that decides whether a machine can
-grade at all (about 1% over 1043 apps, down from about 32% early on). `scripts/report_card.py` turns a
+grade at all (a hand audit of the known classes put this near 1% over 1043 apps, down from about 32%
+early on, an estimate rather than a measured rate since that corpus is unlabeled). `scripts/report_card.py` turns a
 graded record into per finding feedback for the team: what a durable app should have done, what the runner
 saw, what the failure indicates, and how to fix it. Public findings render in full. Hidden pool findings
 show up as an opaque count and are itemized only for the organizer, so a team cannot teach to a test it

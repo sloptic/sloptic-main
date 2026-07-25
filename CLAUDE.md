@@ -22,7 +22,7 @@ fires on a false positive is worse than a missing check, because it poisons comp
    ```
    The two ignored files spin real Docker containers with reused names, so run them only when Docker is
    free. Browser tests need the browser group (see Run recipes). Without it, exclude `tests/test_browser.py`
-   and the other render dependent files. A green run is about 347 passing (365 with Docker and a browser).
+   and the other render dependent files. A green run is about 497 passing (535 with Docker and a browser).
 2. **One commit per change.** End every code writing turn with a ready to paste commit command.
    Conventional commit style, scope in parens, `+`-join related parts:
    `feat(discovery): infer field names for anonymous SPA inputs`. Put the why in the body.
@@ -93,7 +93,7 @@ back on. Export the key for a terminal session before a batch.
 `devpost_repos.py`, `stats.py`, `precision.py`, `parity.py`, `report_card.py`, `list_probes.py`. The LLM
 perception and audit passes live in `deploy_and_grade.py`.
 **`references/`**, reference apps for precision and recall: `vulnerable` (accrues slop, anchor score
-**642**, axis `{security 416, qa 158, performance 68}`), `hardened` (clean), `minimal`, `spa`, `qa-janky`,
+**664**, axis `{security 429, qa 167, performance 68}`), `hardened` (clean), `minimal`, `spa`, `qa-janky`,
 `jsonapi`. Tests grade these to lock discrimination.
 **`tests/`**, the offline gate, one file per probe or subsystem.
 
@@ -102,16 +102,19 @@ perception and audit passes live in `deploy_and_grade.py`.
 - **Scoring.** Unbounded, deduction only slop, lower is better. No 0 to 100 normalization (reverted, on
   purpose). Per axis decomposition (security, qa, perf). Penalties priced by risk, frequency times
   severity. Security penalty ceiling 40, a variant group fires once, geometric decay within a category
-  stops one weakness from dominating. Vulnerable anchor 642, hardened 0.
+  stops one weakness from dominating. Vulnerable anchor 664, hardened 0.
 - **The LLM's bounded role.** The LLM decides where to look and flags what discovery missed. It never sets
   the score. Two passes, both in `deploy_and_grade.py`: a perception pass (`perceive_surface`) that seeds
   proactive discovery, verified by the deterministic probes, and an off score coverage auditor
   (`audit_coverage`) that reports missed surface to a human. A hallucinated pointer makes a probe fire on
   nothing, which no-ops, so a bad pointer only ever discovers less, never changes the score. Determinism
   comes from temp-0 plus the per commit surface cache, not from the model being steady.
-- **Precision is the product.** A false positive is worse than a miss. `scripts/precision.py` measures
-  residual false positives on scored apps. The last full run sat near 1% across 1043 real hackathon apps,
-  down from about 32% early on. Broken and placeholder apps rank DNF class, below every running app, so
+- **Precision is the product.** A false positive is worse than a miss. `scripts/precision.py` audits the
+  KNOWN false positive classes on scored apps, and on the last full run those sat near 1% across 1043 real
+  hackathon apps, down from about 32% early on. That number is an estimate, not a measurement: the
+  hackathon corpus has no labels, so it can retire a class you already suspect but can never certify a
+  rate. Measured precision comes from labeled targets, the reference pair in CI and GapBench externally.
+  Never quote the corpus number as a precision guarantee. Broken and placeholder apps rank DNF class, below every running app, so
   they never score a misleading clean zero.
 - **Discovery parity.** An undiscovered surface reads as a clean surface. If the runner is blind to a
   stack's login or upload, that app scores artificially low and comparability breaks, so parity is a
