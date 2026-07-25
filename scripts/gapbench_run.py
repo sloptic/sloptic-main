@@ -19,6 +19,7 @@ FULL battery, because a false positive can come from any probe and that is the w
 """
 import argparse
 import collections
+import fnmatch
 import json
 import pathlib
 import subprocess
@@ -89,6 +90,24 @@ def wait_until_clear(check_every: float, max_wait: float, log=print, blocked=is_
 
 def probes_for_cwes(cwes, cwe2probe) -> list:
     return sorted({pid for w in (cwes or []) for pid in cwe2probe.get(w, ())})
+
+
+class ScenarioSelectionError(SystemExit):
+    """A pattern that matches nothing is fatal. Silently running zero scenarios would print a clean summary
+    and read as 'nothing to fix', the same failure mode --probe already guards against in the catalog."""
+
+
+def select_scenarios(scenarios, only: str):
+    """Narrow the manifest to `only` (comma-separated ids or fnmatch globs). Empty -> everything."""
+    pats = [p.strip() for p in (only or "").split(",") if p.strip()]
+    if not pats:
+        return scenarios
+    ids = [s["id"] for s in scenarios]
+    for p in pats:
+        if not any(fnmatch.fnmatchcase(i, p) or i == p for i in ids):
+            raise ScenarioSelectionError(f"--only: no scenario matches {p!r}")
+    keep = {i for i in ids for p in pats if fnmatch.fnmatchcase(i, p) or i == p}
+    return [s for s in scenarios if s["id"] in keep]
 
 
 # Probes that need a SESSION but don't declare has_auth_entrypoint, because they mint their own identities
@@ -201,6 +220,10 @@ def main() -> None:
     ap.add_argument("--grade-timeout", type=int, default=300,
                     help="per-scenario grading cap in SECONDS (int: deploy_and_grade rejects a float)")
     ap.add_argument("--limit", type=int, default=0, help="stop after N scenarios (0 = all)")
+    ap.add_argument("--only", default="", metavar="IDS",
+                    help="comma-separated scenario ids or fnmatch globs (e.g. 'ssti,*redirect*'). Re-checking "
+                         "a handful of fixed probes costs ~100 requests instead of ~9700, which matters on a "
+                         "shared host that rate-limits us. Unmatched patterns are fatal, not silently empty.")
     ap.add_argument("--recheck", type=float, default=60.0, metavar="SECONDS",
                     help="while blocked, re-test the host this often (one request per check)")
     ap.add_argument("--max-wait", type=float, default=1800.0, dest="max_wait", metavar="SECONDS",
@@ -211,8 +234,11 @@ def main() -> None:
     args = ap.parse_args()
 
     scenarios = json.load(open(args.manifest))["scenarios"]
+    scenarios = select_scenarios(scenarios, args.only)
     cwe2probe, needs_browser, needs_auth = build_index(args.catalog)
-    done = already_done(args.results)
+    # "already done" only means anything relative to what we were ASKED to run: with --only, the full-run
+    # count reads as nonsense ("4 scenarios ... 91 already done") and hides why the plan came out empty.
+    done = already_done(args.results) & {s["id"] for s in scenarios}
 
     plan, skipped, controls = [], [], []
     for s in scenarios:
@@ -238,6 +264,13 @@ def main() -> None:
     print(f"  running {len(jobs)} now · ~{est} requests total (vs ~{len(jobs) * _REQ_FULL_BATTERY} for full "
           f"batteries) · {args.delay:.0f}s apart · ~{len(jobs) * args.delay / 60:.0f} min of gaps")
     print("  heaviest: " + ", ".join(f"{sid} ~{n}" for n, sid in heaviest))
+    if args.only and not jobs and done:
+        # the whole point of --only is re-checking a FIXED probe, and those ids are already in the old file.
+        # Never append a new code version's rows to an old run's file: the mixture is unscoreable.
+        print(f"\n  all {len(done)} selected scenario(s) are already graded in {args.results}.")
+        print("  a post-fix re-check must write a NEW file, so the run measures one code version:")
+        print(f"    --only '{args.only}' --results gapbench-recheck.jsonl\n")
+        return
     print(f"  skipped: {', '.join(skipped[:10])}{' ...' if len(skipped) > 10 else ''}\n")
     if args.dry_run:
         for sid, sel in jobs[:15]:
