@@ -95,3 +95,17 @@ def test_percentile_interpolates_between_frozen_landmarks():
     assert _percentile_of(part, 0) == 0 and _percentile_of(part, 500) == 100
     assert _percentile_of(part, 50) == 50
     assert 25 < _percentile_of(part, 37) < 50                # between stored landmarks
+
+
+def test_a_curve_is_provisional_until_declared_final_and_says_so():
+    # the curve gets regraded once the catalog's calibration settles, so a percentile quoted from this one has
+    # to carry that caveat. A provisional number presented as final is the exact failure a versioned reference
+    # exists to prevent.
+    prov = build(_corpus(), "2026.1", "run.jsonl")
+    assert prov["status"] == "provisional"
+    assert "PROVISIONAL" in rank(prov, 50)["reference"]
+    final = build(_corpus(), "2027.1", "run.jsonl", status="final")
+    assert final["status"] == "final" and "PROVISIONAL" not in rank(final, 50)["reference"]
+    # an older curve file without the field is treated as provisional, never silently as final
+    legacy = {k: v for k, v in prov.items() if k != "status"}
+    assert "PROVISIONAL" in rank(legacy, 50)["reference"]

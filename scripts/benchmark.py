@@ -84,11 +84,15 @@ def _pcts(values: list) -> dict:
     return out
 
 
-def build(recs: list, version: str, source: str) -> dict:
+def build(recs: list, version: str, source: str, status: str = "provisional") -> dict:
     rows = [r for r in recs if _eligible(r)]
     if not rows:
         sys.exit("ERROR: no eligible rows (need deployed + scored + not anchor/subset/dead/DNF)")
-    curve = {"version": version, "source": source, "population": "live hackathon web apps",
+    # status rides ON the curve and into every ranked result. A curve built before the catalog's calibration
+    # settles will be regraded, and a percentile quoted from it must say so: a provisional number presented as
+    # final is the failure mode a versioned reference exists to prevent.
+    curve = {"version": version, "source": source, "status": status,
+             "population": "live hackathon web apps",
              "overall": _pcts([r["slop_score"] for r in rows]), "axes": {}}
     for axis in _AXES:
         vals = [(r.get("axis_slop") or {}).get(axis, 0) for r in rows if _axis_applicable(r).get(axis)]
@@ -121,8 +125,10 @@ def rank(curve: dict, score, record: dict | None = None) -> dict:
     of the reference population this app is cleaner than... inverted at the end for readability."""
     pct = _percentile_of(curve["overall"], score)
     cleaner_than = 100 - pct
+    status = curve.get("status", "provisional")
     out = {"slop": score, "percentile": pct, "cleaner_than_pct": cleaner_than, "band": _band(pct),
-           "reference": f"{curve['population']}, n={curve['overall']['n']}, {curve['version']}", "axes": {}}
+           "reference": f"{curve['population']}, n={curve['overall']['n']}, {curve['version']}"
+                        + (f" ({status.upper()})" if status != "final" else ""), "axes": {}}
     if record:
         applicable = _axis_applicable(record)
         for axis, part in curve["axes"].items():
@@ -164,6 +170,9 @@ def main() -> None:
     b.add_argument("results")
     b.add_argument("--version", required=True, help="curve version, e.g. 2026.1 (a badge must cite one)")
     b.add_argument("--out", default=str(_DEFAULT_CURVE))
+    b.add_argument("--status", default="provisional", choices=("provisional", "final"),
+                   help="provisional (default) until the catalog's calibration settles and the corpus is "
+                        "regraded; it is stamped on the curve and shown with every rank")
     q = sub.add_parser("rank", help="place a score (or a graded app) on the curve")
     q.add_argument("score", nargs="?", type=float, help="a raw slop score")
     q.add_argument("--results", help="a results JSONL to read the app from (enables per-axis + gates)")
@@ -174,10 +183,11 @@ def main() -> None:
 
     if args.cmd == "build":
         recs = [json.loads(l) for l in pathlib.Path(args.results).read_text().splitlines() if l.strip()]
-        curve = build(recs, args.version, pathlib.Path(args.results).name)
+        curve = build(recs, args.version, pathlib.Path(args.results).name, args.status)
         pathlib.Path(args.out).write_text(json.dumps(curve, indent=2) + "\n")
         o = curve["overall"]
-        print(f"\n  froze {args.out}  ({curve['version']}, n={o['n']} from {curve['source']})")
+        print(f"\n  froze {args.out}  ({curve['version']}, {curve['status']}, "
+              f"n={o['n']} from {curve['source']})")
         print(f"  overall  p10 {o['p10']}  p25 {o['p25']}  median {o['p50']}  p75 {o['p75']}  "
               f"p90 {o['p90']}  p99 {o['p99']}  max {o['max']}")
         for axis, a in curve["axes"].items():
