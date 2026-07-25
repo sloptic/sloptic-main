@@ -1448,6 +1448,97 @@ def _bola_pairs(endpoints):
     return pairs
 
 
+# A collection we will POST to must not be an action endpoint dressed as one. Writes here are bounded and
+# the targets are under test, but inferring a create on /logout or /checkout is never worth it.
+_NO_WRITE = re.compile(r"logout|sign[_-]?out|delete|remove|pay\b|payment|checkout|refund|charge|subscribe|"
+                       r"cancel|webhook|/auth/|token|session|admin", re.I)
+_CONV_PAIR_CAP = 4          # collections to probe for a conventional pair (each costs one GET + one POST)
+_CONV_SKIP_FIELDS = ("id", "createdat", "created_at", "updatedat", "updated_at", "_id", "uuid", "slug")
+# An id-looking path segment, so /api/products/<cuid>/reviews and /api/products/<other>/reviews collapse to
+# ONE shape. Without this a crawl that saw six products spends the whole cap re-testing one collection.
+_ID_SEGMENT = re.compile(r"^(?:\d+|[0-9a-f]{8,}|[a-z0-9]{16,}|[0-9a-fA-F-]{32,})$", re.I)
+
+
+def _path_shape(path: str) -> str:
+    return "/".join("{}" if _ID_SEGMENT.match(seg) else seg for seg in path.split("/"))
+
+
+def _conventional_pairs(ctx, cap: int = _CONV_PAIR_CAP):
+    """REST-convention create+read pairs the crawl never OBSERVED, so the authorization probes can run at all.
+
+    _bola_pairs needs BOTH halves already in the profile: a POST-with-body on the collection AND a templated
+    `GET /coll/{id}`. A client-rendered app only issues those from a logged-in page the crawl may never reach,
+    so the pair goes undiscovered and IDOR/integrity/race read N/A — measured as the single largest dark
+    region of the catalog (all five sec-idor probes NEVER APPLIED across 1110 corpus apps, and on the OopsSec
+    anchor whose `POST /api/wishlists` + `GET /api/wishlists/{id}` are right there and reachable).
+
+    So infer the pair from the convention, but ONLY on evidence: GET the discovered collection, require a JSON
+    ARRAY OF OBJECTS CARRYING AN ID (that is what makes it a resource collection rather than an action or a
+    scalar), and take the create body's field names from those objects' OWN keys — the shape the app itself
+    returns, not a guess.
+
+    Then VERIFY the read template against an id that already exists in that collection, and emit nothing if it
+    does not resolve. Without that check the inference MANUFACTURES false positives: measured on OopsSec, whose
+    reviews collection has no read-by-id, the round-trip probe created a review (201), failed to read it back
+    at the invented path (404), and reported a 34-penalty data-integrity finding that was purely our own bad
+    guess. An unverifiable read means the app has no read-by-id, which is not a defect."""
+    out = []
+    seen = set()
+    with make_client(ctx.base_url, ctx.headers, timeout=10.0, follow_redirects=True) as c:
+        for path in _collection_paths(ctx.profile.endpoints):
+            if len(out) >= cap:
+                break
+            coll = path.rstrip("/")
+            shape = _path_shape(coll)
+            if not coll or shape in seen or _NO_WRITE.search(coll):
+                continue
+            seen.add(shape)   # by SHAPE, so sibling collections under different resource ids count once
+            try:
+                r = c.get(coll)
+            except (httpx.HTTPError, httpx.InvalidURL):
+                continue
+            if r.status_code != 200 or "json" not in r.headers.get("content-type", "").lower():
+                continue
+            try:
+                data = r.json()
+            except ValueError:
+                continue
+            items = data if isinstance(data, list) else next(
+                (v for v in data.values() if isinstance(v, list)) if isinstance(data, dict) else iter(()), None)
+            rows = [x for x in (items or []) if isinstance(x, dict)]
+            if not rows or not any(k.lower() == "id" for k in rows[0]):
+                continue          # not a resource collection (no per-object id -> nothing to read back by id)
+            fields = [k for k in rows[0] if k.lower() not in _CONV_SKIP_FIELDS
+                      and not isinstance(rows[0][k], (dict, list))]
+            if not fields:
+                continue
+            # PROVE the read template exists, using an id the collection itself just handed us. A collection
+            # with no read-by-id (very common) would otherwise make every round-trip look broken.
+            existing = next((v for k, v in rows[0].items() if k.lower() == "id"), None)
+            if existing is None:
+                continue
+            try:
+                probe_read = c.get(f"{coll}/{existing}")
+            except (httpx.HTTPError, httpx.InvalidURL):
+                continue
+            if probe_read.status_code >= 400:
+                continue          # no read-by-id endpoint -> nothing to round-trip against, and NOT a defect
+            create = Endpoint(path=coll, method="post", body_fields=fields, raw_path=coll, origin="convention")
+            read = Endpoint(path=coll + "/1", method="get", path_params=["id"],
+                            raw_path=coll + "/{id}", origin="convention")
+            out.append((create, read, "id", None))
+    return out
+
+
+def _create_read_pairs(ctx):
+    """Every create+read pair to test: the ones discovery OBSERVED first (their body/param names are real),
+    then conventional ones inferred from a collection's own shape (see _conventional_pairs)."""
+    pairs = _bola_pairs(ctx.profile.endpoints)
+    have = {(c.raw_path or c.path).rstrip("/") for c, _r, _p, _i in pairs}
+    return pairs + [t for t in _conventional_pairs(ctx)
+                    if (t[0].raw_path or t[0].path).rstrip("/") not in have]
+
+
 def _created_id(resp):
     """The id of a just-created object: a Location header tail, or an id-like field in the JSON body."""
     loc = resp.headers.get("location")
@@ -1506,7 +1597,7 @@ def api_bola(ctx, probe) -> bool | None:
     can read that object and sees A's canary, object-level authorization is broken. Only pairs whose
     create body has a sensitive field are tested (precision — a shared collection isn't BOLA). N/A when
     there's no such pair or two accounts can't be established."""
-    pairs = [(c, r, p, idf) for (c, r, p, idf) in _bola_pairs(ctx.profile.endpoints)
+    pairs = [(c, r, p, idf) for (c, r, p, idf) in _create_read_pairs(ctx)
              if any(_SENSITIVE_FIELD.search(f) for f in c.body_fields)]
     if not pairs:
         ctx.evidence["na_reason"] = "no create+read API pair with a private field to cross-check"
@@ -1758,7 +1849,7 @@ def data_integrity_roundtrip(ctx, probe) -> bool | None:
     (404 / 410 / 5xx) -> silent data loss / non-durable writes (the 'it said it saved, but it's gone'
     failure). Uses the same create+read pairing as BOLA. N/A when there's no create+read pair or no
     create succeeds (couldn't establish the round-trip -> not a clean pass, a missed test)."""
-    pairs = _bola_pairs(ctx.profile.endpoints)
+    pairs = _create_read_pairs(ctx)
     if not pairs:
         ctx.evidence["na_reason"] = "no create+read endpoint pair to round-trip (SPA writes go off-origin)"
         return None
@@ -2114,13 +2205,22 @@ def _postgrest_tables(resp) -> list[str]:
     return []
 
 
-def _supabase_tables(blob: str) -> list[str]:
-    """Candidate tables to probe: names the app's OWN code queries — supabase-js `.from('t')` and hardcoded
-    `/rest/v1/t` paths (string literals that survive minification) — first (the real signal), then a common
-    fallback. Bundle-driven because the anon key can no longer enumerate the PostgREST OpenAPI root."""
-    mined = list(dict.fromkeys([m.group(1) for m in _SUPABASE_FROM.finditer(blob)]
+def _supabase_tables(blob: str, observed: list[str] | None = None) -> list[str]:
+    """Candidate tables to probe, strongest signal first: tables the app was OBSERVED reading at runtime
+    (profile.backend_tables — survives minification and dynamically-built queries, which is exactly what a
+    bundle scan loses), then names mined from its code (supabase-js `.from('t')`, hardcoded `/rest/v1/t`
+    literals), then a common fallback. Bundle+observation-driven because the anon key can no longer
+    enumerate the PostgREST OpenAPI root — and enumeration by guesswork was refuted."""
+    mined = list(dict.fromkeys(list(observed or [])
+                               + [m.group(1) for m in _SUPABASE_FROM.finditer(blob)]
                                + [m.group(1) for m in _SUPABASE_REST.finditer(blob)]))
     return (mined + [t for t in _SUPABASE_COMMON if t not in mined])[:16]
+
+
+def _observed_tables(ctx) -> list[str]:
+    """Managed-backend tables the app itself read at runtime (discovery records them from observed traffic);
+    empty without a browser render, in which case the probes fall back to bundle mining alone."""
+    return list(getattr(getattr(ctx, "profile", None), "backend_tables", None) or [])
 
 
 def _sensitive_leak(table: str, columns: list[str]) -> bool:
@@ -2187,10 +2287,12 @@ def _firebase_readable(client, json_url: str):
     return None
 
 
-def _firestore_collections(blob: str) -> list[str]:
-    """Collections the app's OWN code queries (Firestore `collection(db, 'name')` calls), then a small
-    common-name fallback — the set to test for public readability. App-referenced names first (real signal)."""
-    found = list(dict.fromkeys(m.group(1) for m in _FIRESTORE_COLL.finditer(blob)))
+def _firestore_collections(blob: str, observed: list[str] | None = None) -> list[str]:
+    """Collections to test for public readability, strongest signal first: OBSERVED at runtime (survives
+    minification/dynamic queries), then the app's own code (`collection(db, 'name')`), then a small
+    common-name fallback."""
+    found = list(dict.fromkeys(list(observed or [])
+                               + [m.group(1) for m in _FIRESTORE_COLL.finditer(blob)]))
     return (found + [c for c in _COMMON_COLLECTIONS if c not in found])[:14]
 
 
@@ -2235,7 +2337,7 @@ def exposed_backend_readable(ctx, probe) -> bool | None:
     with httpx.Client(timeout=8.0, follow_redirects=True, verify=False) as ext:   # external provider hosts
         if sm:
             base = "https://" + sm.group(1) + ".supabase.co"
-            hit = _supabase_readable(ext, base, keys, _supabase_tables(blob))
+            hit = _supabase_readable(ext, base, keys, _supabase_tables(blob, _observed_tables(ctx)))
             if isinstance(hit, dict):
                 ctx.evidence.update(backend="supabase", host=base, table=hit["table"],
                                     rows_readable=hit["rows"], columns=hit["columns"], repro=hit["repro"])
@@ -2253,7 +2355,7 @@ def exposed_backend_readable(ctx, probe) -> bool | None:
         if fs_used:
             proj, key = proj_m.group(1), key_m.group(0)
             hit = _firestore_readable(ext, "https://firestore.googleapis.com", proj, key,
-                                      _firestore_collections(blob))
+                                      _firestore_collections(blob, _observed_tables(ctx)))
             if isinstance(hit, dict):
                 ctx.evidence.update(backend="firestore", project=proj, collection=hit["collection"],
                                     documents_readable=hit["documents"], fields=hit["fields"], repro=hit["repro"])
@@ -2377,7 +2479,8 @@ def authenticated_backend_readable(ctx, probe) -> bool | None:
             token = _firebase_anon_token(ext, "https://identitytoolkit.googleapis.com", key_m.group(0))
             if token:
                 hit = _firestore_authed_only(ext, "https://firestore.googleapis.com", proj_m.group(1),
-                                             key_m.group(0), token, _firestore_collections(blob))
+                                             key_m.group(0), token,
+                                             _firestore_collections(blob, _observed_tables(ctx)))
                 if isinstance(hit, dict):
                     ctx.evidence.update(backend="firestore", tier="authenticated", project=proj_m.group(1),
                                         collection=hit["collection"], documents_readable=hit["documents"],
@@ -2391,7 +2494,8 @@ def authenticated_backend_readable(ctx, probe) -> bool | None:
             if anon_key:
                 jwt = _supabase_signup(ext, base, anon_key)
                 if jwt:
-                    hit = _supabase_authed_only(ext, base, anon_key, jwt, _supabase_tables(blob))
+                    hit = _supabase_authed_only(ext, base, anon_key, jwt,
+                                                _supabase_tables(blob, _observed_tables(ctx)))
                     if isinstance(hit, dict):
                         ctx.evidence.update(backend="supabase", tier="authenticated", host=base,
                                             table=hit["table"], rows_readable=hit["rows"],
@@ -2400,6 +2504,24 @@ def authenticated_backend_readable(ctx, probe) -> bool | None:
                     reached = reached or hit != "unreachable"
     ctx.evidence.update(checked=True, reachable=reached, authenticated_bypass=False)
     return False if reached else None
+
+
+def _https_browser_enforced(ctx) -> bool:
+    """HTTPS is ALREADY enforced by the browser for this host, so a cookie missing `Secure` cannot transit in
+    cleartext — the request is upgraded before it leaves. True for a preloaded-apex platform subdomain, or
+    when the app itself sends HSTS with includeSubDomains AND preload (i.e. it claims preload-list
+    membership; a bare max-age is trust-on-first-use, so we do NOT suppress on that). Mirrors the
+    sec-headers-003 carve-out: without it we forgive a missing HSTS header on *.vercel.app yet still charge
+    for the Secure flag that same enforcement makes redundant. Suppression is upside-only."""
+    host = urllib.parse.urlparse(getattr(ctx, "base_url", "") or "").netloc.lower().split(":")[0]
+    if host.endswith(_HSTS_PRELOADED_SUFFIXES):
+        return True
+    with contextlib.suppress(Exception):
+        hsts = ctx.client.get("/").headers.get("strict-transport-security", "").lower().replace(" ", "")
+        m = re.search(r"max-age=(\d+)", hsts)
+        if m and int(m.group(1)) > 0 and "includesubdomains" in hsts and "preload" in hsts:
+            return True
+    return False
 
 
 def session_cookie_missing_flag(ctx, probe) -> bool | None:
@@ -2415,7 +2537,13 @@ def session_cookie_missing_flag(ctx, probe) -> bool | None:
         cookie = auth.session_cookie(account.register_response)
         if cookie is None:
             return None  # registration yielded no recognizable session cookie -> couldn't test
-        ctx.evidence.update(flag=flag, present=cookie[flag])
+        # record WHICH cookie was judged: several can match the session-name heuristic, so an unnamed
+        # verdict is unfalsifiable ("no HttpOnly" on an app whose real token HAS it reads as a bug).
+        ctx.evidence.update(flag=flag, present=cookie[flag], cookie=cookie["name"])
+        if flag == "secure" and not cookie["secure"] and _https_browser_enforced(ctx):
+            ctx.evidence["suppressed"] = ("HTTPS is browser-enforced for this host (HSTS preload / "
+                                          "preloaded-apex subdomain) -> the cookie cannot transit cleartext")
+            return False
         return not cookie[flag]
     finally:
         account.client.close()
