@@ -90,6 +90,26 @@ _PROBE_OVERRIDES = {          # where a category is coarser than the probe
 # not a claim that this app is exploitable — and the benchmark's own edge omits these on every scenario,
 # controls included, so charging them as FPs would measure Vercel's defaults, not our precision.
 _FP_EXEMPT_CATEGORIES = {"security-headers", "mixed-content"}
+# Scenarios whose flaw lives at the LLM/agent TOOL boundary: the agent obeys instructions embedded in a prompt,
+# a fetched page, a tool result or a tool description. They declare CWE-77/94 because the end effect is code or
+# command execution, and our shell/template-injection probes claim those CWEs — but there is no HTTP parameter
+# to inject into, so counting them as "covered and missed" credits us with a reach we do not have and inflates
+# the gap list. Deliberately out of scope per the spec's scope philosophy (intent-dependent + LLM-specific).
+# Kept DELIBERATELY narrow: agent-confused-deputy (an as_user param), llm-html-rendering (innerHTML on model
+# output), function-calling-arg-poison (args interpolated into SQL/exec) and prompt-leak-via-error all DO have
+# an HTTP surface, so they stay as real gaps.
+#
+# `tls-downgrade` is out of scope for a different and simpler reason: it declares TLS 1.0 with RC4, an expired
+# certificate and no HSTS, but it is a PATH on a shared host that terminates valid modern TLS at the edge. The
+# scenario cannot present the certificate or cipher it claims, so no transport-layer probe can ever see the
+# flaw and sec-mixed-001 reading clean is the correct answer, not a miss.
+_OUT_OF_SCOPE = {
+    "agent-tool-abuse": "out of scope (LLM tool boundary)",
+    "indirect-prompt-injection": "out of scope (LLM tool boundary)",
+    "tool-output-injection": "out of scope (LLM tool boundary)",
+    "mcp-tool-spec-injection": "out of scope (LLM tool boundary)",
+    "tls-downgrade": "unobservable (shared host terminates valid TLS)",
+}
 # every CWE ANY probe of ours can evidence -> used to split "we missed it" from "we don't cover it"
 _COVERED_CWES = set().union(*_CWE_BY_CATEGORY.values(), *_PROBE_OVERRIDES.values())
 
@@ -134,7 +154,10 @@ def score(recs: list, scenarios: list) -> dict:
             "id": sid, "vulnerability": s.get("vulnerability", ""), "cwes": sorted(expected),
             "control": is_control,
             "graded": rec is not None and not rec.get("dead_url") and "slop_score" in (rec or {}),
-            "covered": bool(expected & _COVERED_CWES),
+            # covered = we ship a probe that could evidence this class AND it is in scope. Independent of
+            # whether the row was graded: a class we do not cover is a scope boundary whether or not the
+            # scenario ran, and reporting it as UNGRADED reads like a failure we caused.
+            "covered": bool(expected & _COVERED_CWES) and sid not in _OUT_OF_SCOPE,
             "matched": sorted({f["probe_id"] for f in matched}),
             "vuln_findings": sorted({f["probe_id"] for f in vuln_findings}),
             "slop": (rec or {}).get("slop_score"),
@@ -168,12 +191,15 @@ def report(res: dict) -> None:
 
     print(f"\n(b) PER-SCENARIO  (declared bug -> did we catch it)")
     for r in sorted(rows, key=lambda x: (not x["graded"], bool(x["matched"]), x["id"])):
-        if not r["graded"]:
+        if not r["covered"]:
+            # scope boundary FIRST: an uncovered class is out of scope whether or not it was graded, and
+            # calling it UNGRADED implies a run failure we caused (the driver skips these on purpose).
+            verdict, why = "no-cov ", _OUT_OF_SCOPE.get(
+                r["id"], "no probe maps to " + ",".join(r["cwes"]))
+        elif not r["graded"]:
             verdict, why = "UNGRADED", str(r["dead"] or "")[:46]
         elif r["matched"]:
             verdict, why = "HIT    ", "via " + ", ".join(r["matched"][:3])
-        elif not r["covered"]:
-            verdict, why = "no-cov ", "no probe maps to " + ",".join(r["cwes"])
         else:
             verdict, why = "MISS   ", "fired: " + (", ".join(r["vuln_findings"][:3]) or "nothing")
         print(f"    {verdict} {r['id']:<28} {r['vulnerability'][:30]:<30} {','.join(r['cwes']):<18} {why}")
@@ -192,8 +218,9 @@ def report(res: dict) -> None:
     else:
         print("    (none — every covered class was caught)")
 
-    nocov = [r for r in rows if r["graded"] and not r["covered"]]
-    print(f"\n(d) UNCOVERED CLASSES — no probe of ours maps to these ({len(nocov)}); scope decision, not a bug")
+    nocov = [r for r in rows if not r["covered"]]      # graded or not: a scope boundary either way
+    print(f"\n(d) UNCOVERED CLASSES — out of scope, not a bug ({len(nocov)}): no probe of ours maps to the "
+          f"class, or the scenario cannot present the flaw over HTTP (see _OUT_OF_SCOPE)")
     seen = collections.Counter(w for r in nocov for w in r["cwes"] if w not in _COVERED_CWES)
     for w, n in seen.most_common():
         ids = [r["id"] for r in nocov if w in r["cwes"]][:4]

@@ -108,3 +108,53 @@ def test_a_near_universal_category_never_credits_a_scenario():
     # it still credits what it genuinely detects: clickjacking defence and header hardening
     assert {"CWE-1021", "CWE-693"} <= _finding_cwes({"probe_id": "sec-headers-004",
                                                     "category": "security-headers"})
+
+
+def test_an_uncovered_class_is_a_scope_boundary_whether_or_not_it_ran():
+    # the driver SKIPS scenarios no probe covers, so they have no record. Reporting those as UNGRADED reads as
+    # a run failure we caused; they belong in the uncovered-by-design bucket and out of the recall denominator.
+    scen = _SCEN + [{"id": "grpc-2", "vulnerability": "gRPC reflection", "cwes": ["CWE-9999"]}]
+    res = score([_rec("sqli-raw", [_f("sec-sqli-004", "sql-injection")])], scen)
+    rows = {r["id"]: r for r in res["rows"]}
+    assert rows["grpc-2"]["covered"] is False and rows["grpc-2"]["graded"] is False
+    assert res["covered"] == 1 and res["hits"] == 1 and res["recall_covered"] == 100.0
+
+
+def test_llm_tool_boundary_scenarios_are_out_of_scope_not_recall_gaps():
+    # they declare CWE-77/94 because the end effect is code execution, and our shell/template probes claim
+    # those CWEs -- but there is no HTTP parameter to inject into, so counting them as covered-and-missed
+    # credits us with reach we don't have and pads the gap list.
+    from gapbench_score import _OUT_OF_SCOPE
+    scen = [{"id": "agent-tool-abuse", "vulnerability": "LLM Tool Hijack", "cwes": ["CWE-77", "CWE-94"]},
+            {"id": "ssti", "vulnerability": "Template Injection", "cwes": ["CWE-94", "CWE-1336"]}]
+    res = score([_rec("agent-tool-abuse", []), _rec("ssti", [])], scen)
+    rows = {r["id"]: r for r in res["rows"]}
+    assert rows["agent-tool-abuse"]["covered"] is False      # same CWEs, no HTTP surface -> out of scope
+    assert rows["ssti"]["covered"] is True                   # same CWEs, real HTTP surface -> a real gap
+    # kept narrow on purpose: these have an HTTP surface and must stay in scope
+    for sid in ("agent-confused-deputy", "llm-html-rendering", "function-calling-arg-poison"):
+        assert sid not in _OUT_OF_SCOPE
+
+
+def test_a_scenario_that_cannot_present_its_flaw_over_http_is_a_scope_boundary():
+    """tls-downgrade declares TLS 1.0 / RC4 / an expired certificate, but it is a PATH on a shared host that
+    terminates valid modern TLS. No transport-layer probe can see the flaw, so sec-mixed-001 reading clean is
+    correct and counting it as a miss would inflate the gap list with work nobody can do."""
+    from gapbench_score import _OUT_OF_SCOPE
+    scen = [{"id": "tls-downgrade", "vulnerability": "TLS Downgrade", "cwes": ["CWE-319", "CWE-326"]},
+            {"id": "sqli-raw", "vulnerability": "Raw SQL", "cwes": ["CWE-89"]}]
+    res = score([_rec("tls-downgrade", []), _rec("sqli-raw", [])], scen)
+    rows = {r["id"]: r for r in res["rows"]}
+    assert rows["tls-downgrade"]["covered"] is False      # unobservable -> out of the recall denominator
+    assert rows["sqli-raw"]["covered"] is True            # a real, reachable gap -> stays in
+    assert res["covered"] == 1
+    assert "valid TLS" in _OUT_OF_SCOPE["tls-downgrade"]
+
+
+def test_each_out_of_scope_entry_carries_its_own_reason():
+    """The set became a dict precisely because there are now TWO distinct reasons, and printing 'LLM tool
+    boundary' next to a TLS scenario would be a lie in the report."""
+    from gapbench_score import _OUT_OF_SCOPE
+    assert isinstance(_OUT_OF_SCOPE, dict)
+    assert all(v and isinstance(v, str) for v in _OUT_OF_SCOPE.values())
+    assert len({v for v in _OUT_OF_SCOPE.values()}) >= 2
