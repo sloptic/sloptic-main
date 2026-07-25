@@ -2279,6 +2279,63 @@ def debug_mode_enabled(ctx, probe) -> bool | None:
 # three data planes: Supabase PostgREST (/rest/v1/<table>), Firebase Realtime DB (<db>/.json), and
 # Firestore (the default Firebase DB — REST documents endpoint with the public web key).
 _SUPABASE_URL = re.compile(r"https://([a-z0-9]{15,40})\.supabase\.co")
+
+# SELF-HOSTED Supabase. Binding support to the hosted domain made a self-hosted gateway invisible, and with it
+# every RLS finding: measured on the supavulnbase fixture, whose Supabase runs at http://localhost:8055 and
+# whose manifest attributes 8 of its 23 findings (7 of them EXCLUSIVELY) to reaching that gateway. Docker
+# `supabase/postgrest` behind Kong is an ordinary deployment shape, and an app proxying PostgREST on its own
+# domain is another.
+#
+# The host restriction above is an SSRF GUARD, not laziness, so it is narrowed rather than removed: a candidate
+# origin from the bundle is only followed when it is somewhere the TARGET already is — the same hostname on any
+# port, or loopback when the target itself is loopback. On a real deployment at app.example.com a bundle string
+# pointing at internal-db.corp is still refused. Then the origin must PROVE it is PostgREST before we use it.
+_BUNDLE_ORIGIN = re.compile(r"""["'`](https?://[A-Za-z0-9.\-\[\]]+(?::\d{2,5})?)(?=["'`/])""")
+_LOOPBACK = {"localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0"}
+
+
+def _reachable_baas_origin(candidate: str, target: str) -> bool:
+    """Is `candidate` an origin the target is already on? Same host (any port), or loopback-for-loopback."""
+    try:
+        c, t = urllib.parse.urlparse(candidate), urllib.parse.urlparse(target)
+    except ValueError:
+        return False
+    ch, th = (c.hostname or "").lower(), (t.hostname or "").lower()
+    if not ch or not th:
+        return False
+    return ch == th or (ch in _LOOPBACK and th in _LOOPBACK)
+
+
+def _looks_postgrest(client, origin: str) -> bool:
+    """Behavioural signature, so this works for any hostname: PostgREST's root answers JSON — an OpenAPI
+    document, or its own 'no API key' complaint — and Supabase fronts it with Kong."""
+    with contextlib.suppress(Exception):
+        r = client.get(origin.rstrip("/") + "/rest/v1/")
+        server = (r.headers.get("server") or "").lower()
+        if "postgrest" in server or "kong" in server:
+            return True
+        if "json" in (r.headers.get("content-type") or "").lower():
+            body = (r.text or "")[:400].lower()
+            return any(t in body for t in ('"swagger"', '"paths"', "api key", "apikey", "postgrest"))
+    return False
+
+
+def _supabase_base(blob: str, ctx) -> str | None:
+    """The Supabase data-plane origin this app talks to: the hosted project, else a self-hosted gateway the
+    target is co-located with that proves itself PostgREST."""
+    m = _SUPABASE_URL.search(blob)
+    if m:
+        return "https://" + m.group(1) + ".supabase.co"
+    target = getattr(ctx, "base_url", "") or ""
+    cands = [c for c in dict.fromkeys(_BUNDLE_ORIGIN.findall(blob or ""))
+             if _reachable_baas_origin(c, target)]
+    if not cands:
+        return None
+    with httpx.Client(timeout=6.0, follow_redirects=True, verify=False) as probe_client:
+        for c in cands[:6]:
+            if _looks_postgrest(probe_client, c):
+                return c.rstrip("/")
+    return None
 _FIREBASE_RTDB = re.compile(r"https://([a-z0-9][a-z0-9-]{2,60}\.firebaseio\.com)")
 _JWT = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")
 # Firestore (the DEFAULT Firebase DB since ~2019 — RTDB above is the legacy one, so RTDB-only coverage
@@ -2544,6 +2601,54 @@ def _sensitive_leak(table: str, columns: list[str]) -> bool:
     return bool(_SENSITIVE_TABLE.search(table) or any(_SENSITIVE_COLUMN.search(c) for c in columns))
 
 
+# ANON WRITE beats anon read as an RLS oracle, and it needs no write to succeed. An RLS-off table is often
+# readable BY DESIGN (a build log's projects, a blog's posts), which is why the read path needs a sensitivity
+# gate and why that gate misfires: measured on supavulnbase, the read probe reported `profiles` — the fixture's
+# own control for "correct owner-scoped RLS" — while the three genuinely unpoliced tables went unnamed.
+#
+# Writability has no such ambiguity: no legitimate app lets an anonymous stranger INSERT. And PostgREST tells us
+# without creating anything. POST an EMPTY object and read the SQLSTATE:
+#   42501 / 401 / 403  -> RLS refused the write            -> SECURE, and this is what the controls answer
+#   23502 / 23503 ...  -> a CONSTRAINT rejected it, meaning the insert already passed RLS -> FINDING
+#   PGRST204 / 42P01   -> schema mismatch or absent table  -> inconclusive, never a finding
+# Measured on the fixture: projects / updates / drafts answer 23502 (all three are declared findings) while
+# profiles / payout_accounts / sponsor_leads answer 42501 (two are declared controls). Row counts unchanged.
+# SQLSTATE is five ALPHANUMERIC characters, not five digits: `22P02` (invalid text representation) is a real
+# and common one, and a \d{3} tail silently dropped every lettered code in the class.
+_RLS_PASSED_SQLSTATE = re.compile(r"^(?:22|23)[0-9A-Z]{3}$")    # integrity / data-exception = past RLS
+_RLS_REFUSED_SQLSTATE = {"42501"}
+
+
+def _supabase_anon_writable(client, base: str, keys: list[str], tables: list[str]):
+    """{table, sqlstate, repro} for the first table an anonymous INSERT gets PAST RLS on, else None.
+    Never creates a row: the body is empty, so a table that accepts the write still fails validation."""
+    for key in keys[:3]:
+        hdr = {"apikey": key, "Content-Type": "application/json"}
+        if key.startswith("eyJ"):
+            hdr["Authorization"] = "Bearer " + key
+        cand = list(tables)
+        with contextlib.suppress(Exception):   # same root enumeration the read path does, or the write test
+            root = client.get(base + "/rest/v1/", headers=hdr, timeout=6.0)   # only ever sees bundle-mined
+            cand += [t for t in _postgrest_tables(root) if t not in cand]     # names and misses the rest
+        for table in cand[:20]:
+            try:
+                r = client.post(base + "/rest/v1/" + table, json={}, headers=hdr, timeout=6.0)
+            except (httpx.HTTPError, httpx.InvalidURL):
+                continue
+            if r.status_code in (401, 403):
+                continue                       # RLS refused -> secure
+            code = ""
+            with contextlib.suppress(Exception):
+                code = str((r.json() or {}).get("code") or "")
+            if code in _RLS_REFUSED_SQLSTATE:
+                continue
+            if _RLS_PASSED_SQLSTATE.match(code):
+                return {"table": table, "sqlstate": code,
+                        "repro": _repro_from_resp(
+                            r, matched="anonymous INSERT passed RLS (rejected only by constraint %s)" % code)}
+    return None
+
+
 def _supabase_readable(client, base: str, keys: list[str], tables: list[str]):
     """Return {table, rows, columns} for the first SENSITIVE table that returns rows to the anon/publishable
     key (RLS off or permissive + anon grant), 'unreachable' if the host can't be reached (-> N/A), else None.
@@ -2639,7 +2744,7 @@ def exposed_backend_readable(ctx, probe) -> bool | None:
     the config + public key, then read the DB with that key. Fire if real rows come back. N/A when no such
     config is embedded (the firewalled Tier-A case) or the provider host is unreachable (egress blocked)."""
     blob = _client_bundle(ctx)
-    sm = _SUPABASE_URL.search(blob)
+    sm = _supabase_base(blob, ctx)          # hosted project OR a co-located self-hosted PostgREST gateway
     fm = _FIREBASE_RTDB.search(blob)
     proj_m = _FIREBASE_PROJECT.search(blob)
     key_m = _FIREBASE_APIKEY.search(blob)
@@ -2650,8 +2755,16 @@ def exposed_backend_readable(ctx, probe) -> bool | None:
     keys = [m.group(0) for m in _JWT.finditer(blob)] + _SUPABASE_PUB.findall(blob)   # JWT anon + publishable
     with httpx.Client(timeout=8.0, follow_redirects=True, verify=False) as ext:   # external provider hosts
         if sm:
-            base = "https://" + sm.group(1) + ".supabase.co"
-            hit = _supabase_readable(ext, base, keys, _supabase_tables(blob, _observed_tables(ctx)))
+            base = sm
+            tables = _supabase_tables(blob, _observed_tables(ctx))
+            # WRITE first: it is the unambiguous half, so an app whose tables are public-by-design but
+            # correctly write-protected reports nothing instead of reporting its own control table.
+            w = _supabase_anon_writable(ext, base, keys, tables)
+            if isinstance(w, dict):
+                ctx.evidence.update(backend="supabase", host=base, table=w["table"], anon_writable=True,
+                                    sqlstate=w["sqlstate"], repro=w["repro"])
+                return True
+            hit = _supabase_readable(ext, base, keys, tables)
             if isinstance(hit, dict):
                 ctx.evidence.update(backend="supabase", host=base, table=hit["table"],
                                     rows_readable=hit["rows"], columns=hit["columns"], repro=hit["repro"])
@@ -2781,7 +2894,7 @@ def authenticated_backend_readable(ctx, probe) -> bool | None:
     on app data. N/A when no Supabase/Firestore config, no throwaway auth is obtainable (closed signup /
     confirmation / anonymous-auth-off), or the host is unreachable."""
     blob = _client_bundle(ctx)
-    sm = _SUPABASE_URL.search(blob)
+    sm = _supabase_base(blob, ctx)          # hosted project OR a co-located self-hosted PostgREST gateway
     proj_m = _FIREBASE_PROJECT.search(blob)
     key_m = _FIREBASE_APIKEY.search(blob)
     fs_used = bool(_FIRESTORE_SIGNAL.search(blob) and proj_m and key_m)
@@ -2802,7 +2915,7 @@ def authenticated_backend_readable(ctx, probe) -> bool | None:
                     return True
                 reached = reached or hit != "unreachable"
         if sm:
-            base = "https://" + sm.group(1) + ".supabase.co"
+            base = sm
             anon_key = next((m.group(0) for m in _JWT.finditer(blob)), None) or \
                 next(iter(_SUPABASE_PUB.findall(blob)), None)
             if anon_key:
