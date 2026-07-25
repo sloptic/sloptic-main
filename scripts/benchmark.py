@@ -120,6 +120,89 @@ def _band(pct: int) -> str:
     return "pristine" if pct <= 25 else "typical" if pct <= 75 else "rough" if pct <= 95 else "catastrophic"
 
 
+# THE REPORTING BUNDLE — format_spec §4.2 requires it and nothing implemented it. Grepping the runner for
+# limited_engagement / clean_rate / attack_surface returned nothing; we emitted pct_applicable and stopped.
+# The spec's own words on why it exists: "A slop score in isolation can be ambiguous — a low score could mean a
+# clean submission with broad surface (excellent) or a trivial one with almost no surface to test (Limited
+# Engagement)." And: a DNF or Limited Engagement submission "is ranked below every completed submission
+# regardless of its trivially-low raw slop."
+#
+# Thresholds are corpus-derived, not chosen by taste (v9, n=1110, probes_applicable p5=42 p50=53 p95=60):
+#   Limited Engagement at < 40 applicable ... 2.0% of apps — the genuinely trivial tail, not normal ones
+#   Attack Surface Coverage tertiles 46 / 55 ... narrow 29.7% / moderate 36.8% / broad 33.5%
+_LIMITED_ENGAGEMENT_BELOW = 40
+_SURFACE_NARROW_BELOW, _SURFACE_BROAD_ABOVE = 46, 55
+
+# UNTESTED FAMILIES is OURS, not the spec's, and is kept under its own name for exactly that reason: Limited
+# Engagement is defined by the spec as an applicable-COUNT threshold, and quietly redefining a spec term to mean
+# something else is the drift this separation prevents. A family is untested when the app HAS the surface and not
+# one probe of that family ran. Measured on v9: 39% of the CLEANEST QUARTILE has a login or signup and yet no
+# session or access-control probe ever ran on it — 109 of 282 top-quartile apps.
+#
+# Rules are CONDITIONAL on the surface existing, never a flat coverage floor: a static brochure site legitimately
+# has no auth to test and must not be failed for simplicity. Per-rule corpus incidence:
+#   login/signup + no session probe ran ......... 34.6%
+#   login/signup + no access-control ran ........ 37.1%
+#   upload + no file-upload probe ran ............ 2.1%
+#   text input + no input-validation/xss ran ..... 2.8%
+#   union ....................................... ~41% carrying at least one untested family
+# Deliberately EXCLUDED: "has an API but data-integrity never ran" fires on 59.9%, because a black-box
+# create+read round-trip genuinely does not exist on most apps. A rule that fires on everything says nothing.
+_UNTESTED_RULES = (
+    ("session", ("has_login", "has_signup"), "has a login/signup but no session probe ran"),
+    ("access-control", ("has_login", "has_signup"), "has a login/signup but no access-control probe ran"),
+    ("file-upload", ("has_upload",), "accepts uploads but no upload probe ran"),
+)
+_INPUT_KINDS = ("input-validation", "xss")
+
+
+def _kind_ran(record: dict, kind: str) -> bool:
+    by_kind = (record.get("coverage") or {}).get("by_kind") or {}
+    return ((by_kind.get(kind) or {}).get("ran") or 0) > 0
+
+
+def _surface_coverage(applicable: int) -> str:
+    return ("narrow" if applicable < _SURFACE_NARROW_BELOW
+            else "broad" if applicable > _SURFACE_BROAD_ABOVE else "moderate")
+
+
+def reporting_bundle(record: dict) -> dict:
+    """format_spec §4.2 Result Reporting: status, probes applicable, slop detected, attack surface coverage,
+    clean rate — the metadata that disambiguates a low score. Plus `untested_families`, which is ours.
+
+    Clean Rate is over APPLICABLE probes only (FUZZ_RUNNER_SPEC: clean / (clean + slop_detected)); a probe that
+    was N/A is neither a pass nor a failure and must not inflate it."""
+    cov = record.get("coverage") or {}
+    surface = record.get("observed_surface") or {}
+    if record.get("dead_url") or record.get("functional") is False:
+        return {"status": "dnf", "probes_applicable": 0, "slop_detected": 0,
+                "attack_surface_coverage": None, "clean_rate": None,
+                "untested_families": [], "why": ["did not deploy"]}
+    if not cov:
+        return {"status": "unknown", "probes_applicable": None, "slop_detected": None,
+                "attack_surface_coverage": None, "clean_rate": None, "untested_families": [],
+                "why": ["no coverage telemetry in the record — completeness cannot be verified"]}
+    applicable = cov.get("probes_applicable") or 0
+    fired = len({f.get("probe_id") for f in record.get("findings") or [] if f.get("probe_id")})
+    untested, why = [], []
+    for kind, flags, reason in _UNTESTED_RULES:
+        if any(surface.get(f) for f in flags) and not _kind_ran(record, kind):
+            untested.append(kind)
+            why.append(reason)
+    takes_input = surface.get("accepts_text_input") or (surface.get("forms") or 0) > 0
+    if takes_input and not any(_kind_ran(record, k) for k in _INPUT_KINDS):
+        untested.append("input-validation")
+        why.append("takes text input but neither input-validation nor xss ran")
+    status = "limited_engagement" if applicable < _LIMITED_ENGAGEMENT_BELOW else "completed"
+    if status == "limited_engagement":
+        why.append(f"only {applicable} probes applicable (Limited Engagement below "
+                   f"{_LIMITED_ENGAGEMENT_BELOW})")
+    return {"status": status, "probes_applicable": applicable, "slop_detected": fired,
+            "attack_surface_coverage": _surface_coverage(applicable),
+            "clean_rate": round(100 * (applicable - fired) / applicable, 1) if applicable else None,
+            "untested_families": untested, "why": why}
+
+
 def rank(curve: dict, score, record: dict | None = None) -> dict:
     """Place one app on the frozen curve. Lower slop is better, so a LOW percentile is good: pct is the share
     of the reference population this app is cleaner than... inverted at the end for readability."""
@@ -143,6 +226,14 @@ def rank(curve: dict, score, record: dict | None = None) -> dict:
                         if f.get("category") in _ABSOLUTE})
         if gates:
             out["absolute_gates"] = gates      # reported REGARDLESS of rank; a percentile never excuses these
+        # The band stays a factual statement about where this app sits among its peers. `certifiable` is the
+        # separate POLICY question of whether that comparison may become a badge, and it answers no on three
+        # independent grounds: a catastrophic class fired, the engagement was Limited/DNF, or a family the app
+        # HAS surface for never ran. Per format_spec §4.2 a DNF or Limited Engagement submission ranks below
+        # every completed one regardless of its trivially-low raw slop, so it can never be a credential.
+        b = reporting_bundle(record)
+        out["reporting"] = b
+        out["certifiable"] = (b["status"] == "completed" and not b["untested_families"] and not gates)
     return out
 
 
@@ -160,6 +251,23 @@ def _report(res: dict) -> None:
     if res.get("absolute_gates"):
         print(f"\n  ABSOLUTE GATE — not certifiable regardless of rank: {', '.join(res['absolute_gates'])}")
         print("    a favourable comparison to equally-broken peers is not a mitigation")
+    b = res.get("reporting")
+    if b is not None:
+        print(f"\n  status {b['status'].replace('_', ' ').upper()}"
+              f"   ·  probes applicable {b['probes_applicable']}"
+              f"   ·  slop detected {b['slop_detected']}")
+        if b["attack_surface_coverage"]:
+            print(f"  attack surface coverage: {b['attack_surface_coverage'].upper()}"
+                  f"   ·  clean rate {b['clean_rate']}%")
+        if b["untested_families"]:
+            print(f"\n  UNTESTED FAMILIES — surface present, no probe of that family ran: "
+                  f"{', '.join(b['untested_families'])}")
+        for why in b["why"]:
+            print(f"    · {why}")
+        if b["untested_families"]:
+            print("    a family that never ran produces no findings; that is not a pass")
+    if "certifiable" in res:
+        print(f"\n  CERTIFIABLE: {'yes' if res['certifiable'] else 'NO'}")
     print()
 
 
