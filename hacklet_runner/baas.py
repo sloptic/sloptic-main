@@ -22,7 +22,10 @@ import httpx
 # A JWT-shaped anon key, and the origins a bundle names. Hosted Supabase is `<ref>.supabase.co`; a self-hosted
 # gateway is any origin the TARGET is already on (see reachable_origin — that restriction is an SSRF guard).
 _JWT = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.([A-Za-z0-9_-]{8,})\.[A-Za-z0-9_-]{6,}")
-_BUNDLE_ORIGIN = re.compile(r"""["'`](https?://[A-Za-z0-9.\-\[\]]+(?::\d{2,5})?)(?=["'`/])""")
+# The trailing lookahead admits a BACKSLASH because a config embedded in JSON escapes its own quotes:
+# `createClient(\"http://gateway\", ...)` inside __NEXT_DATA__ or an RSC payload is an ordinary shape, and
+# requiring a bare quote there silently skipped every such bundle.
+_BUNDLE_ORIGIN = re.compile(r"""["'`](https?://[A-Za-z0-9.\-\[\]]+(?::\d{2,5})?)(?=[\\"'`/])""")
 _SCRIPT_SRC = re.compile(r"""["'](/[^"']*?_next/static/[^"']+?\.js|/[^"']*?\.js)["']""")
 _LOOPBACK = {"localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0"}
 _CHUNK_CAP = 12

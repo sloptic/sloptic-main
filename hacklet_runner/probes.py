@@ -2333,7 +2333,10 @@ def _client_bundle(ctx, cap: int = 2_000_000) -> str:
     """The served client-side text: the homepage plus its same-origin .js bundles, where an SPA embeds
     its backend config + public keys."""
     parts, total = [], 0
-    paths = ["/"] + [r for r in ctx.profile.routes if r.split("?")[0].endswith(".js")]
+    # the app's OWN entry page, not the origin root: on a sub-path deployment "/" is a different app (or, on
+    # supavulnbase, a 404 page that merely happens to reference the same chunks — which made every BaaS probe
+    # lucky rather than correct). Same rebasing rule as every other constructed fetch.
+    paths = [_at(ctx, "/")] + [r for r in ctx.profile.routes if r.split("?")[0].endswith(".js")]
     for p in list(dict.fromkeys(paths))[:10]:
         try:
             t = ctx.client.get(p).text
@@ -2555,6 +2558,145 @@ def exposed_sensitive_file(ctx, probe) -> bool | None:
         ctx.evidence["na_reason"] = "no candidate path was reachable (host refused every request)"
         return None
     ctx.evidence.update(exposed=False, paths_checked=len(_SENSITIVE_FILES))
+    return False
+
+
+# ANONYMOUS BULK DATA. Measured on supavulnbase: an unauthenticated GET of {basePath}/api/admin/export returns
+# 6 sponsor_leads (contact_email, amount_cents, notes), 4 payout_accounts (account_last4, routing_hint) and 108
+# profiles. The instructive part is that payout_accounts is that fixture's OWN control for correct owner-scoped
+# RLS: the database policy is right and this route hands the data out regardless, presumably with a privileged
+# key. No amount of RLS testing finds it, because the flaw sits ABOVE the policy — which is why this is its own
+# probe rather than a widening of sec-backend-001.
+#
+# The gate is COLUMN SENSITIVITY, never the path: a product catalog, a blog index and a public profile list all
+# return bulk records and none is a leak. On the same fixture `profiles` (username/display_name/bio) is a
+# declared control and must stay silent while sponsor_leads and payout_accounts fire, and the existing
+# _SENSITIVE_COLUMN gate does exactly that with no tuning.
+_ANON_BULK_MIN_RECORDS = 3     # one record is /api/me, not a dump
+_ANON_BULK_ENDPOINT_CAP = 25
+
+
+def _record_collections(resp):
+    """Every list-of-objects this JSON response carries, top level or one key deep. An export route nests
+    several collections in one object ({"sponsor_leads":[...], "payout_accounts":[...]}), and reading only the
+    top level would miss all of them."""
+    if "json" not in (resp.headers.get("content-type") or "").lower():
+        return []
+    try:
+        doc = resp.json()
+    except Exception:
+        return []
+    out = []
+    if isinstance(doc, list):
+        out.append(("", [o for o in doc if isinstance(o, dict)]))
+    elif isinstance(doc, dict):
+        for key, val in doc.items():
+            if isinstance(val, list):
+                out.append((str(key), [o for o in val if isinstance(o, dict)]))
+    return [(k, rows) for k, rows in out if rows]
+
+
+def anon_bulk_data_exposed(ctx, probe) -> bool | None:
+    """An ANONYMOUS request returning bulk records with PII / financial / credential columns.
+
+    Deliberately sends NO session — not the probes' own, and not a caller-supplied --header identity — because
+    the claim is precisely that a stranger can read this. N/A when there is no JSON collection anywhere to
+    judge, so an app with no such surface is not scored as clean."""
+    paths = [e.path for e in ctx.profile.endpoints if (e.method or "get").lower() == "get"]
+    paths += [r for r in (ctx.profile.routes or []) if "/api/" in (r or "") and not r.endswith(".js")]
+    paths = list(dict.fromkeys(p for p in paths if p))[:_ANON_BULK_ENDPOINT_CAP]
+    if not paths:
+        ctx.evidence["na_reason"] = "no API-ish GET route to read anonymously"
+        return None
+    judged = False
+    with make_client(ctx.base_url, None, timeout=10.0, follow_redirects=True) as anon:
+        for path in paths:
+            try:
+                r = anon.get(path)
+            except (httpx.HTTPError, httpx.InvalidURL):
+                continue
+            if r.status_code in (401, 403):
+                judged = True     # the app REFUSED a stranger: that is a definitive clean answer, not an
+                continue          # untested one, and calling it N/A would flag a well-built app as unassessed
+            if r.status_code != 200:
+                continue          # 404/5xx: nothing there to judge
+            collections = _record_collections(r)
+            if not collections:
+                continue
+            judged = True
+            if response_leaks_credentials(r):
+                continue          # sec-exposure-005 already reports this body -> one leak, one finding
+            for key, rows in collections:
+                if len(rows) < _ANON_BULK_MIN_RECORDS:
+                    continue
+                cols = sorted({c for row in rows[:5] for c in row})
+                hits = [c for c in cols if _SENSITIVE_COLUMN.search(c)]
+                if not hits:
+                    continue      # bulk but not sensitive: a catalog, an index, a public profile list
+                ctx.evidence.update(anon_readable=True, endpoint=path, collection=key or "(top level)",
+                                    records=len(rows), sensitive_columns=hits[:6], columns=cols[:10],
+                                    repro=_repro_from_resp(
+                                        r, matched="%d records with %s readable to an anonymous request"
+                                                   % (len(rows), ", ".join(hits[:3]))))
+                return True
+    if not judged:
+        ctx.evidence["na_reason"] = "no anonymous route returned a JSON collection to judge"
+        return None
+    ctx.evidence.update(anon_readable=False, endpoints_checked=len(paths))
+    return False
+
+
+# MANAGED-BACKEND SCHEMA DISCLOSURE. We were already reading both shapes of this and reporting neither: the RLS
+# probes enumerate tables from the PostgREST mount root to build their candidate list, and the anon-write oracle
+# reads the SQLSTATE out of a rejected write to decide whether it passed RLS. The disclosure was a TOOL.
+_SQLSTATE_ERROR = re.compile(r'"code"\s*:\s*"(2[23][0-9A-Z]{3}|42[0-9A-Z]{3})"')
+_DB_COLUMN_LEAK = re.compile(r"Failing row contains|column \"[A-Za-z_][A-Za-z0-9_]*\" of relation|"
+                             r"violates (?:not-null|foreign key|check) constraint", re.I)
+
+
+def backend_schema_disclosed(ctx, probe) -> bool | None:
+    """The app's managed backend discloses its schema to an anonymous caller: the PostgREST root serves an
+    OpenAPI document listing every table, or a rejected write answers with a SQLSTATE and column names.
+    N/A when no managed backend is embedded (nothing to disclose)."""
+    blob = _client_bundle(ctx)
+    base = _supabase_base(blob, ctx)
+    if not base:
+        ctx.evidence["na_reason"] = "no managed-backend (Supabase/PostgREST) config embedded in the client"
+        return None
+    keys = [m.group(0) for m in _JWT.finditer(blob)] + _SUPABASE_PUB.findall(blob)
+    if not keys:
+        ctx.evidence["na_reason"] = "no public backend key in the client to read the schema with"
+        return None
+    with httpx.Client(timeout=8.0, follow_redirects=True, verify=False) as ext:
+        for key in keys[:3]:
+            hdr = {"apikey": key}
+            if key.startswith("eyJ"):
+                hdr["Authorization"] = "Bearer " + key
+            with contextlib.suppress(Exception):
+                root = ext.get(base + "/rest/v1/", headers=hdr, timeout=6.0)
+                tables = _postgrest_tables(root)
+                if root.status_code == 200 and tables:
+                    ctx.evidence.update(disclosed=True, via="openapi-root", host=base,
+                                        tables=sorted(tables)[:12], table_count=len(tables),
+                                        repro=_repro_from_resp(
+                                            root, matched="PostgREST root listed %d tables to the anon key"
+                                                          % len(tables)))
+                    return True
+            # A rejected write is the other half: SQLSTATE plus the failing row's columns. Table names come from
+            # the BUNDLE (the app's own .from('t') literals, plus observed reads and a common-name fallback),
+            # the same source the RLS probes use — depending on the root here would make the error path
+            # unreachable in exactly the case it exists for, a gateway whose root is correctly locked down.
+            for table in _supabase_tables(blob, _observed_tables(ctx))[:6]:
+                with contextlib.suppress(Exception):
+                    r = ext.post(base + "/rest/v1/" + table, json={},
+                                 headers={**hdr, "Content-Type": "application/json"}, timeout=6.0)
+                    body = r.text or ""
+                    if _SQLSTATE_ERROR.search(body) and _DB_COLUMN_LEAK.search(body):
+                        ctx.evidence.update(disclosed=True, via="verbose-db-error", host=base, table=table,
+                                            repro=_repro_from_resp(
+                                                r, matched="database error disclosed SQLSTATE and column names"))
+                        return True
+    ctx.evidence.update(disclosed=False, host=base)
     return False
 
 
@@ -4673,6 +4815,8 @@ PREDICATES = {
     "debug_mode_enabled": debug_mode_enabled,
     "leaks_error_detail": leaks_error_detail,
     "exposed_backend_readable": exposed_backend_readable,
+    "anon_bulk_data_exposed": anon_bulk_data_exposed,
+    "backend_schema_disclosed": backend_schema_disclosed,
     "authenticated_backend_readable": authenticated_backend_readable,
     "bundle_leaks_secret": bundle_leaks_secret,
     "vulnerable_dependency": vulnerable_dependency,
@@ -4760,6 +4904,10 @@ _PREDICATE_REASONS = {
     "debug_mode_enabled": "framework debug mode is on in production (interactive debugger / DEBUG page -> source, settings, env and an RCE console exposed)",
     "leaks_error_detail": "an induced server error leaked a stack trace or a database error to the user (info disclosure + a broken error path)",
     "exposed_backend_readable": "the app's managed backend (Supabase/Firebase) is world-readable with its own public key -> the whole database is exposed (missing row-level security)",
+    "anon_bulk_data_exposed": "an anonymous request returned bulk records carrying personal or financial data "
+                              "(no authorization on a data-export route)",
+    "backend_schema_disclosed": "the managed backend discloses its schema to anyone (table list at the API "
+                               "root, or database errors naming columns)",
     "authenticated_backend_readable": "any logged-in user reads every other user's data -> broken authenticated-tier RLS/Rules (the IDOR equivalent on a BaaS app; missing per-user row filtering)",
     "bundle_leaks_secret": "a hardcoded SECRET key (Stripe sk_ / OpenAI / AWS secret / GitHub PAT / private key) is shipped in the client JS bundle -> account/DB takeover (public anon/publishable keys are not flagged)",
     "vulnerable_dependency": "the app ships a client library with a KNOWN CVE (retire.js-style: jQuery / AngularJS / Bootstrap / Axios / Moment / Handlebars / DOMPurify) -> supply-chain risk the team chose; upgrade per the finding",

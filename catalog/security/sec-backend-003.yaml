@@ -1,0 +1,24 @@
+id: sec-backend-003
+bundle: security
+category: backend-exposure
+variant_group_id: backend-schema-disclosure   # the root and a verbose error are the same disclosure
+pool: public
+evidence_model: provable
+penalty: 12   # information disclosure, not access: the schema itself is not the data. Priced below the
+              # RLS probes (40) deliberately — knowing the table and column names accelerates an attack
+              # without being one, and over-pricing it would drown the finding that actually matters.
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  predicate: backend_schema_disclosed
+  # Two shapes of the same leak, either of which fires the one finding:
+  #   1. the PostgREST mount root answers an OpenAPI document listing every table to the anon key
+  #   2. a rejected write answers with a SQLSTATE and column names ("Failing row contains (uuid, null, ...)")
+  #
+  # We were already reading BOTH and never reporting either: the RLS probes enumerate tables from the root to
+  # build their candidate list, and the anon-write oracle reads the SQLSTATE to decide whether a write passed
+  # RLS. The disclosure was being used as a TOOL and never surfaced as a finding.
+  #
+  # DISCRIMINATION: hosted Supabase blocked the root for the anon role in Apr 2026, so a correctly-configured
+  # managed project answers 403 and reads clean; a self-hosted or misconfigured gateway discloses. N/A when no
+  # managed backend is embedded at all.

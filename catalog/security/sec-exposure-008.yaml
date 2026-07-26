@@ -1,0 +1,25 @@
+id: sec-exposure-008
+bundle: security
+category: data-exposure
+variant_group_id: anon-bulk-data   # "this app hands its records to strangers" = one finding, however many routes
+pool: public
+evidence_model: provable
+penalty: 40   # same tier as broken access control, because that is what it is: an ANONYMOUS request returning
+              # bulk records with PII / financial identifiers. FUZZ_RUNNER_SPEC assigns exactly this class to
+              # the runner — "an anonymous request that returns sensitive or bulk data is a flaw regardless of
+              # intent" — and access control is ~36% of real vibe-coded-app vulnerabilities.
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  predicate: anon_bulk_data_exposed
+  # Measured on supavulnbase: GET {basePath}/api/admin/export, unauthenticated, returns 6 sponsor_leads with
+  # contact_email and amount_cents, 4 payout_accounts with account_last4 and routing_hint, plus 108 profiles.
+  # The instructive part is that payout_accounts is that fixture's OWN control for correct owner-scoped RLS —
+  # the database policy is right and this one route hands the data out anyway, presumably with a privileged
+  # key. No amount of RLS testing finds it, because the flaw sits above the policy.
+  #
+  # PRECISION: the gate is COLUMN SENSITIVITY, not the path. A product catalog, a blog index or a public
+  # profile list returns bulk records too and is not a leak — and on the same fixture `profiles`
+  # (username/display_name/bio) is a declared control, so it must stay silent while sponsor_leads and
+  # payout_accounts fire. Requires >= 3 records so a single /api/me is not mistaken for a dump, and skips a
+  # body sec-exposure-005 already claims so one leak is never billed twice.
