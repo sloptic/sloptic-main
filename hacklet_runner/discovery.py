@@ -657,6 +657,63 @@ def _search_endpoints(base_url, headers, endpoints, app_root: str = "/", routes=
     return out
 
 
+def _verify_api_path(client, path: str, have: set, origin: str = "mined"):
+    """One request settles whether a CANDIDATE path is a real endpoint. Shared by bundle mining and the
+    conventional-name probe so the taxonomy cannot drift between them:
+      404          -> not served; the candidate was a claim and the server refused it
+      405          -> exists but wrong verb, so register it as a POST. This is the point of the whole exercise:
+                      an app's WRITES are the surface the injection/integrity/race probes need and that an
+                      anonymous render never triggers.
+      401/403/2xx  -> exists (auth-gated or open)
+    """
+    if ("get", path) in have or ("post", path) in have:
+        return None
+    try:
+        r = client.get(path)
+    except (httpx.HTTPError, httpx.InvalidURL):
+        return None
+    if r.status_code == 404:
+        return None
+    return Endpoint(path=path, raw_path=path, method="post" if r.status_code == 405 else "get",
+                    query_params=[], baseline_status=r.status_code, origin=origin)
+
+
+# CONVENTIONAL API NAMES. Some endpoints are referenced by NOTHING: measured on supavulnbase, `feedback` appears
+# in zero of 16 reachable chunks and in no page HTML, yet POST {basePath}/api/feedback answers 405 and names its
+# own fields in a Zod error — the fixture's tmpl-001, whose declared discovery mechanism presumes you already
+# have the path. OopsSec's /wishlists is the same shape. No crawl and no mine can reach an unreferenced route,
+# so the only remaining move is to ask for the conventional names, which is what we already do for FILE paths
+# (.env, .git/config) and never did for API paths.
+#
+# Yield measured before building it: 32 candidates found /api/feedback (405) and /api/projects (200) on
+# supavulnbase, and /api/support (405), /api/admin (401), /api/user (401), /api/orders (401), /api/files (400)
+# on OopsSec. One request each, and the same verification as mining, so a wrong guess costs a 404 and never a
+# phantom endpoint.
+_CONVENTIONAL_API = (
+    "feedback", "contact", "support", "upload", "uploads", "export", "admin", "users", "user", "me",
+    "profile", "account", "search", "settings", "notifications", "comments", "messages", "orders",
+    "items", "projects", "posts", "todos", "tasks", "files", "subscribe", "webhook", "webhooks",
+)
+
+
+def _conventional_api_endpoints(base_url, headers, existing, app_root: str = "/", api_seen: bool = False) -> list:
+    """Ask for the conventional API names under the app root and keep what the server confirms.
+
+    Gated on the app plausibly HAVING an API — any /api/ path already seen, or a rendered SPA — so a static
+    brochure site does not pay 27 requests for nothing."""
+    if not api_seen:
+        return []
+    have = {(e.method, e.path) for e in existing}
+    out = []
+    with make_client(base_url, headers, timeout=8.0, follow_redirects=True) as c:
+        for name in _CONVENTIONAL_API:
+            ep = _verify_api_path(c, _under(app_root, "/api/" + name), have, origin="conventional")
+            if ep is not None:
+                out.append(ep)
+                have.add((ep.method, ep.path))
+    return out
+
+
 def _mined_api_endpoints(base_url, headers, route_list, existing, app_root: str = "/") -> list:
     """Fetch the discovered .js chunks, mine their API path literals, and keep the ones the server confirms.
 
@@ -668,28 +725,19 @@ def _mined_api_endpoints(base_url, headers, route_list, existing, app_root: str 
         return []
     have = {(e.method, e.path) for e in existing}
     candidates: set = set()
+    out = []
     with make_client(base_url, headers, timeout=10.0, follow_redirects=True) as c:
         for path in chunks:
             try:
                 candidates |= _mine_api_literals(c.get(path).text)
             except (httpx.HTTPError, httpx.InvalidURL):
                 continue
-        out = []
         for literal in sorted(candidates)[:_MINE_VERIFY_CAP]:
-            path = _under(app_root, literal)     # a bundle literal is APP-relative, not origin-relative
-            if ("get", path) in have or ("post", path) in have:
-                continue
-            try:
-                r = c.get(path)
-            except (httpx.HTTPError, httpx.InvalidURL):
-                continue
-            if r.status_code == 404:
-                continue                      # the bundle names it, the server does not serve it -> not real
-            # 405 = "exists, wrong verb". Registering it as POST is the whole point: an app's writes are the
-            # surface the injection, integrity and race probes need and the anonymous render never triggers.
-            method = "post" if r.status_code == 405 else "get"
-            out.append(Endpoint(path=path, raw_path=path, method=method, query_params=[],
-                                baseline_status=r.status_code, origin="mined"))
+            # a bundle literal is APP-relative, not origin-relative
+            ep = _verify_api_path(c, _under(app_root, literal), have)
+            if ep is not None:
+                out.append(ep)
+                have.add((ep.method, ep.path))
     return out
 
 
@@ -1103,6 +1151,16 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
             if mined:
                 endpoints += mined
                 for e in mined:
+                    routes.setdefault(e.path, None)
+
+            # Some endpoints are referenced by NOTHING, so no crawl and no mine can reach them. Ask for the
+            # conventional names, gated on the app plausibly having an API at all.
+            api_seen = browser_ok or any("/api/" in (r or "") for r in routes) or any(
+                "/api/" in (e.path or "") for e in endpoints)
+            conv = _conventional_api_endpoints(base_url, headers, endpoints, start_path, api_seen)
+            if conv:
+                endpoints += conv
+                for e in conv:
                     routes.setdefault(e.path, None)
 
             # A collection's search sibling is concatenated in the client, so mining cannot see it. Guess the

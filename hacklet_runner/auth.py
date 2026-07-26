@@ -155,7 +155,7 @@ def _account_from_headers(base_url: str, headers) -> Account:
                    register_response=httpx.Response(200, request=httpx.Request("GET", base_url)), provided=True)
 
 
-def _register_via_baas(base_url: str, suffix: str = "") -> Account | None:
+def _register_via_baas(base_url: str, suffix: str = "", entry: str = "") -> Account | None:
     """Register at the app's own Supabase gateway and carry the session the way the app stores it.
 
     The client ends up holding BOTH halves, because they address different servers: the `sb-<ref>-auth-token`
@@ -163,7 +163,10 @@ def _register_via_baas(base_url: str, suffix: str = "") -> Account | None:
     access token gets the unauthenticated shell), and `Authorization: Bearer` + `apikey` are what the GATEWAY
     reads. Returns None when no gateway/key is embedded or signup is closed -> the caller reads N/A."""
     from . import baas   # local import: only the BaaS lane needs it, and this keeps auth import-light
-    blob = baas.client_blob(base_url)      # it derives origin + entry path itself
+    # The ENTRY path matters: the pipeline passes the ORIGIN, so on a sub-path app the blob would come from "/",
+    # which here is a 404 page that only happens to reference the same chunks. Passing landing_path makes it
+    # deliberate instead of lucky.
+    blob = baas.client_blob(base_url, entry)
     if not blob:
         return None
     gateway = baas.resolve_gateway(blob, base_url)
@@ -312,7 +315,7 @@ def register_account(base_url: str, profile: Profile, suffix: str = "", browser_
             if acct is not None:
                 acct.client.close()
             return out
-    baas = _register_via_baas(base_url, suffix)
+    baas = _register_via_baas(base_url, suffix, getattr(profile, "landing_path", "") or "")
     if baas is not None:
         if acct is not None:
             acct.client.close()
