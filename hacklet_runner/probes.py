@@ -2808,10 +2808,7 @@ def _supabase_anon_writable(client, base: str, keys: list[str], tables: list[str
         hdr = {"apikey": key, "Content-Type": "application/json"}
         if key.startswith("eyJ"):
             hdr["Authorization"] = "Bearer " + key
-        cand = list(tables)
-        with contextlib.suppress(Exception):   # same root enumeration the read path does, or the write test
-            root = client.get(base + "/rest/v1/", headers=hdr, timeout=6.0)   # only ever sees bundle-mined
-            cand += [t for t in _postgrest_tables(root) if t not in cand]     # names and misses the rest
+        cand = _supabase_candidate_tables(client, base, hdr, tables)
         for table in cand[:20]:
             try:
                 r = client.post(base + "/rest/v1/" + table, json={}, headers=hdr, timeout=6.0)
@@ -2843,13 +2840,9 @@ def _supabase_readable(client, base: str, keys: list[str], tables: list[str]):
         hdr = {"apikey": key}
         if key.startswith("eyJ"):
             hdr["Authorization"] = "Bearer " + key   # JWT = PostgREST role selector; publishable keys aren't
-        cand = list(tables)
-        try:   # self-hosted / pre-Apr-2026 PostgREST may still expose the table list at the mount root
-            root = client.get(base + "/rest/v1/", headers=hdr, timeout=6.0)
-            reached = True
-            cand += [t for t in _postgrest_tables(root) if t not in cand]
-        except (httpx.HTTPError, httpx.InvalidURL):
-            pass
+        cand = _supabase_candidate_tables(client, base, hdr, tables)
+        if len(cand) > len(tables):
+            reached = True     # the root answered, so the host is up even if no table reads
         for table in cand[:20]:
             try:
                 r = client.get(base + "/rest/v1/" + table, params={"select": "*", "limit": "1"},
@@ -3042,9 +3035,31 @@ def _supabase_signup(client, base: str, anon_key: str):
         return None
 
 
+def _supabase_candidate_tables(client, base: str, hdr: dict, tables) -> list:
+    """The tables to test: the ones mined from the bundle (plus observed reads and the common-name fallback),
+    ENRICHED with whatever the PostgREST mount root discloses.
+
+    One helper because this was the same bug three times. `sponsor_leads` never appears in a bundle literal the
+    anonymous blob can see — its `.from()` call lives in an authed route's chunk — so the candidate list fell
+    back to sixteen generic names and the table was never tested. The root discloses all six names to the anon
+    key (that is sec-backend-003's finding), and two of the three read paths had grown their own inline copy of
+    this enrichment while the authed-tier path had none.
+
+    ORDER MATTERS as much as membership. The root's list is the SERVER'S OWN schema, so it outranks every name
+    we guessed; appending it after the sixteen common-name fallbacks left `sponsor_leads` at index 16+ and every
+    caller slices the list (`tables[:16]`, `cand[:20]`), so the real table was enriched in and then cut off
+    again. Ground truth first, guesses last."""
+    disclosed = []
+    with contextlib.suppress(Exception):
+        disclosed = list(_postgrest_tables(client.get(base + "/rest/v1/", headers=hdr, timeout=6.0)))
+    return disclosed + [t for t in tables if t not in disclosed]
+
+
 def _supabase_authed_only(client, base, anon_key, user_jwt, tables):
     """A table a FRESH authenticated user reads but ANON cannot -> a broken `authenticated` RLS policy (any
     logged-in user reads all rows). Differential + sensitivity gated; read-only. {table,...} / 'unreachable' / None."""
+    tables = _supabase_candidate_tables(client, base, {"apikey": anon_key,
+                                                       "Authorization": "Bearer " + anon_key}, tables)
     def read(table, jwt, lim):
         r = client.get(base + "/rest/v1/" + table, params={"select": "*", "limit": lim},
                        headers={"apikey": anon_key, "Authorization": "Bearer " + jwt}, timeout=6.0)
