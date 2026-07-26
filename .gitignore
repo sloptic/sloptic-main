@@ -8,15 +8,19 @@ __pycache__/
 **/hidden/
 catalog-hidden/
 
-# GRADING OUTPUT MUST NOT BE PUBLISHED. A results file names real third-party apps and carries,
-# per finding, a paste-to-reproduce request against a live deployment — the v9/v10 corpus runs alone
-# held 1,709 named Devpost projects and 8,825 repro blocks. Black-box scanning of a public URL is one
-# thing; publishing per-app reproduction steps against somebody else's submission is a different act,
-# and it contradicts the product's own guardrail (hand the builder back a private report, upside-only).
+# GRADING OUTPUT MUST NOT BE PUBLISHED. A results file names real third-party apps and carries, per finding, a
+# paste-to-reproduce request against a live deployment — the v9/v10 corpus runs alone held 1,709 named Devpost
+# projects and 8,825 repro blocks. Black-box scanning of a public URL is one thing; publishing per-app
+# reproduction steps against someone else's submission is a different act, and it contradicts the product's own
+# guardrail (hand the builder back a private report, upside-only).
 #
-# These landed here because the league->mirror sync is `rsync` followed by `git add -A`: rsync copies
-# the untracked results across and add -A stages whatever it finds. The sync command now carries
-# matching --exclude flags, and this file is the backstop for when someone forgets one.
+# THIS FILE IS THE SOURCE OF TRUTH FOR BOTH REPOS, and that is the whole point. The league -> mirror sync is
+# `rsync --delete` followed by `git add -A`, so rsync OVERWRITES the mirror's .gitignore with this one on every
+# sync — a fix applied only on the mirror side survives until the next sync and then silently un-ignores
+# everything (observed, not hypothesised). The sync command also carries matching --exclude flags; this is the
+# backstop for when one is forgotten.
+#
+# *.jsonl and NOT *.json: validation/benchmark-curve.json is the frozen scoring curve and must stay tracked.
 *.jsonl
 *.log
 *.tsv
