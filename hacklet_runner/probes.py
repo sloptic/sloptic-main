@@ -3186,11 +3186,23 @@ def session_cookie_missing_flag(ctx, probe) -> bool | None:
     flag = probe.probe.get("flag", "httponly")
     account = ctx.register()
     if account is None:
-        return None  # couldn't self-register -> couldn't test
+        # WHY, not just N/A. Measured on v10 (865 apps, run WITH --browser-auth): the session cluster reported
+        # N/A on 177 of the 204 apps that have BOTH a login and a signup, and every one of those records
+        # carried no na_reason — so the corpus could not distinguish "registration failed" from "this app's
+        # auth simply isn't in a cookie". Those have opposite fixes (auth lanes vs. sec-session-005 already
+        # covering it correctly), and one run of telemetry decides which.
+        ctx.evidence["na_reason"] = ("self-registration could not establish an account (no signup lane "
+                                     "succeeded: refused, e-mail confirmation required, CAPTCHA, or SSO-only)")
+        return None
     try:
         cookie = auth.session_cookie(account.register_response)
         if cookie is None:
-            return None  # registration yielded no recognizable session cookie -> couldn't test
+            # NOT a failure to register — registration WORKED and the app just doesn't keep its session in a
+            # cookie. That is the bolt/Supabase/Firebase default (JWT in localStorage + Bearer), and it is
+            # sec-session-005's job, so this N/A is CORRECT rather than a coverage hole.
+            ctx.evidence["na_reason"] = ("registered, but the app set no recognizable session cookie — token "
+                                         "auth (JWT in localStorage / Bearer) is sec-session-005's case")
+            return None
         # record WHICH cookie was judged: several can match the session-name heuristic, so an unnamed
         # verdict is unfalsifiable ("no HttpOnly" on an app whose real token HAS it reads as a bug).
         ctx.evidence.update(flag=flag, present=cookie[flag], cookie=cookie["name"])
@@ -3212,12 +3224,18 @@ def session_token_in_local_storage(ctx, probe) -> bool | None:
     so this is inherently N/A without --browser-auth, never a false 'clean'."""
     account = ctx.register()
     if account is None:
-        return None  # couldn't self-register -> couldn't test
+        ctx.evidence["na_reason"] = ("self-registration could not establish an account (no signup lane "
+                                     "succeeded: refused, e-mail confirmation required, CAPTCHA, or SSO-only)")
+        return None
     try:
         if account.provided:
-            return None  # a --header session reveals nothing about how the app STORES its token -> can't assess
+            ctx.evidence["na_reason"] = ("session supplied via --header: reveals nothing about how the app "
+                                         "STORES its own token")
+            return None
         if not auth._has_session(account):
-            return None  # no session established (email-verify/CAPTCHA/SSO, or httpx-only run) -> couldn't test
+            ctx.evidence["na_reason"] = ("account created but no session established (e-mail verification / "
+                                         "CAPTCHA / SSO), or the run had no browser to read localStorage with")
+            return None
         exposed = bool(account.storage_exposed)
         ctx.evidence.update(session_in_local_storage=exposed)
         return exposed  # True = token sits in localStorage (XSS-exfiltratable); False = session held elsewhere
@@ -3601,6 +3619,9 @@ def weak_session_id(ctx, probe) -> bool | None:
             if "=" in part:
                 add(part.split("=", 1)[0].strip(), part.split("=", 1)[1].strip())
     if not samples:
+        ctx.evidence["na_reason"] = ("no Set-Cookie session token observed across %d route(s) — the app issues "
+                                     "no cookie session to sample (token auth, or auth entirely off-origin)"
+                                     % len(list(dict.fromkeys(routes))[:6]))
         return None
     weak = any(_weak_token(vals) for vals in samples.values())
     ctx.evidence.update(weak=weak, cookies=list(samples.keys()),

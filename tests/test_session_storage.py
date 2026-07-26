@@ -45,3 +45,33 @@ def test_na_when_no_session_established():
 
 def test_na_when_registration_fails():
     assert session_token_in_local_storage(_ctx(None), _Probe()) is None
+
+
+def test_every_na_path_says_WHY_and_the_reasons_are_DISTINGUISHABLE():
+    """The session cluster was the corpus's largest coverage hole and its least diagnosable one.
+
+    Measured on v10 (865 apps, run WITH --browser-auth): of the 204 apps carrying BOTH a login and a signup,
+    session reported N/A on 177 — and not one of those records held an na_reason, because every N/A path here
+    returned a bare None. aggregate.py surfaces ctx.evidence["na_reason"] per kind and had nothing to surface.
+
+    The two dominant causes demand OPPOSITE responses: "registration failed" is a hole in the auth lanes, while
+    "registered fine, but this app keeps its session in localStorage" is sec-session-005 already doing its job
+    correctly. A single bare None makes 177 apps indistinguishable between a bug and correct behaviour, so the
+    reasons have to be different STRINGS, not merely present.
+    """
+    seen = {}
+    for label, account in (("no_account", None),
+                           ("no_session", _acct(storage_exposed=False)),
+                           ("provided", _acct(bearer="eyJ.tok.sig", storage_exposed=True))):
+        if label == "provided":
+            account.provided = True
+        ctx = _ctx(account)
+        assert session_token_in_local_storage(ctx, _Probe()) is None, label
+        reason = ctx.evidence.get("na_reason")
+        assert reason, "%s returned N/A with no na_reason" % label
+        seen[label] = reason
+
+    assert len(set(seen.values())) == 3, "N/A reasons collapse to the same text: %r" % seen
+    assert "could not establish an account" in seen["no_account"]
+    assert "no session established" in seen["no_session"]
+    assert "--header" in seen["provided"]
