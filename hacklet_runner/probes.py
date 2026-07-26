@@ -21,7 +21,7 @@ from dataclasses import replace
 
 import httpx
 
-from . import auth, browser, depscan, oob, perf, secretscan
+from . import auth, baas, browser, depscan, oob, perf, secretscan
 from .net import make_client
 from .schema import Endpoint
 from .discovery import _CATCHALL_PROBE, _body_sig
@@ -2287,55 +2287,19 @@ _SUPABASE_URL = re.compile(r"https://([a-z0-9]{15,40})\.supabase\.co")
 # domain is another.
 #
 # The host restriction above is an SSRF GUARD, not laziness, so it is narrowed rather than removed: a candidate
-# origin from the bundle is only followed when it is somewhere the TARGET already is — the same hostname on any
-# port, or loopback when the target itself is loopback. On a real deployment at app.example.com a bundle string
-# pointing at internal-db.corp is still refused. Then the origin must PROVE it is PostgREST before we use it.
-_BUNDLE_ORIGIN = re.compile(r"""["'`](https?://[A-Za-z0-9.\-\[\]]+(?::\d{2,5})?)(?=["'`/])""")
-_LOOPBACK = {"localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0"}
-
-
-def _reachable_baas_origin(candidate: str, target: str) -> bool:
-    """Is `candidate` an origin the target is already on? Same host (any port), or loopback-for-loopback."""
-    try:
-        c, t = urllib.parse.urlparse(candidate), urllib.parse.urlparse(target)
-    except ValueError:
-        return False
-    ch, th = (c.hostname or "").lower(), (t.hostname or "").lower()
-    if not ch or not th:
-        return False
-    return ch == th or (ch in _LOOPBACK and th in _LOOPBACK)
-
-
-def _looks_postgrest(client, origin: str) -> bool:
-    """Behavioural signature, so this works for any hostname: PostgREST's root answers JSON — an OpenAPI
-    document, or its own 'no API key' complaint — and Supabase fronts it with Kong."""
-    with contextlib.suppress(Exception):
-        r = client.get(origin.rstrip("/") + "/rest/v1/")
-        server = (r.headers.get("server") or "").lower()
-        if "postgrest" in server or "kong" in server:
-            return True
-        if "json" in (r.headers.get("content-type") or "").lower():
-            body = (r.text or "")[:400].lower()
-            return any(t in body for t in ('"swagger"', '"paths"', "api key", "apikey", "postgrest"))
-    return False
+# origin from the bundle is only followed when it is somewhere the TARGET already is. The implementation lives in
+# `baas` because `auth` needs it too and cannot import this module (probes imports auth), and two copies of an
+# SSRF guard is exactly the kind of duplication that drifts apart. Local aliases keep the probe bodies readable.
+_reachable_baas_origin = baas.reachable_origin
+_looks_postgrest = baas.looks_postgrest
 
 
 def _supabase_base(blob: str, ctx) -> str | None:
-    """The Supabase data-plane origin this app talks to: the hosted project, else a self-hosted gateway the
-    target is co-located with that proves itself PostgREST."""
-    m = _SUPABASE_URL.search(blob)
-    if m:
-        return "https://" + m.group(1) + ".supabase.co"
-    target = getattr(ctx, "base_url", "") or ""
-    cands = [c for c in dict.fromkeys(_BUNDLE_ORIGIN.findall(blob or ""))
-             if _reachable_baas_origin(c, target)]
-    if not cands:
-        return None
-    with httpx.Client(timeout=6.0, follow_redirects=True, verify=False) as probe_client:
-        for c in cands[:6]:
-            if _looks_postgrest(probe_client, c):
-                return c.rstrip("/")
-    return None
+    """The Supabase data-plane origin this app talks to: the hosted project, else a co-located self-hosted
+    gateway that proves itself PostgREST. See baas.resolve_gateway for the SSRF reasoning."""
+    return baas.resolve_gateway(blob, getattr(ctx, "base_url", "") or "")
+
+
 _FIREBASE_RTDB = re.compile(r"https://([a-z0-9][a-z0-9-]{2,60}\.firebaseio\.com)")
 _JWT = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")
 # Firestore (the DEFAULT Firebase DB since ~2019 — RTDB above is the legacy one, so RTDB-only coverage

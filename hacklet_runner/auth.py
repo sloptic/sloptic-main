@@ -155,6 +155,34 @@ def _account_from_headers(base_url: str, headers) -> Account:
                    register_response=httpx.Response(200, request=httpx.Request("GET", base_url)), provided=True)
 
 
+def _register_via_baas(base_url: str, suffix: str = "") -> Account | None:
+    """Register at the app's own Supabase gateway and carry the session the way the app stores it.
+
+    The client ends up holding BOTH halves, because they address different servers: the `sb-<ref>-auth-token`
+    cookie is what the APP reads to render an authed page (measured: 10675 bytes vs 31 anonymous, while a bare
+    access token gets the unauthenticated shell), and `Authorization: Bearer` + `apikey` are what the GATEWAY
+    reads. Returns None when no gateway/key is embedded or signup is closed -> the caller reads N/A."""
+    from . import baas   # local import: only the BaaS lane needs it, and this keeps auth import-light
+    blob = baas.client_blob(base_url)      # it derives origin + entry path itself
+    if not blob:
+        return None
+    gateway = baas.resolve_gateway(blob, base_url)
+    key = baas.anon_key(blob)
+    if not gateway or not key:
+        return None
+    session = baas.signup(gateway, key, suffix)
+    if not session:
+        return None
+    client = httpx.Client(base_url=base_url, timeout=15.0, follow_redirects=True)
+    client.cookies.set(baas.cookie_name(gateway), baas.cookie_value(session))
+    client.headers["Authorization"] = "Bearer " + session["access_token"]
+    client.headers["apikey"] = key
+    resp = httpx.Response(200, request=httpx.Request("POST", gateway + "/auth/v1/signup"),
+                          json={"gateway": gateway})
+    return Account(username=session.get("_email", "hl_baas"), password=session.get("_password", ""),
+                   client=client, register_response=resp)
+
+
 def _carry_secure_cookies_over_http(base_url: str, client: httpx.Client) -> None:
     """Re-send the jar's session cookies as an explicit Cookie header when the target is PLAINTEXT http.
 
@@ -260,15 +288,36 @@ def register_account(base_url: str, profile: Profile, suffix: str = "", browser_
     if _has_session(acct):
         _carry_secure_cookies_over_http(base_url, acct.client)
         return acct
-    if browser_register is None:
-        return acct
+    # Two remaining lanes, and their ORDER costs a finding either way round.
+    #
+    # BROWSER first when a callback is available: it registers the way the app's own JS does, so it observes the
+    # session cookie WITH ITS FLAGS — a cookie written by document.cookie is not HttpOnly by definition, which
+    # is exactly what the cookie-hygiene probes exist to report.
+    #
+    # BaaS second: on a managed-backend app the auth API is not the app's at all. Measured on supavulnbase,
+    # every app-side path 404s while POST <gateway>/auth/v1/signup with the public anon key answers 200 with a
+    # session. That session unlocks the authed half of the app — its routes, its per-route chunks, and the
+    # service_role key compiled into the dashboard chunk. But it sets the cookie OURSELVES, so no Set-Cookie is
+    # ever observed and sec-session-001..004 read N/A: running it FIRST traded a real 20-point cookie finding
+    # for the 35-point bundle secret rather than collecting both.
+    #
+    # `_crawl_auth_headers` passes no browser callback, so discovery still takes the BaaS lane it needs.
     caps = profile.capabilities
-    if _password_form(profile.forms) is None and not (caps.get("login_trigger") or caps.get("signup_trigger")):
-        return acct   # no auth surface at all -> don't spend a browser launch
-    out = _register_via_browser(base_url, browser_register) or acct
-    if out is not None:
-        _carry_secure_cookies_over_http(base_url, out.client)   # the browser path lands a Secure cookie too
-    return out
+    has_auth_surface = _password_form(profile.forms) is not None or bool(
+        caps.get("login_trigger") or caps.get("signup_trigger"))
+    if browser_register is not None and has_auth_surface:   # the caps gate: never spend a launch on an app
+        out = _register_via_browser(base_url, browser_register)   # with no auth surface at all
+        if _has_session(out):
+            _carry_secure_cookies_over_http(base_url, out.client)
+            if acct is not None:
+                acct.client.close()
+            return out
+    baas = _register_via_baas(base_url, suffix)
+    if baas is not None:
+        if acct is not None:
+            acct.client.close()
+        return baas
+    return acct
 
 
 def _register_httpx(base_url: str, profile: Profile, suffix: str = "") -> Account | None:
