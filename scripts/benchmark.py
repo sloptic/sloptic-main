@@ -42,6 +42,7 @@ _LANDMARKS = (10, 25, 50, 75, 90, 95, 99)
 # A fired probe in one of these classes means "not certifiable", independent of rank: the app is exploitable
 # now, and a favourable comparison to equally-broken peers is not a mitigation.
 _ABSOLUTE = {"access-control", "backend-exposure", "secrets-exposure", "sql-injection", "xss", "dom-xss",
+             "filter-injection",   # CWE-943: the caller controls what the data query matches
              "command-injection", "template-injection", "path-traversal", "file-upload", "ssrf", "xxe",
              "data-exposure"}
 

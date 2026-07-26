@@ -1,0 +1,28 @@
+id: sec-filterinj-001
+bundle: security
+category: filter-injection
+pool: public
+evidence_model: provable
+penalty: 34   # injection tier, priced just under SQLi/RLS-off (40) on purpose: controlling a data-store FILTER
+              # widens what a query returns and can defeat the app's own scoping, but it is bounded by whatever
+              # row-level policy still applies, whereas raw SQL or an RLS-off table is the whole database. When
+              # both are true they are separate findings and the total reflects that.
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  predicate: filter_injection
+  # CWE-943, the BaaS-era analogue of SQL injection: user input concatenated into a data-store filter
+  # expression rather than passed as a parameter. Measured on supavulnbase's {basePath}/api/projects/search:
+  #   q=Build          -> 200 {"count":0}
+  #   q=Build,other    -> 400 {"error":"failed to parse logic tree
+  #                            ((title.ilike.%Build,other%,tagline.ilike.%Build,other%))"}
+  #   q=*              -> 200 {"count":7}   every row, because * lands inside the ilike pattern
+  #
+  # EVIDENCE, not heuristic. The payload is a comma and a benign token, so a response containing
+  # `title.ilike.%` can only be the APP's own filter template — reflecting our input cannot produce it. Same
+  # rule as sec-lfi-001 matching /etc/passwd's root line: the signature is something only the flaw can emit.
+  #
+  # PRECISION: a benign baseline must first come back WITHOUT the signature, so an app that always answers with
+  # a parse error cannot false-fire. The wildcard differential (* returning strictly more rows than a specific
+  # term) is recorded as corroborating evidence but never fires on its own — a search that deliberately treats
+  # `*` as match-all is a design choice, not a defect.

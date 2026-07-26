@@ -42,6 +42,9 @@ _CWE_BY_CATEGORY = {
     "data-exposure":     {"CWE-200", "CWE-201"},
     "secrets-exposure":  {"CWE-200", "CWE-321", "CWE-522", "CWE-540", "CWE-798"},
     "sql-injection":     {"CWE-89"},
+    "filter-injection":  {"CWE-943"},   # PostgREST/NoSQL filter injection — NOT CWE-89: raw SQL
+    #                    is sec-sqli-*, and crediting both would let one finding claim the other's
+    #                    scenario. GapBench's nosql-injection declares CWE-943 and is ours now.
     "xss":               {"CWE-79", "CWE-80"},
     "dom-xss":           {"CWE-79", "CWE-80"},
     "path-traversal":    {"CWE-22", "CWE-23", "CWE-36"},

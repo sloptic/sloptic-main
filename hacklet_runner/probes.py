@@ -2561,6 +2561,82 @@ def exposed_sensitive_file(ctx, probe) -> bool | None:
     return False
 
 
+# FILTER INJECTION (CWE-943) — the BaaS-era analogue of SQLi: user input concatenated into a data-store filter
+# expression instead of passed as a parameter. Measured on supavulnbase's {basePath}/api/projects/search:
+#   q=Build        -> 200 {"count":0}
+#   q=Build,other  -> 400 {"error":"failed to parse logic tree
+#                          ((title.ilike.%Build,other%,tagline.ilike.%Build,other%))"}
+#   q=*            -> 200 {"count":7}    every row, because * lands inside the ilike pattern
+#
+# The signature is the app's OWN filter template. Our payload is a comma and a benign token, so a response
+# containing `title.ilike.%` cannot be a reflection of it — the same rule that makes sec-lfi-001 precise by
+# matching /etc/passwd's root line rather than the path we asked for.
+_FILTER_GRAMMAR = re.compile(
+    r"failed to parse logic tree"
+    r"|unexpected .{0,24}expecting"
+    # a PostgREST/Supabase filter operator applied to a value: title.ilike.%x%, id.eq.3, or(...), and(...)
+    r"|\b[A-Za-z_][A-Za-z0-9_]{0,40}\.(?:ilike|like|eq|neq|gte|lte|gt|lt|in|fts|plfts|cs|cd|is|not)\."
+    r"|\b(?:or|and)\([A-Za-z_]",
+    re.I)
+_FILTER_PAYLOAD = ",hlfi"          # a comma is what breaks a PostgREST logic tree
+_FILTER_BENIGN = "hlfiprobe"
+_FILTER_TARGET_CAP = 12
+
+
+def _filter_targets(profile):
+    """(path, param) pairs worth testing: any GET endpoint carrying a query parameter. Search endpoints come
+    first because a search box is where user input reaches a filter."""
+    out = []
+    for e in profile.endpoints or []:
+        if (e.method or "get").lower() != "get":
+            continue
+        for p in e.query_params or []:
+            out.append((e.path, p, (e.kind or "") == "search"))
+    out.sort(key=lambda t: not t[2])         # search endpoints first
+    return [(path, param) for path, param, _s in out][:_FILTER_TARGET_CAP]
+
+
+def filter_injection(ctx, probe) -> bool | None:
+    """User input reaching a data-store FILTER expression. Fires when a benign baseline comes back clean and a
+    payload carrying a filter metacharacter provokes the store's own filter grammar in the response.
+    N/A when there is no GET endpoint with a query parameter to inject into."""
+    targets = _filter_targets(ctx.profile)
+    if not targets:
+        ctx.evidence["na_reason"] = "no GET endpoint with a query parameter to inject a filter into"
+        return None
+    tested = 0
+    with make_client(ctx.base_url, ctx.headers, timeout=10.0, follow_redirects=True) as c:
+        for path, param in targets:
+            try:
+                base = c.get(path, params={param: _FILTER_BENIGN})
+            except (httpx.HTTPError, httpx.InvalidURL):
+                continue
+            if _FILTER_GRAMMAR.search(base.text or ""):
+                continue      # this app answers with filter grammar even when nothing is wrong -> no signal
+            tested += 1
+            try:
+                r = c.get(path, params={param: _FILTER_BENIGN + _FILTER_PAYLOAD})
+            except (httpx.HTTPError, httpx.InvalidURL):
+                continue
+            m = _FILTER_GRAMMAR.search(r.text or "")
+            if not m:
+                continue
+            ev = {"injectable": True, "endpoint": path, "param": param, "matched": m.group(0)[:60],
+                  "repro": _repro_from_resp(
+                      r, matched="filter grammar disclosed by a metacharacter: " + m.group(0)[:48])}
+            with contextlib.suppress(Exception):   # corroboration only, never the trigger
+                wide = c.get(path, params={param: "*"})
+                ev["wildcard_rows"] = len(_json_objects(wide) or [])
+                ev["baseline_rows"] = len(_json_objects(base) or [])
+            ctx.evidence.update(**ev)
+            return True
+    if not tested:
+        ctx.evidence["na_reason"] = "no query parameter answered a clean baseline to compare against"
+        return None
+    ctx.evidence.update(injectable=False, params_tested=tested)
+    return False
+
+
 # ANONYMOUS BULK DATA. Measured on supavulnbase: an unauthenticated GET of {basePath}/api/admin/export returns
 # 6 sponsor_leads (contact_email, amount_cents, notes), 4 payout_accounts (account_last4, routing_hint) and 108
 # profiles. The instructive part is that payout_accounts is that fixture's OWN control for correct owner-scoped
@@ -4816,6 +4892,7 @@ PREDICATES = {
     "leaks_error_detail": leaks_error_detail,
     "exposed_backend_readable": exposed_backend_readable,
     "anon_bulk_data_exposed": anon_bulk_data_exposed,
+    "filter_injection": filter_injection,
     "backend_schema_disclosed": backend_schema_disclosed,
     "authenticated_backend_readable": authenticated_backend_readable,
     "bundle_leaks_secret": bundle_leaks_secret,
@@ -4904,6 +4981,7 @@ _PREDICATE_REASONS = {
     "debug_mode_enabled": "framework debug mode is on in production (interactive debugger / DEBUG page -> source, settings, env and an RCE console exposed)",
     "leaks_error_detail": "an induced server error leaked a stack trace or a database error to the user (info disclosure + a broken error path)",
     "exposed_backend_readable": "the app's managed backend (Supabase/Firebase) is world-readable with its own public key -> the whole database is exposed (missing row-level security)",
+    "filter_injection": "a query parameter reaches the data store's FILTER expression (PostgREST/NoSQL filter injection: the caller controls what the query matches)",
     "anon_bulk_data_exposed": "an anonymous request returned bulk records carrying personal or financial data "
                               "(no authorization on a data-export route)",
     "backend_schema_disclosed": "the managed backend discloses its schema to anyone (table list at the API "
