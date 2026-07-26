@@ -221,6 +221,42 @@ def test_a_gateway_that_discloses_neither_reads_clean():
     assert hit is False and ev["disclosed"] is False
 
 
+def test_the_disclosure_shapes_have_a_FIXED_PRECEDENCE_so_the_finding_is_attributable():
+    """THE ABLATION INVARIANT, and it is about attribution rather than detection.
+
+    supavulnbase's hardened reference is not a should-score-zero twin; it is an ablation harness whose
+    `HARDEN_CLASS` fixes exactly ONE flaw class so that "the differential against :8090 is attributable to that
+    class alone". That only holds if our findings do not move for reasons belonging to another class.
+
+    This probe has two firing shapes and the second one is NOT independent of RLS. `_serve_gateway`'s own dial
+    says so: a terse 42501 is RLS refusing the write, a 23502 with `Failing row contains (...)` is RLS passing
+    it and a constraint rejecting it. So `HARDEN_CLASS=rls` flips the anon-write response, and if the probe
+    consulted the write FIRST, hardening rls would silence a schema-disclosure finding — the rls delta would
+    read 52 instead of 40 and the harness would be measuring our coupling instead of their fix.
+
+    The root is checked first (probes.py: the OpenAPI block returns before the write loop), which makes the top
+    two rows below immune to the rls dial. Only cell 3 is legitimately coupled, and there the finding is
+    genuinely gone. The matrix is asserted in full because three of these four cells already passed by accident
+    and nothing named why.
+
+    CONSEQUENCE FOR THE HARNESS: attribution holds while the PostgREST root stays open, which on supavulnbase
+    it deliberately does (info-001, stock self-hosted behaviour). A HARDEN_CLASS that closes the root without
+    being the schema-disclosure class would make this finding vanish under the wrong label.
+    """
+    for root_status, verbose, expect_hit, expect_via in ((200, True, True, "openapi-root"),
+                                                         (200, False, True, "openapi-root"),
+                                                         (403, True, True, "verbose-db-error"),
+                                                         (403, False, False, None)):
+        hit, ev = _run_schema(root_status=root_status, verbose_error=verbose)
+        label = "root=%s verbose_write=%s" % (root_status, verbose)
+        assert hit is expect_hit, label
+        assert ev.get("via") == expect_via, label
+
+    # stated as its own assertion because it IS the invariant: with the root open, the rls dial changes nothing
+    open_root = [_run_schema(root_status=200, verbose_error=v)[0] for v in (True, False)]
+    assert open_root[0] == open_root[1] is True, "the rls dial moved a schema-disclosure verdict"
+
+
 def test_no_managed_backend_is_na_not_clean():
     srv = _serve({"/": (200, "<html>no backend here</html>")})
     base = "http://127.0.0.1:%d" % srv.server_address[1]

@@ -2779,8 +2779,27 @@ def backend_schema_disclosed(ctx, probe) -> bool | None:
 def _sensitive_leak(table: str, columns: list[str]) -> bool:
     """A table readable to anon is a LEAK only if it looks private: a sensitive table name OR a PII/secret
     column. A public-by-design table (blog posts, product catalog, countries) reading to anon is NOT a
-    finding — this gate is what separates a real RLS misconfiguration from an intentionally-public table."""
+    finding — this gate is what separates a real RLS misconfiguration from an intentionally-public table.
+
+    DO NOT use this to gate an anonymous READ — use _sensitive_columns. The table-name half is the half that
+    misfires there, and `profile` is one of the names it matches; see the note above _supabase_anon_writable.
+    It stays as-is for the two DIFFERENTIAL callers (Firestore, and the authed tier), where a table name is
+    corroboration rather than the whole case: sec-backend-002 fires only where ANON is denied and a fresh
+    authed user still sees rows, so a public-by-design table is already excluded before this gate runs."""
     return bool(_SENSITIVE_TABLE.search(table) or any(_SENSITIVE_COLUMN.search(c) for c in columns))
+
+
+def _sensitive_columns(columns: list[str]) -> list[str]:
+    """The PII/secret column names in `columns`, COLUMNS ONLY. This is the same gate sec-exposure-008 applies
+    and it is deliberately narrower than _sensitive_leak: a table NAMED `profiles` is not evidence that its
+    contents are private, and the anon-read path has nothing but the name and the columns to go on.
+
+    KNOWN TRADE-OFF, recorded rather than hidden: a genuinely sensitive table whose column names happen to be
+    bland (`payments(id, amount, status)`) now reads clean here. The table-name half used to catch that case,
+    at the cost of reporting every public profile directory in the corpus. Column names are the only evidence
+    that survives contact with a hardened app, so the recall loss is the price and it belongs in the gap
+    backlog, not in a silent 40-point penalty."""
+    return [c for c in columns if _SENSITIVE_COLUMN.search(c)]
 
 
 # ANON WRITE beats anon read as an RLS oracle, and it needs no write to succeed. An RLS-off table is often
@@ -2858,9 +2877,19 @@ def _supabase_readable(client, base: str, keys: list[str], tables: list[str]):
                 continue
             if isinstance(rows, list) and rows:       # non-empty -> RLS off/permissive
                 columns = sorted(rows[0]) if isinstance(rows[0], dict) else []
-                if _sensitive_leak(table, columns):   # gate out intentionally-public tables
+                # COLUMNS ONLY, and the table name deliberately does not count. Measured on supavulnbase's
+                # HARDENED reference (HARDEN_CLASS=all): the write half above was fixed, control fell through
+                # to here, and `profiles` (bio/created_at/display_name/id/username/website) was reported for
+                # 40 points — ctl-002, the fixture's own control for CORRECT owner-scoped RLS. The table-name
+                # half of _sensitive_leak matched on `profile` alone. Write-first ordering masked this rather
+                # than suppressing it, so it stayed invisible until a hardened target existed.
+                sensitive = _sensitive_columns(columns)
+                if sensitive:
                     return {"table": table, "rows": len(rows), "columns": columns[:8],
-                            "repro": _repro_from_resp(r, matched="%d row(s) readable to anon" % len(rows))}
+                            "sensitive_columns": sensitive[:6],
+                            "repro": _repro_from_resp(
+                                r, matched="%d row(s) readable to anon, carrying %s"
+                                           % (len(rows), ", ".join(sensitive[:3])))}
     return None if reached else "unreachable"
 
 
@@ -2942,7 +2971,8 @@ def exposed_backend_readable(ctx, probe) -> bool | None:
             hit = _supabase_readable(ext, base, keys, tables)
             if isinstance(hit, dict):
                 ctx.evidence.update(backend="supabase", host=base, table=hit["table"],
-                                    rows_readable=hit["rows"], columns=hit["columns"], repro=hit["repro"])
+                                    rows_readable=hit["rows"], columns=hit["columns"],
+                                    sensitive_columns=hit.get("sensitive_columns"), repro=hit["repro"])
                 return True
             reached = reached or hit != "unreachable"
         if fm:

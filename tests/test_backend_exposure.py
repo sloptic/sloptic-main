@@ -118,6 +118,58 @@ def test_supabase_fires_on_sensitive_bundle_table(serve):
     assert hit["table"] == "accounts" and "email" in hit["columns"]
 
 
+def test_a_public_profile_table_is_not_an_RLS_failure(serve):
+    """THE HARDENED-REFERENCE REGRESSION, reproduced from a measured 40-point false positive.
+
+    supavulnbase's hardened reference (HARDEN_CLASS=all) fixed the anon-WRITE half, control fell through to
+    the read path, and this probe reported `profiles` — ctl-002, the table whose RLS that fixture declares
+    CORRECT — with exactly the columns below. The old gate was `_sensitive_leak`, whose table-name half matches
+    `profile` on its own, so the name alone carried a 40-point finding on an app that had done nothing wrong.
+
+    Write-first ordering did not prevent this; it only MASKED it, which is why four `profiles` findings sit in
+    the v10 corpus and none was visible until a hardened target existed to fall through to.
+    """
+    cols = {"id": 1, "username": "ada", "display_name": "Ada", "bio": "hi",
+            "website": "https://x.test", "created_at": "2026-01-01"}
+
+    def h(path):
+        if "/rest/v1/profiles" in path and path != "/rest/v1/":
+            return 200, "application/json", json.dumps([cols]).encode()
+        return 403, "application/json", b'{"code":"42501","message":"permission denied"}'
+
+    base = serve(h)
+    with httpx.Client(timeout=5) as c:
+        assert probes._supabase_readable(c, base, ["eyJanon"], ["profiles"]) is None
+
+
+def test_the_same_table_DOES_fire_once_a_sensitive_column_appears(serve):
+    """The other half of the pin: the fix must not silence the table wholesale. Add one PII column to the very
+    same public-looking table and it is a finding again — which is what keeps the one v10 app whose `profiles`
+    exposes `email` reported."""
+    def h(path):
+        if "/rest/v1/profiles" in path and path != "/rest/v1/":
+            return 200, "application/json", json.dumps(
+                [{"id": 1, "username": "ada", "bio": "hi", "email": "ada@x.test"}]).encode()
+        return 403, "application/json", b'{"code":"42501","message":"permission denied"}'
+
+    base = serve(h)
+    with httpx.Client(timeout=5) as c:
+        hit = probes._supabase_readable(c, base, ["eyJanon"], ["profiles"])
+    assert hit["table"] == "profiles" and hit["sensitive_columns"] == ["email"]
+    assert "carrying email" in hit["repro"]["matched"]
+
+
+def test_the_table_NAME_alone_never_fires_an_anon_read():
+    """States the rule directly, so a future edit that reaches for the convenient shared helper trips here.
+    _sensitive_leak still answers True on the name — it is correct for the differential callers and wrong for
+    this one, and that difference is the whole fix."""
+    public = ["id", "username", "display_name", "bio", "website", "created_at"]
+    assert probes._sensitive_columns(public) == []
+    assert probes._sensitive_leak("profiles", public) is True      # the old gate: name-only match
+    for name in ("profiles", "user_accounts", "sessions", "payments"):
+        assert probes._sensitive_columns(public) == [], name       # no name makes bland columns sensitive
+
+
 def test_firebase_readable_fires_on_open_rtdb(serve):
     base = serve(lambda p: (200, "application/json", json.dumps({"users": {"1": {"email": "a@x.com"}}}).encode()))
     with httpx.Client(timeout=5) as c:
