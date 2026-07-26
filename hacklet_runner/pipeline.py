@@ -7,6 +7,7 @@ so multiple vulnerable endpoints cost more than one but less than linearly.
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field, replace
 
 import httpx
@@ -129,6 +130,7 @@ def _matches(probe: Probe, resp: httpx.Response) -> bool:
     return bool(probe.slop_if)
 
 
+_RATE_LIMIT_BACKOFF_S = 0.75   # one beat before the single retry on a 429
 _PENALTY_CAP = 250   # runaway guard on penalty_override — above any real per-rule a11y sum (axe dedups to
                      # ~100 rules max), so it only ever catches a bug, never clips a legitimate multi-barrier fire
 
@@ -163,10 +165,27 @@ def _run_probe(probe: Probe, ctx: _Ctx, client: httpx.Client, profile: Profile) 
     na_if_absent = probe.probe.get("na_if_absent", False)
     produced: list[Outcome] = []
     for label, fetch in _expand(probe, profile):
-        try:
-            resp = fetch(client)
-        except (httpx.HTTPError, httpx.InvalidURL):
+        # A 429 is the HOST telling us to go away; its body says nothing about the app. Scanning it and finding
+        # no secret counted as a CLEAN observation, so a rate-limited bundle fetch silently turned a real finding
+        # into a pass. Measured: sec-secrets-001 and -002 both vanished on two corpus apps that still ship an
+        # openai-key today — the probes reproduce on current code, so the miss was the fetch, not the detector.
+        # ONE retry, because a limiter needs a beat and a second request is far cheaper than a lost finding.
+        # 5xx is deliberately NOT in here: qa-crash-010 matches a 5xx as evidence the app crashed, and skipping
+        # those would trade this false-clean for a false-clean somewhere else.
+        resp = None
+        for attempt in (0, 1):
+            try:
+                resp = fetch(client)
+            except (httpx.HTTPError, httpx.InvalidURL):
+                resp = None
+            if resp is not None and resp.status_code != 429:
+                break
+            if attempt == 0:
+                time.sleep(_RATE_LIMIT_BACKOFF_S)
+        if resp is None:
             continue  # unreachable / malformed-URL (control-char path) target -> next
+        if resp.status_code == 429:
+            continue  # still throttled: not readable, so it must not count as evidence of cleanliness
         client.cookies.clear()  # form-fan submissions stay independent (no session leak)
         # endpoint-specific probe: 404/405/501 means the target endpoint/method isn't served here,
         # so it's N/A — not a clean pass (a fake "handled gracefully").
