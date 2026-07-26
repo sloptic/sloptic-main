@@ -6,8 +6,11 @@ could mean a clean submission with broad surface (excellent) or a trivial one wi
 (Limited Engagement)" — and its consequence: a DNF or Limited Engagement submission "is ranked below every
 completed submission regardless of its trivially-low raw slop."
 
-Thresholds are corpus-derived (v9, n=1110): Limited Engagement below 40 applicable probes fires on 2.0%, the
-genuinely trivial tail; the Attack Surface tertiles 46/55 split the population 29.7 / 36.8 / 33.5.
+Thresholds are corpus-derived and RE-DERIVED per calibration run. On v10 (n=865): Limited Engagement below 40
+applicable probes fires on 0.8%, the genuinely trivial tail; the Attack Surface tertiles are 48/58, splitting the
+population 31.0 / 42.5 / 26.5. The v9-era 46/55 awarded BROAD to 47.7% of v10 — the boundary test below now pins
+the exact cut points, because the loose 45/50/60 sample it used before passed under both sets of thresholds and
+would have let a recalibration change grader output with the suite still green.
 
 `untested_families` is OURS and keeps its own name deliberately. Limited Engagement is a spec term defined by an
 applicable-COUNT threshold, and quietly redefining it to also mean "a family never ran" is exactly the drift this
@@ -65,9 +68,12 @@ def test_repeated_findings_from_one_probe_count_once_as_slop_detected():
 
 
 def test_attack_surface_coverage_uses_the_corpus_tertiles():
-    assert reporting_bundle(_rec(applicable=45))["attack_surface_coverage"] == "narrow"
-    assert reporting_bundle(_rec(applicable=50))["attack_surface_coverage"] == "moderate"
-    assert reporting_bundle(_rec(applicable=60))["attack_surface_coverage"] == "broad"
+    """Pins the v10 cut points EXACTLY (48/58), on both sides of each boundary. A sample of 45/50/60 satisfies
+    46/55 and 48/58 alike, so it would have gone green through a recalibration that moved a third of the corpus
+    between bands."""
+    for applicable, band in ((21, "narrow"), (47, "narrow"), (48, "moderate"), (58, "moderate"),
+                             (59, "broad"), (69, "broad")):
+        assert reporting_bundle(_rec(applicable=applicable))["attack_surface_coverage"] == band, applicable
 
 
 def test_a_trivial_surface_is_limited_engagement():

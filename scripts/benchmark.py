@@ -128,11 +128,21 @@ def _band(pct: int) -> str:
 # Engagement)." And: a DNF or Limited Engagement submission "is ranked below every completed submission
 # regardless of its trivially-low raw slop."
 #
-# Thresholds are corpus-derived, not chosen by taste (v9, n=1110, probes_applicable p5=42 p50=53 p95=60):
-#   Limited Engagement at < 40 applicable ... 2.0% of apps — the genuinely trivial tail, not normal ones
-#   Attack Surface Coverage tertiles 46 / 55 ... narrow 29.7% / moderate 36.8% / broad 33.5%
+# Thresholds are corpus-derived, not chosen by taste. RE-DERIVED on v10 (n=865 scored, all at probes_total=90,
+# so the percentiles share the code's denominator; p10=46 p33=48 p50=55 p66=58 p90=61):
+#   Limited Engagement at < 40 applicable ... 0.8% of apps — re-checked and HELD. Still the genuinely trivial
+#       tail; it thinned from v9's 2.0% because this session's reach work (BaaS auth, conventional-API and
+#       search-sibling discovery, the create+read pair) made more of the surface applicable, not because the
+#       apps changed. A threshold meant to catch "nothing to test" should thin as reach improves.
+#   Attack Surface Coverage tertiles 48 / 58 ... narrow 31.0% / moderate 42.5% / broad 26.5%
+#
+# The old 46/55 came off v9's p5/p50/p95 read as if they were tertiles, and on v10 it awards BROAD to 47.7% of
+# the corpus (narrow 8.9% / moderate 43.4%). A label half the population earns disambiguates nothing, which is
+# the one job §4.2 gives this field. Same catalog, same runner — the drift is the reach work moving the whole
+# distribution right, so the cut points have to move with it. RE-DERIVE THESE AFTER EVERY CALIBRATION RUN; they
+# are a property of the corpus and the catalog together, and 90 probes will not be 90 forever.
 _LIMITED_ENGAGEMENT_BELOW = 40
-_SURFACE_NARROW_BELOW, _SURFACE_BROAD_ABOVE = 46, 55
+_SURFACE_NARROW_BELOW, _SURFACE_BROAD_ABOVE = 48, 58
 
 # UNTESTED FAMILIES is OURS, not the spec's, and is kept under its own name for exactly that reason: Limited
 # Engagement is defined by the spec as an applicable-COUNT threshold, and quietly redefining a spec term to mean
