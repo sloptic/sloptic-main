@@ -177,13 +177,26 @@ def test_console_first_party_classification():
 
 
 def test_a11y_penalty_damps_stacked_barriers():
+    """Tiers re-priced 30/18/10/4 -> 20/12/7/3 off the v11 corpus, where a11y was 34.0% of ALL penalty and one
+    critical barrier cost 30 against a security ceiling of 40. The SHAPE is unchanged — worst counts full, each
+    additional decays by 0.6 — only the tier values moved."""
     from hacklet_runner.probes import _a11y_penalty
-    assert _a11y_penalty({"serious": 1}) == 18                  # a lone contrast miss -> below the old flat 26
-    assert _a11y_penalty({"critical": 1}) == 30                 # a screen-reader blocker -> above the old ceiling
-    assert _a11y_penalty({"critical": 1, "serious": 1}) == 41   # additive but DAMPED: 30 + 18*.6 (not a raw 48)
-    assert _a11y_penalty({"serious": 3}) == 35                  # worst full, rest decay: 18 + 18*.6 + 18*.36
-    assert _a11y_penalty({"moderate": 1, "minor": 2}) == 14     # 10 + 4*.6 + 4*.36 -> cosmetics stay cheap
+    assert _a11y_penalty({"serious": 1}) == 12                  # a lone contrast miss
+    assert _a11y_penalty({"critical": 1}) == 20                 # a screen-reader blocker -> HALF the sec ceiling
+    assert _a11y_penalty({"critical": 1, "serious": 1}) == 27   # additive but DAMPED: 20 + 12*.6 (not a raw 32)
+    assert _a11y_penalty({"serious": 3}) == 24                  # worst full, rest decay: 12 + 7.2 + 4.32
+    assert _a11y_penalty({"moderate": 1, "minor": 2}) == 10      # 7 + 3*.6 + 3*.36 -> cosmetics stay cheap
     assert _a11y_penalty({}) == 0
+
+
+def test_a11y_stays_a_real_penalty_after_the_repricing():
+    """The re-pricing is a RELATIVE correction, not a decision to go soft on hygiene — the opposite change was
+    proposed once and was wrong. A barred app must still pay enough to matter against the security axis."""
+    from hacklet_runner.probes import _a11y_penalty, _A11Y_TIER
+    assert _A11Y_TIER["critical"] * 2 == 40, "a critical barrier should be exactly half the security ceiling"
+    assert _a11y_penalty({"critical": 2, "serious": 2}) >= 30, "a multi-barrier app is still a serious finding"
+    # ordering must survive any future re-pricing: worse impact tiers always cost more
+    assert (_A11Y_TIER["critical"] > _A11Y_TIER["serious"] > _A11Y_TIER["moderate"] > _A11Y_TIER["minor"] > 0)
 
 
 def test_console_scales_by_render_health():

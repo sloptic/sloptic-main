@@ -4,10 +4,16 @@ category: accessibility
 variant_group_id: qa-a11y   # same flaw as qa-a11y-002 (static), two detection methods -> fire once
 pool: public
 evidence_model: oracle
-penalty: 30   # NOMINAL — the real fire is a per-rule severity SUM (_a11y_penalty): critical 30 / serious 18
-              # / moderate 10 / minor 4, over DISTINCT barriers (they stack; a11y harm is additive across
-              # populations). ~16% of people (1.3B, WHO 2023) are barred; ADA web suits run >4,000/yr
+penalty: 20   # NOMINAL — the real fire is a per-rule severity SUM (_a11y_penalty): critical 20 / serious 12
+              # / moderate 7 / minor 3, over DISTINCT barriers (they stack with decay; a11y harm is additive
+              # across populations). ~16% of people (1.3B, WHO 2023) are barred; ADA web suits run >4,000/yr
               # (UsableNet). Grouped w/ qa-a11y-002, fires once.
+              #
+              # Re-priced from 30/18/10/4 off the v11 corpus, where a11y was 34.0% of ALL penalty — the largest
+              # single category — and one critical barrier cost 30 against a security ceiling of 40. At 20 a
+              # critical barrier is half the ceiling and the category share is 25.5%, alongside security-headers
+              # (24.4%) instead of dominating. See _A11Y_TIER in probes.py for the full model and the reasoning
+              # about why this is a relative correction rather than going soft on hygiene.
 applicability:
   requires: [browser]   # needs a rendered DOM; N/A without --browser
 probe:

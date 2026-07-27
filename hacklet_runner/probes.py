@@ -3197,11 +3197,24 @@ def session_cookie_missing_flag(ctx, probe) -> bool | None:
     try:
         cookie = auth.session_cookie(account.register_response)
         if cookie is None:
-            # NOT a failure to register — registration WORKED and the app just doesn't keep its session in a
-            # cookie. That is the bolt/Supabase/Firebase default (JWT in localStorage + Bearer), and it is
-            # sec-session-005's job, so this N/A is CORRECT rather than a coverage hole.
-            ctx.evidence["na_reason"] = ("registered, but the app set no recognizable session cookie — token "
-                                         "auth (JWT in localStorage / Bearer) is sec-session-005's case")
+            # TWO different worlds here, and the earlier version of this reason conflated them into a claim of
+            # coverage that did not exist. Measured on v11 (1,531 apps): 187 apps reported "token auth is
+            # sec-session-005's case" and sec-session-005 ran on ZERO of them — because it needs
+            # _has_session(), which is false when there is neither a bearer nor a cookie anywhere.
+            #
+            #   bearer present  -> genuinely token auth. sec-session-005 DOES pick this up. Correct N/A.
+            #   nothing at all  -> we hold no session by any means, so "registered" is an illusion: a 2xx from
+            #                      an SPA placeholder POST that never reached a backend. _has_session's own
+            #                      docstring names this case. It is a coverage HOLE, not coverage.
+            if auth._has_session(account):
+                ctx.evidence["na_reason"] = ("registered with a bearer token and no session cookie — token auth "
+                                             "(JWT in localStorage / Authorization header), which is "
+                                             "sec-session-005's case")
+            else:
+                ctx.evidence["na_reason"] = ("registration returned a response but established NO session — no "
+                                             "cookie and no bearer, so the signup POST likely hit an SPA shell "
+                                             "without reaching a backend; nothing to test and NOT covered "
+                                             "elsewhere")
             return None
         # record WHICH cookie was judged: several can match the session-name heuristic, so an unnamed
         # verdict is unfalsifiable ("no HttpOnly" on an app whose real token HAS it reads as a bug).
@@ -3727,7 +3740,27 @@ def console_errors_present(ctx, probe) -> bool:
     return True
 
 
-_A11Y_TIER = {"critical": 30, "serious": 18, "moderate": 10, "minor": 4}
+_A11Y_TIER = {"critical": 20, "serious": 12, "moderate": 7, "minor": 3}
+# RE-PRICED off v11 (1,531 scored apps), because one category had become a third of the whole measurement.
+# Measured shares of total corpus penalty at the old 30/18/10/4: accessibility 34.0%, security-headers 24.4%,
+# web-vitals 10.4%. a11y fired on 73.6% of apps and was the largest single term in the score by a wide margin.
+#
+# The sharpest anomaly was the ratio, not the absolute value: a single CRITICAL barrier cost 30 against a
+# security ceiling of 40, so a missing alt attribute was priced at three quarters of a SQL injection. At 20 it
+# is exactly half the ceiling, which is defensible — a11y EXCLUDES users, injection COMPROMISES them.
+#
+# Modelled against every recorded `impacts` map in the v11 corpus before changing anything:
+#     30/18/10/4 -> 34.0%   median hit 29   max 65   (was)
+#     24/14/ 8/3 -> 28.7%   median hit 22   max 52
+#     20/12/ 7/3 -> 25.5%   median hit 19   max 44   (chosen)
+#     18/11/ 6/2 -> 23.8%   median hit 18   max 39
+#     15/ 9/ 5/2 -> 20.3%   median hit 14   max 33
+#
+# THIS IS A RELATIVE CORRECTION, NOT LENIENCY, and the distinction matters because the opposite change was
+# proposed once and was wrong. Hygiene stays in the number on purpose: the score is named for AI slop, a 0 must
+# mean "you even nailed the boring hygiene", and apps that fail it are not to be coddled. What is being fixed is
+# that a single category dominating a third of the variance drowns out the other 89 probes. a11y remains the
+# second-largest category (25.5% against headers' 24.4%) and a barred app still pays.
 _A11Y_DECAY = 0.6   # SAME within-category diminishing-returns constant as aggregate.CATEGORY_DECAY: each
                     # additional barrier adds less MARGINAL exclusion (populations overlap; a multi-barrier
                     # app is already substantially unusable) -> a11y stacks like every other category, not raw

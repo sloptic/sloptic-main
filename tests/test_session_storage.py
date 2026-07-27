@@ -47,6 +47,40 @@ def test_na_when_registration_fails():
     assert session_token_in_local_storage(_ctx(None), _Probe()) is None
 
 
+def test_the_no_cookie_reason_distinguishes_token_auth_from_no_session_at_all():
+    """The v11 run caught this reason ASSERTING COVERAGE THAT DID NOT EXIST.
+
+    187 apps reported "token auth is sec-session-005's case" and sec-session-005 ran on ZERO of them, because
+    005 gates on _has_session() and that is false when there is neither a bearer nor a cookie. Two different
+    worlds had been collapsed into one reassuring string:
+
+        bearer present -> genuinely token auth, 005 does pick it up, the N/A is correct
+        nothing at all -> we hold no session by any means, so "registered" is an illusion (a 2xx from an SPA
+                          placeholder POST that never reached a backend). A coverage HOLE, not coverage.
+
+    Reading the first as the second is what made the corpus's largest gap look two thirds smaller than it is.
+    """
+    from hacklet_runner.probes import session_cookie_missing_flag
+
+    class _Flag:
+        probe = {"flag": "httponly"}
+
+    # a bearer and no cookie -> the genuine sec-session-005 case
+    bearer = _acct(bearer="eyJ.tok.sig")
+    ctx = _ctx(bearer)
+    assert session_cookie_missing_flag(ctx, _Flag()) is None
+    assert "sec-session-005" in ctx.evidence["na_reason"]
+    assert "bearer" in ctx.evidence["na_reason"]
+
+    # nothing at all -> must NOT claim 005 covers it, and must name it as untested
+    empty = _acct()
+    ctx = _ctx(empty)
+    assert session_cookie_missing_flag(ctx, _Flag()) is None
+    reason = ctx.evidence["na_reason"]
+    assert "sec-session-005" not in reason, "claims coverage that does not exist: %r" % reason
+    assert "NO session" in reason and "NOT covered" in reason
+
+
 def test_every_na_path_says_WHY_and_the_reasons_are_DISTINGUISHABLE():
     """The session cluster was the corpus's largest coverage hole and its least diagnosable one.
 

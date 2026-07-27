@@ -144,9 +144,15 @@ def test_vulnerable_app_accrues_slop():
     # (frequency x severity, see the catalog): security holds its catastrophic per-instance ceiling (40),
     # while qa/perf are priced up for their every-user frequency. On this deliberately security-riddled
     # reference, security still dominates; a realistic janky app (references/qa-janky) leans qa/perf.
-    assert report.axis_slop == {"security": 429, "qa": 167, "performance": 68}
-    assert report.slop_score == 664   # security 435->429: sec-session-003 (Secure) is https-gated -> N/A over
-                                      # http (mirrors HSTS). qa 183->167:
+    assert report.axis_slop == {"security": 429, "qa": 152, "performance": 68}
+    assert report.slop_score == 649   # qa 167->152 and total 664->649: the a11y tier re-pricing
+                                      # (30/18/10/4 -> 20/12/7/3, see _A11Y_TIER). This reference renders
+                                      # critical 1 + serious 2, priced 47 -> 32, and that -15 is the WHOLE
+                                      # delta — security 429 and performance 68 are unmoved, which is the
+                                      # check that the re-pricing stayed inside its own category.
+                                      # Earlier moves, kept for the trail: security 435->429 because
+                                      # sec-session-003 (Secure) is https-gated -> N/A over http (mirrors
+                                      # HSTS). qa 183->167:
                                       # crash re-price (qa-crash-010 32->16) — a 500-not-400 on malformed input
                                       # is ungraceful error handling (a QA-hygiene tier), not a server crash
     assert sum(report.axis_slop.values()) == report.slop_score
@@ -220,7 +226,7 @@ def test_cached_profile_freezes_surface_and_reproduces_score(monkeypatch):
     catalog = load_catalog(CATALOG)
     minted = []
     r1 = run(SubprocessDeployer(str(REFS / "vulnerable" / "app.py")), catalog, on_profile=minted.append)
-    assert len(minted) == 1 and r1.slop_score == 664          # cache MISS -> discovered once + handed back
+    assert len(minted) == 1 and r1.slop_score == 649          # cache MISS -> discovered once + handed back
 
     import hacklet_runner.pipeline as pipeline_mod            # PROVE the crawl is skipped on a cache HIT:
     monkeypatch.setattr(pipeline_mod, "discover",             # discover() must never be called with a cached profile
@@ -228,7 +234,7 @@ def test_cached_profile_freezes_surface_and_reproduces_score(monkeypatch):
     seen = []
     r2 = run(SubprocessDeployer(str(REFS / "vulnerable" / "app.py")), catalog,
              cached_profile=minted[0], on_profile=seen.append)
-    assert r2.slop_score == 664 and seen == []                # HIT -> same score, no re-crawl, no re-mint
+    assert r2.slop_score == 649 and seen == []                # HIT -> same score, no re-crawl, no re-mint
     assert r2.axis_slop == r1.axis_slop                       # identical per-axis decomposition too
 
 

@@ -268,7 +268,7 @@ comment once swallowed `"dom-xss"` off a gate list. Both were caught by reading 
 
 No single target validates this thing. Five layers, each answering a different question:
 
-1. **The reference pair** (`references/vulnerable` 664 vs `references/hardened` 0) — does it discriminate at
+1. **The reference pair** (`references/vulnerable` 649 vs `references/hardened` 0) — does it discriminate at
    all? Note what that 0 means: `hardened/app.py` is a hand-rolled server that satisfies every probe by
    construction. It proves the probes are satisfiable, not that a real app scores 0.
 2. **The local vulnerable corpus** (DVWA, Juice Shop, VAmPI, bWAPP) — probe recall on known flaws. Every port
