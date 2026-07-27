@@ -28,3 +28,9 @@ v9-baseline-stats.json
 nextjs-trace-sample.txt
 sprint-sample.txt
 terminal output of test.md
+
+# Diagnostic URL worklists carry hundreds of named third-party apps (the v11 session-gap list is 311). Same
+# reasoning as the grading output above: black-box scanning a public URL is one thing, publishing the list of
+# who we scanned is another. Keep the *pattern* here so a regenerated list is covered without anyone rememb-
+# ering to add it.
+*.urls.txt
