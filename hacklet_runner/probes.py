@@ -3217,12 +3217,12 @@ def session_cookie_missing_flag(ctx, probe) -> bool | None:
             if auth._has_session(account):
                 ctx.evidence["na_reason"] = ("registered with a bearer token and no session cookie — token auth "
                                              "(JWT in localStorage / Authorization header), which is "
-                                             "sec-session-005's case")
+                                             "sec-session-005's case" + _browser_lane_detail())
             else:
                 ctx.evidence["na_reason"] = ("registration returned a response but established NO session — no "
                                              "cookie and no bearer, so the signup POST likely hit an SPA shell "
                                              "without reaching a backend; nothing to test and NOT covered "
-                                             "elsewhere")
+                                             "elsewhere" + _browser_lane_detail())
             return None
         # record WHICH cookie was judged: several can match the session-name heuristic, so an unnamed
         # verdict is unfalsifiable ("no HttpOnly" on an app whose real token HAS it reads as a bug).
@@ -3256,7 +3256,8 @@ def session_token_in_local_storage(ctx, probe) -> bool | None:
             return None
         if not auth._has_session(account):
             ctx.evidence["na_reason"] = ("account created but no session established (e-mail verification / "
-                                         "CAPTCHA / SSO), or the run had no browser to read localStorage with")
+                                         "CAPTCHA / SSO), or the run had no browser to read localStorage with"
+                                         + _browser_lane_detail())
             return None
         exposed = bool(account.storage_exposed)
         ctx.evidence.update(session_in_local_storage=exposed)

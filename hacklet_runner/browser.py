@@ -322,6 +322,18 @@ def _fill_and_submit_signup(page, creds) -> bool:
 # Conventional signup routes a 'Get Started' / 'Sign up' CTA navigates to via the JS router (QuizForge's
 # /register et al.) — an <a> LINK the button-only reveal can't open. Tried in order when the homepage has no
 # fillable signup, so a separate-route signup (the common SPA shape) is still reached.
+# The LAST failure stage of register_in_browser, read by auth._register_via_browser so an N/A reason can name
+# WHICH exit was taken. This lives here rather than as an out-param because the callable is INJECTED into auth
+# as `browser_register(base_url)` — a one-arg contract several call sites rely on — and widening that signature
+# to carry diagnostics would be the tail wagging the dog.
+#
+# Why it matters, measured: the first 39 apps of the session-gap run put 87% into a single bucket that reads
+# "no fillable signup, OR the signup left neither a cookie nor a token". Those are OPPOSITE findings — the
+# first is our discovery bug and the second is almost certainly e-mail confirmation, which is a CORRECT N/A —
+# and merging them makes a four-hour run unable to answer the question it was launched for.
+LAST_STAGE: dict = {}
+
+
 _SIGNUP_ROUTES = ("/register", "/signup", "/sign-up", "/join", "/auth/register", "/auth/signup",
                   "/create-account", "/get-started")
 
@@ -396,6 +408,7 @@ def register_in_browser(base_url: str, headers=None, timeout: float = 12.0, tota
     uname = "hl_" + secrets.token_hex(5)
     creds = {"email": uname + "@example.com", "username": uname, "password": "Hl-Probe-Passw0rd!"}
     captured, seen_bearer, reads, out = {}, {}, [], None
+    LAST_STAGE.clear()
     try:
         with sync_playwright() as pw:
             b = _launch(pw)
@@ -422,6 +435,9 @@ def register_in_browser(base_url: str, headers=None, timeout: float = 12.0, tota
                 page.on("request", _on_request)
 
                 if not _reach_and_submit_signup(page, base_url, creds, timeout):
+                    LAST_STAGE["stage"] = ("no fillable signup reached: no visible password field on the "
+                                           "homepage (after revealing hidden controls) or at any of %d "
+                                           "conventional signup routes" % len(_SIGNUP_ROUTES))
                     return None
                 with contextlib.suppress(Exception):                 # let the registration fetch + Set-Cookie/token land
                     page.wait_for_load_state("networkidle", timeout=8000)
@@ -437,13 +453,21 @@ def register_in_browser(base_url: str, headers=None, timeout: float = 12.0, tota
                 # the session for our authed client: a persisted localStorage token, else a Bearer the app sent
                 bearer = stored.get("token") or seen_bearer.get("token")
                 if not jar and not bearer:
-                    return None   # no cookie AND no token -> registration didn't take (email-verify/CAPTCHA) -> N/A
+                    # THE SIGNUP WAS FILLED AND SUBMITTED and the app still granted nothing. Distinct from the
+                    # exit above and usually NOT our bug: e-mail confirmation, CAPTCHA, admin approval or an
+                    # SSO-only backend all land here, and every one of them is a correct N/A.
+                    LAST_STAGE["stage"] = ("signup filled and submitted, but the app set no cookie and issued "
+                                           "no token%s (e-mail confirmation / CAPTCHA / approval / SSO-only)"
+                                           % (" — a registration request WAS observed" if captured else
+                                              " and no registration request was even observed"))
+                    return None
                 out = {"creds": creds, "cookies": jar, "request": captured or None,
                        "bearer": bearer, "storage_exposed": bool(stored.get("token")),
                        "backend_reads": reads}
             finally:
                 b.close()
-    except Exception:
+    except Exception as exc:
+        LAST_STAGE["stage"] = "browser registration raised %s" % type(exc).__name__
         return None
     return out
 

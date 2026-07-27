@@ -713,6 +713,14 @@ def _register_via_browser(base_url: str, browser_register, diag: dict | None = N
     except Exception as exc:
         return _fail("browser register raised %s" % type(exc).__name__)
     if not result:
+        # Prefer the stage register_in_browser recorded for ITSELF. From here the two causes are
+        # indistinguishable — the callable just returned falsy — and merging them is what made the first
+        # session-gap run put 87% of apps into one useless bucket. Fall back only if the browser module is
+        # absent or older than this instrumentation.
+        with contextlib.suppress(Exception):
+            from . import browser as _browser
+            if (_browser.LAST_STAGE or {}).get("stage"):
+                return _fail(_browser.LAST_STAGE["stage"])
         return _fail("browser found no fillable signup, or the signup left neither a cookie nor a token")
     cookies = result.get("cookies") or []
     bearer = result.get("bearer")

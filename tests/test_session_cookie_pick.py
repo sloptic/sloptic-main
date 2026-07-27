@@ -170,3 +170,32 @@ def test_the_browser_lane_names_WHICH_stage_it_failed_at():
     ok = {"cookies": [{"name": "auth0", "value": "y" * 40}], "bearer": None, "creds": {"username": "u"}}
     assert _register_via_browser("http://x", lambda _u: ok, diag) is not None
     assert diag == {}, "a SUCCESS must not record a failure stage"
+
+
+def test_the_two_causes_that_look_identical_from_auth_are_reported_SEPARATELY():
+    """The bucket that made the first session-gap run useless.
+
+    From auth's side both look the same — register_in_browser just returned falsy — so the reason read "no
+    fillable signup, OR the signup left neither a cookie nor a token" and 87% of the first 39 apps landed
+    there. They are opposite findings: one is our discovery bug, the other is almost certainly e-mail
+    confirmation and a CORRECT N/A. register_in_browser now records which exit it took, and auth prefers it.
+    """
+    from hacklet_runner import auth, browser
+
+    browser.LAST_STAGE.clear()
+    browser.LAST_STAGE["stage"] = "no fillable signup reached: no visible password field"
+    diag = {}
+    assert auth._register_via_browser("http://x", lambda _u: None, diag) is None
+    assert "no fillable signup reached" in diag["stage"]
+
+    browser.LAST_STAGE.clear()
+    browser.LAST_STAGE["stage"] = "signup filled and submitted, but the app set no cookie and issued no token"
+    diag = {}
+    assert auth._register_via_browser("http://x", lambda _u: None, diag) is None
+    assert "filled and submitted" in diag["stage"]
+    assert "no fillable signup" not in diag["stage"], "the two causes must not collapse again"
+
+    browser.LAST_STAGE.clear()          # no stage recorded -> the generic fallback still applies
+    diag = {}
+    assert auth._register_via_browser("http://x", lambda _u: None, diag) is None
+    assert diag["stage"]
