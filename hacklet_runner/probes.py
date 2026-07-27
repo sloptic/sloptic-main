@@ -3178,6 +3178,13 @@ def _https_browser_enforced(ctx) -> bool:
     return False
 
 
+def _browser_lane_detail() -> str:
+    """What the BROWSER registration lane hit, appended to an N/A reason. Empty when the lane never ran (no
+    --browser-auth, or no auth surface to spend a launch on), so the reason stays honest about that too."""
+    stage = (auth.LAST_BROWSER_DIAG or {}).get("stage")
+    return " | browser lane: " + stage if stage else " | browser lane: not attempted"
+
+
 def session_cookie_missing_flag(ctx, probe) -> bool | None:
     """Self-as-oracle: register an account, then inspect the session cookie it sets. Slop if it lacks
     the hardening flag named in the probe (httponly | samesite | secure). Returns None (-> N/A) when
@@ -3192,7 +3199,8 @@ def session_cookie_missing_flag(ctx, probe) -> bool | None:
         # auth simply isn't in a cookie". Those have opposite fixes (auth lanes vs. sec-session-005 already
         # covering it correctly), and one run of telemetry decides which.
         ctx.evidence["na_reason"] = ("self-registration could not establish an account (no signup lane "
-                                     "succeeded: refused, e-mail confirmation required, CAPTCHA, or SSO-only)")
+                                     "succeeded: refused, e-mail confirmation required, CAPTCHA, or SSO-only)"
+                                     + _browser_lane_detail())
         return None
     try:
         cookie = auth.session_cookie(account.register_response)
@@ -3238,7 +3246,8 @@ def session_token_in_local_storage(ctx, probe) -> bool | None:
     account = ctx.register()
     if account is None:
         ctx.evidence["na_reason"] = ("self-registration could not establish an account (no signup lane "
-                                     "succeeded: refused, e-mail confirmation required, CAPTCHA, or SSO-only)")
+                                     "succeeded: refused, e-mail confirmation required, CAPTCHA, or SSO-only)"
+                                     + _browser_lane_detail())
         return None
     try:
         if account.provided:

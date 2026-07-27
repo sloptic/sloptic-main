@@ -140,6 +140,13 @@ def login_form(forms: list[Form]) -> Form | None:
     return non_register[0] if non_register else None
 
 
+# The browser lane's last failure stage, so a probe reading N/A can say WHICH of the five outcomes it hit
+# without threading an out-param through register_account -> ctx.register -> every predicate. A grade runs in
+# its own subprocess and register_account is single-threaded within it, so a module slot is safe here; the
+# `diag` out-param on _register_via_browser stays the testable interface.
+LAST_BROWSER_DIAG: dict = {}
+
+
 def _provided_session(headers) -> bool:
     """A caller supplied a live session via --header (a Cookie or an Authorization/Bearer) — the Option-B path
     for apps we can't self-register (CAPTCHA / email-verify / SSO)."""
@@ -276,6 +283,7 @@ def register_account(base_url: str, profile: Profile, suffix: str = "", browser_
     the BROWSER to register (its own JS makes the real request) and use the session cookie/token it establishes.
     Returns None when nothing establishes a session (email-verify / CAPTCHA / SSO / third-party auth) -> caller
     reads N/A. If the caller supplied a session via --header (Option B), that is used directly (single identity)."""
+    LAST_BROWSER_DIAG.clear()
     if _provided_session(headers):
         return _account_from_headers(base_url, headers)
     acct = _register_httpx(base_url, profile, suffix)
@@ -309,7 +317,7 @@ def register_account(base_url: str, profile: Profile, suffix: str = "", browser_
     has_auth_surface = _password_form(profile.forms) is not None or bool(
         caps.get("login_trigger") or caps.get("signup_trigger"))
     if browser_register is not None and has_auth_surface:   # the caps gate: never spend a launch on an app
-        out = _register_via_browser(base_url, browser_register)   # with no auth surface at all
+        out = _register_via_browser(base_url, browser_register, LAST_BROWSER_DIAG)   # with no auth surface at all
         if _has_session(out):
             _carry_secure_cookies_over_http(base_url, out.client)
             if acct is not None:
@@ -547,10 +555,33 @@ def parse_set_cookies(resp: httpx.Response) -> list[dict]:
 # oracle holds no identity, so every authed probe (IDOR x5, session x4, CSRF, upload x2) reads N/A, and the
 # session-hygiene probes never judge the real token. Measured on the OopsSec anchor, whose cookie is authToken.
 _SESSION_HINTS = ("session", "sessid", "token", "jwt")
+# HOSTED AUTH PROVIDERS whose cookie name contains none of the generic hints above. Measured, not guessed: on
+# dawg-den.vercel.app the browser lane registered successfully and handed back seven token-shaped cookies —
+# `auth0` and `auth0_compat` (the session, 303 bytes each), `did`/`did_compat`, and three `__txn_*` — and
+# _is_session_cookie rejected ALL of them, so _register_via_browser threw a real session away and the app
+# reported "no recognizable session cookie".
+#
+# Most hosted providers are already covered incidentally and were checked before adding anything here: Clerk
+# (`__session`), Auth0's Next.js SDK (`appSession`), NextAuth/Auth.js (`next-auth.session-token`,
+# `authjs.session-token`), Better Auth (`better-auth.session_token`), WorkOS (`wos-session`), Ory
+# (`ory_kratos_session`), Keycloak (`AUTH_SESSION_ID`) all contain "session"; Supabase (`sb-<ref>-auth-token`),
+# SuperTokens (`sAccessToken`) and Cognito contain "token". Auth0's bare `auth0` cookie is the gap.
+#
+# Kept to what is VERIFIED against a live app rather than a list of plausible vendors: a speculative fragment
+# here is a wrong-cookie verdict, and _NOT_SESSION exclusions still win. Note `__txn_*` correctly stays
+# unmatched — those are Auth0's short-lived pre-login transaction cookies, not the session, and judging one
+# would report flags for the wrong cookie.
+_PROVIDER_SESSION = ("auth0",)
 # ... but a token-NAMED cookie is not always the session. A CSRF/anti-forgery token is deliberately
 # JS-readable (judging it would report a false hygiene failure), a refresh token is not the access session,
 # and an email/verification token is not a login. Exclusions win over hints.
-_NOT_SESSION = ("csrf", "xsrf", "antiforgery", "anti-forgery", "verification", "verify", "refresh")
+_NOT_SESSION = ("csrf", "xsrf", "antiforgery", "anti-forgery", "authenticity", "verification", "verify",
+                "refresh")
+# `authenticity` was missing and is a pre-existing FP vector this file's own precision test caught: Rails names
+# its CSRF token `authenticity_token`, which contains "token" and so matched as a session. is_csrf_field already
+# listed it for FORM fields (_CSRF_FIELD_HINTS) while the COOKIE check did not — the two lists had drifted. A
+# CSRF cookie is deliberately JS-readable, so judging one reports a false "missing HttpOnly" on an app doing
+# nothing wrong, which is precisely what these exclusions exist to prevent.
 
 
 def _is_session_cookie(name: str) -> bool:
@@ -560,7 +591,8 @@ def _is_session_cookie(name: str) -> bool:
     low = name.lower()
     if any(h in low for h in _NOT_SESSION):
         return False
-    return low in SESSION_COOKIE_NAMES or any(h in low for h in _SESSION_HINTS)
+    return (low in SESSION_COOKIE_NAMES or any(h in low for h in _SESSION_HINTS)
+            or any(h in low for h in _PROVIDER_SESSION))
 
 
 def _all_set_cookies(resp: httpx.Response) -> list[dict]:
@@ -658,22 +690,38 @@ def _synthesize_response(base_url: str, cookies: list[dict]) -> httpx.Response:
     return httpx.Response(200, headers=setc, request=httpx.Request("POST", base_url))
 
 
-def _register_via_browser(base_url: str, browser_register) -> Account | None:
+def _register_via_browser(base_url: str, browser_register, diag: dict | None = None) -> Account | None:
     """SPA registration through the browser: the injected browser_register(base_url) drives Playwright to fill +
     submit the signup so the app's OWN JS makes the real request, returning the session it establishes — a cookie
     AND/OR a Bearer token (the bolt/Supabase/Firebase cohort authenticates by JWT, not cookie). Build an Account
     whose httpx client carries both (cookie jar + Authorization header) for the authed IDOR / etc. probes, plus a
     synthetic register_response for the cookie-flag probes. None when the browser established NEITHER."""
+    # `diag` is an out-param the caller may pass to learn WHICH stage failed. Five distinct outcomes used to
+    # collapse into one bare None, and diagnosing them by inspection cost three wrong guesses in a row: a
+    # concurrency theory, a hydration-race theory and a homepage-login-hijack theory, all refuted against live
+    # apps. Naming the stage is what turns "187 apps, cause unknown" into a distribution we can fix in frequency
+    # order. Measured causes so far, one live app each: an unrecognised provider cookie (dawg-den, Auth0), a real
+    # signup that established no session (timbermarket, running-bh — most likely e-mail confirmation, which is a
+    # CORRECT N/A), and no fillable password field anywhere (flashcard-royale).
+    def _fail(stage: str):
+        if diag is not None:
+            diag["stage"] = stage
+        return None
+
     try:
         result = browser_register(base_url)
-    except Exception:
-        return None
+    except Exception as exc:
+        return _fail("browser register raised %s" % type(exc).__name__)
     if not result:
-        return None
+        return _fail("browser found no fillable signup, or the signup left neither a cookie nor a token")
     cookies = result.get("cookies") or []
     bearer = result.get("bearer")
     if not any(_is_session_cookie(c["name"]) for c in cookies) and not bearer:
-        return None   # neither a session cookie nor a token (email-verify / CAPTCHA / SSO) -> nothing to test -> N/A
+        # NOT "registration failed" — the browser drove a real signup and the app set cookies; we simply do not
+        # recognise any of their NAMES as a session. Distinguishing this from the no-signup case above is the
+        # whole point of the split, because this one is OUR bug and that one may not be.
+        return _fail("browser registered and set %d cookie(s) but none is a recognised session name (%s) and no "
+                     "bearer was seen" % (len(cookies), ", ".join(c["name"] for c in cookies[:4]) or "none"))
     client = httpx.Client(base_url=base_url, timeout=15.0, follow_redirects=True)
     for c in cookies:
         with contextlib.suppress(Exception):

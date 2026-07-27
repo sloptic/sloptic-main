@@ -105,3 +105,68 @@ def test_secure_flag_is_moot_where_https_is_browser_enforced():
     assert _https_browser_enforced(_Ctx("https://ex.com", "max-age=63072000; includeSubDomains")) is False
     assert _https_browser_enforced(_Ctx("https://ex.com", "max-age=0; includeSubDomains; preload")) is False
     assert _https_browser_enforced(_Ctx("https://ex.com")) is False           # no HSTS at all -> real finding
+
+
+# --------------------------------------------------------- hosted auth providers (measured, not guessed)
+
+def test_auth0s_bare_cookie_is_recognised_as_a_session():
+    """A REAL browser registration was being thrown away over a name list.
+
+    On dawg-den.vercel.app the browser lane drove a full signup and handed back seven token-shaped cookies —
+    `auth0` and `auth0_compat` (303 bytes each, the session), `did`/`did_compat`, and three `__txn_*`.
+    _is_session_cookie matched NONE of them, so _register_via_browser returned None and the app reported "no
+    recognizable session cookie" despite holding a live session.
+
+    Auth0's bare `auth0` cookie is the gap. Every other hosted provider checked is already covered
+    incidentally by the generic hints, which is why only this one was added.
+    """
+    from hacklet_runner.auth import _is_session_cookie
+    assert _is_session_cookie("auth0")
+    assert _is_session_cookie("auth0_compat")
+    # covered incidentally — asserted so a future "tidy-up" of the hint list cannot silently drop them
+    for name in ("__session",                 # Clerk
+                 "appSession",                # Auth0 Next.js SDK
+                 "next-auth.session-token",   # NextAuth
+                 "authjs.session-token",      # Auth.js v5
+                 "better-auth.session_token", # Better Auth
+                 "wos-session",               # WorkOS
+                 "ory_kratos_session",        # Ory
+                 "sb-abcdefgh-auth-token",    # Supabase
+                 "sAccessToken"):             # SuperTokens
+        assert _is_session_cookie(name), name
+
+
+def test_the_provider_widening_did_not_take_the_non_session_cookies_with_it():
+    """Precision guard on the same live sample. `__txn_*` are Auth0's short-lived PRE-login transaction
+    cookies and `did` is a device id — both token-shaped, neither a session. Judging one would report cookie
+    flags for the wrong cookie, which is exactly the unfalsifiable verdict session_cookie() exists to avoid."""
+    from hacklet_runner.auth import _is_session_cookie
+    for name in ("__txn_f8XSvhCTI92gUF2uF6hAmwhgn87v", "did", "did_compat",
+                 "csrftoken", "XSRF-TOKEN", "authenticity_token",   # deliberately JS-readable
+                 "refresh_token", "email_verification_token",       # not the access session
+                 "_ga", "__stripe_mid"):                            # third-party, token-shaped
+        assert not _is_session_cookie(name), name
+
+
+def test_the_browser_lane_names_WHICH_stage_it_failed_at():
+    """Five distinct outcomes used to collapse into one bare None, and diagnosing them by inspection cost three
+    refuted theories in a row. The diag out-param is what turns "187 apps, cause unknown" into a distribution."""
+    from hacklet_runner.auth import _register_via_browser
+
+    diag = {}
+    assert _register_via_browser("http://x", lambda _u: None, diag) is None
+    assert "no fillable signup" in diag["stage"]
+
+    diag = {}
+    assert _register_via_browser("http://x", lambda _u: (_ for _ in ()).throw(RuntimeError()), diag) is None
+    assert "raised RuntimeError" in diag["stage"]
+
+    diag = {}                                     # the Auth0 shape, before the fix: cookies but no known name
+    result = {"cookies": [{"name": "__txn_abc", "value": "x" * 40}], "bearer": None, "creds": {}}
+    assert _register_via_browser("http://x", lambda _u: result, diag) is None
+    assert "none is a recognised session name" in diag["stage"] and "__txn_abc" in diag["stage"]
+
+    diag = {}                                     # and after: a recognised provider cookie yields an account
+    ok = {"cookies": [{"name": "auth0", "value": "y" * 40}], "bearer": None, "creds": {"username": "u"}}
+    assert _register_via_browser("http://x", lambda _u: ok, diag) is not None
+    assert diag == {}, "a SUCCESS must not record a failure stage"
