@@ -108,12 +108,38 @@ in that data, and they demand opposite responses:
 - registered fine, session is not in a cookie → the localStorage/Bearer cohort, which `sec-session-005` already
   handles correctly, so not a hole at all
 
-**Rule: if a predicate has more than one `return None` path, each one gets a distinct reason string.** Not
-merely a reason — a *different* one. Three identical messages satisfy "has a reason" and still leave the
-aggregate unable to tell a bug from correct behaviour. There is a test that asserts distinctness for the
-session cluster; copy that pattern.
+**THE RULE, in three parts, because the first two were satisfied and the gap survived anyway:**
 
-`access-control` ran on only 20% of v10 and is the prime suspect for the same defect. Audit it.
+1. **Every `return None` gets a reason.**
+2. **Each one gets a DISTINCT reason string** — not merely a reason. Three identical messages satisfy "has a
+   reason" and still leave the aggregate unable to tell a bug from correct behaviour. There is a test asserting
+   distinctness for the session cluster; copy that pattern.
+3. **Verify against REAL DATA that the dominant path is one of the ones you instrumented.** This part is not
+   optional and it is the one that keeps getting skipped.
+
+Part 3 exists because the same mistake was made three times in one day, at three different depths, each time
+satisfying the rule as written up to that point:
+
+- the session probes returned bare `None` on several preconditions -> 177 apps undiagnosable;
+- `_register_via_browser` was then instrumented, but the two exits that actually distinguish the causes live
+  one level down inside `register_in_browser`, so a 120-app run put **87%** into a single bucket reading "no
+  fillable signup, OR the signup left neither a cookie nor a token" — two OPPOSITE findings merged;
+- and `_browser_lane_detail()` was appended to the two `account is None` paths but not to the `cookie is None`
+  paths, which turned out to be the dominant one, leaving **44%** of the sample unattributable.
+
+Each fix was a few lines. Each omission cost a run. The lesson is not "add reasons", it is that **instrumenting
+the layer you are looking at is not the same as instrumenting the layer that decides**, and the only way to
+know which is which is to run it and count.
+
+**Corollary — a bare signal supports NO hypothesis.** When the observable is one bit (`None`, `False`, an
+absent field), every mechanism consistent with that bit is equally supported, so ranking mechanisms by
+plausibility is not inference. Ten hypotheses were refuted in a single day this way — concurrency starvation, a
+hydration race, a homepage-login hijack, a lane short-circuit, GoTrue rate-limiting, an unset `--browser-auth`
+— against three confirmed. Instrument first, then hypothesise. And weight DULL causes above clever ones: every
+real cause found that day was a missing list entry, an append on the wrong branch, or an unrecorded flag.
+
+`access-control` ran on only 18.7% of v11 and is the prime suspect for the same defect; `file-upload` and
+`csrf` record no reason at all. Audit them.
 
 ## 6. Precision and recall are different games
 
@@ -287,6 +313,25 @@ integrity, race, upload, stored-xss) are dark on it — a thousand-app run canno
 silently regressed, because nothing fires. Probe recall is the synthetic-target job. The two are complementary
 halves of "comprehensive," not substitutes. Drop known-vulnerable and known-clean anchors *into* corpus runs so
 the dark probes stay observably firing.
+
+**THE ORACLE PROBLEM: the corpus has no answer key, so it can tell you WHERE to look and never WHETHER you are
+right.** A corpus run measures the distribution of *our own code's self-reports*. When the auth lane says "no
+fillable signup reached" on 20% of a sample, that is a fact about what the lane concluded — not about the app.
+Maybe a signup was there and detection missed it; maybe the app really has none. Same for "the app withheld a
+session": possibly e-mail confirmation, possibly our submit sending something malformed. Both readings fit the
+data, which is exactly the bare-signal trap above wearing a bigger hat.
+
+So the two layers answer different questions and neither substitutes:
+
+- **Corpus = frequency.** Valid for PRIORITISATION: which failure class is worth fixing first. A stratified
+  sample of ~120 with a fixed seed answers this to about ±9pp, in ~45 minutes, and a census usually buys
+  nothing (measure per-app cost from the last run's data before estimating — 40 minutes was guessed for a run
+  that was 4 hours).
+- **Fixture with a manifest = correctness.** Valid for VERIFYING a conclusion, because ground truth exists.
+  supavulnbase declares what is planted, which controls must stay silent, and what each dial changes.
+
+The failure mode to avoid is treating a corpus percentage as validated truth. It is a prioritisation signal
+whose *interpretation* is still unverified until a fixture confirms it.
 
 **Run cadence.** A full corpus re-grade is 6–10 hours, so fixes are stacked into sprints — one run per batch,
 not per fix. Validating a batch can use a sampled or affected-subset run; a full run is for calibration.
