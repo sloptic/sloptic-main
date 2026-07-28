@@ -406,6 +406,47 @@ _SIGNUP_ROUTES = ("/register", "/signup", "/sign-up", "/join", "/auth/register",
                   "/create-account", "/get-started")
 
 
+# sign[ _-]?up, not "sign ?up|sign-up": the underscore form is Devise's canonical Rails route
+# (/users/sign_up) and this file's own precision test caught it missing.
+_SIGNUP_LINK = re.compile(r"sign[ _-]?up|regist|create[ _-]?account|get[ _-]?started|\bjoin\b", re.I)
+
+
+def _signup_hrefs(page, base_url: str) -> list[str]:
+    """Signup destinations the APP ITSELF advertises, resolved and same-origin only.
+
+    Measured on the 38 apps that reported "no fillable signup reached": 17 exposed a signup href in the DOM and
+    13 of those pointed somewhere _SIGNUP_ROUTES does not walk. The app tells us where its signup is and we
+    were guessing eight conventional paths instead. The misses were `/auth/sign-up` (a variant we lack),
+    `/auth?mode=register` (a QUERY parameter), `#signup` and `#/signup` (hash routing),
+    `/auth/login?screen_hint=signup` (the Auth0 pattern) and `signup.html` (relative). Following the href
+    subsumes every one of those without enumerating any of them.
+
+    SAME-ORIGIN ONLY, deliberately. An off-origin "Sign up" is a third party's registration (a hosted IdP, a
+    marketing site) — not this app's surface, and following it would both mis-attribute the finding and point
+    a credential-submitting robot at somebody who never asked for it. Same narrowing rule the bundle-origin
+    SSRF guard uses.
+    """
+    from urllib.parse import urljoin, urlparse
+    origin = urlparse(base_url)
+    out: list[str] = []
+    with contextlib.suppress(Exception):
+        raw = page.eval_on_selector_all("a[href]", """els => els
+            .filter(e => e.offsetParent !== null)
+            .map(e => [(e.innerText || '').trim(), e.getAttribute('href') || ''])""")
+        for text, href in raw:
+            if not href or href.lower().startswith(("mailto:", "tel:", "javascript:")):
+                continue
+            if not (_SIGNUP_LINK.search(text) or _SIGNUP_LINK.search(href)):
+                continue
+            full = urljoin(page.url or base_url, href)
+            u = urlparse(full)
+            if u.scheme not in ("http", "https") or u.netloc != origin.netloc:
+                continue                      # off-origin -> someone else's signup, not this app's
+            if full not in out:
+                out.append(full)
+    return out[:6]
+
+
 def _reach_and_submit_signup(page, base_url, creds, timeout) -> bool:
     """Get to a fillable signup and submit it. The homepage (reveal an inline modal) first; if the signup lives
     on its OWN route — a 'Get Started' <a> link the reveal can't open — walk conventional signup paths and try
@@ -419,6 +460,20 @@ def _reach_and_submit_signup(page, base_url, creds, timeout) -> bool:
         # /signup never happens.
         if _looks_like_signup(page) and _fill_and_submit_signup(page, creds):
             return True
+    # THE APP'S OWN LINKS BEFORE OUR GUESSES. A hash-only href (#signup, #/signup) is client-side routing that
+    # a goto may not re-trigger from the same document, so click those instead; anything with a path or query
+    # is navigable.
+    for href in _signup_hrefs(page, base_url):
+        with contextlib.suppress(Exception):
+            if "#" in href and href.split("#", 1)[0].rstrip("/") in (page.url or "").rstrip("/"):
+                frag = "#" + href.split("#", 1)[1]
+                page.click("a[href$='%s']" % frag.replace("'", ""), timeout=2500)
+            else:
+                page.goto(href, timeout=timeout * 1000, wait_until="load")
+            page.wait_for_timeout(400)
+            _reveal_hidden_controls(page)
+            if _fill_and_submit_signup(page, creds):
+                return True
     for route in _SIGNUP_ROUTES:
         with contextlib.suppress(Exception):
             page.goto(base_url.rstrip("/") + route, timeout=timeout * 1000, wait_until="load")

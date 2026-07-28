@@ -234,3 +234,43 @@ def test_a_login_only_homepage_does_not_consume_the_signup_attempt():
     for lbl in ("Create account", "Sign up", "Register", "Get started", "Join now"):
         assert _SIGNUP_SUBMIT.search(lbl), lbl
         assert not _LOGIN_ONLY.search(lbl), lbl
+
+
+def test_signup_hrefs_follows_the_apps_own_link_and_never_leaves_the_origin():
+    """The app advertises where its signup is; we were guessing eight conventional paths instead.
+
+    Measured on the 38 apps reporting "no fillable signup reached": 15 exposed a signup href and 11 pointed
+    somewhere _SIGNUP_ROUTES does not walk — /auth/sign-up, /auth?mode=register, #signup, #/signup,
+    /auth/login?screen_hint=signup, signup.html. Following the href subsumes all of those.
+
+    SAME-ORIGIN IS A HARD RULE, not an optimisation: an off-origin "Sign up" belongs to a hosted IdP or a
+    marketing site, so following it both mis-attributes the finding and points a credential-submitting robot
+    at someone who never asked. Same narrowing the bundle-origin SSRF guard uses.
+    """
+    from hacklet_runner.browser import _signup_hrefs, _SIGNUP_LINK
+
+    for text in ("Sign up", "Create account", "Register", "Get started", "Join"):
+        assert _SIGNUP_LINK.search(text), text
+    for href in ("/auth/sign-up", "/auth?mode=register", "#signup", "/users/sign_up"):
+        assert _SIGNUP_LINK.search(href), href
+
+    class _Page:
+        url = "https://app.test/"
+        def __init__(self, pairs): self._pairs = pairs
+        def eval_on_selector_all(self, _sel, _js): return self._pairs
+
+    got = _signup_hrefs(_Page([
+        ["Sign up", "/auth/sign-up"],                        # the variant we did not walk
+        ["Register", "/auth?mode=register"],                 # query-param auth
+        ["Get started", "signup.html"],                      # relative
+        ["Create account", "https://accounts.google.com/signup"],   # OFF-ORIGIN -> must be dropped
+        ["Sign up", "mailto:hi@app.test"],                   # non-http -> dropped
+        ["Pricing", "/pricing"],                             # not a signup affordance
+    ]), "https://app.test/")
+
+    assert "https://app.test/auth/sign-up" in got
+    assert "https://app.test/auth?mode=register" in got
+    assert "https://app.test/signup.html" in got
+    assert not any("google.com" in u for u in got), "followed an off-origin signup: %r" % got
+    assert not any(u.startswith("mailto") for u in got)
+    assert not any("/pricing" in u for u in got)

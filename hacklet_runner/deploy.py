@@ -223,6 +223,19 @@ class DockerDeployer(Deployer):
         return (proc.stdout + proc.stderr)[-2000:]
 
 
+# The liveness read timeout MUST exceed perf.TTFB_CEILING, and it did not: both were 3.0s, so an app slow
+# enough to trip perf-ttfb-003 (">3s to first byte is pathological anywhere", 26 points) was declared DEAD
+# before the probe could ever run. Measured on supavulnbase's perf-005 fixture, which answers HTTP 200 with a
+# TTFB of 3.01s by construction: curl gets a clean 200, we recorded "URL DEAD — target did not respond".
+#
+# So the worst-performing apps in the corpus were being converted into DNFs instead of into findings, and the
+# probe designed to catch them could not fire by construction. A DNF also ranks BELOW every completed
+# submission (format_spec §4.2), so the failure mode was harsher than the finding it replaced.
+#
+# test_liveness_gate_outlasts_the_ttfb_ceiling pins the RELATIONSHIP rather than the value, so neither
+# constant can drift back into collision.
+_LIVENESS_READ_TIMEOUT = 10.0
+
 class RemoteDeployer(Deployer):
     """Targets an already-running HTTP endpoint — dogfooding the league's own site, or any URL you
     own or are authorized to test. 'Deploys' nothing, so it needs no Docker and runs on any box
@@ -242,7 +255,7 @@ class RemoteDeployer(Deployer):
                 # "/": a target with a path (e.g. .../portal.php, pointing at a specific vuln page) would
                 # become ".../portal.php/", which on some apps (bWAPP) triggers a relative-redirect loop
                 # -> TooManyRedirects -> a false "did not respond".
-                if httpx.get(self.base_url, timeout=3.0, follow_redirects=True,
+                if httpx.get(self.base_url, timeout=_LIVENESS_READ_TIMEOUT, follow_redirects=True,
                              verify=False).status_code < 500:   # target may present a self-signed cert
                     return DeployHandle(self.base_url)  # a non-5xx response means it is up
             except httpx.HTTPError:
