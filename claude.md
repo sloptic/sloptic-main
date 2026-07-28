@@ -245,6 +245,34 @@ fixed, control still falls through to the read path. If you need suppression, ga
 
 ## 10. How not to fool yourself
 
+**RULE ZERO: every claim about what this code does must be READ and CITED — `file.py:line` — before it is said.**
+Not from memory. Not from a prior session's note. Not from a flag's own help text. Not from a doc that
+described the plan. If you have not opened the file in this session, you do not know.
+
+The three sources that feel authoritative and are not:
+
+- **A memory note describes what was TRUE or INTENDED when written.** Every recalled memory in this project
+  literally ships with "claims about code behavior or file:line citations may be outdated. Verify against
+  current code before asserting as fact." That warning was present and ignored.
+- **Help text describes INTENT.** `--controlled-deploy`'s help says it gates platform-attribution and the
+  env-var-dead DNF; its own next line says `(Future: ...)`. Reading the help alone would have misled too.
+- **A design doc describes a PLAN.** [[corpus-vs-hacklet-distribution]] said "HackLet support = one
+  `--controlled-deploy` flag gating existing behavior" — a roadmap sentence, repeated later as shipped fact.
+
+The cost, measured: `--controlled-deploy` was described from a stale note **five times in one session** —
+including in a strategic recommendation that it "dissolves the auth problem" and is "strictly better than what
+Burp offers". It does three things (`deploy_and_grade.py:801` sets `auth_crawl`, `:1308` forces the browser,
+`run_batch.py:287` forwards it) and none of them is account minting. Reading the file also surfaced a probable
+bug in ninety seconds — `browser_register` is set only by `browser_auth` (`:786`), so `--controlled-deploy`
+alone authenticates the crawl while leaving the probes' browser-registration lane off — and a capability
+already built that had just been called unbuilt: `--login 'email:password'` (`:1116` -> `pipeline.py:224` ->
+`auth.login_with_credentials`), which runs every authed probe as a supplied identity and "bypasses ALL signup
+gates at once".
+
+So the rule pays twice: it stops false claims, and reading the file is where the real findings are.
+
+
+
 The failures that cost the most time were not code bugs. They were reasoning errors about our own data.
 
 **An untested-family rate is a claim about the RUN before it is a claim about the population.** The coverage
