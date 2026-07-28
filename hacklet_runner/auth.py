@@ -690,6 +690,29 @@ def _synthesize_response(base_url: str, cookies: list[dict]) -> httpx.Response:
     return httpx.Response(200, headers=setc, request=httpx.Request("POST", base_url))
 
 
+# Cookies that are never an app session: platform/CDN infrastructure, and auth-FLOW state that exists before a
+# login completes. Measured across the 9 apps whose reason read "cookies set but none is a recognised session
+# name" — NOT ONE was a missing vendor name, which is what that wording implied and what I nearly acted on:
+#   __Host-GAPS, GAESA          Google's own cookies -> the app uses Google SSO, we cannot self-register
+#   __client, __client_uat*     Clerk client state WITHOUT __session -> no session was established
+#   __Host-next-auth.csrf-token,
+#   __Secure-next-auth.callback-url,
+#   __Host-oauth_csrf           an auth flow that STARTED and never completed
+#   __cf_bm, __dpl              Cloudflare bot-management and Vercel deploy id — the app set none of its own
+# So the honest verdict there is "no app session exists", usually SSO-only or an abandoned flow, which is a
+# CORRECT N/A. Reporting it as an unrecognised name sends the reader hunting for vendors to add.
+_NEVER_SESSION = ("__cf_bm", "__dpl", "gaps", "gaesa", "_ga", "__stripe", "callback-url", "_uat",
+                  "oauth_state", "__client", "amplitude", "_hj", "intercom")
+
+
+def _no_app_session_cookies(names: list[str]) -> bool:
+    """True when EVERY cookie is infrastructure, third-party or pre-login flow state — so the app itself never
+    set a session and there is no vendor name we are failing to recognise."""
+    return bool(names) and all(
+        any(h in n.lower() for h in _NEVER_SESSION) or any(h in n.lower() for h in _NOT_SESSION)
+        for n in names)
+
+
 def _register_via_browser(base_url: str, browser_register, diag: dict | None = None) -> Account | None:
     """SPA registration through the browser: the injected browser_register(base_url) drives Playwright to fill +
     submit the signup so the app's OWN JS makes the real request, returning the session it establishes — a cookie
@@ -728,8 +751,16 @@ def _register_via_browser(base_url: str, browser_register, diag: dict | None = N
         # NOT "registration failed" — the browser drove a real signup and the app set cookies; we simply do not
         # recognise any of their NAMES as a session. Distinguishing this from the no-signup case above is the
         # whole point of the split, because this one is OUR bug and that one may not be.
+        names = [c["name"] for c in cookies]
+        shown = ", ".join(names[:4]) or "none"
+        if _no_app_session_cookies(names):
+            # NOT a gap in our vendor list. Every cookie is infrastructure, third-party or an unfinished auth
+            # flow, so the app set no session of its own — SSO-only or an abandoned login. A CORRECT N/A.
+            return _fail("no app session exists: the %d cookie(s) present are all infrastructure, third-party "
+                         "or pre-login flow state (%s), so registration never completed — SSO-only or an "
+                         "abandoned auth flow" % (len(cookies), shown))
         return _fail("browser registered and set %d cookie(s) but none is a recognised session name (%s) and no "
-                     "bearer was seen" % (len(cookies), ", ".join(c["name"] for c in cookies[:4]) or "none"))
+                     "bearer was seen — candidate vendor cookie to add" % (len(cookies), shown))
     client = httpx.Client(base_url=base_url, timeout=15.0, follow_redirects=True)
     for c in cookies:
         with contextlib.suppress(Exception):

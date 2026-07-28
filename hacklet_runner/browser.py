@@ -283,6 +283,59 @@ _SIGNUP_SUBMIT = re.compile(r"sign ?up|register|create account|create your accou
                             r"\bjoin\b|continue|submit|create", re.I)
 
 
+_LOGIN_ONLY = re.compile(r"^\s*(log ?in|sign ?in|login|signin)\b", re.I)
+
+
+def _looks_like_signup(page) -> bool:
+    """Positive evidence that THIS form registers rather than authenticates.
+
+    A password field is not evidence: a login form has one too. Measured on recovr-smoky.vercel.app — the
+    homepage is a login whose only button reads "Login", so the fill loop filled it, reported success, and
+    _reach_and_submit_signup returned before ever walking to /signup. The Enter fallback then submitted a LOGIN
+    with credentials for an account that does not exist, so no registration request was ever made. That is the
+    homepage-login hijack, and it is real here even though it was NOT the cause on timbermarket, where the
+    homepage carries a genuine "Create account" form.
+
+    Evidence accepted: a signup-labelled submit, or a confirm-password field (logins do not have one). A form
+    whose ONLY submit says Login/Sign in is rejected outright.
+    """
+    with contextlib.suppress(Exception):
+        labels = [((b.inner_text() or "") + " " + (b.get_attribute("value") or "")).strip()
+                  for b in page.query_selector_all("button, input[type=submit], [role=button]")
+                  if b.is_visible()]
+        labels = [l for l in labels if l]
+        if any(_SIGNUP_SUBMIT.search(l) and not _NO_CLICK.search(l) for l in labels):
+            return True
+        if labels and all(_LOGIN_ONLY.search(l) for l in labels):
+            return False       # a login form and nothing else -> do not spend our one signup on it
+        for el in page.query_selector_all("input[type=password]"):
+            with contextlib.suppress(Exception):
+                if el.is_visible() and re.search(r"confirm|repeat|again|retype|verify", _field_hint(el)):
+                    return True       # a confirm-password field is a registration tell
+    return False
+
+
+def _field_hint(el) -> str:
+    """Everything that might name this field, ATTRIBUTES PLUS DOM CONTEXT.
+
+    React forms routinely render inputs with no name, id, placeholder or aria-label and put the wording in a
+    sibling element, so attribute-only matching leaves them unidentified. Measured on timbermarket.lol: the
+    signup's two visible inputs carried NO name/placeholder/aria-label/id at all, with "Username" and
+    "Password" sitting in the previousElementSibling. The text field was therefore never filled, it was
+    `required`, HTML5 validation silently refused the submit, and no registration request ever left the page —
+    which is 26.7% of the measured v11 session gap and was indistinguishable from "the app withheld a session"
+    until the request-observed split existed.
+    """
+    parts = [el.get_attribute(a) or "" for a in ("name", "placeholder", "aria-label", "id", "autocomplete")]
+    with contextlib.suppress(Exception):
+        parts.append(el.evaluate("""e => {
+            const lab  = [...(e.labels || [])].map(l => l.textContent || '').join(' ');
+            const prev = e.previousElementSibling ? (e.previousElementSibling.textContent || '') : '';
+            return (lab + ' ' + prev).slice(0, 120);
+        }"""))
+    return " ".join(parts).lower()
+
+
 def _fill_and_submit_signup(page, creds) -> bool:
     """Fill the visible signup inputs (email / username / password + confirm, tick any terms box) and submit,
     so the app's OWN JS runs the real registration. True iff a password field was found and a submit issued.
@@ -294,8 +347,7 @@ def _fill_and_submit_signup(page, creds) -> bool:
                 if not el.is_visible():
                     continue
                 typ = (el.get_attribute("type") or "text").lower()
-                hint = ((el.get_attribute("name") or "") + " " + (el.get_attribute("placeholder") or "") + " "
-                        + (el.get_attribute("aria-label") or "") + " " + (el.get_attribute("id") or "")).lower()
+                hint = _field_hint(el)
                 if typ == "password" or "pass" in hint or "pwd" in hint:
                     el.fill(creds["password"]); filled_pw = True
                 elif typ == "email" or "email" in hint or "mail" in hint:
@@ -306,6 +358,22 @@ def _fill_and_submit_signup(page, creds) -> bool:
                     el.fill(creds["username"])
     if not filled_pw:
         return False   # no fillable password field -> not a signup form we can register through
+    # LAST RESORT, and the reason the fix above is not sufficient on its own: a visible REQUIRED input left
+    # empty makes the form unsubmittable no matter how good the labels are, and the failure is SILENT (a native
+    # validation bubble, not DOM text, so nothing to scrape). Better to fill it with something and let the app
+    # reject the value — a rejection is observable, a blocked submit is not.
+    with contextlib.suppress(Exception):
+        for el in page.query_selector_all("input"):
+            with contextlib.suppress(Exception):
+                if not el.is_visible() or el.get_attribute("required") is None:
+                    continue
+                typ = (el.get_attribute("type") or "text").lower()
+                if typ in ("checkbox", "radio", "hidden", "submit", "button", "file"):
+                    continue
+                if (el.input_value() or "").strip():
+                    continue                                  # already filled by the typed pass above
+                hint = _field_hint(el)
+                el.fill(creds["email"] if typ == "email" or "mail" in hint else creds["username"])
     with contextlib.suppress(Exception):                             # prefer a signup-labeled submit button
         for btn in page.query_selector_all("button, input[type=submit], [role=button]"):
             lbl = ((btn.inner_text() or "") + " " + (btn.get_attribute("value") or "") + " "
@@ -346,7 +414,10 @@ def _reach_and_submit_signup(page, base_url, creds, timeout) -> bool:
         page.goto(base_url.rstrip("/") + "/", timeout=timeout * 1000, wait_until="load")
         page.wait_for_timeout(300)
         _reveal_hidden_controls(page)
-        if _fill_and_submit_signup(page, creds):
+        # The homepage is the one place we have no route-name evidence, so require the form to LOOK like a
+        # signup. Without this an app whose landing page is a login gets its login submitted and the walk to
+        # /signup never happens.
+        if _looks_like_signup(page) and _fill_and_submit_signup(page, creds):
             return True
     for route in _SIGNUP_ROUTES:
         with contextlib.suppress(Exception):

@@ -199,3 +199,38 @@ def test_the_two_causes_that_look_identical_from_auth_are_reported_SEPARATELY():
     diag = {}
     assert auth._register_via_browser("http://x", lambda _u: None, diag) is None
     assert diag["stage"]
+
+
+def test_infrastructure_and_flow_cookies_are_not_reported_as_a_missing_vendor():
+    """The wording I nearly acted on. Nine apps read "cookies set but none is a recognised session name", which
+    implies a vendor list to extend — and not ONE was a missing vendor. Every cookie was Google's own
+    (__Host-GAPS, GAESA -> SSO), Clerk client state without __session, a NextAuth/oauth CSRF or callback-url
+    from a flow that never completed, or Cloudflare/Vercel infrastructure. The honest verdict is "no app session
+    exists", which is a CORRECT N/A."""
+    from hacklet_runner.auth import _no_app_session_cookies
+
+    # the real samples, from session-gap-diag2/3
+    assert _no_app_session_cookies(["__Host-GAPS", "GAESA"])                     # Google SSO
+    assert _no_app_session_cookies(["__client", "__client_uat_u843LpZH"])        # Clerk, no __session
+    assert _no_app_session_cookies(["__Host-next-auth.csrf-token",
+                                    "__Secure-next-auth.callback-url"])         # unfinished NextAuth flow
+    assert _no_app_session_cookies(["__cf_bm", "__dpl"])                        # platform only
+    assert _no_app_session_cookies(["__Host-oauth_csrf"])
+
+    # but a plausible unknown vendor session MUST still be flagged as one worth adding
+    assert not _no_app_session_cookies(["myapp_sess_v2"])
+    assert not _no_app_session_cookies(["__cf_bm", "kinde_state_thing"])
+    assert not _no_app_session_cookies([])                                      # nothing set at all
+
+
+def test_a_login_only_homepage_does_not_consume_the_signup_attempt():
+    """recovr-smoky.vercel.app: the homepage is a login whose only button reads "Login". A password field is
+    present, so the fill loop filled it, reported success, and the walk to /signup never ran — then the Enter
+    fallback submitted a LOGIN for an account that does not exist, so no registration request was ever made.
+    A password field is not evidence of a signup; a login form has one too."""
+    from hacklet_runner.browser import _LOGIN_ONLY, _SIGNUP_SUBMIT
+    for lbl in ("Login", "log in", "Sign in", "SIGNIN"):
+        assert _LOGIN_ONLY.search(lbl), lbl
+    for lbl in ("Create account", "Sign up", "Register", "Get started", "Join now"):
+        assert _SIGNUP_SUBMIT.search(lbl), lbl
+        assert not _LOGIN_ONLY.search(lbl), lbl
