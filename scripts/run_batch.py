@@ -27,6 +27,7 @@ import time
 from urllib.parse import urlparse
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+from hacklet_runner import provenance  # noqa: E402
 from hacklet_runner.jsonl import append_jsonl  # noqa: E402  (lock-guarded results append, safe under concurrency)
 from hacklet_runner.browser import browser_preflight  # noqa: E402  (fail-loud browser preflight)
 
@@ -498,6 +499,11 @@ def main():
                      f"  fix:  uv run playwright install chromium chromium-headless-shell\n"
                      f"  or grade static-only (skips a11y/console/CWV/dead-controls/dom-xss):  add --no-browser")
         os.environ["HL_BROWSER_PREFLIGHTED"] = "1"   # children inherit -> skip the redundant per-app preflight
+        # the preflight already knows the build ("chromium 149.0.7827.55"); hand it to the children so every
+        # row can record it without paying a second browser launch per app. Chromium version is load-bearing
+        # for the qa/perf axes: a11y comes from axe-core inside it and CWV is measured inside it.
+        with contextlib.suppress(Exception):
+            os.environ["HL_CHROMIUM_VERSION"] = detail.split()[-1] if detail else ""
     if args.app_timeout is None:   # sum of the phase budgets (clone 300 + per-attempt build + grade) + margin
         args.app_timeout = 300 + args.attempts * (args.build_timeout + 90) + args.grade_timeout + 120
 
@@ -552,6 +558,10 @@ def main():
     repo_jobs = [j for j in to_run if j["source"] == "repo"]
     url_jobs = [j for j in to_run if j["source"] == "url"]
     conc = max(1, args.concurrency)
+    # ONE run id for the whole batch, so its rows group and two runs can never merge silently; and the
+    # concurrency, which is otherwise unrecoverable from the results and was uncheckable when it mattered.
+    os.environ.setdefault("HL_RUN_ID", provenance.run_id())
+    os.environ["HL_CONCURRENCY"] = str(conc)
     if conc > 1:
         note = f" · url {conc}-wide" + (f", {len(repo_jobs)} repo serial" if repo_jobs else "")
         print(f"   concurrency: {conc}{note}", flush=True)

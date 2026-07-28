@@ -32,3 +32,51 @@ def test_the_ceiling_probe_is_reachable_at_its_own_threshold():
     be inside the liveness budget, otherwise the probe can never observe it."""
     just_over_ceiling = perf.TTFB_CEILING + 0.01
     assert just_over_ceiling < _LIVENESS_READ_TIMEOUT
+
+
+# --------------------------------------------------------------- provenance (same file: both are run-context)
+
+def test_provenance_records_what_cannot_be_reconstructed_later():
+    """Three times in one session an unrecorded invocation cost a real answer: --browser-auth was inferred to
+    be off from coverage rates (it was on), --concurrency could not be checked at all, and a v10-vs-v11
+    comparison had no way to know the runs used different machines, Pythons and Playwrights. Every other
+    question about a corpus run can be re-measured from the same corpus; this one cannot."""
+    from hacklet_runner import perf, provenance
+
+    p = provenance.collect(flags={"browser_auth": True, "concurrency": "6"})
+    assert p["run_id"] and p["run_id"] == provenance.run_id(), "run_id must be stable within a process"
+    assert p["host"]["cores"] and p["host"]["platform"]
+    assert p["versions"]["python"] and p["versions"]["playwright"]
+    assert p["flags"]["browser_auth"] is True and p["flags"]["concurrency"] == "6"
+
+
+def test_the_qa_and_perf_axes_get_their_engine_versions():
+    """This is why provenance matters MORE for qa/perf than for security. A missing CSP header is missing on any
+    machine; a11y comes out of axe-core, whose RULE SET changes between versions, and it is ~25% of total corpus
+    penalty. Bump axe and a11y findings move with no app having changed — so a curve comparison without the
+    version cannot tell an app that got worse from a rule that got stricter."""
+    from hacklet_runner import provenance
+
+    v = provenance.collect()["versions"]
+    assert v["axe_core"], "axe-core version missing — a11y findings become incomparable across runs"
+    assert v["axe_core"][0].isdigit()
+    # the perf PROFILE is not environmental, it IS the definition of perf-loadtime-001 and the tier thresholds
+    prof = provenance.collect()["perf_profile"]
+    assert prof["bandwidth_mbps"] and prof["rtt_ms"]
+    th = provenance.collect()["perf_thresholds"]
+    assert th["ttfb_ceiling"] and th["requests_profile"]
+
+
+def test_provenance_never_stores_a_credential():
+    """--header carries a live session and --login carries a password. Only WHETHER one was supplied may be
+    recorded. A results file is also the thing we must never publish (see .gitignore), so a leaked credential
+    there would be doubly wrong."""
+    import json
+
+    from hacklet_runner import provenance
+
+    blob = json.dumps(provenance.collect(flags={
+        "header_supplied": True, "login_supplied": True,
+    })).lower()
+    for secret in ("bearer ", "password", "sb-", "eyj", "cookie:"):
+        assert secret not in blob, "provenance leaked %r" % secret

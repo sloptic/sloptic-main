@@ -47,6 +47,7 @@ from hacklet_runner.jsonl import append_jsonl  # noqa: E402
 from hacklet_runner.scope import off_target  # noqa: E402
 from hacklet_runner.aggregate import CATEGORY_DECAY, _damped_total  # noqa: E402
 from hacklet_runner.catalog import load_catalog, select_probes  # noqa: E402
+from hacklet_runner import provenance  # noqa: E402
 from hacklet_runner.deploy import RemoteDeployer  # noqa: E402
 from hacklet_runner.pipeline import run  # noqa: E402
 from hacklet_runner.schema import profile_from_dict, profile_to_dict  # noqa: E402
@@ -1187,6 +1188,10 @@ def main():
             sys.exit(f"ERROR: --browser is on (the default) but chromium won't launch here:\n    {detail}\n"
                      f"  fix:  uv run playwright install chromium chromium-headless-shell\n"
                      f"  or grade static-only (skips a11y/console/CWV/dead-controls/dom-xss):  add --no-browser")
+        # the preflight already resolved the build ("chromium 149.0.7827.55") — record it, so a STANDALONE
+        # grade carries the same qa/perf provenance a batch run does. a11y comes from axe inside this build and
+        # CWV is measured inside it, so a row without it cannot be compared to a row from another build.
+        os.environ.setdefault("HL_CHROMIUM_VERSION", (detail or "").split()[-1])
 
     meta = json.loads(args.meta) if args.meta.strip() else {}
     # an injected calibration anchor (project=anchor-*, e.g. VAmPI/OopsSec) sits on a shared localhost by
@@ -1200,9 +1205,23 @@ def main():
     # source: the LENS this grade is — "repo" (our controlled Docker deploy, dummy keys, powers the
     # reproducibility metric) vs "url" (their live deployment, real keys + full surface but their infra
     # headers). A submission can be graded BOTH ways; stats keep the two separate — never blended.
+    # PROVENANCE on every row. Everything else about a run can be re-measured from the same corpus; how it was
+    # INVOKED cannot, and its absence cost three real answers in one session (--browser-auth inferred wrongly
+    # from coverage, --concurrency uncheckable, a v10-vs-v11 comparison blind to two different machines).
+    # Credential VALUES are deliberately never stored — only whether one was supplied.
+    _prov = provenance.collect(flags={
+        "browser": bool(args.browser), "browser_auth": bool(args.browser_auth),
+        "controlled_deploy": bool(args.controlled_deploy), "proactive": bool(args.proactive),
+        "url_ingest": bool(args.url_ingest), "recon": bool(args.recon),
+        "grade_timeout": args.grade_timeout, "attempts": args.attempts,
+        "probe_filter": list(probe_filter) if probe_filter else None,
+        "header_supplied": bool(args.headers), "login_supplied": bool(args.login),   # never the value
+        "concurrency": os.environ.get("HL_CONCURRENCY"),   # set by run_batch; None for a standalone grade
+    })
     result = {"repo": args.repo, "deployed": False, "attempts_used": 0, "browser": args.browser,
               **({"probe_filter": probe_filter} if probe_filter else {}),
-              "source": "url" if args.url_ingest else "repo", "model": args.model, "ts": time.time(), **meta}
+              "source": "url" if args.url_ingest else "repo", "model": args.model, "ts": time.time(),
+              "provenance": _prov, **meta}
 
     plan, url, error, repo = None, None, "", None
     _sha, cached_profile = None, None   # repo-commit identity + its frozen surface; stay None for --url

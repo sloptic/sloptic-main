@@ -1378,12 +1378,19 @@ def _locate_upload(resp_text: str, filename: str) -> list[str]:
     return list(dict.fromkeys(urls))
 
 
+# `file-upload` recorded NO reason at all on the v11 corpus, so its 7.7%-ran rate was unreadable. This N/A is
+# usually a TRUE ABSENCE rather than a miss, and saying so is what separates "this app has no upload" from "our
+# form discovery broke" — the distinction the session cluster needed two extra runs to make.
+NO_UPLOAD_FORM = ("no multipart form with a file field in the discovered surface (%d form(s) found)")
+
+
 def file_upload(ctx, probe) -> bool | None:
     """Insecure file upload across multipart forms with a file field: upload a PHP webshell in several
     filter-bypass shapes, locate it (from the response or common upload dirs), fetch it, and fire when
     it EXECUTES (arithmetic marker). N/A when there's no file-upload form."""
     forms = [f for f in ctx.profile.forms if f.file_fields]
     if not forms:
+        ctx.evidence["na_reason"] = (NO_UPLOAD_FORM % len(ctx.profile.forms or []))
         return None
     tested = False
     with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
@@ -1453,6 +1460,7 @@ def upload_stored_xss(ctx, probe) -> bool | None:
     file-upload form; clean (False) when uploads are accepted but served safely (download/plain/non-exec)."""
     forms = [f for f in ctx.profile.forms if f.file_fields]
     if not forms:
+        ctx.evidence["na_reason"] = (NO_UPLOAD_FORM % len(ctx.profile.forms or []))
         return None
     tested = False
     with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
@@ -3525,13 +3533,21 @@ def csrf_missing(ctx, probe) -> bool | None:
     there's no candidate form or no session to test with."""
     candidates = _csrf_candidates(ctx.profile)
     if not candidates:
-        return None  # no tokenless state-changing form -> N/A
+        # `csrf` recorded no reason at all on the v11 corpus, so its 1.8%-ran rate was undiagnosable — the same
+        # bare-None problem the session cluster needed two extra runs to escape.
+        ctx.evidence["na_reason"] = ("no candidate form: every state-changing form either already carries a "
+                                     "CSRF token or none was discovered (%d form(s) in the surface)"
+                                     % len(ctx.profile.forms or []))
+        return None
     account = None
     if ctx.headers:                                   # grade the authenticated surface as the given user
         client = make_client(ctx.base_url, ctx.headers, timeout=10.0, follow_redirects=False)
     else:                                             # open-registration app: be our own user
         account = ctx.register(suffix="_csrf")
         if account is None:
+            ctx.evidence["na_reason"] = ("a candidate form exists but no session could be established to submit "
+                                         "it as — self-registration failed and no --header/--login session was "
+                                         "supplied" + _browser_lane_detail())
             return None
         cookie = auth.session_cookie(account.register_response)
         if cookie is not None and cookie["samesite"]:
