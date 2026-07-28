@@ -196,7 +196,13 @@ def response_uncompressed(resp, arg=1024) -> bool:
     ctype = resp.headers.get("content-type", "").lower()
     if not any(t in ctype for t in ("text/", "javascript", "json", "xml", "svg")):
         return False
-    if "content-encoding" in resp.headers:
+    # `identity` is HTTP's explicit token for "no transformation applied" (RFC 9110 8.4.1), so the header
+    # being PRESENT is not evidence of compression — its VALUE is. Measured on supavulnbase's perf-001
+    # fixture, which serves 124,879 bytes of text/plain with `content-encoding: identity` even when we send
+    # `Accept-Encoding: gzip, deflate, br`: their verify.sh asserts it is uncompressed and passes, and we
+    # read the header, saw it existed and reported clean.
+    enc = resp.headers.get("content-encoding", "").strip().lower()
+    if enc and enc != "identity":
         return False
     return len(resp.content) > int(arg)
 
@@ -4109,7 +4115,12 @@ def _page_weight(c, base_url, path="/"):
             continue
         t = urllib.parse.urlparse(urllib.parse.urljoin("%s://%s%s" % (base.scheme, base.netloc, path), ref))
         if t.netloc == base.netloc and t.path:
-            assets.append(t.path)
+            # KEEP THE QUERY. `dot.png?v=11` and `dot.png?v=12` are two round trips and two cache entries,
+            # and cache-busting query strings are precisely how bundlers version assets — so stripping the
+            # query before the dedupe below collapsed a chatty page into a tidy one. Measured on
+            # supavulnbase's perf-003 fixture: 60 statically-referenced `dot.png?v=N` links counted as ONE
+            # request against a threshold of 50, so perf-requests-001 read clean on a page built to fail it.
+            assets.append(t.path + ("?" + t.query if t.query else ""))
     uniq = list(dict.fromkeys(assets))
     reqs += len(uniq)                         # request count = homepage + EVERY referenced asset
     for a in uniq[:40]:                       # fetch a bounded subset for the weight number
