@@ -140,10 +140,10 @@ def test_find_json_login_accepts_a_real_auth_failure():
 
 
 # --- a GUESSED login path must be anchored under the APP, never the origin -----------------------
-# Six of GapBench's seven clean controls each reported an identical "no rate limiting" finding, all of them
-# about gapbench.vibe-eval.com/rest/user/login — the benchmark HOST's login, not the scenario at /site/<id>/.
-# Sub-path rebasing, in the form it takes when the candidate path is invented by us rather than read off the
-# page: nothing in the response says which app it belongs to, so the finding looks perfectly legitimate.
+# A sub-path deployment must not inherit a NEIGHBOUR's login when we invent the path rather than read it off
+# the page. This is a real correctness fix. It is NOT, however, what clears the GapBench control false
+# positives — that was the wrong diagnosis in 1993fa2, corrected below by test_a_control_with_its_OWN: the
+# controls fire because their own login is unthrottled, a calibration matter, not a targeting one.
 
 def _host_only_login():
     """A host that serves a real login at the ORIGIN and nothing under /site/ref0/ — the GapBench shape."""
@@ -177,3 +177,21 @@ def test_the_resolved_path_is_returned_so_a_caller_keeps_hammering_the_APP():
     path, _creds, _r = find_json_login(c, root="/app/")
     assert path.startswith("/app/"), path
     assert all(p.startswith("/app/") for p in seen), seen
+
+
+def test_a_control_with_its_OWN_unthrottled_login_is_still_FOUND_so_the_fp_is_calibration():
+    """The correction to 1993fa2. Anchoring under the app root does NOT clear the GapBench control false
+    positives, because the controls have their OWN login. Re-graded live, ref0 still fires sec-ratelimit-001
+    at /site/ref0/api/login — a real endpoint (a nonexistent sibling 404s) that answers wrong creds and never
+    throttles. find_json_login FINDS that login (correctly — it is the app's own), so the probe fires; whether
+    firing is a false positive is a CALIBRATION question (missing login rate-limiting is near-universal: 626/628
+    corpus apps and GapBench's 'clean' controls alike), not something a path prefix decides."""
+    def handler(req):
+        # ref0's shape: nothing at the origin, a real unthrottled login under the app's own path
+        if req.url.path == "/site/ref0/api/login":
+            return httpx.Response(200, json={"error": "invalid credentials"})
+        return httpx.Response(404)
+    c = httpx.Client(base_url="http://t", transport=httpx.MockTransport(handler))
+    path, _creds, r = find_json_login(c, root="/site/ref0/")
+    assert path == "/site/ref0/api/login", path      # the app's OWN login is found -> the probe will fire
+    assert r.status_code == 200

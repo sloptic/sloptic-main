@@ -402,11 +402,21 @@ def find_json_login(client: httpx.Client, root: str = ""):
 
     `root` is the APP's root path, and it matters because these candidates are GUESSED rather than
     discovered. Resolved against the origin, a sub-path deployment gets its HOST probed instead of itself:
-    on GapBench every scenario lives at /site/<id>/, so all 104 hammered the same
-    gapbench.vibe-eval.com/rest/user/login and six clean controls each reported an identical "no rate
-    limiting" finding about the benchmark's own login, not the scenario under test. Sub-path rebasing is the
-    most repeated bug in this codebase and this is the form it takes when the path is invented by us rather
-    than read off the page. Empty root (the whole root-served corpus) is a no-op.
+    on GapBench every scenario lives at /site/<id>/, so before this the probe hammered the origin
+    gapbench.vibe-eval.com/rest/user/login for every scenario. Anchoring under `root` keeps a sub-path app
+    from inheriting a NEIGHBOUR's login — a real correctness fix, covered by the sub-path test. Empty root
+    (the whole root-served corpus) is a no-op.
+
+    WHAT THIS DOES NOT DO, corrected after live verification: it does NOT clear the GapBench control false
+    positives, and the commit that introduced it (1993fa2) wrongly claimed it would. Re-graded live, the
+    control ref0 STILL fires sec-ratelimit-001 — now at /site/ref0/api/login, a REAL endpoint of ref0's own
+    app (a nonexistent sibling 404s) that answers wrong creds with {"error":"invalid credentials"} and never
+    throttles. The FP was never about targeting the wrong host; it is that our probe treats "10 wrong logins,
+    no 429" as a finding and that condition is near-universal — 626/628 corpus apps, and GapBench's own "clean"
+    controls, have unthrottled logins. That is a CALIBRATION question (is missing login rate-limiting a
+    distinguishing weakness or a near-constant we over-charge?), owned by the score, not something a path
+    prefix fixes. The mistake here was verifying the precondition (targeting is anchored — a unit test) and
+    asserting the outcome (FP eliminated) without measuring it.
 
     The returned path is the RESOLVED one, so a caller that keeps hammering it stays on the app."""
     creds = {"email": "hacklet_probe_rl@example.com", "username": "hacklet_probe_rl",
