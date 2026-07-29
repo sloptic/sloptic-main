@@ -35,6 +35,14 @@ import secrets
 
 from . import perf
 
+# THE SHAPE OF A RESULT ROW, versioned so a consumer can tell before it parses. Rows written before this
+# existed carry no field at all, and absence MEANS 1 — that is the whole contract for reading them, and it is
+# why this starts at 2 rather than 1: a reader cannot distinguish "v1" from "written by a tool that didn't
+# version" if v1 is also the first value ever emitted. Bump on any change that breaks a reader: a field
+# removed, renamed, or given a new meaning. Adding a field does not bump it, because a reader that ignores
+# unknown keys is unaffected — that is the difference between extending the contract and changing it.
+CONTRACT_VERSION = 2
+
 _AXE_VERSION = re.compile(r'axe\.version\s*=\s*"([0-9][0-9.]*)"')
 
 # One id per batch, so every row of a run can be grouped and two runs never merge silently. run_batch exports

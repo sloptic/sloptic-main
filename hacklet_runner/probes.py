@@ -4325,7 +4325,9 @@ def _page_weight(c, base_url, path="/"):
 
 
 def perf_ttfb(ctx, probe) -> bool:
-    """Homepage time-to-first-byte (server compute) exceeds the tier threshold — p90 over samples."""
+    """Homepage time-to-first-byte (server compute) exceeds the tier threshold — MEDIAN of 3 samples, per
+    perf.sample_ttfb, which rejects a cold-start/GC outlier. This said "p90 over samples", which is not what
+    the code does and is the opposite kind of statistic: p90 leans INTO the tail this deliberately discards."""
     thresh = perf.TTFB_CEILING if probe.probe.get("tier") == "ceiling" else perf.TTFB_PROFILE
     with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
         sample = perf.sample_ttfb(c, _home_path(ctx, probe))

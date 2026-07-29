@@ -1327,6 +1327,13 @@ def surface_metrics(profile: Profile) -> dict:
         "routes_all": len(profile.routes),           # incl. vendor assets, for reference
         "routes_list": app_routes[:12],              # the actual APP route PATHS (vendor-stripped, capped) —
                                                      # lets the coverage auditor render sub-routes, not just "/"
+        # WHICH PAGE THE HOMEPAGE PROBES ACTUALLY GRADED. Every `target: /` probe — a11y, seo, headers, perf,
+        # dev-build — routes through _home_path, which resolves to THIS, not to the origin root. On a sub-path
+        # deployment they grade /Project rather than the host's not-found shell, so a row without it cannot say
+        # which page its largest findings describe. Sub-path rebasing is also the most repeated bug family in
+        # this codebase; recording the resolved value makes a regression visible in the data instead of only in
+        # a re-read of the code.
+        "landing_path": profile.landing_path,
         "forms": len(forms),
         "inputs": inputs,
         "endpoints": len(healthy_eps),               # healthy = responds to a baseline without a 5xx

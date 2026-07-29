@@ -1218,7 +1218,8 @@ def main():
         "header_supplied": bool(args.headers), "login_supplied": bool(args.login),   # never the value
         "concurrency": os.environ.get("HL_CONCURRENCY"),   # set by run_batch; None for a standalone grade
     })
-    result = {"repo": args.repo, "deployed": False, "attempts_used": 0, "browser": args.browser,
+    result = {"contract_version": provenance.CONTRACT_VERSION,   # absent on older rows, and absence means 1
+              "repo": args.repo, "deployed": False, "attempts_used": 0, "browser": args.browser,
               **({"probe_filter": probe_filter} if probe_filter else {}),
               "source": "url" if args.url_ingest else "repo", "model": args.model, "ts": time.time(),
               "provenance": _prov, **meta}
