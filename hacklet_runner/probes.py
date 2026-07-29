@@ -351,12 +351,27 @@ def sqli_auth_bypass(ctx, probe) -> bool:
 # comes from a differential + a DB-error signature: an unbalanced quote must induce a database error
 # string the benign baseline never shows. Only GET/POST are probed (never PUT/PATCH/DELETE), so
 # grading can't destroy the target's state.
+# Two FAMILIES, and we only had the first. Most entries below name a DRIVER or an exception CLASS
+# (psycopg2, sqlalchemy.exc, PG::Error, Npgsql., sqlite3.OperationalError, SQLSTATE[) — the shape you get when
+# a stack trace leaks. A modern JSON API does `catch (e) { res.json({error: e.message}) }` and returns only the
+# ENGINE's own sentence, with no class name anywhere, so it slipped straight through. Measured on GapBench's
+# sqli-raw: the app answers a quote with {"error":"unterminated string at character 35"} at HTTP 200, its
+# boolean differential is inert (' OR '1'='1 and ' AND '1'='2 both return 3 rows), so error-based was the only
+# technique that could fire and it missed on wording alone. The additions are bare engine text:
+#   * `syntax error at or near`  — PostgreSQL's canonical syntax error, the most common one there is
+#   * `near "...": syntax error` — SQLite's phrasing of the same
+#   * `unterminated string at character` — the character-offset form
+# Deliberately NOT `unterminated string` bare: JSON parsers emit "Unterminated string in JSON at position N",
+# which an app can echo when a quote is injected into a JSON body — a false positive we would have bought for
+# nothing. The baseline guard below (an endpoint whose UNINJECTED response already matches is skipped as
+# unattributable) is what makes widening this safe at all.
 _SQL_ERROR = re.compile(
     r"SQL syntax|SQLITE_ERROR|sqlite3\.(?:Operational|Integrity|Programming|Interface)Error|"
     r"sqlalchemy\.exc|unrecognized token|unterminated quoted string|"
     r"quoted string not properly terminated|you have an error in your sql syntax|mysqlsyntaxerror|"
     r"com\.mysql|psycopg2|PG::\w*Error|PostgreSQL query failed|ORA-\d{5}|Microsoft OLE DB|"
-    r"ODBC SQL Server|SQLSTATE\[|Npgsql\.|unclosed quotation mark|incorrect syntax near|\[SQL:\s",
+    r"ODBC SQL Server|SQLSTATE\[|Npgsql\.|unclosed quotation mark|incorrect syntax near|\[SQL:\s|"
+    r"syntax error at or near|near \"[^\"]{0,40}\": syntax error|unterminated string at character",
     re.IGNORECASE,
 )
 _SQLI_BENIGN = "1"
@@ -512,12 +527,28 @@ def _endpoint_is_live(ctx, client, path: str, method: str, base_resp) -> bool:
     return True
 
 
+# TWO payloads, tried in order, because they break DIFFERENT things. "1'" closes a quoted literal and leaves a
+# dangling quote — the standard error-based probe. A BARE "'" sends nothing but the quote, which some apps treat
+# differently: a value-shaped input can be coerced, length-checked or cast before it reaches SQL while a lone
+# quote is not. Measured on GapBench's sqli-raw, which answers `?username=1'` with rows and no error but
+# `?username='` with {"error":"unterminated string at character 35"} — one payload found it, the other did not,
+# and we only ever sent the one. (That target is a lenient emulation: a real engine errors on both, since
+# `WHERE username = '1''` leaves a literal open. The breadth is worth having regardless — sending a single
+# payload for a whole technique is the same narrowness the SQLi variants exist to avoid.)
+_SQLI_ERROR_PAYLOADS = (_SQLI_PAYLOAD, "'")
+
+
 def _tech_error(c, method, reqfn):
-    """A lone quote induces a DB-error signature (the app leaks SQL errors) -> return the MATCHED signature
-    (self-documenting for the audit), else None. The signature set is specific DB strings a validation error
-    or SPA shell can't produce, so a match is a high-confidence real leak."""
-    m = _SQL_ERROR.search(_do(c, method, reqfn(_SQLI_PAYLOAD)).text)
-    return m.group(0) if m else None
+    """A quote induces a DB-error signature (the app leaks SQL errors) -> return (MATCHED signature, the
+    payload that produced it), else (None, None). Reporting the payload keeps the repro honest: with more than
+    one candidate, naming the wrong one hands the auditor a request that does not reproduce. The signature set
+    is specific DB strings a validation error or SPA shell can't produce, so a match is a high-confidence
+    leak."""
+    for payload in _SQLI_ERROR_PAYLOADS:
+        m = _SQL_ERROR.search(_do(c, method, reqfn(payload)).text)
+        if m:
+            return m.group(0), payload
+    return None, None
 
 
 _SQLI_TRUE = "1' OR '1'='1' -- "
@@ -637,9 +668,9 @@ def api_sqli(ctx, probe) -> bool | None:
                 slots_tested += 1
                 reqfn = (lambda ep=ep, slot=slot: lambda v: _sqli_request(ep, slot, v))()
                 try:
-                    err = _tech_error(c, method, reqfn)
+                    err, err_pay = _tech_error(c, method, reqfn)
                     if err or _tech_boolean(c, method, reqfn):
-                        pay = _SQLI_PAYLOAD if err else _SQLI_TRUE   # the injected value that revealed it
+                        pay = err_pay if err else _SQLI_TRUE   # the injected value that ACTUALLY revealed it
                         ctx.evidence.update(injectable=True, via=("error" if err else "boolean"), param=slot,
                                             endpoint=ep.raw_path, sql_error=err, techniques_tried=techs,
                                             repro=_sqli_repro(ctx, method, reqfn, pay, matched=err))
