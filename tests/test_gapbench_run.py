@@ -14,7 +14,8 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
-from gapbench_run import (_REQ_FULL_BATTERY, _est_requests, already_done, build_index,  # noqa: E402
+from gapbench_run import (_CHUNK_PROBES, _REQ_FULL_BATTERY, _chunks, _est_requests,  # noqa: E402
+                          already_done, build_index,
                           child_cmd, probes_for_cwes)
 
 _CATALOG = pathlib.Path(__file__).resolve().parent.parent / "catalog"
@@ -75,8 +76,24 @@ def test_resume_skips_graded_scenarios_but_retries_blocked_ones(tmp_path):
         {"project": "some-devpost-app", "slop_score": 12},                            # not a scenario
         "not json",
     ]) + "\n")
-    assert already_done(f) == {"sqli-raw", "ref0"}
+    # keyed by (scenario, chunk): a row written before chunking carries no `chunk` and reads as batch 0
+    assert already_done(f) == {("sqli-raw", 0), ("ref0", 0)}
     assert already_done(tmp_path / "missing.jsonl") == set()
+
+
+def test_resume_is_per_BATCH_so_a_half_finished_scenario_is_not_read_as_finished(tmp_path):
+    """A chunked scenario is done only when EVERY batch is. Treating the first recorded batch as 'scenario
+    done' would silently drop the rest of its probes on every resume — the same erasure the scorer's merge
+    prevents, arriving by a different route."""
+    f = tmp_path / "r.jsonl"
+    f.write_text("\n".join(json.dumps(r) for r in [
+        {"project": "anchor-gapbench-ai-startup", "chunk": 0, "slop_score": 12},   # batch 0 done
+        {"project": "anchor-gapbench-ai-startup", "chunk": 1, "dead_url": True,    # batch 1 blocked -> retry
+         "deploy_error": "URL DEAD — HTTP 403", "slop_score": None},
+    ]) + "\n")
+    done = already_done(f)
+    assert ("ai-startup", 0) in done
+    assert ("ai-startup", 1) not in done, "a blocked batch must be retried, not counted done"
 
 
 def test_a_graded_row_that_later_went_dead_is_not_counted_done(tmp_path):
@@ -212,3 +229,24 @@ def test_a_control_gets_inverted_vocabulary_not_hit_miss():
            "findings": [{"probe_id": "sec-lfi-001", "category": "path-traversal"}]}
     v, _n, fired = verdict(bad, ctrl, [])
     assert v == "FP(1)" and fired == ["sec-lfi-001"]
+
+
+# ---------------------------------------------------------------- batching to stay under the challenge
+
+def test_a_selection_is_split_into_batches_no_larger_than_the_measured_threshold():
+    """The overnight log split perfectly at 10: 55 scenarios at <=10 probes caused zero blocks, and >=11
+    blocked ~always, each block costing a flat 7 minutes."""
+    sel = ["p%02d" % i for i in range(23)]
+    out = _chunks(sel, _CHUNK_PROBES)
+    assert all(len(b) <= _CHUNK_PROBES for b in out)
+    assert [p for b in out for p in b] == sel, "batching must not drop or reorder a probe"
+
+
+def test_an_exact_multiple_does_not_produce_a_trailing_empty_batch():
+    assert _chunks(["a", "b"], 2) == [["a", "b"]]
+
+
+def test_an_empty_selection_stays_one_job():
+    """A control expands to an explicit probe list upstream; an empty selection must still be one runnable
+    job rather than zero, or the scenario would silently vanish from the plan."""
+    assert _chunks([], _CHUNK_PROBES) == [[]]

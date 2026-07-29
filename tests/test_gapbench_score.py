@@ -9,7 +9,7 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
-from gapbench_score import _COVERED_CWES, _finding_cwes, _scenario_id, score  # noqa: E402
+from gapbench_score import _COVERED_CWES, _finding_cwes, _merge, _scenario_id, score  # noqa: E402
 
 _SCEN = [
     {"id": "supabase-clone", "vulnerability": "Missing RLS", "cwes": ["CWE-862", "CWE-200"]},
@@ -158,3 +158,51 @@ def test_each_out_of_scope_entry_carries_its_own_reason():
     assert isinstance(_OUT_OF_SCOPE, dict)
     assert all(v and isinstance(v, str) for v in _OUT_OF_SCOPE.values())
     assert len({v for v in _OUT_OF_SCOPE.values()}) >= 2
+
+
+# ---------------------------------------------------------------- chunked runs write several rows per scenario
+
+def _row(sid, chunk, findings=(), applied=(), **kw):
+    return {"project": "anchor-gapbench-%s" % sid, "chunk": chunk, "slop_score": 1,
+            "findings": list(findings), "coverage": {"applied": list(applied)}, **kw}
+
+
+def test_a_single_row_passes_through_untouched():
+    """An unchunked run must behave exactly as before this existed."""
+    r = _row("x", 0, findings=[{"probe_id": "a"}])
+    assert _merge([r]) is r
+
+
+def test_findings_UNION_across_batches_instead_of_the_last_one_winning():
+    """THE regression this guards. Batches are complementary — probe A ran in batch 0, probe B in batch 1 —
+    so last-wins would silently discard batch 0's catches and recall would read low for a reason that has
+    nothing to do with the detectors."""
+    m = _merge([_row("x", 0, findings=[{"probe_id": "sec-exposure-002"}], applied=["sec-exposure-002"]),
+                _row("x", 1, findings=[{"probe_id": "sec-idor-001"}], applied=["sec-idor-001"])])
+    assert {f["probe_id"] for f in m["findings"]} == {"sec-exposure-002", "sec-idor-001"}
+    assert m["coverage"]["applied"] == ["sec-exposure-002", "sec-idor-001"]
+
+
+def test_the_same_probe_in_two_batches_is_not_double_counted():
+    m = _merge([_row("x", 0, findings=[{"probe_id": "a", "target": "/"}]),
+                _row("x", 1, findings=[{"probe_id": "a", "target": "/"}])])
+    assert len(m["findings"]) == 1
+
+
+def test_a_scenario_is_dead_only_when_EVERY_batch_died():
+    """One batch reaching the target proves the scenario was reachable; calling it dead would turn a partial
+    block into a fabricated coverage gap."""
+    assert _merge([_row("x", 0, dead_url=True), _row("x", 1, findings=[{"probe_id": "a"}])])["dead_url"] is False
+    assert _merge([_row("x", 0, dead_url=True), _row("x", 1, dead_url=True)])["dead_url"] is True
+
+
+def test_a_chunked_scenario_scores_as_one_hit(tmp_path):
+    """End to end through score(): the catch lands in batch 1, and the scenario must still read HIT."""
+    scen = [{"id": "x", "vulnerability": "Open Redirect", "cwes": ["CWE-601"]}]
+    # the catch is in the FIRST batch and a later batch finds nothing — the ordering last-wins gets wrong.
+    # (Putting it in the last batch passes under last-wins too, so it would not guard the regression at all.)
+    recs = [_row("x", 0, findings=[{"probe_id": "sec-redirect-001", "category": "open-redirect"}]),
+            _row("x", 1, findings=[])]
+    row = next(r for r in score(recs, scen)["rows"] if r["id"] == "x")
+    assert row["matched"] == ["sec-redirect-001"], "the catch was in batch 1 and must survive the merge"
+    assert row["graded"] is True

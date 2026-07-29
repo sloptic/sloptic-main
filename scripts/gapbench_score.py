@@ -137,12 +137,51 @@ def load(path) -> list:
     return [json.loads(ln) for ln in pathlib.Path(path).read_text().splitlines() if ln.strip()]
 
 
+def _merge(rows: list) -> dict:
+    """Fold one scenario's rows into a single record by UNIONING what each measured.
+
+    A chunked run writes several rows per scenario on purpose: the runner splits a large probe selection into
+    sub-batches to stay under the host's bot-challenge threshold, and each sub-batch is its own grade. Those
+    rows are COMPLEMENTARY, not competing — probe A ran in chunk 1, probe B in chunk 2. Keeping only the last
+    (which is what this did) would silently discard every earlier chunk's findings, and recall would read low
+    for a reason that has nothing to do with the detectors.
+
+    Unmerged single-row scenarios pass straight through, so an unchunked run behaves exactly as before.
+
+    Within ONE results file the rows are always from one code version — the runner refuses to append a
+    re-check to an old file for exactly that reason — so union is the right fold here, not last-wins."""
+    if len(rows) == 1:
+        return rows[0]
+    out = dict(rows[-1])
+    seen, findings, applied = set(), [], []
+    for r in rows:
+        for f in r.get("findings") or []:
+            key = (f.get("probe_id"), f.get("target"))
+            if key not in seen:
+                seen.add(key)
+                findings.append(f)
+        for pid in (r.get("coverage") or {}).get("applied") or []:
+            if pid not in applied:
+                applied.append(pid)
+    out["findings"] = findings
+    out["coverage"] = {**(out.get("coverage") or {}), "applied": sorted(applied)}
+    # dead only if EVERY chunk died; one chunk reaching the target means the scenario was reachable
+    out["dead_url"] = all(r.get("dead_url") for r in rows)
+    graded = [r.get("slop_score") for r in rows if r.get("slop_score") is not None]
+    if graded:
+        # a subset grade's slop is already declared meaningless (it is a fraction of a battery) and must never
+        # feed a distribution; carried only so `graded` can tell a real row from a dead one.
+        out["slop_score"] = max(graded)
+    return out
+
+
 def score(recs: list, scenarios: list) -> dict:
-    by_id = {}
-    for r in recs:                      # last record per scenario wins (a re-run appends)
+    grouped: dict = {}
+    for r in recs:
         sid = _scenario_id(r)
         if sid:
-            by_id[sid] = r
+            grouped.setdefault(sid, []).append(r)
+    by_id = {sid: _merge(rows) for sid, rows in grouped.items()}
     rows, controls = [], []
     for s in scenarios:
         sid = s["id"]

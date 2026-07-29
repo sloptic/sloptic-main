@@ -42,9 +42,42 @@ from hacklet_runner.catalog import load_catalog  # noqa: E402
 # so the delay can be chosen from arithmetic instead of optimism.
 _REQ_COST = {"sec-cmdi-001": 165, "sec-lfi-001": 45, "sec-xss-001": 15}
 _REQ_SQLI = 24          # per sec-sqli-* probe (119 across the five)
-_REQ_DEFAULT = 4
+_REQ_DEFAULT = 4        # NOT measured per-probe: only the injection families above were counted server-side.
+#     The overnight run showed this understates the exposure/secrets/backend families badly enough that the
+#     estimate never predicted a single block, so treat _est_requests as an ORDER-OF-MAGNITUDE figure for the
+#     dry run and never as the throttle input. _CHUNK_PROBES below is the measured control.
 _REQ_DISCOVERY = 15     # the crawl each grade pays before any probe runs
 _REQ_FULL_BATTERY = 685
+
+# THE MEASURED THRESHOLD. Attributing each block in the overnight log to the scenario that ran before it, the
+# split by SELECTION SIZE is unusually sharp:
+#
+#     probes in selection    scenarios    caused a block
+#        0- 5                   43            0   ( 0%)
+#        6-10                   12            0   ( 0%)
+#       11-15                   17           15   (88%)
+#       16-20                   14           14   (100%)
+#       21+ (full battery)       7            5   (71%)
+#
+# 55 scenarios at <=10 probes tripped the challenge zero times; at >=11 it is near-certain. Each block then
+# costs a flat 7 minutes (34 blocks -> 242 wait-minutes -> 4.0h of the 8.7h run, against grades that take
+# 2-15s each). So the run was ~97% waiting.
+#
+# Splitting a selection into <=10-probe batches keeps every grade inside the envelope that never tripped it.
+# It also works whichever way the host actually counts: a smaller batch is both less VOLUME per burst and,
+# since each batch is its own process with its own discovery, a lower sustained RATE. The evidence cannot
+# separate those two hypotheses — request/sec did not discriminate (blocked median 19.6/s vs clean 11.2/s,
+# with clean showing the higher MEAN) — so the fix deliberately does not depend on knowing which.
+#
+# Falsifiable: if a <=10-probe batch ever blocks, the per-burst reading is wrong and this constant is not the
+# control it appears to be. That shows up in the first few scenarios, not at the end of a night.
+_CHUNK_PROBES = 10
+
+
+def _chunks(seq, n):
+    """Split a probe selection into <=n batches. An empty selection (a control, i.e. the full battery) is
+    returned as-is by the caller, which expands it explicitly rather than passing 'no --probe flags'."""
+    return [seq[i:i + n] for i in range(0, len(seq), n)] or [[]]
 
 
 def _est_requests(sel: list) -> int:
@@ -169,8 +202,13 @@ def verdict(rec, scenario, selected) -> tuple:
 
 
 def already_done(results_path) -> set:
-    """Scenario ids already recorded with a real grade, so a resumed run re-sends nothing it needn't. A row
-    that recorded a 403/dead URL is NOT done: that is exactly what a resume should retry."""
+    """(scenario id, chunk) pairs already recorded with a real grade, so a resumed run re-sends nothing it
+    needn't. A row that recorded a 403/dead URL is NOT done: that is exactly what a resume should retry.
+
+    Keyed by CHUNK, not scenario: a chunked scenario is only finished when every one of its batches is, and
+    treating the first recorded batch as 'the scenario is done' would silently drop the rest of its probes on
+    every resume — the same erasure the scorer's merge exists to prevent, arriving by a different route. Rows
+    written before chunking carry no `chunk` field and read as chunk 0, which is what an unchunked run is."""
     done = set()
     p = pathlib.Path(results_path)
     if not p.exists():
@@ -186,11 +224,11 @@ def already_done(results_path) -> set:
             continue      # a valid JSON scalar is not a record; .get would raise and kill the whole run
         proj = str(r.get("project") or "")
         if proj.startswith("anchor-gapbench-") and r.get("slop_score") is not None and not r.get("dead_url"):
-            done.add(proj[len("anchor-gapbench-"):])
+            done.add((proj[len("anchor-gapbench-"):], int(r.get("chunk") or 0)))
     return done
 
 
-def child_cmd(sid, sel, results, grade_timeout, needs_browser, needs_auth) -> list:
+def child_cmd(sid, sel, results, grade_timeout, needs_browser, needs_auth, chunk: int = 0) -> list:
     """The deploy_and_grade invocation for one scenario, including the two capability decisions.
 
     LEAST PRIVILEGE for the expensive capabilities, not just the probe list: a render costs every chunk the
@@ -200,7 +238,10 @@ def child_cmd(sid, sel, results, grade_timeout, needs_browser, needs_auth) -> li
     type=int and rejects "300.0" with an argparse error the parent would otherwise swallow."""
     cmd = PY + [str(_HERE / "deploy_and_grade.py"), f"https://gapbench.vibe-eval.com/site/{sid}/",
                 "--url", "--record", str(results), "--grade-timeout", str(int(grade_timeout)),
-                "--meta", json.dumps({"project": f"anchor-gapbench-{sid}", "hackathon": "gapbench"})]
+                # project stays the bare scenario tag so the scorer still groups every batch under it; `chunk`
+                # rides alongside so a resume can tell WHICH batches are already recorded.
+                "--meta", json.dumps({"project": f"anchor-gapbench-{sid}", "hackathon": "gapbench",
+                                      "chunk": chunk})]
     for pid in sel:
         cmd += ["--probe", pid]
     if not ((not sel) or set(sel) & needs_browser):
@@ -224,6 +265,11 @@ def main() -> None:
                     help="comma-separated scenario ids or fnmatch globs (e.g. 'ssti,*redirect*'). Re-checking "
                          "a handful of fixed probes costs ~100 requests instead of ~9700, which matters on a "
                          "shared host that rate-limits us. Unmatched patterns are fatal, not silently empty.")
+    ap.add_argument("--light-delay", type=float, default=25.0, dest="light_delay", metavar="SECONDS",
+                    help="gap after a batch that ran clean (default 25). Batches are capped at "
+                         "%d probes, the size that caused zero blocks across 55 scenarios overnight, so this "
+                         "is the normal spacing; --delay is the fallback after one that still blocked."
+                         % _CHUNK_PROBES)
     ap.add_argument("--recheck", type=float, default=60.0, metavar="SECONDS",
                     help="while blocked, re-test the host this often (one request per check)")
     ap.add_argument("--max-wait", type=float, default=1800.0, dest="max_wait", metavar="SECONDS",
@@ -238,31 +284,41 @@ def main() -> None:
     cwe2probe, needs_browser, needs_auth = build_index(args.catalog)
     # "already done" only means anything relative to what we were ASKED to run: with --only, the full-run
     # count reads as nonsense ("4 scenarios ... 91 already done") and hides why the plan came out empty.
-    done = already_done(args.results) & {s["id"] for s in scenarios}
+    done = already_done(args.results)
+    sel_ids = {s["id"] for s in scenarios}
+    done = {(sid, ch) for sid, ch in done if sid in sel_ids}
+    # A control's full battery is expanded to an EXPLICIT probe list so it can be batched like anything else.
+    # Passing "no --probe flags" is unbatchable, and it also made every control pay a browser launch and a
+    # self-registration; with explicit batches only the batches that actually contain a browser/auth probe do.
+    all_probes = sorted(p.id for p in load_catalog(args.catalog))
 
     plan, skipped, controls = [], [], []
     for s in scenarios:
         sid = s["id"]
         is_control = str(s.get("vulnerability", "")).startswith("None")
         sel = probes_for_cwes(s.get("cwes"), cwe2probe)
-        if sid in done:
-            continue
         if is_control:
-            controls.append((sid, []))          # full battery: an FP can come from ANY probe
+            controls.append((sid, all_probes))   # an FP can come from ANY probe, so a control keeps them all
         elif sel:
             plan.append((sid, sel))
         else:
-            skipped.append(sid)                 # no probe of ours covers its class -> nothing to learn
+            skipped.append(sid)                  # no probe of ours covers its class -> nothing to learn
 
-    jobs = plan + controls
+    # BATCH: every job is <=_CHUNK_PROBES probes, the envelope that never tripped the challenge. `done` is
+    # consulted per BATCH so a resume re-sends only what is actually missing.
+    jobs = [(sid, batch, i) for sid, sel in plan + controls
+            for i, batch in enumerate(_chunks(sel, _CHUNK_PROBES)) if (sid, i) not in done]
     if args.limit:
         jobs = jobs[:args.limit]
-    est = sum(_est_requests(sel) for _sid, sel in jobs)
-    heaviest = sorted(((_est_requests(sel), sid) for sid, sel in jobs), reverse=True)[:3]
-    print(f"\n  {len(scenarios)} scenarios: {len(plan)} targeted, {len(controls)} controls (full battery), "
-          f"{len(skipped)} skipped (no covering probe), {len(done)} already done")
-    print(f"  running {len(jobs)} now · ~{est} requests total (vs ~{len(jobs) * _REQ_FULL_BATTERY} for full "
-          f"batteries) · {args.delay:.0f}s apart · ~{len(jobs) * args.delay / 60:.0f} min of gaps")
+    est = sum(_est_requests(sel) for _sid, sel, _i in jobs)
+    heaviest = sorted(((_est_requests(sel), sid) for sid, sel, _i in jobs), reverse=True)[:3]
+    n_sc = len({sid for sid, _s, _i in jobs})
+    print(f"\n  {len(scenarios)} scenarios: {len(plan)} targeted, {len(controls)} controls, "
+          f"{len(skipped)} skipped (no covering probe), {len(done)} batches already done")
+    print(f"  running {len(jobs)} batches across {n_sc} scenarios · <={_CHUNK_PROBES} probes each (the size "
+          f"that never tripped the bot challenge) · ~{est} requests total")
+    print(f"  spacing {args.light_delay:.0f}s · ~{len(jobs) * args.light_delay / 60:.0f} min of gaps "
+          f"(a flat {args.delay:.0f}s would be ~{len(jobs) * args.delay / 60:.0f} min)")
     print("  heaviest: " + ", ".join(f"{sid} ~{n}" for n, sid in heaviest))
     if args.only and not jobs and done:
         # the whole point of --only is re-checking a FIXED probe, and those ids are already in the old file.
@@ -273,12 +329,12 @@ def main() -> None:
         return
     print(f"  skipped: {', '.join(skipped[:10])}{' ...' if len(skipped) > 10 else ''}\n")
     if args.dry_run:
-        for sid, sel in jobs[:15]:
+        for sid, sel, ci in jobs[:15]:
             caps = ("B" if (not sel) or set(sel) & needs_browser else "-") + \
                    ("A" if (not sel) or set(sel) & needs_auth else "-")
-            print(f"    {sid:<28} {len(sel) or 'FULL':>4}p {caps}  {','.join(sel[:5])}")
-        nb = sum(1 for _s, sel in jobs if sel and not set(sel) & needs_browser)
-        na = sum(1 for _s, sel in jobs if sel and not set(sel) & needs_auth)
+            print(f"    {sid:<26} #{ci:<2} {len(sel) or 'FULL':>4}p {caps}  {','.join(sel[:5])}")
+        nb = sum(1 for _s, sel, _i in jobs if sel and not set(sel) & needs_browser)
+        na = sum(1 for _s, sel, _i in jobs if sel and not set(sel) & needs_auth)
         print(f"\n  capabilities: {nb} of {len(jobs)} skip the browser render, {na} skip self-registration"
               f"  (B=browser, A=auth)")
         print("\n  (dry run — nothing sent)\n")
@@ -290,13 +346,13 @@ def main() -> None:
     attempts: dict = {}
     i = 0
     while queue:
-        sid, sel = queue.pop(0)
+        sid, sel, ci = queue.pop(0)
         i += 1
         if not wait_until_clear(args.recheck, args.max_wait):
             print(f"\n  still blocked after {args.max_wait / 60:.0f}m — stopping. Rerun to resume "
                   f"(graded scenarios are skipped).\n")
             return
-        cmd = child_cmd(sid, sel, args.results, args.grade_timeout, needs_browser, needs_auth)
+        cmd = child_cmd(sid, sel, args.results, args.grade_timeout, needs_browser, needs_auth, chunk=ci)
         caps = ("B" if "--no-browser" not in cmd else "-") + ("A" if "--browser-auth" in cmd else "-")
         t0 = time.monotonic()
         proc = None
@@ -313,7 +369,9 @@ def main() -> None:
             for line in fh:
                 with __import__("contextlib").suppress(json.JSONDecodeError):
                     r = json.loads(line)
-                    if r.get("project") == f"anchor-gapbench-{sid}":
+                    # match THIS batch: with chunking a scenario has several rows, and taking any of them
+                    # would report another batch's verdict on this line.
+                    if r.get("project") == f"anchor-gapbench-{sid}" and int(r.get("chunk") or 0) == ci:
                         rec = r
         scen = by_id.get(sid, {})
         if rec is None and proc is not None and proc.returncode != 0:
@@ -334,18 +392,21 @@ def main() -> None:
             state = f"applied {n_applied}/{len(sel) or 'all':<3} {shown or '—'}"[:44]
         # denominator = the ORIGINAL job count plus however many the block forced back on; using
         # len(queue) made it count DOWN as work completed, which reads like the total is shrinking.
-        print(f"  [{i:>3}/{len(jobs) + sum(attempts.values())}] {sid:<26} "
+        print(f"  [{i:>3}/{len(jobs) + sum(attempts.values())}] {sid:<22} #{ci:<2} "
               f"{str(scen.get('vulnerability', ''))[:22]:<22} {v:<8} {state:<46} ·{time.monotonic()-t0:4.0f}s",
               flush=True)
         # a scenario killed BY THE BLOCK is a lost measurement, not a result: put it back and let the
         # pre-flight gate above wait the window out before it runs again.
         if rec is not None and rec.get("dead_url") and "403" in str(rec.get("deploy_error") or ""):
-            attempts[sid] = attempts.get(sid, 0) + 1
-            if attempts[sid] <= args.max_retries:
-                queue.append((sid, sel))
-                print(f"    -> blocked; requeued (attempt {attempts[sid]} of {args.max_retries})")
+            attempts[(sid, ci)] = attempts.get((sid, ci), 0) + 1
+            if attempts[(sid, ci)] <= args.max_retries:
+                queue.append((sid, sel, ci))
+                print(f"    -> blocked; requeued (attempt {attempts[(sid, ci)]} of {args.max_retries})")
         if queue:
-            time.sleep(args.delay)
+            # every batch is <=_CHUNK_PROBES, the size that never tripped the challenge, so the LIGHT spacing
+            # is the normal case. --delay remains for a batch that somehow still blocked, where the host has
+            # told us it wants more room.
+            time.sleep(args.delay if (rec is not None and rec.get("dead_url")) else args.light_delay)
     print(f"\n  {sum(tally.values())} run: "
           + ", ".join(f"{n} {k}" for k, n in sorted(tally.items(), key=lambda kv: -kv[1]))
           + f"\n  HIT = the declared class was caught · miss = probes ran, nothing matched · "
