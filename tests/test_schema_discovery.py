@@ -22,8 +22,8 @@ import threading
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import httpx  # noqa: E402
 
-from hacklet_runner.discovery import _schema_discovery, _schema_fields  # noqa: E402
-from hacklet_runner.schema import Endpoint  # noqa: E402
+from sloptic.discovery import _schema_discovery, _schema_fields  # noqa: E402
+from sloptic.schema import Endpoint  # noqa: E402
 
 
 def _resp(body, ctype="application/json"):

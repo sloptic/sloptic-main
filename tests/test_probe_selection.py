@@ -16,7 +16,7 @@ import sys
 import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from hacklet_runner.catalog import ProbeSelectionError, load_catalog, select_probes  # noqa: E402
+from sloptic.catalog import ProbeSelectionError, load_catalog, select_probes  # noqa: E402
 
 _CATALOG = pathlib.Path(__file__).resolve().parent.parent / "catalog"
 

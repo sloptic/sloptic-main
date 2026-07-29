@@ -6,7 +6,7 @@ import threading
 
 import pytest
 
-from hacklet_runner.probes import broken_links
+from sloptic.probes import broken_links
 
 _MODE_LINK = {
     "dead": '<a href="/gone">x</a>',

@@ -7,7 +7,7 @@ import zipfile
 
 import pytest
 
-from hacklet_runner.ingest import SubmissionError, extract_submission
+from sloptic.ingest import SubmissionError, extract_submission
 
 
 def _make_zip(path, files: dict):
@@ -53,7 +53,7 @@ def test_zip_slip_is_rejected(tmp_path):
 
 
 def test_rejects_zip_bomb(tmp_path, monkeypatch):
-    import hacklet_runner.ingest as ingest
+    import sloptic.ingest as ingest
     monkeypatch.setattr(ingest, "MAX_TOTAL_BYTES", 1000)  # tiny cap for the test
     z = tmp_path / "bomb.zip"
     with zipfile.ZipFile(z, "w", zipfile.ZIP_DEFLATED) as zf:

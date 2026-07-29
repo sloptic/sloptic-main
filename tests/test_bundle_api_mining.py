@@ -18,8 +18,8 @@ import sys
 import threading
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from hacklet_runner.discovery import _mine_api_literals, _mined_api_endpoints  # noqa: E402
-from hacklet_runner.schema import Endpoint  # noqa: E402
+from sloptic.discovery import _mine_api_literals, _mined_api_endpoints  # noqa: E402
+from sloptic.schema import Endpoint  # noqa: E402
 
 _BUNDLE = """
   var e=await fetch("/api/wishlists");let t=await fetch("/api/orders",{method:"POST"});

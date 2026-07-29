@@ -6,8 +6,8 @@ from urllib.parse import urlparse
 
 import pytest
 
-from hacklet_runner import perf
-from hacklet_runner.probes import perf_load_time, perf_page_weight, perf_request_count, perf_ttfb
+from sloptic import perf
+from sloptic.probes import perf_load_time, perf_page_weight, perf_request_count, perf_ttfb
 
 
 def test_percentile_interpolates():
@@ -119,7 +119,7 @@ def test_content_encoding_identity_is_not_compression():
 
     import httpx
 
-    from hacklet_runner.probes import response_uncompressed
+    from sloptic.probes import response_uncompressed
 
     def _plain(headers, size=5000):
         return httpx.Response(200, headers={"content-type": "text/plain", **headers},

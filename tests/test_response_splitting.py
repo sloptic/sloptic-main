@@ -6,8 +6,8 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from hacklet_runner.probes import http_response_splitting
-from hacklet_runner.schema import Endpoint, Profile
+from sloptic.probes import http_response_splitting
+from sloptic.schema import Endpoint, Profile
 
 
 def _handler(sanitize):

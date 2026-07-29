@@ -21,7 +21,7 @@ import sys
 _ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 
-from hacklet_runner.reportcard import build_card, to_html, to_markdown  # noqa: E402
+from sloptic.reportcard import build_card, to_html, to_markdown  # noqa: E402
 
 
 def _load(results_path: str) -> list[dict]:

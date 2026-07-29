@@ -13,9 +13,9 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from hacklet_runner import provenance  # noqa: E402
-from hacklet_runner.discovery import surface_metrics  # noqa: E402
-from hacklet_runner.schema import Profile  # noqa: E402
+from sloptic import provenance  # noqa: E402
+from sloptic.discovery import surface_metrics  # noqa: E402
+from sloptic.schema import Profile  # noqa: E402
 
 
 def test_contract_version_is_an_int_a_reader_can_compare():

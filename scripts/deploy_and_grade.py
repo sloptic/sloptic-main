@@ -42,15 +42,15 @@ import httpx
 _ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 
-from hacklet_runner import browser  # noqa: E402
-from hacklet_runner.jsonl import append_jsonl  # noqa: E402
-from hacklet_runner.scope import off_target  # noqa: E402
-from hacklet_runner.aggregate import CATEGORY_DECAY, _damped_total  # noqa: E402
-from hacklet_runner.catalog import load_catalog, select_probes  # noqa: E402
-from hacklet_runner import provenance  # noqa: E402
-from hacklet_runner.deploy import RemoteDeployer  # noqa: E402
-from hacklet_runner.pipeline import run  # noqa: E402
-from hacklet_runner.schema import profile_from_dict, profile_to_dict  # noqa: E402
+from sloptic import browser  # noqa: E402
+from sloptic.jsonl import append_jsonl  # noqa: E402
+from sloptic.scope import off_target  # noqa: E402
+from sloptic.aggregate import CATEGORY_DECAY, _damped_total  # noqa: E402
+from sloptic.catalog import load_catalog, select_probes  # noqa: E402
+from sloptic import provenance  # noqa: E402
+from sloptic.deploy import RemoteDeployer  # noqa: E402
+from sloptic.pipeline import run  # noqa: E402
+from sloptic.schema import profile_from_dict, profile_to_dict  # noqa: E402
 
 
 def _axis_str(axis: dict) -> str:

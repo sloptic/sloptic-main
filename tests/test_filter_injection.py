@@ -26,10 +26,10 @@ import threading
 import urllib.parse
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from hacklet_runner.net import make_client  # noqa: E402
-from hacklet_runner.pipeline import _Ctx  # noqa: E402
-from hacklet_runner.probes import _FILTER_GRAMMAR, filter_injection  # noqa: E402
-from hacklet_runner.schema import Endpoint, Profile  # noqa: E402
+from sloptic.net import make_client  # noqa: E402
+from sloptic.pipeline import _Ctx  # noqa: E402
+from sloptic.probes import _FILTER_GRAMMAR, filter_injection  # noqa: E402
+from sloptic.schema import Endpoint, Profile  # noqa: E402
 
 _ROWS = [{"id": i, "title": "Project %d" % i} for i in range(7)]
 
@@ -142,7 +142,7 @@ def test_no_query_parameter_is_na_not_clean():
 # ---------------------------------------------------------------- targeting
 
 def test_search_endpoints_are_tried_first():
-    from hacklet_runner.probes import _filter_targets
+    from sloptic.probes import _filter_targets
     prof = Profile(base_url="http://x", endpoints=[
         Endpoint(path="/api/other", raw_path="/api/other", method="get", query_params=["page"]),
         Endpoint(path="/api/search", raw_path="/api/search", method="get", query_params=["q"], kind="search"),
@@ -153,5 +153,5 @@ def test_search_endpoints_are_tried_first():
 def test_post_endpoints_are_not_targets():
     prof = Profile(base_url="http://x", endpoints=[
         Endpoint(path="/api/create", raw_path="/api/create", method="post", query_params=["q"])])
-    from hacklet_runner.probes import _filter_targets
+    from sloptic.probes import _filter_targets
     assert _filter_targets(prof) == []

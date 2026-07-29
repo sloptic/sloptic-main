@@ -11,7 +11,7 @@ import importlib.util
 
 import pytest
 
-from hacklet_runner import browser
+from sloptic import browser
 
 needs_playwright = pytest.mark.skipif(
     importlib.util.find_spec("playwright") is None,

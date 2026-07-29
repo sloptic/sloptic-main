@@ -15,10 +15,10 @@ import threading
 import urllib.parse
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from hacklet_runner.net import make_client  # noqa: E402
-from hacklet_runner.pipeline import _Ctx  # noqa: E402
-from hacklet_runner.probes import development_build_served  # noqa: E402
-from hacklet_runner.schema import Profile  # noqa: E402
+from sloptic.net import make_client  # noqa: E402
+from sloptic.pipeline import _Ctx  # noqa: E402
+from sloptic.probes import development_build_served  # noqa: E402
+from sloptic.schema import Profile  # noqa: E402
 
 _PROD_BUNDLE = b"function e(t){return t+1}export default e;/*# minified prod chunk */"
 _DEV_BUNDLE = b'import.meta.hot;window.$RefreshReg$=function(){};/* react refresh */'

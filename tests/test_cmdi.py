@@ -8,8 +8,8 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from hacklet_runner.probes import command_injection
-from hacklet_runner.schema import Form, Profile
+from sloptic.probes import command_injection
+from sloptic.schema import Form, Profile
 
 
 def _fake_shell(val: str) -> str:

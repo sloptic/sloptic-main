@@ -28,8 +28,8 @@ import threading
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import httpx  # noqa: E402
 
-from hacklet_runner import probes  # noqa: E402
-from hacklet_runner.schema import Endpoint  # noqa: E402
+from sloptic import probes  # noqa: E402
+from sloptic.schema import Endpoint  # noqa: E402
 
 _PRODUCTS = [{"id": "p-real-1", "name": "Sourdough"}, {"id": "p-real-2", "name": "Cold Brew"}]
 

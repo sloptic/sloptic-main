@@ -18,7 +18,7 @@ import sys
 import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from hacklet_runner import secretscan  # noqa: E402
+from sloptic import secretscan  # noqa: E402
 
 
 def _kinds(line: str) -> list:

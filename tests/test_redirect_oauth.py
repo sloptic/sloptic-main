@@ -14,10 +14,10 @@ import threading
 import urllib.parse
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from hacklet_runner.net import make_client  # noqa: E402
-from hacklet_runner.pipeline import _Ctx  # noqa: E402
-from hacklet_runner.probes import _REDIRECT_PARAMS, open_redirect  # noqa: E402
-from hacklet_runner.schema import Profile  # noqa: E402
+from sloptic.net import make_client  # noqa: E402
+from sloptic.pipeline import _Ctx  # noqa: E402
+from sloptic.probes import _REDIRECT_PARAMS, open_redirect  # noqa: E402
+from sloptic.schema import Profile  # noqa: E402
 
 _PROBE_HOST = "hacklet-redirect-probe.example"
 

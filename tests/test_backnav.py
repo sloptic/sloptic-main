@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from hacklet_runner import browser  # noqa: E402
+from sloptic import browser  # noqa: E402
 
 _BROKEN = """<html><body>
 <h1>Alpha unique-alpha-token</h1><a id="nav" href="/b">go to beta</a>

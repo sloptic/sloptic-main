@@ -7,7 +7,7 @@ import threading
 
 import pytest
 
-from hacklet_runner.probes import a11y_hard_fails
+from sloptic.probes import a11y_hard_fails
 
 CLEAN = ('<!doctype html><html lang="en"><head><title>ok</title></head><body>'
          '<h1>hi</h1><img src="/a.png" alt="a">'

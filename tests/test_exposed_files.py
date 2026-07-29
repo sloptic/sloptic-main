@@ -16,10 +16,10 @@ import sys
 import threading
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from hacklet_runner.net import make_client  # noqa: E402
-from hacklet_runner.pipeline import _Ctx  # noqa: E402
-from hacklet_runner.probes import exposed_sensitive_file  # noqa: E402
-from hacklet_runner.schema import Profile  # noqa: E402
+from sloptic.net import make_client  # noqa: E402
+from sloptic.pipeline import _Ctx  # noqa: E402
+from sloptic.probes import exposed_sensitive_file  # noqa: E402
+from sloptic.schema import Profile  # noqa: E402
 
 _TFSTATE = json.dumps({"version": 4, "terraform_version": "1.7.2",
                        "resources": [{"type": "aws_db_instance", "instances": [{"attributes":

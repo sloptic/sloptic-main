@@ -6,8 +6,8 @@ import threading
 
 import pytest
 
-from hacklet_runner.probes import file_upload
-from hacklet_runner.schema import Form, Profile
+from sloptic.probes import file_upload
+from sloptic.schema import Form, Profile
 
 _STORE = {}   # basename -> True if the stored bytes look like PHP
 

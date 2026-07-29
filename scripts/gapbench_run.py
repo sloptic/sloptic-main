@@ -34,7 +34,7 @@ sys.path.insert(0, str(_HERE.parent))
 from gapbench_score import (_CWE_BY_CATEGORY, _FP_EXEMPT_CATEGORIES, _finding_cwes,  # noqa: E402
                             _PROBE_OVERRIDES)
 
-from hacklet_runner.catalog import load_catalog  # noqa: E402
+from sloptic.catalog import load_catalog  # noqa: E402
 
 # Requests each probe actually sends, MEASURED server-side against VAmPI (count the target's own access log
 # before/after a --probe run). The injection families dominate: cmdi + sqli + lfi are half of a full battery's

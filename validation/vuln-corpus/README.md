@@ -29,14 +29,14 @@ docker compose down       # tear down when done
 **VAmPI** grades out of the box (a JSON API, no auth or browser needed). It is the cleanest recall proof:
 
 ```sh
-uv run python -m hacklet_runner.cli --target http://127.0.0.1:8084 --failed
+uv run python -m sloptic.cli --target http://127.0.0.1:8084 --failed
 # catches sec-idor-002 (BOLA, 40), sec-sqli-004 (40), sec-exposure-005 (35), qa-crash-010 (32)
 ```
 
 **Juice Shop** is a client-rendered SPA, so it needs the browser (render + JS-bundle mining):
 
 ```sh
-uv run python -m hacklet_runner.cli --target http://127.0.0.1:8083 --browser --failed
+uv run python -m sloptic.cli --target http://127.0.0.1:8083 --browser --failed
 ```
 
 **DVWA** only serves its vulnerable surface behind a login, at security level `low`. Grab an authed session
@@ -49,7 +49,7 @@ tok=$(curl -s -c "$jar" http://127.0.0.1:8081/login.php \
 curl -s -b "$jar" -c "$jar" --data "username=admin&password=password&user_token=$tok&Login=Login" \
      http://127.0.0.1:8081/login.php -o /dev/null
 sid=$(awk '/PHPSESSID/{print $NF}' "$jar")
-uv run python -m hacklet_runner.cli --target http://127.0.0.1:8081 \
+uv run python -m sloptic.cli --target http://127.0.0.1:8081 \
      --header "Cookie: PHPSESSID=$sid; security=low" --failed
 ```
 
@@ -70,7 +70,7 @@ start. It's the anchor that exercises the authed/IDOR/stored-XSS/mass-assignment
 the off-origin-backed Devpost corpus. Comes up with the rest of the compose on port 3000 (which the image bakes into its client bundle, so it cannot be republished elsewhere):
 
 ```sh
-uv run python -m hacklet_runner.cli --target http://localhost:3000 --browser --failed
+uv run python -m sloptic.cli --target http://localhost:3000 --browser --failed
 ```
 
 35 CTF challenges across 11 chapters — recall-relevant classes to confirm fire: IDOR (`sec-idor-*`), SQLi

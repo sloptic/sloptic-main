@@ -5,8 +5,8 @@ import pathlib
 
 import pytest
 
-from hacklet_runner.deploy import SubprocessDeployer
-from hacklet_runner.discovery import (
+from sloptic.deploy import SubprocessDeployer
+from sloptic.discovery import (
     _ACTION, _FIELD, _FORM, _LINK, _SRC, _parse_forms, _same_origin_path, discover, merge_perceived,
 )
 
@@ -68,7 +68,7 @@ def test_forms_capture_declared_field_constraints():
 def test_observed_requests_become_real_endpoints():
     # the accurate sensor: the app's OWN xhr/fetch calls (observed during render) become real endpoints -
     # method + path + JSON body keys, deduped - instead of the LLM guessing invisible API paths at ~15%.
-    from hacklet_runner.discovery import _endpoints_from_observed
+    from sloptic.discovery import _endpoints_from_observed
     obs = [
         ("GET", "http://x/api/todos?filter=open", None),
         ("POST", "http://x/api/todos", '{"title":"a","done":false}'),
@@ -87,7 +87,7 @@ def test_classify_hosts_attributes_by_deployment_not_just_domain():
     # the app's own backend, safe to probe), a branded third-party it CONSUMES is a vendor, and an unknown
     # off-origin host is OPAQUE (unattributable -> flagged, never probed). The old classifier mislabeled
     # Google/Stripe/Cloudflare as "own backend" (they fell through to a catch-all) — they're consumed, not ours.
-    from hacklet_runner.discovery import _classify_hosts
+    from sloptic.discovery import _classify_hosts
     obs = [
         ("GET",  "http://myapp.com/api/x", None),                       # same-origin
         ("GET",  "https://api.myapp.com/v1/t", None),                   # same registrable domain -> OWN backend
@@ -105,8 +105,8 @@ def test_classify_hosts_attributes_by_deployment_not_just_domain():
 def test_host_tiers_rides_the_surface_and_survives_the_cache():
     # Move 1 wiring: the classify-hosts backend map must reach the RECORD (via surface_metrics -> Report.surface)
     # AND survive the per-commit surface cache, so an overnight batch can aggregate the off-origin distribution.
-    from hacklet_runner.discovery import surface_metrics
-    from hacklet_runner.schema import Profile, profile_from_dict, profile_to_dict
+    from sloptic.discovery import surface_metrics
+    from sloptic.schema import Profile, profile_from_dict, profile_to_dict
     tiers = {"counts": {"same_origin": 2, "own_backend": 1, "managed_baas": 1, "vendor": 3, "opaque": 1},
              "own_hosts": ["api.myapp.com"], "baas_hosts": ["abc.supabase.co"], "opaque_hosts": ["api.unknown.io"]}
     prof = Profile(base_url="http://x", host_tiers=tiers)
@@ -268,7 +268,7 @@ def test_subpath_target_does_not_crawl_a_sibling_app_on_the_same_host():
 def test_root_hosted_target_is_unconfined_and_a_page_target_still_crawls_siblings():
     # the confinement must NOT narrow the normal cases: a bare-origin target crawls the whole host, and a
     # slashless page target (bWAPP's /sqli_1.php shape) keeps crawling its siblings — they ARE its surface.
-    from hacklet_runner.discovery import _entry_scope
+    from sloptic.discovery import _entry_scope
     assert _entry_scope("/") == "" and _entry_scope("") == ""            # bare origin -> unconfined
     assert _entry_scope("/sqli_1.php") == "" and _entry_scope("/deep") == ""   # page/file target -> unconfined
     assert _entry_scope("/site/app-a/") == "/site/app-a"                # explicit directory -> confined
@@ -288,7 +288,7 @@ def test_root_hosted_target_is_unconfined_and_a_page_target_still_crawls_sibling
 
 
 # --- which routes get browser-rendered for forms (pure filter, no browser) ----------------------
-from hacklet_runner.discovery import _formless_form, _renderable_route  # noqa: E402
+from sloptic.discovery import _formless_form, _renderable_route  # noqa: E402
 
 
 def test_renderable_route_filters_static_assets():
@@ -331,7 +331,7 @@ def test_formless_skips_noninjectable_and_nameless():
 
 
 # --- name inference for anonymous SPA inputs (no name/id — React-controlled) ---------------------
-from hacklet_runner.discovery import _infer_name, _scan_form_inputs  # noqa: E402
+from sloptic.discovery import _infer_name, _scan_form_inputs  # noqa: E402
 
 
 def test_infer_name_from_semantic_type():
@@ -363,7 +363,7 @@ def test_scan_associates_nearest_label():
 
 
 # --- observed-surface fingerprint (the parity denominator) --------------------------------------
-from hacklet_runner.discovery import surface_metrics  # noqa: E402
+from sloptic.discovery import surface_metrics  # noqa: E402
 
 
 def test_surface_metrics_fingerprints_discovered_surface(serve):
@@ -380,8 +380,8 @@ def test_surface_metrics_low_on_a_form_less_landing_page(serve):
 
 
 # --- api-only feature seeding + vendor-path stripping -------------------------------------------
-from hacklet_runner.discovery import _VENDOR_PATH, _endpoints_from_features  # noqa: E402
-from hacklet_runner.schema import Endpoint, Form, Profile  # noqa: E402
+from sloptic.discovery import _VENDOR_PATH, _endpoints_from_features  # noqa: E402
+from sloptic.schema import Endpoint, Form, Profile  # noqa: E402
 
 
 def test_endpoints_from_features_seeds_api_surface():
@@ -400,7 +400,7 @@ def test_endpoints_from_features_uses_source_declared_params_and_body_fields():
     # build #2: the LLM names each endpoint's ACTUAL query params + body fields from the source, so
     # injection points at the real input surface a crawler can't see — not a generic guess. Untrusted-plan
     # sanitized, and the search fallback survives only when the LLM named nothing.
-    from hacklet_runner.probes import _sqli_slots
+    from sloptic.probes import _sqli_slots
     eps = _endpoints_from_features([
         {"kind": "crud-create", "path": "/projects", "method": "post",
          "body_fields": ["title", "description"]},                        # POST body -> SQLi body slots
@@ -419,7 +419,7 @@ def test_endpoints_from_features_uses_source_declared_params_and_body_fields():
 
 
 def test_surface_metrics_recognizes_api_login_upload_endpoints():
-    from hacklet_runner.schema import Endpoint
+    from sloptic.schema import Endpoint
     # an api-only app's login/upload are ENDPOINTS (feature kind or a login/upload-named path), not forms —
     # has_login/has_upload must see them, else parity falsely reports a blind spot (sapling)
     eps = [Endpoint(path="/api/login", raw_path="/api/login", method="post", kind="auth"),
@@ -433,8 +433,8 @@ def test_surface_metrics_recognizes_api_login_upload_endpoints():
 
 
 def test_dedup_merges_llm_params_onto_crawler_found_endpoint():
-    from hacklet_runner.discovery import _dedup_merge_endpoints
-    from hacklet_runner.schema import Endpoint
+    from sloptic.discovery import _dedup_merge_endpoints
+    from sloptic.schema import Endpoint
     # a crawler-found endpoint and an LLM feature for the SAME (method, raw_path): the LLM's source-named
     # body/query params must MERGE on (not be dropped by keep-first dedup), and origin must downgrade to
     # crawl (a crawl source found the path too -> not the pointer's UNIQUE contribution).
@@ -460,7 +460,7 @@ def test_catch_all_host_drops_phantom_endpoints_and_forms():
     import http.server
     import threading
 
-    from hacklet_runner.discovery import discover
+    from sloptic.discovery import discover
     _SHELL = (b"<html><body><h1>App</h1>"
               b"<form action='/login'><input name='email'><input name='password' type='password'></form>"
               b"<a href='/api/data?q=x'>data</a></body></html>")
@@ -512,9 +512,9 @@ def test_subpath_deploy_landing_path_and_homepage_probe_target():
     import http.server
     import threading
 
-    from hacklet_runner.net import make_client
-    from hacklet_runner.probes import seo_meta_missing
-    from hacklet_runner.schema import Profile
+    from sloptic.net import make_client
+    from sloptic.probes import seo_meta_missing
+    from sloptic.schema import Profile
 
     _APP = (b"<html lang='en'><head><meta name='viewport' content='width=device-width'>"
             b"<meta name='description' content='real app'><title>App</title></head><body>hi</body></html>")
@@ -571,7 +571,7 @@ def test_subpath_deploy_landing_path_and_homepage_probe_target():
 
 
 def test_vendor_antibot_fields_excluded_from_injectable_surface():
-    from hacklet_runner.discovery import _scan_form_inputs
+    from sloptic.discovery import _scan_form_inputs
     fields, _files, _pw, _ = _scan_form_inputs(
         "<input name='email'><input name='cf-turnstile-response' type='hidden'>"
         "<input name='g-recaptcha-response'><input name='password' type='password'>")
@@ -580,7 +580,7 @@ def test_vendor_antibot_fields_excluded_from_injectable_surface():
 
 
 def test_login_signup_triggers_credit_has_login_without_a_form():
-    from hacklet_runner.discovery import _auth_triggers, surface_metrics
+    from sloptic.discovery import _auth_triggers, surface_metrics
     # button/link CTAs, not inline password forms — the case the audit kept flagging as has_login=false
     assert _auth_triggers("<a href='/x'>Continue with Google</a><button>Sign up free</button>") == (True, True)
     assert _auth_triggers("<button>Get Started</button>") == (False, True)          # 'Get started' = signup CTA
@@ -596,7 +596,7 @@ def test_login_signup_triggers_credit_has_login_without_a_form():
 
 
 def test_surface_metrics_reports_llm_pointer_precision():
-    from hacklet_runner.schema import Endpoint
+    from sloptic.schema import Endpoint
     # build #2 telemetry (off-score): of the endpoints ONLY the LLM seeded (origin llm), how many are real
     # (path exists) vs hallucinated (404). Crawler endpoints are excluded — this measures the POINTER.
     eps = [
@@ -615,7 +615,7 @@ def test_surface_metrics_reports_llm_pointer_precision():
 
 
 def test_surface_metrics_counts_only_healthy_endpoints():
-    from hacklet_runner.schema import Endpoint
+    from sloptic.schema import Endpoint
     eps = [Endpoint(path="/api/a", raw_path="/api/a", baseline_status=200),   # healthy
            Endpoint(path="/api/b", raw_path="/api/b", baseline_status=500),   # env-var-dead
            Endpoint(path="/api/c", raw_path="/api/c", baseline_status=None)]  # untested -> counts as healthy

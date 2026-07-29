@@ -7,7 +7,7 @@ import threading
 
 import pytest
 
-from hacklet_runner.probes import caching_ineffective
+from sloptic.probes import caching_ineffective
 
 HOME = b'<html><body><script src="/app.js"></script></body></html>'
 ASSET = b'console.log(1);\n'

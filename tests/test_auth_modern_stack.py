@@ -23,8 +23,8 @@ import threading
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import httpx  # noqa: E402
 
-from hacklet_runner import auth  # noqa: E402
-from hacklet_runner.schema import Endpoint, Form, Profile  # noqa: E402
+from sloptic import auth  # noqa: E402
+from sloptic.schema import Endpoint, Form, Profile  # noqa: E402
 
 _TOKEN = "eyJhbGciOiJIUzI1NiJ9.hl-probe-session.sig"
 

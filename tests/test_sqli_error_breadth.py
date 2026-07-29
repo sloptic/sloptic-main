@@ -27,8 +27,8 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from hacklet_runner.probes import _SQL_ERROR, api_sqli
-from hacklet_runner.schema import Endpoint, Profile
+from sloptic.probes import _SQL_ERROR, api_sqli
+from sloptic.schema import Endpoint, Profile
 
 _ROWS = json.dumps({"rows": [{"username": "admin"}]}).encode()
 

@@ -9,9 +9,9 @@ import threading
 
 import pytest
 
-from hacklet_runner.catalog import load_catalog
-from hacklet_runner.probes import PREDICATES, _UPLOAD_XSS_MARK, upload_stored_xss
-from hacklet_runner.schema import Form, Profile
+from sloptic.catalog import load_catalog
+from sloptic.probes import PREDICATES, _UPLOAD_XSS_MARK, upload_stored_xss
+from sloptic.schema import Form, Profile
 
 _STORE = {}                     # basename -> raw uploaded bytes (the marker rides inside)
 _MODE = {"how": "inline-html"}  # how the server serves stored files back (set per test)
@@ -120,7 +120,7 @@ def test_na_without_upload_form(app):
 
 def test_marker_is_distinct_from_the_rce_probe_marker():
     # the two upload probes must not cross-trigger on each other's payloads
-    from hacklet_runner.probes import _UPLOAD_MARK
+    from sloptic.probes import _UPLOAD_MARK
     assert _UPLOAD_XSS_MARK != _UPLOAD_MARK
 
 

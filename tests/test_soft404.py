@@ -7,9 +7,9 @@ import threading
 
 import pytest
 
-from hacklet_runner.discovery import _CATCHALL_PROBE
-from hacklet_runner.net import make_client
-from hacklet_runner.probes import http_soft_404
+from sloptic.discovery import _CATCHALL_PROBE
+from sloptic.net import make_client
+from sloptic.probes import http_soft_404
 
 
 def _handler(mode):

@@ -32,7 +32,7 @@ import urllib.parse
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import httpx  # noqa: E402
 
-from hacklet_runner import probes  # noqa: E402
+from sloptic import probes  # noqa: E402
 
 _ANON = "eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoiYW5vbiJ9.sig"
 

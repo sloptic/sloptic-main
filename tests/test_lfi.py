@@ -7,8 +7,8 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from hacklet_runner.probes import path_traversal
-from hacklet_runner.schema import Endpoint, Profile
+from sloptic.probes import path_traversal
+from sloptic.schema import Endpoint, Profile
 
 _PASSWD = "root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n"
 
@@ -88,7 +88,7 @@ def test_lfi_skips_apps_own_js_bundle(app):
 
 def test_lfi_signature_rejects_minified_noise():
     # the old `root:.*?:0:0:` matched unrelated tokens across ONE minified line; the tight form must not.
-    from hacklet_runner.probes import _LFI_SIG
+    from sloptic.probes import _LFI_SIG
     assert _LFI_SIG.search('a.root:{x:1};q=":0:0:";m=[0,0,0];fn=function(){return root}') is None
     assert _LFI_SIG.search("root:x:0:0:root:/root:/bin/bash")        # real passwd still detected
     assert _LFI_SIG.search("root::0:0:root:/root:/bin/sh")           # empty-password variant too

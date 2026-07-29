@@ -15,8 +15,8 @@ from urllib.parse import urlparse
 import httpx
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from hacklet_runner.auth import Account  # noqa: E402
-from hacklet_runner.probes import bola_managed_backend  # noqa: E402
+from sloptic.auth import Account  # noqa: E402
+from sloptic.probes import bola_managed_backend  # noqa: E402
 
 A_CANARY, B_CANARY = "hl_aaaa1111", "hl_bbbb2222"
 _ROWS = {"1": {"id": "1", "username": A_CANARY}, "2": {"id": "2", "username": B_CANARY}}

@@ -8,8 +8,8 @@ import threading
 import httpx
 import pytest
 
-from hacklet_runner import probes
-from hacklet_runner.schema import Profile
+from sloptic import probes
+from sloptic.schema import Profile
 
 
 def _serve(handler_body):

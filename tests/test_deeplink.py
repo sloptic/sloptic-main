@@ -9,11 +9,11 @@ import threading
 import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from hacklet_runner import browser  # noqa: E402
-from hacklet_runner.net import make_client  # noqa: E402
-from hacklet_runner.pipeline import _Ctx  # noqa: E402
-from hacklet_runner.probes import deep_link_shell  # noqa: E402
-from hacklet_runner.schema import Profile  # noqa: E402
+from sloptic import browser  # noqa: E402
+from sloptic.net import make_client  # noqa: E402
+from sloptic.pipeline import _Ctx  # noqa: E402
+from sloptic.probes import deep_link_shell  # noqa: E402
+from sloptic.schema import Profile  # noqa: E402
 
 # broken: the client IGNORES the URL and always paints the same view (every route == fallback)
 _BROKEN_JS = "document.getElementById('app').innerHTML = 'This is the home welcome dashboard about page content view';"

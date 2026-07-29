@@ -14,8 +14,8 @@ import sys
 import httpx
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from hacklet_runner import auth  # noqa: E402
-from hacklet_runner.probes import _https_browser_enforced  # noqa: E402
+from sloptic import auth  # noqa: E402
+from sloptic.probes import _https_browser_enforced  # noqa: E402
 
 _JWT = ("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4ifQ."
         "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk")
@@ -120,7 +120,7 @@ def test_auth0s_bare_cookie_is_recognised_as_a_session():
     Auth0's bare `auth0` cookie is the gap. Every other hosted provider checked is already covered
     incidentally by the generic hints, which is why only this one was added.
     """
-    from hacklet_runner.auth import _is_session_cookie
+    from sloptic.auth import _is_session_cookie
     assert _is_session_cookie("auth0")
     assert _is_session_cookie("auth0_compat")
     # covered incidentally — asserted so a future "tidy-up" of the hint list cannot silently drop them
@@ -140,7 +140,7 @@ def test_the_provider_widening_did_not_take_the_non_session_cookies_with_it():
     """Precision guard on the same live sample. `__txn_*` are Auth0's short-lived PRE-login transaction
     cookies and `did` is a device id — both token-shaped, neither a session. Judging one would report cookie
     flags for the wrong cookie, which is exactly the unfalsifiable verdict session_cookie() exists to avoid."""
-    from hacklet_runner.auth import _is_session_cookie
+    from sloptic.auth import _is_session_cookie
     for name in ("__txn_f8XSvhCTI92gUF2uF6hAmwhgn87v", "did", "did_compat",
                  "csrftoken", "XSRF-TOKEN", "authenticity_token",   # deliberately JS-readable
                  "refresh_token", "email_verification_token",       # not the access session
@@ -151,7 +151,7 @@ def test_the_provider_widening_did_not_take_the_non_session_cookies_with_it():
 def test_the_browser_lane_names_WHICH_stage_it_failed_at():
     """Five distinct outcomes used to collapse into one bare None, and diagnosing them by inspection cost three
     refuted theories in a row. The diag out-param is what turns "187 apps, cause unknown" into a distribution."""
-    from hacklet_runner.auth import _register_via_browser
+    from sloptic.auth import _register_via_browser
 
     diag = {}
     assert _register_via_browser("http://x", lambda _u: None, diag) is None
@@ -180,7 +180,7 @@ def test_the_two_causes_that_look_identical_from_auth_are_reported_SEPARATELY():
     there. They are opposite findings: one is our discovery bug, the other is almost certainly e-mail
     confirmation and a CORRECT N/A. register_in_browser now records which exit it took, and auth prefers it.
     """
-    from hacklet_runner import auth, browser
+    from sloptic import auth, browser
 
     browser.LAST_STAGE.clear()
     browser.LAST_STAGE["stage"] = "no fillable signup reached: no visible password field"
@@ -207,7 +207,7 @@ def test_infrastructure_and_flow_cookies_are_not_reported_as_a_missing_vendor():
     (__Host-GAPS, GAESA -> SSO), Clerk client state without __session, a NextAuth/oauth CSRF or callback-url
     from a flow that never completed, or Cloudflare/Vercel infrastructure. The honest verdict is "no app session
     exists", which is a CORRECT N/A."""
-    from hacklet_runner.auth import _no_app_session_cookies
+    from sloptic.auth import _no_app_session_cookies
 
     # the real samples, from session-gap-diag2/3
     assert _no_app_session_cookies(["__Host-GAPS", "GAESA"])                     # Google SSO
@@ -228,7 +228,7 @@ def test_a_login_only_homepage_does_not_consume_the_signup_attempt():
     present, so the fill loop filled it, reported success, and the walk to /signup never ran — then the Enter
     fallback submitted a LOGIN for an account that does not exist, so no registration request was ever made.
     A password field is not evidence of a signup; a login form has one too."""
-    from hacklet_runner.browser import _LOGIN_ONLY, _SIGNUP_SUBMIT
+    from sloptic.browser import _LOGIN_ONLY, _SIGNUP_SUBMIT
     for lbl in ("Login", "log in", "Sign in", "SIGNIN"):
         assert _LOGIN_ONLY.search(lbl), lbl
     for lbl in ("Create account", "Sign up", "Register", "Get started", "Join now"):
@@ -247,7 +247,7 @@ def test_signup_hrefs_follows_the_apps_own_link_and_never_leaves_the_origin():
     marketing site, so following it both mis-attributes the finding and points a credential-submitting robot
     at someone who never asked. Same narrowing the bundle-origin SSRF guard uses.
     """
-    from hacklet_runner.browser import _signup_hrefs, _SIGNUP_LINK
+    from sloptic.browser import _signup_hrefs, _SIGNUP_LINK
 
     for text in ("Sign up", "Create account", "Register", "Get started", "Join"):
         assert _SIGNUP_LINK.search(text), text

@@ -9,10 +9,10 @@ import threading
 from urllib.parse import urlparse
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from hacklet_runner.net import make_client  # noqa: E402
-from hacklet_runner.pipeline import _Ctx  # noqa: E402
-from hacklet_runner.probes import _MW_PAYLOADS, middleware_auth_bypass  # noqa: E402
-from hacklet_runner.schema import Profile  # noqa: E402
+from sloptic.net import make_client  # noqa: E402
+from sloptic.pipeline import _Ctx  # noqa: E402
+from sloptic.probes import _MW_PAYLOADS, middleware_auth_bypass  # noqa: E402
+from sloptic.schema import Profile  # noqa: E402
 
 _HDR = "x-middleware-subrequest"
 _DASH = '<html><body><h1>Dashboard</h1><p>secret account balance $4,200</p></body></html>'

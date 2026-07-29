@@ -5,11 +5,11 @@ import pathlib
 
 import pytest
 
-from hacklet_runner import browser
-from hacklet_runner.catalog import load_catalog
-from hacklet_runner.deploy import SubprocessDeployer
-from hacklet_runner.discovery import discover
-from hacklet_runner.pipeline import run
+from sloptic import browser
+from sloptic.catalog import load_catalog
+from sloptic.deploy import SubprocessDeployer
+from sloptic.discovery import discover
+from sloptic.pipeline import run
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 REFS = ROOT / "references"
@@ -62,7 +62,7 @@ def test_interaction_reveals_click_gated_login_and_upload():
     import http.server
     import threading
 
-    from hacklet_runner.discovery import _scan_form_inputs
+    from sloptic.discovery import _scan_form_inputs
     page = (
         "<!doctype html><html><body><h1>SPA</h1>"
         "<button id='lb'>Log in</button><button id='ub'>Upload evidence</button>"
@@ -103,7 +103,7 @@ def test_interaction_is_bounded_to_first_n_routes():
     import http.server
     import threading
 
-    from hacklet_runner.discovery import _scan_form_inputs
+    from sloptic.discovery import _scan_form_inputs
     page = (
         "<!doctype html><html><body><h1>SPA</h1><button id='lb'>Log in</button><div id='lm'></div><script>"
         "document.getElementById('lb').onclick=function(){var f=document.createElement('form');"
@@ -275,7 +275,7 @@ def test_auth_route_probing_captures_login_form_behind_a_cta():
     import http.server
     import threading
 
-    from hacklet_runner.discovery import discover
+    from sloptic.discovery import discover
 
     class H(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
@@ -448,9 +448,9 @@ def test_xss_injectable_fires_via_execution_not_reflection(serve):
     # end-to-end: with a browser, sec-xss-001 confirms a GET reflection by EXECUTION. vulnerable /search
     # runs the payload -> fires with via='execution'; hardened reflects the (alphanumeric) marker but the
     # payload never executes -> clean. This is the FP-killing upgrade over string-presence matching.
-    from hacklet_runner.net import make_client
-    from hacklet_runner.probes import xss_injectable
-    from hacklet_runner.schema import Form, Profile
+    from sloptic.net import make_client
+    from sloptic.probes import xss_injectable
+    from sloptic.schema import Form, Profile
 
     class _P:
         probe = {"max_attempts": 150}
@@ -553,8 +553,8 @@ def test_contrast_clean_on_high_contrast():
 
 
 # --- Core Web Vitals (perf-cwv-002 / slow_core_web_vitals) --------------------------------
-from hacklet_runner.net import make_client        # noqa: E402
-from hacklet_runner.probes import slow_core_web_vitals  # noqa: E402
+from sloptic.net import make_client        # noqa: E402
+from sloptic.probes import slow_core_web_vitals  # noqa: E402
 
 # an 800ms synchronous busy-loop blocks the main thread on load -> Total Blocking Time well past 600ms
 _CWV_POOR = ("<!doctype html><html lang=en><head><title>t</title></head><body><h1>slow</h1>"

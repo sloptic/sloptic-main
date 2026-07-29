@@ -27,9 +27,9 @@ import time
 from urllib.parse import urlparse
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from hacklet_runner import provenance  # noqa: E402
-from hacklet_runner.jsonl import append_jsonl  # noqa: E402  (lock-guarded results append, safe under concurrency)
-from hacklet_runner.browser import browser_preflight  # noqa: E402  (fail-loud browser preflight)
+from sloptic import provenance  # noqa: E402
+from sloptic.jsonl import append_jsonl  # noqa: E402  (lock-guarded results append, safe under concurrency)
+from sloptic.browser import browser_preflight  # noqa: E402  (fail-loud browser preflight)
 
 _HERE = pathlib.Path(__file__).resolve().parent
 # Launch children (deploy_and_grade / devpost_repos / stats / parity) with the PROJECT'S OWN venv python —

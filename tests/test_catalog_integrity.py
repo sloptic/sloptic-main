@@ -20,8 +20,8 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from hacklet_runner.catalog import load_catalog  # noqa: E402
-from hacklet_runner.probes import _PREDICATE_REASONS, PREDICATES  # noqa: E402
+from sloptic.catalog import load_catalog  # noqa: E402
+from sloptic.probes import _PREDICATE_REASONS, PREDICATES  # noqa: E402
 
 _ROOT = pathlib.Path(__file__).resolve().parent.parent
 _CATALOG = load_catalog(str(_ROOT / "catalog"))
@@ -30,7 +30,7 @@ _CATALOG = load_catalog(str(_ROOT / "catalog"))
 def _declared_capabilities() -> set[str]:
     """The capability names discovery actually mints, read from the `capabilities = {...}` literal so this
     test tracks discovery.py instead of restating it (a hand-copied list would rot into a second lie)."""
-    mod = ast.parse((_ROOT / "hacklet_runner" / "discovery.py").read_text())
+    mod = ast.parse((_ROOT / "sloptic" / "discovery.py").read_text())
     for node in ast.walk(mod):
         if (isinstance(node, ast.Assign)
                 and any(getattr(t, "id", "") == "capabilities" for t in node.targets)

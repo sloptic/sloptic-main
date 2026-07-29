@@ -3,7 +3,7 @@ problems and must NOT flag benign content (a false positive wrongly penalizes).
 """
 import httpx
 
-from hacklet_runner.probes import (
+from sloptic.probes import (
     _csrf_candidates,
     response_csp_weak,
     response_has_header,
@@ -13,7 +13,7 @@ from hacklet_runner.probes import (
     response_leaks_secret,
     response_missing_header,
 )
-from hacklet_runner.schema import Form, Profile
+from sloptic.schema import Form, Profile
 
 
 def _resp(status, headers=None):
@@ -98,7 +98,7 @@ def test_xss_reflects_rejects_escaped_json_and_non_html():
     # XSS reflection must be EXECUTABLE, not merely present. A `" onmouseover=` that lands inside serialized
     # JSON (Next.js __PAGE__ / RSC flight) is backslash-escaped (\") and can't break an attribute -> NOT XSS
     # (verified live on mekong-watch). A JSON API body echoing the payload isn't HTML -> NOT XSS either.
-    from hacklet_runner.probes import _reflects
+    from sloptic.probes import _reflects
 
     class R:
         def __init__(self, text, ctype="text/html"):
@@ -155,7 +155,7 @@ def test_resource_shaped_tells_a_race_from_a_fixed_redirect():
     # qa-race-001 fires on duplicate ids under concurrency. A per-resource landing (/notes/1) exposes an id
     # to compare; a fixed success-page redirect (/home) exposes none, so uniform landings must NOT read as a
     # race. This is the guard that keeps a create->redirect-to-dashboard app from a phantom race finding.
-    from hacklet_runner.probes import _resource_shaped
+    from sloptic.probes import _resource_shaped
     assert _resource_shaped("/notes/1", "/notes")            # sub-path of the create endpoint + numeric id
     assert _resource_shaped("/api/notes/42", "/api/notes")
     assert _resource_shaped("/items/a1b2c3d4e5", "/create")  # trailing hex/uuid id, different base
@@ -167,7 +167,7 @@ def test_resource_shaped_tells_a_race_from_a_fixed_redirect():
 def test_console_first_party_classification():
     # qa-console-001 fires only on the APP'S OWN uncaught errors. A third-party widget/analytics script
     # that throws (cross-origin, browser-sanitized to "Script error.") is benign noise a working app carries.
-    from hacklet_runner.browser import _first_party_error as fp
+    from sloptic.browser import _first_party_error as fp
     o = "127.0.0.1:8080"
     assert fp("x is not defined", "ReferenceError\n    at http://127.0.0.1:8080/:61:1", o)   # inline, host:PORT
     assert fp("boom", "at f (http://127.0.0.1:8080/main.js:2:9)", o)                          # same-origin script
@@ -180,7 +180,7 @@ def test_a11y_penalty_damps_stacked_barriers():
     """Tiers re-priced 30/18/10/4 -> 20/12/7/3 off the v11 corpus, where a11y was 34.0% of ALL penalty and one
     critical barrier cost 30 against a security ceiling of 40. The SHAPE is unchanged — worst counts full, each
     additional decays by 0.6 — only the tier values moved."""
-    from hacklet_runner.probes import _a11y_penalty
+    from sloptic.probes import _a11y_penalty
     assert _a11y_penalty({"serious": 1}) == 12                  # a lone contrast miss
     assert _a11y_penalty({"critical": 1}) == 20                 # a screen-reader blocker -> HALF the sec ceiling
     assert _a11y_penalty({"critical": 1, "serious": 1}) == 27   # additive but DAMPED: 20 + 12*.6 (not a raw 32)
@@ -192,7 +192,7 @@ def test_a11y_penalty_damps_stacked_barriers():
 def test_a11y_stays_a_real_penalty_after_the_repricing():
     """The re-pricing is a RELATIVE correction, not a decision to go soft on hygiene — the opposite change was
     proposed once and was wrong. A barred app must still pay enough to matter against the security axis."""
-    from hacklet_runner.probes import _a11y_penalty, _A11Y_TIER
+    from sloptic.probes import _a11y_penalty, _A11Y_TIER
     assert _A11Y_TIER["critical"] * 2 == 40, "a critical barrier should be exactly half the security ceiling"
     assert _a11y_penalty({"critical": 2, "serious": 2}) >= 30, "a multi-barrier app is still a serious finding"
     # ordering must survive any future re-pricing: worse impact tiers always cost more
@@ -200,7 +200,7 @@ def test_a11y_stays_a_real_penalty_after_the_repricing():
 
 
 def test_console_scales_by_render_health():
-    from hacklet_runner.probes import _console_broken_render
+    from sloptic.probes import _console_broken_render
     assert _console_broken_render({"error_overlay": True, "content_len": 5000}) is True    # crash overlay -> full
     assert _console_broken_render({"error_overlay": False, "content_len": 8}) is True       # near-empty -> full
     assert _console_broken_render({"error_overlay": False, "content_len": 5000}) is False   # page fine -> reduced
@@ -208,7 +208,7 @@ def test_console_scales_by_render_health():
 
 
 def test_error_hygiene_signatures_match_leaks_not_prose():
-    from hacklet_runner.probes import _TRACE, _SQL_ERROR
+    from sloptic.probes import _TRACE, _SQL_ERROR
     assert _TRACE.search('Traceback (most recent call last):\n  File "app.py", line 9, in f')   # Python
     assert _TRACE.search('at handler (/srv/app/server.js:12:7)')                                  # Node
     assert _TRACE.search('goroutine 17 [chan receive]:')                                          # Go panic
@@ -218,7 +218,7 @@ def test_error_hygiene_signatures_match_leaks_not_prose():
 
 
 def test_depscan_flags_vulnerable_versions_not_patched():
-    from hacklet_runner.depscan import scan_deps
+    from sloptic.depscan import scan_deps
     hits = scan_deps("/*! jQuery v1.12.4 */ x Bootstrap v4.1.3 y moment.js version : 2.10.0")
     libs = {h["library"]: h["version"] for h in hits}
     assert libs.get("jQuery") == "1.12.4"                 # < 3.5.0 -> XSS CVE
@@ -234,7 +234,7 @@ def test_depscan_flags_vulnerable_versions_not_patched():
 
 
 def test_declared_constraint_values_and_acceptance():
-    from hacklet_runner.probes import _constraint_values, _submission_accepted
+    from sloptic.probes import _constraint_values, _submission_accepted
     assert _constraint_values({"type": "email"}) == ("hl.probe@example.com", "hlnotanemail")   # invalid: no @
     assert _constraint_values({"type": "number", "min": "3"})[0] == "3"        # valid = the declared min
     assert not _constraint_values({"type": "number"})[1].isdigit()             # invalid = non-numeric
@@ -253,7 +253,7 @@ def test_declared_constraint_uses_a_valid_vs_invalid_body_differential():
     # qa-input-001 must fire ONLY when the invalid value is accepted the SAME as the valid baseline. A 200
     # status alone isn't acceptance: an app that validates commonly re-renders a 200 with an inline error or
     # returns 200 {ok:false,"error":...} — those are REJECTIONS and must NOT fire.
-    from hacklet_runner.probes import _same_success
+    from sloptic.probes import _same_success
 
     class R:
         def __init__(self, text, status=200, loc=""):

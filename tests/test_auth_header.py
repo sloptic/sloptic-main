@@ -5,7 +5,7 @@ import http.server
 import re
 import threading
 
-from hacklet_runner.discovery import discover
+from sloptic.discovery import discover
 
 
 class _Gated(http.server.BaseHTTPRequestHandler):

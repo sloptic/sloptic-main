@@ -17,7 +17,7 @@ import sys
 import threading
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from hacklet_runner import baas  # noqa: E402
+from sloptic import baas  # noqa: E402
 
 
 def _jwt(payload: dict) -> str:

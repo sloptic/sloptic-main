@@ -7,8 +7,8 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from hacklet_runner.probes import crash_resistance
-from hacklet_runner.schema import Endpoint, Form, Profile
+from sloptic.probes import crash_resistance
+from sloptic.schema import Endpoint, Form, Profile
 
 
 def _handler(crash: bool):

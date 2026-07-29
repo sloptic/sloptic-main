@@ -12,10 +12,10 @@ import time
 from urllib.parse import urlparse
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from hacklet_runner.net import make_client  # noqa: E402
-from hacklet_runner.pipeline import _Ctx  # noqa: E402
-from hacklet_runner.probes import data_integrity_list_roundtrip, race_resource_ids_api  # noqa: E402
-from hacklet_runner.schema import Endpoint, Profile  # noqa: E402
+from sloptic.net import make_client  # noqa: E402
+from sloptic.pipeline import _Ctx  # noqa: E402
+from sloptic.probes import data_integrity_list_roundtrip, race_resource_ids_api  # noqa: E402
+from sloptic.schema import Endpoint, Profile  # noqa: E402
 
 
 def _jwt(sub):

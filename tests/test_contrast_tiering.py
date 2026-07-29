@@ -13,8 +13,8 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from hacklet_runner import probes  # noqa: E402
-from hacklet_runner.probes import _a11y_penalty, _contrast_level  # noqa: E402
+from sloptic import probes  # noqa: E402
+from sloptic.probes import _a11y_penalty, _contrast_level  # noqa: E402
 
 
 def n(ratio, required=4.5):

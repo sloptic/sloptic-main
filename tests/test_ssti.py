@@ -7,8 +7,8 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from hacklet_runner.probes import ssti_injectable
-from hacklet_runner.schema import Endpoint, Profile
+from sloptic.probes import ssti_injectable
+from sloptic.schema import Endpoint, Profile
 
 
 def _render(val: str) -> str:

@@ -5,8 +5,8 @@ import threading
 
 import pytest
 
-from hacklet_runner.probes import host_header_injection
-from hacklet_runner.schema import Profile
+from sloptic.probes import host_header_injection
+from sloptic.schema import Profile
 
 
 def _handler(reflect):

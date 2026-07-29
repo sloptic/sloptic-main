@@ -5,7 +5,7 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-import hacklet_runner.reportcard as rc  # noqa: E402
+import sloptic.reportcard as rc  # noqa: E402
 
 
 def _finding(pid, bundle="security", pen=10, reason="an issue", cat="c"):

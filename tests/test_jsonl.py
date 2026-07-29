@@ -4,7 +4,7 @@ would fail with a bare open('a')+write; the flock in append_jsonl serializes the
 import concurrent.futures
 import json
 
-from hacklet_runner.jsonl import append_jsonl
+from sloptic.jsonl import append_jsonl
 
 
 def test_concurrent_appends_never_corrupt(tmp_path):

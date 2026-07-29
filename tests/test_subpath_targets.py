@@ -12,9 +12,9 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from hacklet_runner.pipeline import _expand  # noqa: E402
-from hacklet_runner.probes import _at  # noqa: E402
-from hacklet_runner.schema import Form, Probe, Profile  # noqa: E402
+from sloptic.pipeline import _expand  # noqa: E402
+from sloptic.probes import _at  # noqa: E402
+from sloptic.schema import Form, Probe, Profile  # noqa: E402
 
 
 def _probe(target):

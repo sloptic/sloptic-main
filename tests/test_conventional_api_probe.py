@@ -23,8 +23,8 @@ import threading
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import httpx  # noqa: E402
 
-from hacklet_runner.discovery import _conventional_api_endpoints, _verify_api_path  # noqa: E402
-from hacklet_runner.schema import Endpoint  # noqa: E402
+from sloptic.discovery import _conventional_api_endpoints, _verify_api_path  # noqa: E402
+from sloptic.schema import Endpoint  # noqa: E402
 
 
 def _serve(table):
@@ -128,6 +128,6 @@ def test_an_endpoint_the_crawl_already_found_is_not_duplicated():
 
 
 def test_the_candidate_list_covers_the_names_the_fixtures_actually_use():
-    from hacklet_runner.discovery import _CONVENTIONAL_API
+    from sloptic.discovery import _CONVENTIONAL_API
     for measured in ("feedback", "projects", "support", "admin", "user", "orders", "files"):
         assert measured in _CONVENTIONAL_API, measured

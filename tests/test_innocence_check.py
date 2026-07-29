@@ -8,11 +8,11 @@ import threading
 from urllib.parse import urlparse
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from hacklet_runner.net import make_client  # noqa: E402
-from hacklet_runner.pipeline import _Ctx  # noqa: E402
-from hacklet_runner.probes import (  # noqa: E402
+from sloptic.net import make_client  # noqa: E402
+from sloptic.pipeline import _Ctx  # noqa: E402
+from sloptic.probes import (  # noqa: E402
     _endpoint_is_live, _same_resource_redirect, api_sqli, crash_resistance, csrf_missing, login_no_rate_limit)
-from hacklet_runner.schema import Endpoint, Form, Profile  # noqa: E402
+from sloptic.schema import Endpoint, Form, Profile  # noqa: E402
 
 _SHELL = b"<html><body>App shell - client-side routing, nothing here server-side</body></html>"
 

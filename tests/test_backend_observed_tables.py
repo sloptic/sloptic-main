@@ -9,9 +9,9 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from hacklet_runner.discovery import _observed_backend_tables  # noqa: E402
-from hacklet_runner.probes import _firestore_collections, _observed_tables, _supabase_tables  # noqa: E402
-from hacklet_runner.schema import Profile, profile_from_dict, profile_to_dict  # noqa: E402
+from sloptic.discovery import _observed_backend_tables  # noqa: E402
+from sloptic.probes import _firestore_collections, _observed_tables, _supabase_tables  # noqa: E402
+from sloptic.schema import Profile, profile_from_dict, profile_to_dict  # noqa: E402
 
 
 def test_observed_traffic_yields_supabase_and_firestore_table_names():

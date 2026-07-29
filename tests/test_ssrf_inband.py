@@ -17,10 +17,10 @@ import threading
 import urllib.parse
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from hacklet_runner.net import make_client  # noqa: E402
-from hacklet_runner.pipeline import _Ctx  # noqa: E402
-from hacklet_runner.probes import _SSRF_INBAND, _ssrf_inband  # noqa: E402
-from hacklet_runner.schema import Endpoint, Profile  # noqa: E402
+from sloptic.net import make_client  # noqa: E402
+from sloptic.pipeline import _Ctx  # noqa: E402
+from sloptic.probes import _SSRF_INBAND, _ssrf_inband  # noqa: E402
+from sloptic.schema import Endpoint, Profile  # noqa: E402
 
 _GCP = json.dumps({"project": {"numericProjectId": 883220117, "projectId": "acme-prod"},
                    "serviceAccounts": {"default": {"email": "sa@acme-prod.iam.gserviceaccount.com"}}})

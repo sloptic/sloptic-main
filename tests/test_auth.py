@@ -1,7 +1,7 @@
 """Self-as-oracle auth helpers — pure functions, no server."""
 import httpx
 
-from hacklet_runner.auth import (
+from sloptic.auth import (
     _fill,
     _password_form,
     create_form,
@@ -10,7 +10,7 @@ from hacklet_runner.auth import (
     parse_set_cookies,
     session_cookie,
 )
-from hacklet_runner.schema import Form
+from sloptic.schema import Form
 
 # DVWA's /vulnerabilities/csrf/ — the form that locked the grader out: password_new/password_conf, no identity
 _DVWA_CSRF = Form(action="/vulnerabilities/csrf/", method="get", fields=["password_new", "password_conf", "Change"])
@@ -103,7 +103,7 @@ def test_is_csrf_field():
 
 
 # --- login forms recovered from INFERRED fields (anonymous SPA inputs -> [email, password]) -------
-from hacklet_runner.auth import login_form  # noqa: E402
+from sloptic.auth import login_form  # noqa: E402
 
 
 def test_inferred_email_password_is_a_detectable_login_not_a_change_form():
@@ -121,7 +121,7 @@ def test_password_only_inferred_form_is_withheld_as_change_form():
 
 
 # --- json-login discovery must not fire on a static SPA (the rate-limit false positive) -----------
-from hacklet_runner.auth import find_json_login  # noqa: E402
+from sloptic.auth import find_json_login  # noqa: E402
 
 
 def test_find_json_login_rejects_a_static_spa_shell():

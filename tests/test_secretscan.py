@@ -1,6 +1,6 @@
 """Static source secret scan — precision over recall (a false positive wrongly penalizes a submission)."""
-from hacklet_runner.pipeline import _source_secret_outcome
-from hacklet_runner.secretscan import scan_secrets
+from sloptic.pipeline import _source_secret_outcome
+from sloptic.secretscan import scan_secrets
 
 
 def _mk(root, files: dict):

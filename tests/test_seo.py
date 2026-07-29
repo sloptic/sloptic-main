@@ -6,7 +6,7 @@ import threading
 
 import pytest
 
-from hacklet_runner.probes import seo_meta_missing
+from sloptic.probes import seo_meta_missing
 
 VIEWPORT = '<meta name="viewport" content="width=device-width, initial-scale=1">'
 DESC = '<meta name="description" content="a page">'

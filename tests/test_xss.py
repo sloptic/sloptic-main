@@ -8,8 +8,8 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from hacklet_runner.probes import xss_injectable
-from hacklet_runner.schema import Endpoint, Form, Profile
+from sloptic.probes import xss_injectable
+from sloptic.schema import Endpoint, Form, Profile
 
 
 class _App(http.server.BaseHTTPRequestHandler):

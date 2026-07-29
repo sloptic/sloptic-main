@@ -22,10 +22,10 @@ import threading
 import urllib.parse
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from hacklet_runner.net import make_client  # noqa: E402
-from hacklet_runner.pipeline import _Ctx  # noqa: E402
-from hacklet_runner.probes import anon_bulk_data_exposed, backend_schema_disclosed  # noqa: E402
-from hacklet_runner.schema import Endpoint, Profile  # noqa: E402
+from sloptic.net import make_client  # noqa: E402
+from sloptic.pipeline import _Ctx  # noqa: E402
+from sloptic.probes import anon_bulk_data_exposed, backend_schema_disclosed  # noqa: E402
+from sloptic.schema import Endpoint, Profile  # noqa: E402
 
 _LEADS = [{"id": i, "company": "Acme", "contact_email": "a%d@x.test" % i, "amount_cents": 5000}
           for i in range(6)]

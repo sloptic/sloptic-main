@@ -31,8 +31,8 @@ import time
 import httpx
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from hacklet_runner.scope import off_target  # noqa: E402  (the ONE authoritative off-target deny-list)
-from hacklet_runner.jsonl import append_jsonl  # noqa: E402  (atomic, resumable append — shared w/ results writer)
+from sloptic.scope import off_target  # noqa: E402  (the ONE authoritative off-target deny-list)
+from sloptic.jsonl import append_jsonl  # noqa: E402  (atomic, resumable append — shared w/ results writer)
 
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
 _HACK_API = "https://devpost.com/api/hackathons"

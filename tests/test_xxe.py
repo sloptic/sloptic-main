@@ -7,8 +7,8 @@ import threading
 import httpx
 import pytest
 
-from hacklet_runner.probes import xxe
-from hacklet_runner.schema import Form, Profile
+from sloptic.probes import xxe
+from sloptic.schema import Form, Profile
 
 
 class _App(http.server.BaseHTTPRequestHandler):

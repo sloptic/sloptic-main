@@ -12,9 +12,9 @@ import shutil
 
 import pytest
 
-from hacklet_runner.catalog import load_catalog
-from hacklet_runner.deploy import DockerDeployer, SubprocessDeployer
-from hacklet_runner.pipeline import run
+from sloptic.catalog import load_catalog
+from sloptic.deploy import DockerDeployer, SubprocessDeployer
+from sloptic.pipeline import run
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 CATALOG = ROOT / "catalog"

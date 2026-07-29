@@ -5,7 +5,7 @@ How to add, change, and remove fuzz probes. The runner is a **fixed engine**; **
 code change — only a *new* detection primitive touches Python. Canonical design lives in
 [../FUZZ_RUNNER_SPEC.md](../FUZZ_RUNNER_SPEC.md); this is the practical recipe.
 
-The live lists of detection primitives are **`MATCHERS` and `PREDICATES` in `hacklet_runner/probes.py`**
+The live lists of detection primitives are **`MATCHERS` and `PREDICATES` in `sloptic/probes.py`**
 — that's the source of truth (this doc deliberately does not enumerate them, so it can't drift). Skim
 those dicts to see everything that exists today.
 

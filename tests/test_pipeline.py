@@ -7,9 +7,9 @@ crash-resistance category (diminishing returns).
 """
 import pathlib
 
-from hacklet_runner.catalog import load_catalog
-from hacklet_runner.deploy import SubprocessDeployer
-from hacklet_runner.pipeline import run
+from sloptic.catalog import load_catalog
+from sloptic.deploy import SubprocessDeployer
+from sloptic.pipeline import run
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 CATALOG = ROOT / "catalog"
@@ -126,7 +126,7 @@ def test_vulnerable_app_accrues_slop():
     assert o["qa-a11y-001"] == "not_applicable"
     # qa-deadctrl-001 (dead controls) is browser-gated too -> N/A here; fire/clean locked in test_browser:
     assert o["qa-deadctrl-001"] == "not_applicable"
-    from hacklet_runner.probes import PREDICATES
+    from sloptic.probes import PREDICATES
     assert "dead_controls_present" in PREDICATES   # its predicate is registered (offline registration lock)
     # sec-exposure-* find the served .env and .git files (.git config+HEAD share a variant group):
     exposure_hits = {x.target for x in report.outcomes
@@ -228,7 +228,7 @@ def test_cached_profile_freezes_surface_and_reproduces_score(monkeypatch):
     r1 = run(SubprocessDeployer(str(REFS / "vulnerable" / "app.py")), catalog, on_profile=minted.append)
     assert len(minted) == 1 and r1.slop_score == 649          # cache MISS -> discovered once + handed back
 
-    import hacklet_runner.pipeline as pipeline_mod            # PROVE the crawl is skipped on a cache HIT:
+    import sloptic.pipeline as pipeline_mod            # PROVE the crawl is skipped on a cache HIT:
     monkeypatch.setattr(pipeline_mod, "discover",             # discover() must never be called with a cached profile
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("discover ran on a cache hit")))
     seen = []
@@ -263,9 +263,9 @@ def test_a_predicate_can_override_its_penalty_absolutely(monkeypatch):
     # predicate sets evidence["penalty_override"] and the framework uses it as the absolute fire penalty,
     # bounded to [1, _PENALTY_CAP]. Locks that hook (which subsumes the old down-only scale).
     import httpx
-    from hacklet_runner.pipeline import _run_probe, _Ctx, _PENALTY_CAP
-    from hacklet_runner.schema import Probe, Profile
-    from hacklet_runner.probes import PREDICATES
+    from sloptic.pipeline import _run_probe, _Ctx, _PENALTY_CAP
+    from sloptic.schema import Probe, Profile
+    from sloptic.probes import PREDICATES
     prof = Profile(base_url="http://x")
     client = httpx.Client(base_url="http://x")
 

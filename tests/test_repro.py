@@ -5,7 +5,7 @@ import sys
 
 import httpx
 
-from hacklet_runner.probes import _repro, _repro_from_resp
+from sloptic.probes import _repro, _repro_from_resp
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
 from stats import _curl  # noqa: E402
@@ -49,9 +49,9 @@ def test_curl_is_pasteable_and_shell_escapes_the_payload_quote():
 
 
 def test_sqli_fire_records_a_replayable_repro():
-    from hacklet_runner.deploy import SubprocessDeployer
-    from hacklet_runner.discovery import discover
-    from hacklet_runner.probes import api_sqli
+    from sloptic.deploy import SubprocessDeployer
+    from sloptic.discovery import discover
+    from sloptic.probes import api_sqli
 
     d = SubprocessDeployer(str(pathlib.Path(__file__).resolve().parent.parent / "references" / "jsonapi" / "app.py"))
     url = d.deploy().base_url

@@ -24,8 +24,8 @@ import sys
 from collections import Counter, defaultdict
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from hacklet_runner.aggregate import CATEGORY_DECAY  # noqa: E402  (the ONE scoring decay — never re-declare)
-from hacklet_runner.catalog import load_catalog  # noqa: E402
+from sloptic.aggregate import CATEGORY_DECAY  # noqa: E402  (the ONE scoring decay — never re-declare)
+from sloptic.catalog import load_catalog  # noqa: E402
 
 
 def _unvalidated_probes(recs, min_penalty: int = 25) -> list:

@@ -7,8 +7,8 @@ import json
 import secrets
 import threading
 
-from hacklet_runner.auth import _has_session, register_account
-from hacklet_runner.schema import Form, Profile
+from sloptic.auth import _has_session, register_account
+from sloptic.schema import Form, Profile
 
 
 class _SpaAuth(http.server.BaseHTTPRequestHandler):

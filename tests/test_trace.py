@@ -6,8 +6,8 @@ import threading
 
 import pytest
 
-from hacklet_runner import net
-from hacklet_runner.net import make_client, set_trace_probe, start_trace
+from sloptic import net
+from sloptic.net import make_client, set_trace_probe, start_trace
 
 
 class _Echo(http.server.BaseHTTPRequestHandler):

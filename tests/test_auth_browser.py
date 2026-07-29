@@ -5,8 +5,8 @@ import socket
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from hacklet_runner.auth import _has_session, register_account, session_cookie  # noqa: E402
-from hacklet_runner.schema import Form, Profile  # noqa: E402
+from sloptic.auth import _has_session, register_account, session_cookie  # noqa: E402
+from sloptic.schema import Form, Profile  # noqa: E402
 
 
 def _dead_url():
@@ -51,8 +51,8 @@ def test_browser_fallback_ignored_when_only_a_non_session_cookie_is_set():
 def test_ctx_register_memoizes_the_browser_registration_per_identity():
     # the efficiency fix: the ~8 authed-surface probes that register the SAME identity share ONE browser
     # registration (browser reg is 20-40s); distinct suffixes stay distinct identities.
-    from hacklet_runner.net import make_client
-    from hacklet_runner.pipeline import _Ctx
+    from sloptic.net import make_client
+    from sloptic.pipeline import _Ctx
     calls = {"n": 0}
 
     def counting_browser_register(url):

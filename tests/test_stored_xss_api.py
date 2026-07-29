@@ -12,11 +12,11 @@ from urllib.parse import urlparse
 import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from hacklet_runner import browser  # noqa: E402
-from hacklet_runner.net import make_client  # noqa: E402
-from hacklet_runner.pipeline import _Ctx  # noqa: E402
-from hacklet_runner.probes import stored_xss_api  # noqa: E402
-from hacklet_runner.schema import Endpoint, Profile  # noqa: E402
+from sloptic import browser  # noqa: E402
+from sloptic.net import make_client  # noqa: E402
+from sloptic.pipeline import _Ctx  # noqa: E402
+from sloptic.probes import stored_xss_api  # noqa: E402
+from sloptic.schema import Endpoint, Profile  # noqa: E402
 
 
 def _make_app(vuln):

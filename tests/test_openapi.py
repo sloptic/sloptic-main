@@ -1,6 +1,6 @@
 """OpenAPI/Swagger spec parsing — pure, no network. Locks the surface a JSON API exposes so the
 declarative fan-out and injection probes get correct paths/params/body fields."""
-from hacklet_runner.openapi import parse_endpoints
+from sloptic.openapi import parse_endpoints
 
 
 def _by_key(eps, path, method):

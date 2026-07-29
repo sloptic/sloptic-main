@@ -7,8 +7,8 @@ import sys
 import httpx
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from hacklet_runner.auth import Account, _synthesize_response  # noqa: E402
-from hacklet_runner.probes import session_token_in_local_storage  # noqa: E402
+from sloptic.auth import Account, _synthesize_response  # noqa: E402
+from sloptic.probes import session_token_in_local_storage  # noqa: E402
 
 
 def _acct(*, bearer=None, cookies=None, storage_exposed=False):
@@ -60,7 +60,7 @@ def test_the_no_cookie_reason_distinguishes_token_auth_from_no_session_at_all():
 
     Reading the first as the second is what made the corpus's largest gap look two thirds smaller than it is.
     """
-    from hacklet_runner.probes import session_cookie_missing_flag
+    from sloptic.probes import session_cookie_missing_flag
 
     class _Flag:
         probe = {"flag": "httponly"}

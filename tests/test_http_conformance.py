@@ -5,7 +5,7 @@ import threading
 
 import pytest
 
-from hacklet_runner.probes import http_conformance
+from sloptic.probes import http_conformance
 
 
 def _handler(ctype):

@@ -23,9 +23,9 @@ from collections import Counter, defaultdict
 _ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 
-from hacklet_runner.aggregate import CATEGORY_DECAY, _damped_total  # noqa: E402
-from hacklet_runner.catalog import load_catalog  # noqa: E402
-from hacklet_runner.schema import Outcome  # noqa: E402
+from sloptic.aggregate import CATEGORY_DECAY, _damped_total  # noqa: E402
+from sloptic.catalog import load_catalog  # noqa: E402
+from sloptic.schema import Outcome  # noqa: E402
 
 
 def load(path):

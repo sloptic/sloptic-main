@@ -1,6 +1,6 @@
 """Aggregation dampers (format_spec §4.2 composition rules)."""
-from hacklet_runner.aggregate import compute_axis_slop, compute_slop_score, coverage_metrics
-from hacklet_runner.schema import Outcome
+from sloptic.aggregate import compute_axis_slop, compute_slop_score, coverage_metrics
+from sloptic.schema import Outcome
 
 
 def _o(pid, category, penalty, outcome="slop_detected", group=None, bundle="security"):

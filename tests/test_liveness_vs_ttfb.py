@@ -10,8 +10,8 @@ probe could run. The probe was structurally unreachable, and a DNF ranks BELOW e
 The corpus could never have surfaced this: perf probes fire on ~22% of it, so the axis looked healthy. It took
 a fixture with a guaranteed-slow route and an answer key.
 """
-from hacklet_runner import perf
-from hacklet_runner.deploy import _LIVENESS_READ_TIMEOUT
+from sloptic import perf
+from sloptic.deploy import _LIVENESS_READ_TIMEOUT
 
 
 def test_liveness_gate_outlasts_the_ttfb_ceiling():
@@ -41,7 +41,7 @@ def test_provenance_records_what_cannot_be_reconstructed_later():
     be off from coverage rates (it was on), --concurrency could not be checked at all, and a v10-vs-v11
     comparison had no way to know the runs used different machines, Pythons and Playwrights. Every other
     question about a corpus run can be re-measured from the same corpus; this one cannot."""
-    from hacklet_runner import perf, provenance
+    from sloptic import perf, provenance
 
     p = provenance.collect(flags={"browser_auth": True, "concurrency": "6"})
     assert p["run_id"] and p["run_id"] == provenance.run_id(), "run_id must be stable within a process"
@@ -55,7 +55,7 @@ def test_the_qa_and_perf_axes_get_their_engine_versions():
     machine; a11y comes out of axe-core, whose RULE SET changes between versions, and it is ~25% of total corpus
     penalty. Bump axe and a11y findings move with no app having changed — so a curve comparison without the
     version cannot tell an app that got worse from a rule that got stricter."""
-    from hacklet_runner import provenance
+    from sloptic import provenance
 
     v = provenance.collect()["versions"]
     assert v["axe_core"], "axe-core version missing — a11y findings become incomparable across runs"
@@ -73,7 +73,7 @@ def test_provenance_never_stores_a_credential():
     there would be doubly wrong."""
     import json
 
-    from hacklet_runner import provenance
+    from sloptic import provenance
 
     blob = json.dumps(provenance.collect(flags={
         "header_supplied": True, "login_supplied": True,

@@ -22,8 +22,8 @@ import threading
 import urllib.parse
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from hacklet_runner.discovery import _collection_token, _search_endpoints  # noqa: E402
-from hacklet_runner.schema import Endpoint  # noqa: E402
+from sloptic.discovery import _collection_token, _search_endpoints  # noqa: E402
+from sloptic.schema import Endpoint  # noqa: E402
 
 _ITEMS = [{"id": "p1", "name": "Artisan Sourdough Bread", "price": 5.49},
           {"id": "p2", "name": "Cold Brew Concentrate", "price": 9.99}]
@@ -189,7 +189,7 @@ def test_a_sub_path_app_is_not_invisible():
     collection and the whole feature was dead on any app not served at the origin. Measured on supavulnbase,
     whose /app/api/projects/search?q= is the location its manifest gives for the PostgREST injection finding.
     """
-    from hacklet_runner.discovery import _relative_to, _under
+    from sloptic.discovery import _relative_to, _under
     assert _relative_to("/app", "/app/api/projects") == "/api/projects"
     assert _relative_to("/", "/api/projects") == "/api/projects"
     # and a bundle literal is APP-relative, so verifying it at the origin 404s an endpoint that exists

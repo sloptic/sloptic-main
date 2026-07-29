@@ -1,6 +1,6 @@
 """Target scoping: a third-party link (reddit/discord/github/...) must never be graded or actively probed —
 the airtight guard that keeps the fuzzer from firing brute-force/injection at a real production site."""
-from hacklet_runner.scope import off_target
+from sloptic.scope import off_target
 
 
 def test_off_target_flags_third_party_links():

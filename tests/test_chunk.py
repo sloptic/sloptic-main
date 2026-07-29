@@ -8,10 +8,10 @@ import threading
 from urllib.parse import urlparse
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from hacklet_runner.net import make_client  # noqa: E402
-from hacklet_runner.pipeline import _Ctx  # noqa: E402
-from hacklet_runner.probes import dead_bundle_chunk  # noqa: E402
-from hacklet_runner.schema import Profile  # noqa: E402
+from sloptic.net import make_client  # noqa: E402
+from sloptic.pipeline import _Ctx  # noqa: E402
+from sloptic.probes import dead_bundle_chunk  # noqa: E402
+from sloptic.schema import Profile  # noqa: E402
 
 
 def _make_app(mode):   # dead | shell | ok | none

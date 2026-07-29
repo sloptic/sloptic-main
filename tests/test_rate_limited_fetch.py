@@ -17,9 +17,9 @@ import sys
 import threading
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from hacklet_runner.net import make_client  # noqa: E402
-from hacklet_runner.pipeline import _run_probe, _Ctx  # noqa: E402
-from hacklet_runner.schema import Probe, Profile  # noqa: E402
+from sloptic.net import make_client  # noqa: E402
+from sloptic.pipeline import _run_probe, _Ctx  # noqa: E402
+from sloptic.schema import Probe, Profile  # noqa: E402
 
 _SECRET = "sk-proj-A1" + "b" * 40      # matches secretscan's openai-key pattern
 

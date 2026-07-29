@@ -9,7 +9,7 @@ import threading
 from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from hacklet_runner.auth import login_with_credentials  # noqa: E402
+from sloptic.auth import login_with_credentials  # noqa: E402
 
 GOOD = ("demo@app.com", "s3cret")
 

@@ -10,8 +10,8 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from hacklet_runner.probes import api_sqli
-from hacklet_runner.schema import Endpoint, Profile
+from sloptic.probes import api_sqli
+from sloptic.schema import Endpoint, Profile
 
 _ROOT_SHELL = b"<html><body>root landing shell</body></html>"
 _API_SHELL = b"<html><body>api client-routed shell, distinct from root, same for every /api path</body></html>"

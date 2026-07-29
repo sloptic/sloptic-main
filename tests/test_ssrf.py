@@ -7,8 +7,8 @@ from urllib.parse import parse_qs, urlparse
 import httpx
 import pytest
 
-from hacklet_runner.probes import ssrf
-from hacklet_runner.schema import Endpoint, Profile
+from sloptic.probes import ssrf
+from sloptic.schema import Endpoint, Profile
 
 
 class _App(http.server.BaseHTTPRequestHandler):

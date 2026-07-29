@@ -9,9 +9,9 @@ import threading
 import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from hacklet_runner import browser  # noqa: E402
-from hacklet_runner.probes import no_error_state  # noqa: E402
-from hacklet_runner.schema import Profile  # noqa: E402
+from sloptic import browser  # noqa: E402
+from sloptic.probes import no_error_state  # noqa: E402
+from sloptic.schema import Profile  # noqa: E402
 
 # silent: on a failed save, do nothing (success-only handling); handled: paint a visible error
 _SILENT = "if (r.ok) { document.body.innerHTML += '<div>saved!</div>'; }"

@@ -6,12 +6,12 @@ import pathlib
 import httpx
 import pytest
 
-from hacklet_runner.catalog import load_catalog
-from hacklet_runner.deploy import SubprocessDeployer
-from hacklet_runner.discovery import discover
-from hacklet_runner.pipeline import run
-from hacklet_runner.probes import api_sqli, response_leaks_credentials
-from hacklet_runner.schema import Endpoint, Profile
+from sloptic.catalog import load_catalog
+from sloptic.deploy import SubprocessDeployer
+from sloptic.discovery import discover
+from sloptic.pipeline import run
+from sloptic.probes import api_sqli, response_leaks_credentials
+from sloptic.schema import Endpoint, Profile
 
 CATALOG = pathlib.Path(__file__).resolve().parent.parent / "catalog"
 
@@ -38,7 +38,7 @@ class _Ctx:
         self.evidence = {}
 
     def register(self, suffix=""):   # mirrors pipeline._Ctx.register (browser fallback off in unit tests)
-        from hacklet_runner import auth
+        from sloptic import auth
         return auth.register_account(self.base_url, self.profile, suffix=suffix)
 
 
@@ -70,8 +70,8 @@ def test_api_sqli_na_when_no_endpoints(jsonapi):
 
 
 def test_sqli_targets_folds_forms_and_common_params():
-    from hacklet_runner.probes import _COMMON_PARAMS, _sqli_targets
-    from hacklet_runner.schema import Form
+    from sloptic.probes import _COMMON_PARAMS, _sqli_targets
+    from sloptic.schema import Form
     prof = Profile(
         base_url="http://x",
         endpoints=[Endpoint(path="/api/search", method="get", raw_path="/api/search"),   # searchable, param-less
@@ -121,7 +121,7 @@ def test_time_advisory_needs_dose_scaling_not_bare_latency(monkeypatch):
     # scaling between SLEEP(d) and SLEEP(3d) -> no advisory; a real sleep that TRACKS the argument does.
     # Uses a fake clock so the test is fast + deterministic (no real sleeping).
     import re as _re
-    from hacklet_runner import probes
+    from sloptic import probes
     clock = {"t": 0.0}
     monkeypatch.setattr(probes.time, "perf_counter", lambda: clock["t"])
     reqfn = lambda v: v                                                        # the "request" IS the payload  # noqa: E731
@@ -141,7 +141,7 @@ def test_time_advisory_needs_dose_scaling_not_bare_latency(monkeypatch):
 def test_boolean_noise_floor_suppresses_content_reflective(monkeypatch):
     # the AI-app FP: two DIFFERENT benign values already diverge (an LLM/TTS/proxy varies output with input),
     # so the noise-floor gate must suppress BEFORE the true/false comparison -> no boolean fire.
-    from hacklet_runner import probes
+    from sloptic import probes
     monkeypatch.setattr(probes, "_do",
         lambda c, m, v: httpx.Response(200, text="x" * (500 if v == probes._SQLI_NOISE_B else 40)))
     assert probes._tech_boolean(None, "GET", lambda v: v) is False   # benign noise diverges -> confounded -> suppress
@@ -150,7 +150,7 @@ def test_boolean_noise_floor_suppresses_content_reflective(monkeypatch):
 def test_boolean_fires_on_stable_endpoint_with_true_false_split(monkeypatch):
     # a real SQL result set: benign values are stable, the always-TRUE payload opens the gate to a large
     # result while FALSE stays small, and the split reproduces -> boolean fires.
-    from hacklet_runner import probes
+    from sloptic import probes
     monkeypatch.setattr(probes, "_do",
         lambda c, m, v: httpx.Response(200, text="x" * (900 if v == probes._SQLI_TRUE else 40)))
     assert probes._tech_boolean(None, "GET", lambda v: v) is True
@@ -159,7 +159,7 @@ def test_boolean_fires_on_stable_endpoint_with_true_false_split(monkeypatch):
 def test_upstream_error_regex_matches_the_proxy_fp_bodies():
     # the two proxy FPs (the-angle NewsAPI 429, oversightusa OpenStates 504) must be suppressed by naming an
     # upstream vendor error; a real DB result must NOT match.
-    from hacklet_runner.probes import _UPSTREAM_ERROR
+    from sloptic.probes import _UPSTREAM_ERROR
     assert _UPSTREAM_ERROR.search("NewsAPI 429 — You have made too many requests recently")
     assert _UPSTREAM_ERROR.search("OpenStates API error: 504 - Gateway Time-out")
     assert not _UPSTREAM_ERROR.search('{"results": [{"id": 1, "name": "widget"}]}')
@@ -219,7 +219,7 @@ def test_data_exposure_probe_fires_on_leaky_endpoint():
 # --- API BOLA / horizontal IDOR (api_bola) ---
 
 def test_bola_pairs_matches_create_to_read():
-    from hacklet_runner.probes import _bola_pairs
+    from sloptic.probes import _bola_pairs
     eps = [
         Endpoint(path="/api/orders", method="post", body_fields=["item", "secret"], raw_path="/api/orders"),
         Endpoint(path="/api/orders/1", method="get", path_params=["id"], raw_path="/api/orders/{id}"),
@@ -250,20 +250,20 @@ def _orders_pair():
 
 
 def test_data_integrity_fires_on_non_durable_write(jsonapi):
-    from hacklet_runner.probes import data_integrity_roundtrip
+    from sloptic.probes import data_integrity_roundtrip
     ctx = _Ctx(jsonapi, Profile(base_url=jsonapi, endpoints=_drafts_pair()))
     assert data_integrity_roundtrip(ctx, _Probe()) is True   # POST 201 + id, but GET /api/drafts/{id} 404s
     assert ctx.evidence["read_status"] == 404 and ctx.evidence["durable"] is False
 
 
 def test_data_integrity_clean_on_durable_pair(jsonapi):
-    from hacklet_runner.probes import data_integrity_roundtrip
+    from sloptic.probes import data_integrity_roundtrip
     ctx = _Ctx(jsonapi, Profile(base_url=jsonapi, endpoints=_orders_pair()))
     assert data_integrity_roundtrip(ctx, _Probe()) is False  # /api/orders create round-trips correctly
 
 
 def test_data_integrity_na_when_no_create_read_pair(jsonapi):
-    from hacklet_runner.probes import data_integrity_roundtrip
+    from sloptic.probes import data_integrity_roundtrip
     ctx = _Ctx(jsonapi, Profile(base_url=jsonapi, endpoints=[]))
     assert data_integrity_roundtrip(ctx, _Probe()) is None
 
@@ -271,8 +271,8 @@ def test_data_integrity_na_when_no_create_read_pair(jsonapi):
 def test_api_bola_na_with_a_single_provided_session():
     # Option B guard: a --header session is ONE identity, so A and B are the SAME user — B "reading A's object"
     # would be a false BOLA. The pair is valid (secret field), so N/A here can only come from the provided guard.
-    from hacklet_runner.probes import api_bola
-    from hacklet_runner.auth import Account
+    from sloptic.probes import api_bola
+    from sloptic.auth import Account
 
     def _provided(suffix=""):
         return Account(username="p", password="", client=httpx.Client(base_url="http://x"),
@@ -292,13 +292,13 @@ def test_data_integrity_probe_fires_end_to_end():
 # --- content-type correctness (content_type_mismatch) ---
 
 def test_declared_type_contradiction_detects_json_as_html():
-    from hacklet_runner.probes import _declared_type_contradicted as m
+    from sloptic.probes import _declared_type_contradicted as m
     assert m("text/html; charset=utf-8", '{"ok": true}') == "json-body-served-as-text/html"
     assert m("application/json", "<!doctype html><html></html>") == "html-body-served-as-application/json"
 
 
 def test_declared_type_contradiction_no_false_positives():
-    from hacklet_runner.probes import _declared_type_contradicted as m
+    from sloptic.probes import _declared_type_contradicted as m
     assert m("application/json", '{"ok": true}') is None            # JSON as JSON
     assert m("text/html; charset=utf-8", "<!doctype html><p>hi") is None  # HTML as HTML
     assert m("text/plain", "just some plain text") is None          # plain text, no JSON/HTML shape
@@ -307,8 +307,8 @@ def test_declared_type_contradiction_no_false_positives():
 
 
 def test_content_type_mismatch_fires_on_mistyped_endpoint(jsonapi):
-    from hacklet_runner.net import make_client
-    from hacklet_runner.probes import content_type_mismatch
+    from sloptic.net import make_client
+    from sloptic.probes import content_type_mismatch
     ctx = _Ctx(jsonapi, Profile(base_url=jsonapi, endpoints=discover(jsonapi).endpoints))
     ctx.client = make_client(jsonapi, None, timeout=10.0, follow_redirects=True)
     assert content_type_mismatch(ctx, _CtypeProbe()) is True   # /api/mistyped: JSON body, text/html header
@@ -316,8 +316,8 @@ def test_content_type_mismatch_fires_on_mistyped_endpoint(jsonapi):
 
 
 def test_content_type_mismatch_clean_on_correctly_typed_endpoints(jsonapi):
-    from hacklet_runner.net import make_client
-    from hacklet_runner.probes import content_type_mismatch
+    from sloptic.net import make_client
+    from sloptic.probes import content_type_mismatch
     correct = [Endpoint(path="/api/notes", method="get", query_params=["q"], raw_path="/api/notes"),
                Endpoint(path="/api/dump", method="get", raw_path="/api/dump")]
     ctx = _Ctx(jsonapi, Profile(base_url=jsonapi, endpoints=correct))

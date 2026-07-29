@@ -304,7 +304,7 @@ def test_profile_cache_roundtrip_keyed_by_commit(tmp_path, monkeypatch):
     import subprocess
 
     import deploy_and_grade as dg
-    from hacklet_runner.schema import Endpoint, Form, Profile
+    from sloptic.schema import Endpoint, Form, Profile
     monkeypatch.setattr(dg, "_CACHE_DIR", tmp_path / "cache")
     repo = tmp_path / "repo"
     repo.mkdir()

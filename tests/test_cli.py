@@ -1,6 +1,6 @@
 """CLI output renderers — pure text builders, no server/Docker, so they run on the dev box."""
-from hacklet_runner.aggregate import compute_axis_slop, compute_slop_score, coverage_metrics
-from hacklet_runner.cli import (
+from sloptic.aggregate import compute_axis_slop, compute_slop_score, coverage_metrics
+from sloptic.cli import (
     _coverage_text,
     _failed_text,
     _fmt_evidence,
@@ -8,7 +8,7 @@ from hacklet_runner.cli import (
     _score_breakdown_text,
     _summary_text,
 )
-from hacklet_runner.schema import Outcome, Report
+from sloptic.schema import Outcome, Report
 
 
 def _report() -> Report:

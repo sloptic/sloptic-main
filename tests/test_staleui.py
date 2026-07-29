@@ -13,9 +13,9 @@ from urllib.parse import urlparse
 import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from hacklet_runner import browser  # noqa: E402
-from hacklet_runner.probes import stale_ui_after_create  # noqa: E402
-from hacklet_runner.schema import Form, Profile  # noqa: E402
+from sloptic import browser  # noqa: E402
+from sloptic.probes import stale_ui_after_create  # noqa: E402
+from sloptic.schema import Form, Profile  # noqa: E402
 
 
 class _P:

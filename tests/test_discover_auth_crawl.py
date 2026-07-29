@@ -5,7 +5,7 @@ import http.server
 import json
 import threading
 
-from hacklet_runner.discovery import discover
+from sloptic.discovery import discover
 
 
 class _SpaBehindLogin(http.server.BaseHTTPRequestHandler):

@@ -9,8 +9,8 @@ import zlib
 
 import pytest
 
-from hacklet_runner.probes import decompression_bomb
-from hacklet_runner.schema import Profile
+from sloptic.probes import decompression_bomb
+from sloptic.schema import Profile
 
 
 def _handler(mode):

@@ -1,6 +1,6 @@
 """SPA JS-bundle path mining — pure, no network. Locks the precision/recall of the API-path regex
 that makes a form-less SPA's backend (e.g. Juice Shop's /rest/*) visible to the probes."""
-from hacklet_runner.jsmine import mine_paths
+from sloptic.jsmine import mine_paths
 
 
 def test_mines_api_rest_graphql_versioned_paths():

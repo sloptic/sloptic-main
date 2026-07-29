@@ -9,11 +9,11 @@ import threading
 from urllib.parse import urlparse
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from hacklet_runner.net import make_client  # noqa: E402
-from hacklet_runner.pipeline import _Ctx  # noqa: E402
-from hacklet_runner.probes import bundle_leaks_secret, source_map_exposed  # noqa: E402
-from hacklet_runner.schema import Profile  # noqa: E402
-from hacklet_runner.secretscan import scan_blob  # noqa: E402
+from sloptic.net import make_client  # noqa: E402
+from sloptic.pipeline import _Ctx  # noqa: E402
+from sloptic.probes import bundle_leaks_secret, source_map_exposed  # noqa: E402
+from sloptic.schema import Profile  # noqa: E402
+from sloptic.secretscan import scan_blob  # noqa: E402
 
 # a realistic MINIFIED bundle: one long line, a leaked Stripe SECRET key, a sourceMappingURL comment
 _SECRET_BUNDLE = ('const cfg={api:"/api",debug:!1,k:"sk_live_' + "A" * 24

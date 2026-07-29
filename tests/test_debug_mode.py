@@ -7,9 +7,9 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from hacklet_runner.net import make_client
-from hacklet_runner.probes import _DEBUG_FINGERPRINT, debug_mode_enabled
-from hacklet_runner.schema import Profile
+from sloptic.net import make_client
+from sloptic.probes import _DEBUG_FINGERPRINT, debug_mode_enabled
+from sloptic.schema import Profile
 
 _WERKZEUG_CRASH = (b"<!DOCTYPE html><html><head><title>ValueError // Werkzeug Debugger</title></head>"
                    b"<body><h1>Werkzeug Debugger</h1><pre>Traceback (most recent call last)</pre></body></html>")

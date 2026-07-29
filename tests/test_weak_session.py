@@ -6,8 +6,8 @@ from urllib.parse import urlparse
 
 import pytest
 
-from hacklet_runner.probes import weak_session_id
-from hacklet_runner.schema import Profile
+from sloptic.probes import weak_session_id
+from sloptic.schema import Profile
 
 _N = {"c": 0}
 

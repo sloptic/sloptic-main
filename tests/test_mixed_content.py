@@ -9,7 +9,7 @@ import threading
 
 import pytest
 
-from hacklet_runner.probes import _http_subresources, mixed_content
+from sloptic.probes import _http_subresources, mixed_content
 
 BASE = "https://site.example/page"
 

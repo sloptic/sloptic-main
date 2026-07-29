@@ -15,12 +15,12 @@ import pathlib
 import sys
 
 _ROOT = pathlib.Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_ROOT))   # so `hacklet_runner` imports when run as scripts/list_probes.py
+sys.path.insert(0, str(_ROOT))   # so `sloptic` imports when run as scripts/list_probes.py
 
-from hacklet_runner.aggregate import compute_slop_score  # noqa: E402
-from hacklet_runner.catalog import load_catalog  # noqa: E402
-from hacklet_runner.probes import describe  # noqa: E402
-from hacklet_runner.schema import Outcome  # noqa: E402
+from sloptic.aggregate import compute_slop_score  # noqa: E402
+from sloptic.catalog import load_catalog  # noqa: E402
+from sloptic.probes import describe  # noqa: E402
+from sloptic.schema import Outcome  # noqa: E402
 
 
 def _check(p) -> str:
