@@ -392,16 +392,28 @@ def _bearer_token(resp: httpx.Response) -> str | None:
     return None
 
 
-def find_json_login(client: httpx.Client):
+def find_json_login(client: httpx.Client, root: str = ""):
     """Probe common JSON login endpoints with a wrong-creds body; return (path, creds, response) for
     the first that behaves like a REAL login, else (None, None, None). Lets the rate-limit probe reach
     JSON-API apps with no HTML login form — WITHOUT firing on a static SPA, whose catch-all serves the
     index.html shell (200 text/html) for any POST, which would look like an always-succeeding 'login'
     and produce a phantom no-rate-limit finding. So we require an auth-shaped answer to wrong creds:
-    an auth-failure status, or a JSON body — never a 2xx HTML shell (the SPA) or 404/405/501."""
+    an auth-failure status, or a JSON body — never a 2xx HTML shell (the SPA) or 404/405/501.
+
+    `root` is the APP's root path, and it matters because these candidates are GUESSED rather than
+    discovered. Resolved against the origin, a sub-path deployment gets its HOST probed instead of itself:
+    on GapBench every scenario lives at /site/<id>/, so all 104 hammered the same
+    gapbench.vibe-eval.com/rest/user/login and six clean controls each reported an identical "no rate
+    limiting" finding about the benchmark's own login, not the scenario under test. Sub-path rebasing is the
+    most repeated bug in this codebase and this is the form it takes when the path is invented by us rather
+    than read off the page. Empty root (the whole root-served corpus) is a no-op.
+
+    The returned path is the RESOLVED one, so a caller that keeps hammering it stays on the app."""
     creds = {"email": "hacklet_probe_rl@example.com", "username": "hacklet_probe_rl",
              "password": "hl-wrong-password"}
-    for path in _JSON_LOGIN_PATHS:
+    root = (root or "").rstrip("/")
+    for suffix in _JSON_LOGIN_PATHS:
+        path = root + suffix
         try:
             r = client.post(path, json=creds)
         except (httpx.HTTPError, httpx.InvalidURL):

@@ -3482,7 +3482,9 @@ def _login_rate_limit_json(ctx, probe) -> bool | None:
     login, /api/login, ...) and hammer it with wrong creds. N/A when no JSON login endpoint responds."""
     attempts = probe.probe.get("attempts", 10)
     with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=False) as c:
-        path, creds, first = auth.find_json_login(c)
+        # anchor the GUESSED login paths under the app, not the origin: on a sub-path deployment the
+        # origin belongs to the host (or another app), and a finding there is not about this submission.
+        path, creds, first = auth.find_json_login(c, root=_landing(ctx))
         if path is None:
             return None  # no login surface at all -> couldn't test
         if first.status_code in (429, 423):

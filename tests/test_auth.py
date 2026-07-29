@@ -137,3 +137,43 @@ def test_find_json_login_accepts_a_real_auth_failure():
         lambda req: httpx.Response(401, json={"error": "invalid credentials"})))
     path, _creds, r = find_json_login(c)
     assert path is not None and r.status_code == 401
+
+
+# --- a GUESSED login path must be anchored under the APP, never the origin -----------------------
+# Six of GapBench's seven clean controls each reported an identical "no rate limiting" finding, all of them
+# about gapbench.vibe-eval.com/rest/user/login — the benchmark HOST's login, not the scenario at /site/<id>/.
+# Sub-path rebasing, in the form it takes when the candidate path is invented by us rather than read off the
+# page: nothing in the response says which app it belongs to, so the finding looks perfectly legitimate.
+
+def _host_only_login():
+    """A host that serves a real login at the ORIGIN and nothing under /site/ref0/ — the GapBench shape."""
+    def handler(req):
+        if req.url.path.startswith("/site/"):
+            return httpx.Response(404)
+        return httpx.Response(401, json={"error": "invalid credentials"})
+    return httpx.Client(base_url="http://t", transport=httpx.MockTransport(handler))
+
+
+def test_a_sub_path_app_does_not_report_the_HOSTs_login():
+    """THE regression. The origin has a login, the app does not — the app must read as having no login
+    surface, not inherit its neighbour's."""
+    assert find_json_login(_host_only_login(), root="/site/ref0/") == (None, None, None)
+
+
+def test_the_origins_login_is_still_found_for_a_root_served_app():
+    """The whole normal corpus is root-served, where this must stay a no-op."""
+    path, _creds, r = find_json_login(_host_only_login(), root="")
+    assert path is not None and r.status_code == 401
+
+
+def test_the_resolved_path_is_returned_so_a_caller_keeps_hammering_the_APP():
+    seen = []
+
+    def handler(req):
+        seen.append(req.url.path)
+        return httpx.Response(401, json={"error": "nope"})
+
+    c = httpx.Client(base_url="http://t", transport=httpx.MockTransport(handler))
+    path, _creds, _r = find_json_login(c, root="/app/")
+    assert path.startswith("/app/"), path
+    assert all(p.startswith("/app/") for p in seen), seen
