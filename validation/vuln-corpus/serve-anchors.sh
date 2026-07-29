@@ -69,7 +69,7 @@ fi
 cat <<'EOF'
 
   poke around:  open the URLs above in a browser (all loopback-only).
-  calibrate (from the fuzz-runner ROOT dir):
+  calibrate (from the Sloptic ROOT dir):
       uv run python scripts/run_batch.py --urls validation/vuln-corpus/anchors.txt  --url-only --tldr \
           --results anchors-recall.jsonl  --limit 50
       uv run python scripts/run_batch.py --urls validation/vuln-corpus/gapbench.txt --url-only --tldr \

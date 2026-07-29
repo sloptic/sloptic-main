@@ -1,8 +1,8 @@
-# claude.md — the fuzz runner
+# claude.md — Sloptic
 
 Conventions and hard-won decisions for this project. This file governs everything at or below
-`fuzz-runner/`. The league's root `claude.md` governs the league; where they disagree about code in this
-directory, this file wins.
+this directory (Sloptic). The league's root `claude.md` governs the league; where they disagree about code
+in this directory, this file wins.
 
 Read `FUZZ_RUNNER_SPEC.md` for architecture and `format_spec.md` §4 for the scoring contract. This file is the
 *why*: the decisions that are expensive to rediscover, and the mistakes that are expensive to repeat.

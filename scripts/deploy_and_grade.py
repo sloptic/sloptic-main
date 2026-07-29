@@ -3,8 +3,8 @@
 
 Clone a repo, ask an LLM (via OpenRouter) HOW to deploy it — a Dockerfile, an optional DB sidecar, env,
 and a migrate step — then execute that plan on a throwaway docker network, iterating on build/run/health
-failures by feeding the error back to the LLM, and finally grade the running app with the fuzz-runner.
-The LLM ONLY figures out the deploy; the fuzzer does the grading.
+failures by feeding the error back to the LLM, and finally grade the running app with Sloptic.
+The LLM ONLY figures out the deploy; Sloptic does the grading.
 
     export OPENROUTER_API_KEY=sk-or-...
     # optional: export OPENROUTER_MODEL=...   (default qwen/qwen3.7-plus — cheap + a strong anti-hallucinator,

@@ -1,4 +1,4 @@
-# HackLet fuzz runner (Stage 5 vertical slice)
+# Sloptic
 
 Deploys a submission, probes it over HTTP, and emits a **slop score** (deduction-only, lower is
 better). This is the smallest end-to-end proof of the pipeline; the catalog and sandbox grow from

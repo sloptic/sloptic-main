@@ -1,4 +1,4 @@
-"""HackLet fuzz runner (Stage 5 vertical slice).
+"""Sloptic — a black-box HTTP resilience grader.
 
 Deploys a submission to a reachable HTTP base URL, discovers its surface, runs the
 applicable catalog probes, and sums per-probe penalties into a slop score. The deploy step
