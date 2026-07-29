@@ -918,6 +918,35 @@ def _eval_page(url, headers, timeout, js_list):
         return None
 
 
+def _contrast_data(violation) -> list:
+    """The measured contrast ratio and the ratio WCAG REQUIRED, per failing node.
+
+    Both are needed, not just the ratio: WCAG asks 4.5:1 of body text but only 3:1 of large text, so the
+    honest severity measure is the SHORTFALL (ratio / required). A 2.5:1 heading is a 0.83 shortfall while
+    2.5:1 body text is 0.56 — the same ratio, genuinely different harm, because larger glyphs stay legible
+    at lower contrast (which is exactly why WCAG relaxes the bar for them).
+
+    axe files the measurement under whichever check matched, so all three groups are searched. Nodes whose
+    background axe could not resolve carry no contrastRatio and are skipped rather than guessed at."""
+    out = []
+    for node in violation.get("nodes") or []:
+        for group in ("any", "all", "none"):
+            for chk in node.get(group) or []:
+                data = chk.get("data") or {}
+                ratio = data.get("contrastRatio")
+                if not isinstance(ratio, (int, float)):
+                    continue
+                req = data.get("expectedContrastRatio")   # "4.5:1"
+                if isinstance(req, str):
+                    try:
+                        req = float(req.split(":")[0])
+                    except ValueError:
+                        req = None
+                out.append({"ratio": round(float(ratio), 2),
+                            "required": float(req) if isinstance(req, (int, float)) else None})
+    return out
+
+
 def a11y_violations(url: str, headers=None, timeout: float = 12.0) -> list | None:
     """Render url, inject axe-core, and return its WCAG 2 A/AA violations as [{id, impact}] — the
     gold-standard deterministic a11y ruleset (~100 rules incl. contrast, ARIA, structure). None if no
@@ -942,7 +971,16 @@ def a11y_violations(url: str, headers=None, timeout: float = 12.0) -> list | Non
                 page.add_script_tag(content=_axe_js())            # defines window.axe
                 results = page.evaluate(
                     "() => axe.run(document, {runOnly: {type: 'tag', values: %s}})" % json.dumps(_AXE_WCAG_TAGS))
-                return [{"id": v["id"], "impact": v.get("impact")} for v in results.get("violations", [])]
+                out = []
+                for v in results.get("violations", []):
+                    rec = {"id": v["id"], "impact": v.get("impact")}
+                    if v["id"] == "color-contrast":
+                        # axe fixes this rule's impact at "serious" regardless of HOW unreadable the text is,
+                        # so 4.4:1 (a hair under AA) and 1.1:1 (effectively invisible) arrive identical. Keep
+                        # the measured ratios so severity can be graded downstream instead of flattened.
+                        rec["contrast"] = _contrast_data(v)
+                    out.append(rec)
+                return out
             finally:
                 b.close()
     except Exception:

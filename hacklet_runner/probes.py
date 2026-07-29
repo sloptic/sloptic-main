@@ -3938,10 +3938,52 @@ def _a11y_penalty(impacts: dict) -> int:
     contrast miss blocks low-vision, a missing label blocks screen-readers), just with decreasing MARGINAL
     harm — the 6th barrier adds less new exclusion than the 1st (populations overlap; the app is already
     largely unusable). `impacts` counts RULES not nodes (a systematic issue across 50 buttons is one barrier).
-    Tiers (critical 30 > serious 18 > moderate 10 > minor 4) aim weight at exclusion over cosmetics."""
+    Tiers aim weight at exclusion over cosmetics; the live values are _A11Y_TIER (currently critical 20 >
+    serious 12 > moderate 7 > minor 3) — read them there rather than here, because this sentence spelled out
+    the PRE-re-price 30/18/10/4 for as long as it took someone to notice."""
     tiers = sorted((_A11Y_TIER.get(level, _A11Y_TIER["minor"])
                     for level, n in impacts.items() for _ in range(n)), reverse=True)
     return round(sum(v * (_A11Y_DECAY ** i) for i, v in enumerate(tiers)))
+
+
+_CONTRAST_BANDS = ((0.30, "critical"), (0.50, "serious"), (0.75, "moderate"), (1.01, "minor"))
+
+
+def _contrast_level(contrast: list):
+    """Grade a color-contrast violation by HOW unreadable it is -> (level, worst_shortfall).
+
+    axe fixes this rule's impact at "serious" however bad the text is, so 4.4:1 (a hair under the bar) and
+    1.1:1 (invisible) arrive identical and are charged identically. That is the largest single flattening in
+    the score: color-contrast fires on 55.1% of the corpus and is involved in 14.3% of ALL penalty.
+
+    The measure is SHORTFALL = measured / required, not the raw ratio, because WCAG asks 4.5:1 of body text
+    but only 3:1 of large text. The same ratio is a different failure at a different size — which is the
+    whole reason WCAG relaxes the bar for large glyphs, and #949494 on white demonstrates it: 3.03:1, a
+    violation as body text, not a violation as a heading.
+
+    Bands are anchored to WCAG first, then CHECKED against the corpus (60 apps that fired the rule, 347
+    failing nodes) rather than fitted to it:
+      >= 0.75  minor     body text at >= 3.4:1, which CLEARS the 3:1 large-text bar — readable, and failing
+                         only the stricter rule that applies at its size          (33.9% of sampled apps)
+      >= 0.50  moderate  below both bars, still perceptible                                       (44.1%)
+      >= 0.30  serious   substantially unreadable                                                 (18.6%)
+      <  0.30  critical  under a third of the required ratio; effectively invisible                (3.4%)
+
+    Graded on the WORST node, consistent with the rest of a11y (one unlabeled button is a whole barrier, not
+    a fraction of one) and safe here because we ingest axe's `violations` only: a node whose background axe
+    could not resolve is filed `incomplete` and never reaches us. That excludes the classic contrast false
+    positives — text over images, gradients, unresolved alpha — by construction rather than by heuristic.
+
+    None when no node carried a usable ratio, which leaves axe's own impact in place rather than guessing."""
+    shortfalls = [c["ratio"] / c["required"] for c in contrast
+                  if c.get("required") and isinstance(c.get("ratio"), (int, float))]
+    if not shortfalls:
+        return None
+    worst = min(shortfalls)
+    for cut, level in _CONTRAST_BANDS:
+        if worst < cut:
+            return level, worst
+    return "minor", worst
 
 
 def a11y_violations_present(ctx, probe) -> bool:
@@ -3955,10 +3997,18 @@ def a11y_violations_present(ctx, probe) -> bool:
     if viols is None:
         return False
     impacts: dict[str, int] = {}
+    worst_shortfall = None
     for v in viols:
-        impacts[v.get("impact")] = impacts.get(v.get("impact"), 0) + 1
+        level = v.get("impact")
+        if v["id"] == "color-contrast":
+            graded = _contrast_level(v.get("contrast") or [])
+            if graded:
+                level, worst_shortfall = graded
+        impacts[level] = impacts.get(level, 0) + 1
     ctx.evidence.update(violations=len(viols), rules=sorted({v["id"] for v in viols})[:15],
                         impacts=impacts, engine="axe-core", penalty_override=_a11y_penalty(impacts))
+    if worst_shortfall is not None:
+        ctx.evidence["contrast_shortfall"] = round(worst_shortfall, 2)
     return len(viols) > probe.probe.get("threshold", 0)
 
 
