@@ -85,10 +85,20 @@ def _account(sub, canary, backend, reads=True):
                    backend_reads=br)
 
 
-def _ctx(backend):
-    accts = {"_a": _account("1", A_CANARY, backend), "_b": _account("2", B_CANARY, backend, reads=False)}
+_LANE_ON = object()   # a non-None browser_register: deploy_and_grade sets one only under --browser-auth
+
+
+def _ctx(backend, *, a_reads=True, canary=A_CANARY, a_auth=True, b_auth=True, browser_register=_LANE_ON):
+    a = _account("1", canary, backend, reads=a_reads)
+    b = _account("2", B_CANARY, backend, reads=False)
+    if not a_auth:
+        a.client.headers.pop("Authorization", None)
+    if not b_auth:
+        b.client.headers.pop("Authorization", None)
+    accts = {"_a": a, "_b": b}
     return type("C", (), {"register": lambda self, suffix="": accts[suffix],
-                          "evidence": {}, "base_url": "http://x"})()
+                          "evidence": {}, "base_url": "http://x",
+                          "browser_register": browser_register})()
 
 
 def _run(mode):
@@ -109,3 +119,53 @@ def test_clean_when_rls_scopes_to_owner():
 
 def test_na_when_world_readable():
     assert _run("public") is None          # apikey alone returns the row -> exposure finding, not per-user IDOR
+
+
+# ---------------------------------------------------------------- N/A reasons must name the ACTUAL cause
+# One message used to cover four causes and named only the first, blaming --browser-auth unconditionally. v12
+# recorded it on 273 apps whose provenance says browser_auth was ON, i.e. it told the reader to enable a flag
+# they had already enabled. Each cause points at a different next action, so each gets its own reason.
+
+def _na(**kw):
+    srv = _serve("scoped")
+    try:
+        ctx = _ctx("http://127.0.0.1:%d" % srv.server_address[1], **kw)
+        return bola_managed_backend(ctx, _Probe()), dict(ctx.evidence)
+    finally:
+        srv.shutdown()
+
+
+def test_no_reads_and_lane_OFF_names_the_flag():
+    verdict, ev = _na(a_reads=False, browser_register=None)
+    assert verdict is None
+    assert "not enabled" in ev["na_reason"] and "--browser-auth" in ev["na_reason"]
+
+
+def test_no_reads_but_lane_ON_must_NOT_blame_the_flag():
+    """THE REGRESSION. The lane ran; telling the reader to switch it on is a dead end."""
+    verdict, ev = _na(a_reads=False)
+    assert verdict is None
+    assert "--browser-auth" not in ev["na_reason"], ev["na_reason"]
+    assert "observed no Supabase" in ev["na_reason"]
+
+
+def test_reads_without_a_per_user_jwt_says_so():
+    """A cookie/session app: the reads exist, but there is no second identity to replay them AS."""
+    verdict, ev = _na(b_auth=False)
+    assert verdict is None
+    assert "no per-user bearer JWT for account B" in ev["na_reason"]
+
+
+def test_reads_without_a_canary_says_the_oracle_is_missing():
+    verdict, ev = _na(canary="")
+    assert verdict is None
+    assert "no unique username" in ev["na_reason"] and "oracle" in ev["na_reason"]
+
+
+def test_the_four_causes_produce_four_DISTINCT_reasons():
+    """The point of the fix: an aggregate over a corpus must be able to tell them apart."""
+    reasons = {_na(a_reads=False, browser_register=None)[1]["na_reason"],
+               _na(a_reads=False)[1]["na_reason"],
+               _na(b_auth=False)[1]["na_reason"],
+               _na(canary="")[1]["na_reason"]}
+    assert len(reasons) == 4, reasons

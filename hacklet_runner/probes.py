@@ -1974,8 +1974,11 @@ def bola_managed_backend(ctx, probe) -> bool | None:
 
     Fire when a read that returns A's record for A — and is NOT anon/world-readable (apikey alone; that's the
     separate sec-exposure finding) — ALSO returns A's record for B: a second user reads A's private row -> RLS
-    is per-user broken. A's unique registration username is the oracle. N/A when no backend reads were observed
-    (no --browser-auth, or a same-origin/cookie app) or two distinct accounts can't be established."""
+    is per-user broken. A's unique registration username is the oracle. N/A — each with its OWN reason, because
+    they point at different next actions — when the browser-auth capture lane never ran, when it ran and saw no
+    /rest/v1 reads (not a managed-backend app), when there is no per-user JWT to replay the read AS (a
+    cookie/session app), when registration yielded no canary to attribute a row to, or when two distinct
+    accounts can't be established."""
     a, b = _two_accounts(ctx)
     if a is None:
         return None
@@ -1984,8 +1987,31 @@ def bola_managed_backend(ctx, probe) -> bool | None:
         a_auth = a.client.headers.get("Authorization")
         b_auth = b.client.headers.get("Authorization")
         reads = getattr(a, "backend_reads", None) or []
-        if not reads or not canary or not a_auth or not b_auth:
-            ctx.evidence["na_reason"] = "no managed-backend (Supabase) reads captured to replay (needs --browser-auth)"
+        # FOUR DISTINCT CAUSES, not one message naming only the first. The old reason blamed --browser-auth
+        # unconditionally, and v12 recorded it on 273 apps whose own provenance row says browser_auth was ON:
+        # it told the reader to enable a flag they had already enabled, which is a dead end and the same family
+        # as db1ca28 (a reason claiming coverage it lacks). deploy_and_grade sets browser_register only when
+        # --browser-auth is passed, so the probe can distinguish "lane never ran" from "lane ran and saw
+        # nothing" instead of guessing — and those two point at completely different next actions.
+        if not reads:
+            if getattr(ctx, "browser_register", None) is None:
+                ctx.evidence["na_reason"] = ("no managed-backend (Supabase) reads to replay: the browser-auth "
+                                             "capture lane was not enabled (--browser-auth)")
+            else:
+                ctx.evidence["na_reason"] = ("browser-auth ran but observed no Supabase /rest/v1 reads to "
+                                             "replay — not a managed-backend app, or its reads happen outside "
+                                             "the captured lane" + _browser_lane_detail())
+            return None
+        if not canary:
+            ctx.evidence["na_reason"] = ("Supabase reads captured, but registration yielded no unique username "
+                                         "to use as the cross-user oracle — a replayed row can't be attributed "
+                                         "to A, so a cross-read can't be PROVEN")
+            return None
+        if not a_auth or not b_auth:
+            who = ("both accounts" if not a_auth and not b_auth else "account A" if not a_auth else "account B")
+            ctx.evidence["na_reason"] = ("Supabase reads captured, but no per-user bearer JWT for %s — a "
+                                         "cookie/session app, so there is no second identity to replay the "
+                                         "read AS" % who)
             return None
         tested = False
         with httpx.Client(timeout=10.0, follow_redirects=True) as c:
