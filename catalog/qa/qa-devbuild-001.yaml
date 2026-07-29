@@ -1,0 +1,47 @@
+id: qa-devbuild-001
+bundle: qa
+category: deployment-hygiene
+pool: public
+evidence_model: provable
+penalty: 15   # frequency(rare in a CDN-deployed corpus, EXPECTED where the player writes their own Dockerfile)
+              # x severity(moderate — the app works, but it is the wrong artifact: unminified, unbundled,
+              # debug tooling live, and a dev server is explicitly not a production server) x fix(trivial —
+              # one line of the start command). Sits with the soft-404 / broken-link hygiene tier rather than
+              # the qa-chunk-001 hard-fail tier (30), because the app DOES render.
+# NO applicability block, deliberately — the predicate self-N/As, exactly like qa-chunk-001. Gating on
+# `at_least_one_http_endpoint_exists` was the first attempt and it SILENTLY DISABLED the probe: that capability
+# means discovered API endpoints, and a dev-server SPA has none, so a real Vite dev server graded clean while
+# the predicate itself returned True when called directly. The unit tests passed and the direct call passed;
+# only an end-to-end grade against a live dev server exposed it.
+probe:
+  predicate: development_build_served
+  target: /   # routed through _home_path -> the discovered landing page, so a sub-path deployment is graded
+              # at the page the app serves rather than the origin-root not-found shell
+  #
+  # WHY THE HMR CLIENT IS CATEGORICAL, not a heuristic. Hot Module Replacement exists to swap one module while
+  # a developer edits files: the dev server injects a client that holds a WebSocket open and waits for pushes.
+  # It is meaningless in a deployment (nobody is editing; the socket retries forever) and INCOMPATIBLE with a
+  # production build, because HMR needs modules kept separate and addressable while bundling fuses, tree-shakes
+  # and mangles them. Bundlers strip the dev branches statically — Vite replaces `import.meta.hot`, webpack
+  # `module.hot` — so these markers cannot survive a production build even when the guard is in source.
+  # Presence therefore PROVES the artifact was produced in dev mode. There is no legitimate deployed app that
+  # ships one, so the intent-independence litmus passes without a gate.
+  #
+  # SCOPE IS DELIBERATELY NARROW. Source maps are a dev-build tell and are NOT a signal here: sec-exposure-006
+  # already prices a served .map at 15 in the security bundle, and charging the same file twice for one root
+  # cause is the double-count that variant groups exist to prevent. Likewise this is QA, not PERFORMANCE — a
+  # dev build is unminified and unbundled, so perf-weight-001 already prices the size and perf-cwv-* the render
+  # cost. The residual claim is neither "slow" nor "readable" but "you shipped the wrong artifact".
+  #
+  # PRECISION: matched in SCRIPT CONTEXT ONLY (a <script src>, or the runtime markers inside fetched
+  # same-origin JavaScript), never against raw page text — a tutorial or write-up that merely mentions
+  # `/@vite/client` in a code block would otherwise fire, and hackathon submissions are full of write-ups.
+  # The header signature is recorded as corroboration and never fires alone: `vite`, `webpack-dev-server` and
+  # `werkzeug` all appear on production stacks too.
+  #
+  # EXPECT ~ZERO ON THE DEVPOST CORPUS, and do not read that as failure. 61.5% of that corpus is deployed on
+  # Vercel/Netlify/Pages, where the platform runs the production build for you — the defect is structurally
+  # impossible there, and a 260-app sample found no HMR client anywhere. The population this probe is FOR is
+  # HackLet, where FUZZ_RUNNER_SPEC's deployment contract puts the Dockerfile "fully in the player's hands"
+  # and `CMD ["npm", "run", "dev"]` is the path of least resistance under a 24-minute clock. Judge it against
+  # a synthetic dev-server reference, never against corpus fire rate — that is the trap perf-ttfb-003 fell into.

@@ -888,6 +888,107 @@ def back_nav_broken(ctx, probe) -> bool | None:
 _SCRIPT_SRC = re.compile(r"""<script\b[^>]*\bsrc=["']([^"']+)["']""", re.I)
 
 
+# DEVELOPMENT BUILD SHIPPED TO PRODUCTION — the HMR client is the categorical tell.
+#
+# Hot Module Replacement exists to swap one module while a developer edits files: the dev server injects a
+# client that holds a WebSocket open and waits for pushes. It is meaningless in a deployment — nobody is
+# editing, the socket retries forever against a server that will never speak — and it is INCOMPATIBLE with a
+# production build, because HMR needs modules kept separate and addressable while bundling fuses, tree-shakes
+# and mangles them. Bundlers therefore strip the dev branches statically (Vite replaces `import.meta.hot`,
+# webpack `module.hot`), so these markers CANNOT survive a production build even when the guard is in source.
+# That is what makes this categorical rather than heuristic: presence proves the artifact was produced in dev
+# mode. No legitimate deployed app ships one.
+#
+# SCOPE, deliberately narrow (option (a)): source maps are NOT a signal here even though they are a dev-build
+# tell, because sec-exposure-006 already prices a served .map at 15 in the security bundle and its claim (your
+# source is reconstructable) is the right one. Charging the same .map twice for one root cause is exactly the
+# double-count variant groups exist to prevent. This probe also lives in QA rather than PERFORMANCE for the
+# same reason: a dev build is unminified and unbundled, so perf-weight-001 already prices the size and
+# perf-cwv-* the render cost. The residual claim left to make is neither "slow" nor "readable" but "you
+# shipped the wrong artifact", which is deployment hygiene.
+_HMR_CLIENT_SRC = re.compile(r"/@vite/client|/@react-refresh|sockjs-node|webpack-dev-server"
+                             r"|webpack/hot/|__webpack_hmr|react-refresh/runtime", re.I)
+# Runtime markers that only the dev transform emits, matched inside FETCHED JAVASCRIPT (never raw page text —
+# see below).
+_HMR_RUNTIME = re.compile(r"\$RefreshReg\$|\$RefreshSig\$|__vite_ping|vite:beforeUpdate"
+                          r"|__webpack_hmr|webpackHotUpdate", re.I)
+# Corroboration only, never a fire on its own: dev servers are chatty in ways prod builds usually are not, but
+# every one of these appears on plenty of production stacks too.
+_DEV_HEADER = re.compile(r"webpack-dev-server|vite|next\.js dev|werkzeug|flask development", re.I)
+
+
+def development_build_served(ctx, probe) -> bool | None:
+    """The deployment is running a DEV BUILD: an HMR client is being served. Categorical — bundlers strip HMR
+    statically, so it cannot survive a production build. Header signature is recorded as corroboration but
+    never fires alone. N/A when the landing page serves no same-origin script to inspect.
+
+    PRECISION: matched in SCRIPT CONTEXT ONLY — a <script src> pointing at an HMR client path, or the runtime
+    markers inside fetched same-origin JavaScript. Deliberately NOT matched against raw page text, because a
+    tutorial, changelog or docs page that merely MENTIONS `/@vite/client` in a code block would otherwise fire.
+    That is the obvious false-positive vector for a string-matching probe and hackathon submissions include
+    plenty of project write-ups."""
+    path = _home_path(ctx, probe)
+    host = urllib.parse.urlparse(ctx.base_url).netloc
+    with make_client(ctx.base_url, ctx.headers, timeout=10.0, follow_redirects=True) as c:
+        try:
+            r = c.get(path)
+        except (httpx.HTTPError, httpx.InvalidURL):
+            ctx.evidence["na_reason"] = "landing page could not be fetched"
+            return None
+        html = r.text
+        hdr = " ".join("%s: %s" % (k, v) for k, v in r.headers.items()
+                       if k.lower() in ("server", "x-powered-by"))
+        dev_header = bool(_DEV_HEADER.search(hdr))
+        srcs = [s.strip() for s in _SCRIPT_SRC.findall(html)]
+        if not srcs:
+            ctx.evidence["na_reason"] = "landing page references no script to inspect"
+            return None
+        # 1) the dev client requested BY NAME in a script tag -> categorical, no fetch needed.
+        # SAME-ORIGIN ONLY, same rule as the bundle check below: a CDN-hosted react-refresh belongs to
+        # whoever runs the CDN, and firing on it would attribute someone else's script to this submission.
+        # (Caught by this probe's own precision test, which fired on an esm.sh-style URL.)
+        for s in srcs:
+            su = urllib.parse.urlparse(urllib.parse.urljoin(ctx.base_url.rstrip("/") + path, s))
+            if su.netloc and su.netloc != host:
+                continue
+            if _HMR_CLIENT_SRC.search(s):
+                ctx.evidence.update(dev_build=True, signal="hmr-client-script", script=s[:120],
+                                    dev_header=dev_header, header=hdr[:120],
+                                    repro=_repro_from_resp(r, matched="served HTML requests the HMR client %s"
+                                                                     % s[:60]))
+                return True
+        # 2) else look for the dev-only transform markers INSIDE the app's own JavaScript
+        checked = 0
+        for s in srcs[:12]:
+            pu = urllib.parse.urlparse(urllib.parse.urljoin(ctx.base_url.rstrip("/") + path, s))
+            if pu.netloc and pu.netloc != host:
+                continue                                   # a CDN/vendor script is not the app's build
+            try:
+                # KEEP THE QUERY. `?v=<hash>` is not decoration on a dev server — Vite serves pre-bundled deps
+                # as /node_modules/.vite/deps/react.js?v=1a2b3c and cache-busted prod assets use the same shape.
+                # Fetching the bare path can 404 (leaving `checked` at 0, so the probe reports N/A instead of
+                # inspecting the bundle) or return a DIFFERENT artifact than the page actually loaded. Same bug
+                # already fixed once in _page_weight, where dropping the query deduped distinct assets into one.
+                js = c.get(pu.path + ("?" + pu.query if pu.query else ""))
+            except (httpx.HTTPError, httpx.InvalidURL):
+                continue
+            if "javascript" not in (js.headers.get("content-type", "") or "").lower():
+                continue                                   # an SPA shell served where JS should be
+            checked += 1
+            m = _HMR_RUNTIME.search(js.text[:400_000])
+            if m:
+                ctx.evidence.update(dev_build=True, signal="hmr-runtime-in-bundle", marker=m.group(0),
+                                    script=pu.path[:120], dev_header=dev_header, header=hdr[:120],
+                                    repro=_repro_from_resp(js, matched="app bundle carries the dev-only HMR "
+                                                                       "runtime marker %s" % m.group(0)))
+                return True
+        if not checked:
+            ctx.evidence["na_reason"] = "no same-origin JavaScript could be inspected"
+            return None
+        ctx.evidence.update(dev_build=False, scripts_checked=checked, dev_header=dev_header)
+        return False
+
+
 def dead_bundle_chunk(ctx, probe) -> bool | None:
     """Stale/dead bundle chunk (UI-state honesty, a hard-fail): the served HTML references a JS bundle URL
     that no longer resolves — cached HTML pointing at a PREVIOUS deploy's bundle hash — so the app literally
@@ -5012,6 +5113,7 @@ PREDICATES = {
     "stored_xss_api": stored_xss_api,
     "back_nav_broken": back_nav_broken,
     "dead_bundle_chunk": dead_bundle_chunk,
+    "development_build_served": development_build_served,
     "deep_link_shell": deep_link_shell,
     "no_error_state": no_error_state,
     "weak_session_id": weak_session_id,
@@ -5104,6 +5206,7 @@ _PREDICATE_REASONS = {
     "middleware_auth_bypass": "a protected route is reachable with no credentials via the Next.js x-middleware-subrequest header (auth bypass, CVE-2025-29927)",
     "back_nav_broken": "the browser back button did not return to the prior in-app view (broken SPA history handling)",
     "dead_bundle_chunk": "the served HTML references a JS bundle that doesn't resolve — the app can't render (stale/dead chunk)",
+    "development_build_served": "a development build was deployed — the served page requests an HMR client, which no production build can emit",
     "deep_link_shell": "a client-side route loaded directly renders only the app shell/fallback, not its content (broken deep link)",
     "no_error_state": "a save/create action failed but the app showed no error — silent data loss (the UI told the user nothing)",
     "weak_session_id": "session identifiers are weak/predictable (short / numeric / sequential)",

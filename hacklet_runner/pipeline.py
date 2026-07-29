@@ -143,9 +143,16 @@ def _run_probe(probe: Probe, ctx: _Ctx, client: httpx.Client, profile: Profile) 
     if not _applicable(probe, profile):
         return [_outcome(probe, "not_applicable", 0, target)]
     if "predicate" in probe.probe:
+        # RESOLVED OUTSIDE THE GUARD BELOW, deliberately. A name the registry doesn't know is OUR bug — a
+        # catalog/probes mismatch — not something the target did, and it must not be laundered into an N/A
+        # that reads as "this app had no surface". qa-devbuild-001 shipped unregistered and graded a live
+        # Vite dev server clean: the KeyError landed in the except, so the probe reported not_applicable with
+        # no reason while its unit tests (which import the function directly) all passed. test_catalog_integrity
+        # now fails at CI time instead; this line makes it loud at run time if it ever gets that far.
+        fn = PREDICATES[probe.probe["predicate"]]
         ctx.evidence = {}   # fresh per probe; the predicate may fill it with what it measured/attempted
         try:
-            slop = PREDICATES[probe.probe["predicate"]](ctx, probe)
+            slop = fn(ctx, probe)
         except Exception:
             # a predicate drives an UNTRUSTED target; a hostile/edge-case response must degrade this
             # one probe to N/A, never crash the whole grade (run must not DNF). Calibration is the
