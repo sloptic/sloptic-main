@@ -1,93 +1,119 @@
 # Sloptic
 
-Deploys a submission, probes it over HTTP, and emits a **slop score** (deduction-only, lower is
-better). This is the smallest end-to-end proof of the pipeline; the catalog and sandbox grow from
-here. Canonical design: [../FUZZ_RUNNER_SPEC.md](../FUZZ_RUNNER_SPEC.md).
+A **black-box HTTP resilience grader**. Point it at a running web app — a live URL, a repo it
+deploys, or a submitted `Dockerfile` — and it probes the app over HTTP and emits a **slop score**:
+deduction-only, unbounded, lower is better, `0` = nothing found. It never reads your source.
 
-## What the slice proves
-
-`deploy → discover → applicability → execute → aggregate → report`, against two reference apps
-with the same surface: a **vulnerable** one (accrues slop) and a **hardened** one (clean). Three
-probes, one per bundle:
-
-- `sec-sqli-001` — SQL injection via a boolean/auth-bypass **oracle** (security)
-- `qa-errhyg-001` — leaked stack trace, a **declarative** matcher (qa)
-- `perf-ttfb-001` — TTFB speed gate ≥ 3s (performance)
-
-## Run it
+The name is for **AI slop**. Sloptic grades the *observable* consequences of slop — the failures
+that are wrong no matter what the app is for — not the code that produced them.
 
 ```sh
-uv run pytest -q                                          # the three-way calibration suite
-uv run python -m sloptic.cli --app references/vulnerable/app.py   # prints a slop report
-uv run python -m sloptic.cli --app references/hardened/app.py     # slop_score 0
+uv run python -m sloptic.cli --target https://your-app.example.com
 ```
 
-## Engaging the runner (a submission)
+## What it grades
 
-Submissions arrive as a zip containing a `Dockerfile`. The runner unzips it safely (zip-slip and
-size-capped), locates the Dockerfile (archive root or a single top-level folder), builds it, runs
-the image in the sandbox, fuzzes it, and prints the slop report:
+Sloptic only fires on **intent-independent** failures: things that are defects regardless of what
+the app is supposed to do. A leaked SQL error, a login with no rate limiting, a page of
+near-invisible text, a crash on malformed input, a dev build shipped to production — none of these
+depend on knowing the app's purpose. That boundary is deliberate: **humans carry intent, Sloptic
+carries the parts a machine can judge objectively.** It will never tell you whether a feature is
+*good*; it tells you whether the app *holds up*.
+
+The catalog is **91 probes** across three axes:
+
+| axis | probes | examples |
+|------|:------:|----------|
+| **security** | 57 | SQLi, XSS/SSTI, path traversal, SSRF, exposed `.git`/backups/secrets, missing rate-limiting, header/CORS/redirect defenses, managed-backend (Supabase/Firebase) RLS |
+| **qa** | 22 | accessibility (axe-core, severity-tiered), broken links, soft-404s, unhandled 5xx, dev-build-shipped, content-type honesty |
+| **performance** | 12 | TTFB, page weight, request count, Core Web Vitals (throttled, best-of-N), computed load time |
+
+Each axis reports its own damped subtotal; the three sum exactly to the slop score.
+
+## The score
+
+- **Deduction-only and unbounded.** There is no positive credit to protect and no 0–100 ceiling. An
+  app with no attack surface and an app that defends its surface both score `0` — "no slop found"
+  and "slop found and handled" are the same outcome.
+- **Risk-priced.** Each penalty is `frequency × severity` (expected harm), not raw severity — a
+  designed table, not ordinal multiplication.
+- **Damped, so one root cause counts once.** A probe's detection *variants* collapse to a single
+  finding; repeated instances of the same category across many endpoints have diminishing marginal
+  penalty. Ten missing-header endpoints are not ten findings.
+
+## Coverage honesty
+
+A low score is only meaningful if you know what was tested. Every grade ships with a coverage
+report — **probes applicable, probes that ran, surface observed** — so a `0` that means "clean" is
+distinguishable from a `0` that means "we couldn't reach the surface." Sloptic grades the
+unauthenticated, observable surface well; it does **not** claim to exercise deep authenticated or
+intent-dependent behavior, and it says so rather than implying comprehensiveness.
+
+## Install
 
 ```sh
-# a real submission, built + run in Docker:
+uv sync                      # core
+uv sync --group browser      # + Playwright, for the accessibility / CWV / DOM-XSS probes
+uv run playwright install chromium
+```
+
+## Usage
+
+**Grade a live URL** (deploys nothing, tears nothing down — only test targets you own or are
+authorized to test):
+
+```sh
+uv run python -m sloptic.cli --target https://your-app.example.com
+```
+
+**Grade a submission** (a zip with a `Dockerfile`) — built and run in a sandbox, then graded:
+
+```sh
 uv run python -m sloptic.cli --submission team.zip
-
-# production sandbox (read-only rootfs + egress-blocked network):
-docker network create --internal hacklet-fuzz-net          # one-time
-uv run python -m sloptic.cli --submission team.zip --harden
 ```
 
-A submission that won't unzip, has no Dockerfile, won't build, or never answers `$PORT` prints
-`{"status": "DNF", ...}` and exits 1 — never a runner crash. (Extraction → build context lives in
-`sloptic/ingest.py`; the deploy/fuzz path is identical to the reference apps below.)
+A submission that won't unzip, has no `Dockerfile`, won't build, or never answers `$PORT` yields a
+`DNF` record and exits non-zero — never a crash.
 
-### Dogfooding — aim at any live URL
-
-The same catalog can fuzz an **already-running** endpoint with no Docker (runs on any box, including
-this dev machine) — point it at the league's own site:
+**Run the calibration suite** against the bundled reference apps:
 
 ```sh
-uv run python -m sloptic.cli --target https://hackletleague.com
+uv run pytest -q
 ```
 
-Only test targets you own or are authorized to test. The runner deploys nothing and never tears the
-target down. (Discovery crawls the site and security-header checks now fan across every discovered
-route. Injection probes still read N/A against a JS-rendered SPA whose forms a static crawl can't
-see — the browser harness is the next step there.)
+## How it deploys
 
-## Hosting model
+The pipeline depends only on a `Deployer`, so the same catalog runs against any of three backends:
 
-The pipeline depends only on a `Deployer` (`sloptic/deploy.py`):
+- **`SubprocessDeployer`** (dev/CI) — launches a **trusted reference app** locally. Never used for
+  untrusted code.
+- **`DockerDeployer`** (production) — builds an untrusted submission's `Dockerfile` and runs it in a
+  sandbox: ephemeral, fixed CPU/RAM/PID quotas, `--cap-drop=ALL`, `--security-opt=no-new-privileges`,
+  and an optional read-only rootfs on an **egress-blocked** internal network for hostile code.
+- **`RemoteDeployer`** (dogfooding) — targets an already-running URL. Deploys nothing.
 
-- **`SubprocessDeployer`** (dev/CI) launches a **trusted reference app** as a local subprocess on
-  an injected `$PORT`. No Docker required. **Never** used for untrusted submissions.
-- **`DockerDeployer`** (production) builds the submission's `Dockerfile` and runs it in the sandbox
-  on the runner host where Docker exists: ephemeral, fixed CPU/RAM/PID quotas, `--cap-drop=ALL`,
-  `--security-opt=no-new-privileges`, `$PORT` injected. Everything downstream of "container answers
-  `$PORT`" is identical and stack-blind. The three-way calibration runs through it and scores
-  identically — that equivalence is the test (`tests/test_docker_deploy.py`).
-- **`RemoteDeployer`** (dogfooding) targets an already-running URL you own or are authorized to
-  test. Deploys nothing, needs no Docker, and never tears the target down.
+Everything downstream of "the app answers `$PORT`" is identical and stack-blind.
 
-### Hardened sandbox (production)
+## How correctness is checked
 
-For untrusted submissions, enable the hardening toggles:
+Two instruments, because they answer different questions:
 
-```py
-DockerDeployer(ctx, read_only=True, network="hacklet-fuzz-net", runtime="runsc")
-```
+- **Reference apps** (`references/`: `vulnerable`, `hardened`, `minimal`, `jsonapi`, `qa-janky`,
+  `spa`) — a fixed calibration triad with a known answer key. The vulnerable app must accrue slop;
+  the hardened app must score `0`. This is the correctness anchor.
+- **A recall benchmark** of CWE-tagged scenarios confirms each probe fires when its bug is actually
+  present — the corpus of real apps tells you *how often* a defect occurs, but only a benchmark with
+  ground truth tells you the *detector works*.
 
-Create the egress-blocked network once (`docker network create --internal hacklet-fuzz-net`) and
-install gVisor for `runtime="runsc"`. `tests/test_docker_hardened.py` verifies that hardening
-preserves the 98/0/0 calibration and that the `--internal` network actually blocks egress; it
-manages its own throwaway network, so it needs no setup.
+`uv run pytest -q` runs the calibration suite (848 tests).
 
-## Not yet in the slice (tracked in the spec)
+## Scope, honestly
 
-Browser-driven discovery (Playwright) for SPAs + FCP/INP; the hidden pool; stochastic sampling
-(median-of-N); container orchestration + throughput across many submissions; gVisor/Firecracker
-runtime install on the runner host.
+Sloptic is for grading deployed web apps at scale — hackathon submissions, CI gates, your own
+projects. It is strongest on the unauthenticated observable surface and on client-rendered SPAs with
+same-origin backends. It is weaker where a defect hides behind authentication it can't establish
+black-box, or where judging the finding needs product intent. Those limits are reported, not hidden.
 
-Already wired: the composition dampers (`aggregate.py` — variant-group-once +
-diminishing-returns-within-category; per-bundle ordering lives in the penalty magnitudes) and the
-vuln/hardened/minimal reference triad.
+## License
+
+Apache-2.0.
