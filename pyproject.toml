@@ -1,6 +1,6 @@
 [project]
 name = "sloptic"
-version = "0.0.1"
+version = "1.0.0"
 description = "Sloptic — a black-box HTTP resilience grader: deploys a web app, probes it over HTTP, and emits a slop score (deduction-only, lower is better)."
 requires-python = ">=3.11"
 dependencies = [
