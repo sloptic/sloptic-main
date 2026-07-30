@@ -2,8 +2,7 @@
 
 How to add, change, and remove probes. The engine is **fixed**; **probes are data**
 (`catalog/**/*.yaml`, loaded by `load_catalog()` at run time). Reusing existing detection needs no
-code change, only a *new* detection primitive touches Python. Canonical design lives in
-[FUZZ_RUNNER_SPEC.md](FUZZ_RUNNER_SPEC.md); this is the practical recipe.
+code change, only a *new* detection primitive touches Python. This is the practical recipe.
 
 The live lists of detection primitives are **`MATCHERS` and `PREDICATES` in `sloptic/probes.py`**,
 the source of truth (this doc deliberately does not enumerate them, so it cannot drift). Skim those
@@ -158,6 +157,6 @@ place. `test_remote.py` and the docker tests assert *deployer-equivalence* (they
 SubprocessDeployer baseline), so they self-track and never need editing for a scoring change.
 
 ## Over time
-Versioning (semver + quarterly cadence), PR review, and public-vs-hidden governance are in
-[FUZZ_RUNNER_SPEC.md](FUZZ_RUNNER_SPEC.md). Hidden probes are authored the same way but live in the
-private hidden-probe catalog repo, never this public one.
+Versioning follows semver on a quarterly cadence, with PR review and public-vs-hidden pool governance.
+Hidden probes are authored the same way but live in the private hidden-probe catalog repo, never this
+public one.
