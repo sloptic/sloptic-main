@@ -221,7 +221,7 @@ def _clear_bar(args) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        prog="hacklet-runner",
+        prog="sloptic",
         description="Deploy/target an app, probe it over HTTP, and report a slop score (lower is better).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent(
@@ -255,7 +255,7 @@ def main() -> None:
                          "(repeatable; note: state-changing probes then act AS that user)")
     ap.add_argument("--harden", action="store_true",
                     help="production sandbox for --submission: read-only rootfs + egress-blocked network")
-    ap.add_argument("--network", metavar="NET", default="hacklet-fuzz-net",
+    ap.add_argument("--network", metavar="NET", default="sloptic-net",
                     help="docker network for --harden (create once: docker network create --internal NET)")
     ap.add_argument("--source", metavar="DIR",
                     help="also statically scan this source tree for hardcoded secrets (auto for "

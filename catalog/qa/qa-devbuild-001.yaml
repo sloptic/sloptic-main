@@ -42,6 +42,6 @@ probe:
   # EXPECT ~ZERO ON THE DEVPOST CORPUS, and do not read that as failure. 61.5% of that corpus is deployed on
   # Vercel/Netlify/Pages, where the platform runs the production build for you — the defect is structurally
   # impossible there, and a 260-app sample found no HMR client anywhere. The population this probe is FOR is
-  # HackLet, where FUZZ_RUNNER_SPEC's deployment contract puts the Dockerfile "fully in the player's hands"
+  # a hackathon submission, where the player writes their own Dockerfile (it is fully in their hands)
   # and `CMD ["npm", "run", "dev"]` is the path of least resistance under a 24-minute clock. Judge it against
   # a synthetic dev-server reference, never against corpus fire rate — that is the trap perf-ttfb-003 fell into.

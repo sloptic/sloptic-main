@@ -1,4 +1,4 @@
-"""Aggregation dampers (format_spec §4.2 composition rules)."""
+"""Aggregation dampers: a variant group fires once at its max, and repeated instances within a category decay."""
 from sloptic.aggregate import compute_axis_slop, compute_slop_score, coverage_metrics
 from sloptic.schema import Outcome
 

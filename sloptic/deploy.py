@@ -92,8 +92,8 @@ class SubprocessDeployer(Deployer):
 
 class DockerDeployer(Deployer):
     """Production deployer: builds the submission's Dockerfile and runs the image in a sandboxed
-    container, injecting ONLY ``$PORT`` (self-containment policy, format_spec §5.7). Safe for
-    untrusted code; requires Docker on the host.
+    container, injecting ONLY ``$PORT`` (self-containment policy: no DATABASE_URL, no keys, no egress).
+    Safe for untrusted code; requires Docker on the host.
 
     Always-on: ephemeral container, fixed CPU/RAM/PID quotas, ``--cap-drop=ALL``,
     ``--security-opt=no-new-privileges``. Hardening toggles default OFF so the reference
@@ -105,9 +105,8 @@ class DockerDeployer(Deployer):
       does not route on an internal network)
     * ``runtime="runsc"`` — gVisor (or a Firecracker microVM) for container-escape defense
 
-    See FUZZ_RUNNER_SPEC "Production deploy (DockerDeployer)". The reference Dockerfiles let the
-    calibration suite run through this deployer unchanged and produce identical scores; see
-    tests/test_docker_deploy.py.
+    The reference Dockerfiles let the calibration suite run through this deployer unchanged and
+    produce identical scores; see tests/test_docker_deploy.py.
     """
 
     def __init__(
@@ -230,7 +229,7 @@ class DockerDeployer(Deployer):
 #
 # So the worst-performing apps in the corpus were being converted into DNFs instead of into findings, and the
 # probe designed to catch them could not fire by construction. A DNF also ranks BELOW every completed
-# submission (format_spec §4.2), so the failure mode was harsher than the finding it replaced.
+# submission, so the failure mode was harsher than the finding it replaced.
 #
 # test_liveness_gate_outlasts_the_ttfb_ceiling pins the RELATIONSHIP rather than the value, so neither
 # constant can drift back into collision.

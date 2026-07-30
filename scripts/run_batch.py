@@ -451,7 +451,7 @@ def main():
                          "drive the browser to fill+submit the signup so the app's JS registers, and use the "
                          "cookie/token it sets (wakes session/idor on self-hosted SPAs; opt-in, extra browser launch).")
     ap.add_argument("--controlled-deploy", action="store_true", dest="controlled_deploy",
-                    help="forward to deploy_and_grade: the HackLet profile — the deploy is OURS, so authenticate the "
+                    help="forward to deploy_and_grade: the controlled-deploy profile, the deploy is OURS, so authenticate the "
                          "crawl by default (register a throwaway account, land its session on the authed surface). "
                          "Reliable because a 24-min build has no email confirmation; degrades safely otherwise.")
     ap.add_argument("--login", dest="login", metavar="'email:password'",

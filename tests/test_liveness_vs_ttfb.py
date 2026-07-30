@@ -4,8 +4,8 @@ Measured on supavulnbase's perf-005 fixture (PERF_MODE=on), which answers HTTP 2
 CONSTRUCTION: curl returned a clean 200 and the runner recorded "URL DEAD — target did not respond". Both
 constants were 3.0 — RemoteDeployer's per-request read timeout and perf.TTFB_CEILING — so an app slow enough
 to trip perf-ttfb-003 (26 points, ">3s to first byte is pathological anywhere") was declared dead before the
-probe could run. The probe was structurally unreachable, and a DNF ranks BELOW every completed submission
-(format_spec §4.2), so the failure was harsher than the finding it displaced.
+probe could run. The probe was structurally unreachable, and a DNF ranks BELOW every completed submission,
+so the failure was harsher than the finding it displaced.
 
 The corpus could never have surfaced this: perf probes fire on ~22% of it, so the axis looked healthy. It took
 a fixture with a guaranteed-slow route and an answer key.

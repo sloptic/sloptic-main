@@ -4,7 +4,7 @@ __pycache__/
 .pytest_cache/
 
 # Hidden-pool probes must NEVER be committed to this PUBLIC repo. The real boundary is a
-# separate PRIVATE fuzz-catalog repo (see FUZZ_RUNNER_SPEC.md); this is only a backstop.
+# separate PRIVATE hidden-probe catalog repo; this is only a backstop.
 **/hidden/
 catalog-hidden/
 

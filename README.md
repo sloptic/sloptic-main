@@ -17,10 +17,11 @@ a list. Sloptic does something different: it turns an arbitrary app into a **com
 number**, so many unrelated apps can be ranked on the same yardstick without knowing anything about
 what any of them does.
 
-That is the purpose it was built for: objective quality grading of hackathon submissions. It is
-designed for the future HackLet League, and for any hackathon organizer who wants an objective,
-consistent quality measure across every entry. A human judge cannot hold a hundred stacks in their
-head. Sloptic grades them all the same way and places each one on a single curve.
+That is the purpose it was built for: objective quality grading of hackathon submissions. Sloptic
+began as the resilience grader for the HackLet League and is now its own project, for that league and
+for any hackathon organizer who wants an objective, consistent quality measure across every entry. A
+human judge cannot hold a hundred stacks in their head. Sloptic grades them all the same way and places
+each one on a single curve.
 
 The name is for AI slop. Sloptic grades the observable consequences of slop, the failures that are
 wrong no matter what the app is for, not the code that produced them.

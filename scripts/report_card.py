@@ -7,7 +7,7 @@ the fuzzer knows exactly where and how to improve.
     uv run python scripts/report_card.py results.jsonl --app theirapp --organizer         # reveal hidden checks
     uv run python scripts/report_card.py results.jsonl --all --html-dir cards/            # one card per app
 
-PUBLIC findings render in full (teams learn + fix real durability); HIDDEN-pool findings (HackLet League's
+PUBLIC findings render in full (teams learn + fix real durability); HIDDEN-pool findings (the hidden pool's
 anti-gaming set) are an opaque count in the team card and only itemized under --organizer. The catalog is the
 pool source of truth, so marking a probe `pool: hidden` withholds it from team cards automatically."""
 from __future__ import annotations

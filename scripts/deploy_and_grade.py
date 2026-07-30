@@ -535,7 +535,7 @@ def _llm_json(system: str, user: str, model: str = DEFAULT_MODEL, timeout: float
         try:
             r = httpx.post(OPENROUTER_URL, json=body, timeout=httpx.Timeout(timeout, connect=10.0),
                            headers={"Authorization": "Bearer " + key,
-                                    "HTTP-Referer": "https://hacklet.league", "X-Title": "hacklet-fuzz"})
+                                    "HTTP-Referer": "https://sloptic.org", "X-Title": "sloptic"})
             if r.status_code == 200:
                 out["content"] = r.json()["choices"][0]["message"]["content"]
         except Exception:
@@ -796,7 +796,7 @@ def _grade_worker(url, use_browser, features, q, cached_profile=None, cache_key=
                      # authenticate the CRAWL (not just the probes): an SPA hides upload/item-CRUD behind login,
                      # so an unauthenticated render only maps the login page. Register a throwaway crawl session
                      # and carry it into the browser context. On under --browser-auth OR --controlled-deploy
-                     # (the HackLet profile: the deploy is ours, apps have no email confirmation in a 24-min
+                     # (the controlled-deploy profile: the deploy is ours, apps have no email confirmation in a 24-min
                      # build, so register-then-crawl lands every time). Off when a --header session is supplied
                      # (used for the crawl directly). Degrades safely: no register session -> crawl stays login-only.
                      auth_crawl=((browser_auth or controlled_deploy) and use_browser and not session_headers),
@@ -1103,7 +1103,7 @@ def main():
                          "it sets — waking the session/idor probes on self-hosted SPAs. Opt-in (an extra browser "
                          "launch per auth app); best-effort, N/A on captcha / email-verify / SSO / third-party auth.")
     ap.add_argument("--controlled-deploy", action="store_true", dest="controlled_deploy",
-                    help="the HackLet profile: the deploy is OURS (a sandbox-built zip, not a third-party URL). "
+                    help="the controlled-deploy profile: the deploy is OURS (a sandbox-built zip, not a third-party URL). "
                          "Authenticates the crawl by default (register a throwaway account, land its session on "
                          "the authed surface) — reliable here because a 24-min build has no email confirmation, so "
                          "register-then-crawl always yields a session. Degrades safely if it doesn't. "

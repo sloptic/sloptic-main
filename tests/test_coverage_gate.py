@@ -1,4 +1,4 @@
-"""format_spec §4.2's Result Reporting bundle, plus the credential gate built on it.
+"""The Result Reporting bundle, plus the credential gate built on it.
 
 The spec required this and nothing implemented it: grepping the runner for limited_engagement / clean_rate /
 attack_surface returned nothing. Its stated reason — "A slop score in isolation can be ambiguous: a low score
@@ -167,7 +167,7 @@ def test_a_completed_fully_exercised_grade_is_certifiable():
 
 
 def test_limited_engagement_can_never_be_a_credential():
-    # format_spec §4.2: it ranks below every completed submission regardless of its trivially-low raw slop
+    # a DNF ranks below every completed submission regardless of its trivially-low raw slop
     res = rank(_curve(), 1, _rec(applicable=9, slop=1))
     assert res["reporting"]["status"] == "limited_engagement"
     assert res["certifiable"] is False

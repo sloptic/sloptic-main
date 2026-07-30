@@ -1,5 +1,5 @@
 """Phase 4 aggregation: sum fired-probe penalties into a slop score, with the composition
-dampers from format_spec §4.2.
+dampers (a variant group fires once at its max; repeated instances within a category decay).
 
 - **Variant group fires once.** Probes sharing a `variant_group_id` are one logical flaw probed
   via different syntaxes; if any fire, the group contributes its penalty once (its max), never

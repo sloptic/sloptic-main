@@ -97,7 +97,7 @@ _DEBUG_FINGERPRINT = re.compile(
 # ---- declarative matchers -------------------------------------------------------------------
 
 def ttfb_at_least(resp, arg) -> bool:
-    # Slice uses one sample; production samples N and takes the median (see FUZZ_RUNNER_SPEC).
+    # This matcher uses one sample; the production TTFB path samples N and takes the median.
     return resp.elapsed.total_seconds() >= float(arg)
 
 

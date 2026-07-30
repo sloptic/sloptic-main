@@ -1,5 +1,5 @@
-"""Probe schema + runtime structures. Probe mirrors FUZZ_RUNNER_SPEC's YAML schema (trimmed
-to what the vertical slice exercises)."""
+"""Probe schema + runtime structures. Probe mirrors the catalog YAML schema (trimmed
+to what the runner exercises)."""
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, fields

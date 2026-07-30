@@ -28,5 +28,5 @@ http://127.0.0.1:8084,anchor-vampi
 http://127.0.0.1:8083,anchor-juiceshop
 http://localhost:3000,anchor-oopssec
 # CLEAN pin (optional, recommended): a real well-built app you OWN or are authorized to grade -- e.g.
-# your live HackLet League deployment -- anchors the CLEAN end of the distribution. Uncomment + fill in:
+# your live deployment anchors the CLEAN end of the distribution. Uncomment + fill in:
 # https://YOUR-LEAGUE-APP-URL,anchor-clean-league

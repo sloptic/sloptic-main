@@ -25,7 +25,7 @@ from sloptic.pipeline import run
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 CATALOG = ROOT / "catalog"
 REFS = ROOT / "references"
-NET = "hacklet-fuzz-test-net"
+NET = "sloptic-test-net"
 
 pytestmark = pytest.mark.skipif(
     shutil.which("docker") is None, reason="Docker not available (run on the VM/CI)"

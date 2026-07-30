@@ -9,7 +9,7 @@ the fuzzer knows exactly where and how to improve. Every finding renders four fi
 Two DISCLOSURE tiers, driven by the probe's `pool` (schema.Probe.pool = public | hidden):
   - PUBLIC findings get the full four-field breakdown — teams learn and fix REAL durability, so teaching to
     these tests IS the goal (a real 429, real headers, real escaping = a genuinely more durable app).
-  - HIDDEN findings (HackLet League's anti-gaming set) are WITHHELD from the team card as an opaque count and
+  - HIDDEN findings (the hidden pool's anti-gaming set) are WITHHELD from the team card as an opaque count and
     revealed only in the organizer view (`organizer=True`). Teams can't teach-to-the-test on checks they
     can't see, so a team that only surface-patched the public checks still fails the hidden variants and its
     score reflects real durability, not gaming. Both tiers count toward the score identically — only the

@@ -121,7 +121,7 @@ def _band(pct: int) -> str:
     return "pristine" if pct <= 25 else "typical" if pct <= 75 else "rough" if pct <= 95 else "catastrophic"
 
 
-# THE REPORTING BUNDLE — format_spec §4.2 requires it and nothing implemented it. Grepping the runner for
+# THE REPORTING BUNDLE. The score's reporting contract requires it and nothing implemented it. Grepping the runner for
 # limited_engagement / clean_rate / attack_surface returned nothing; we emitted pct_applicable and stopped.
 # The spec's own words on why it exists: "A slop score in isolation can be ambiguous — a low score could mean a
 # clean submission with broad surface (excellent) or a trivial one with almost no surface to test (Limited
@@ -178,10 +178,10 @@ def _surface_coverage(applicable: int) -> str:
 
 
 def reporting_bundle(record: dict) -> dict:
-    """format_spec §4.2 Result Reporting: status, probes applicable, slop detected, attack surface coverage,
+    """The Result Reporting bundle: status, probes applicable, slop detected, attack surface coverage,
     clean rate — the metadata that disambiguates a low score. Plus `untested_families`, which is ours.
 
-    Clean Rate is over APPLICABLE probes only (FUZZ_RUNNER_SPEC: clean / (clean + slop_detected)); a probe that
+    Clean Rate is over APPLICABLE probes only (clean / (clean + slop_detected)); a probe that
     was N/A is neither a pass nor a failure and must not inflate it."""
     cov = record.get("coverage") or {}
     surface = record.get("observed_surface") or {}
@@ -240,7 +240,7 @@ def rank(curve: dict, score, record: dict | None = None) -> dict:
         # The band stays a factual statement about where this app sits among its peers. `certifiable` is the
         # separate POLICY question of whether that comparison may become a badge, and it answers no on three
         # independent grounds: a catastrophic class fired, the engagement was Limited/DNF, or a family the app
-        # HAS surface for never ran. Per format_spec §4.2 a DNF or Limited Engagement submission ranks below
+        # HAS surface for never ran. A DNF or Limited Engagement submission ranks below
         # every completed one regardless of its trivially-low raw slop, so it can never be a credential.
         b = reporting_bundle(record)
         out["reporting"] = b

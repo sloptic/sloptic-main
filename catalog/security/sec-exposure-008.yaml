@@ -5,8 +5,8 @@ variant_group_id: anon-bulk-data   # "this app hands its records to strangers" =
 pool: public
 evidence_model: provable
 penalty: 40   # same tier as broken access control, because that is what it is: an ANONYMOUS request returning
-              # bulk records with PII / financial identifiers. FUZZ_RUNNER_SPEC assigns exactly this class to
-              # the runner — "an anonymous request that returns sensitive or bulk data is a flaw regardless of
+              # bulk records with PII / financial identifiers. This class is squarely the runner's:
+              # "an anonymous request that returns sensitive or bulk data is a flaw regardless of
               # intent" — and access control is ~36% of real vibe-coded-app vulnerabilities.
 applicability:
   requires: [at_least_one_http_endpoint_exists]
