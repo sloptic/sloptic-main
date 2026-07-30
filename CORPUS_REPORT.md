@@ -1,0 +1,201 @@
+# The Shape of AI Era Web App Slop
+
+### A black-box quality audit of 1,537 live hackathon web apps
+
+**Reference release:** `2026.1` · **Instrument:** Sloptic (deduction-only black-box grader) · **Population:** live hackathon submissions
+
+---
+
+## TL;DR
+
+- On a corpus of **1,537** live web apps graded black-box, AI era "slop" is overwhelmingly **chronic**, not **acute**. Pervasive missing hygiene, not exploitable holes.
+- **98%** ship no Content-Security-Policy, **41%** never rate limit a login, **70%** have a critical accessibility violation. But only **3.7%** expose any exploitable vulnerability, and just **0.26%** a remote code execution class.
+- The acute danger has not disappeared. It **relocated behind authentication and vendor boundaries**: only **11%** of apps even have an own injectable backend, so a black-box grader mostly cannot reach the dangerous surface.
+- The overall score is smooth and unimodal (good for ranking), but the security axis is **bimodal**, two "header flat tax" values account for **70%** of it.
+- The median app defends **~95%** of its worst case failure surface. Slop is the rare exception, not the rule, per app.
+
+---
+
+## 1. The question
+
+AI assisted building makes shipping a web app nearly free, and the volume of "looks done" submissions has exploded. The security research is blunt about the tradeoff. Veracode's 2025 report, testing over 100 models on 80 tasks, found that **45%** of AI generated code introduces an OWASP Top 10 vulnerability and that AI written code carries **2.74 times** more flaws than human written code, a pass rate that had not budged by early 2026. The Cloud Security Alliance put the share of AI generated solutions carrying a design flaw or known vulnerability at **62%**. Hackathons feel this directly: when any team can generate a polished UI in minutes, judges report the bar for "impressive" moving from "does it look done" to "does it hold up." So a natural question for anyone grading these apps at scale:
+
+> When you look at a large population of real, deployed, AI era web apps from the outside, **what does the failure actually look like?** A field of exploitable vulnerabilities, or something else?
+
+This report answers that from one instrument's black-box view of 1,537 apps.
+
+## 2. The dataset
+
+| property | value |
+|---|---|
+| Apps ingested | 2,250 |
+| Apps successfully graded | **1,537** |
+| Attrition | dead URLs, pages that are not web apps, and submissions that never deployed |
+| Each row | one deployed app, graded over HTTP with no source and no spec |
+| Grader version | frozen catalog of 91 probes across 3 axes |
+
+Rows that could not be graded (a URL that never answered, a repo that never deployed) are excluded rather than scored, so the population is "apps that actually presented a working surface."
+
+### 2.1 Where the apps came from
+
+The corpus is drawn from **60 hackathons** on Devpost, whose public project galleries were scraped for submissions that shipped a live URL. The events span North America (the majority, largely US and Canadian university hackathons), Europe (London, Barcelona, Ireland), Latin America (Monterrey), and Asia Pacific (Singapore and Australia), with editions concentrated in 2025 and 2026. From these galleries, **2,250** submissions carried a gradeable URL and **1,537** graded successfully. The full list of 60 events is in Appendix A.
+
+This provenance matters for reading the results. The population is young, collegiate, time boxed (a hackathon is a day or a weekend), and built in the AI era, so it is a clean look at what teams ship when speed is everything and the tooling writes much of the code. It is deliberately **not** a sample of production software.
+
+## 3. Method
+
+Sloptic is a **black-box** grader. It reads no source, needs no spec, and emits one **slop score**: deduction-only, unbounded, lower is better, `0` means nothing was found. The score decomposes into three axes (security, quality, performance) whose subtotals sum exactly to the total. Penalties are risk priced (frequency times severity) and damped, so one root cause counts once.
+
+Because it ignores the stack, the same 91 probes run identically against every app, which is what makes 1,537 unrelated apps **comparable on one axis**. Every grade also ships a coverage report, so a `0` that means "clean" is distinguishable from a `0` that means "we could not reach the surface."
+
+Two things this method is honest about up front: it grades the **unauthenticated, observable** surface, and it measures **intent-independent** failures only (defects no matter what the app is for).
+
+## 4. Results
+
+### 4.1 The score distribution
+
+| statistic | value |
+|---|---|
+| mean | 55.1 |
+| median | 49 |
+| max | 168 |
+| distinct values | 132 |
+| landmarks (p10 / p25 / p50 / p75 / p90 / p99) | 26 / 35 / 49 / 70 / 89 / 142 |
+
+The overall score is **smooth and nearly unimodal**, the largest single spike holds under 5% of the population. This is exactly the property a ranking needs: the convolution of three axes and many probes spreads apps out, so a percentile is meaningful.
+
+### 4.2 What drives the score
+
+Penalty mass splits across the three axes like this:
+
+| axis | share of total slop | median | shape |
+|---|---:|---:|---|
+| security | **41.9%** | 14 | bimodal (two values = 70%) |
+| quality | 36.4% | 20 | spike at 0 (15%), then spread |
+| performance | 21.7% | 0 | **62% score zero** |
+
+The probes that fire most often are not exotic. They are missing HTTP headers:
+
+| prevalence | probe |
+|---:|---|
+| 98% | missing Content-Security-Policy |
+| 97% | no clickjacking defense |
+| 91% | missing `X-Content-Type-Options` |
+| 90% | missing `Referrer-Policy` |
+| 70% | critical accessibility violation |
+| 41% | login with no rate limiting |
+
+A finding at 98% prevalence is nearly a constant, it taxes everyone and separates no one. The **discriminating** signal lives in the middle band (rate limiting at 41%, source map disclosure at 11%, accessibility tiers, Core Web Vitals), which is where apps actually pull apart.
+
+### 4.3 Severity composition: chronic, not acute
+
+This is the headline. Split every security finding into **acute** (exploitable now) versus **chronic** (missing mitigation), and the population is lopsided:
+
+| tier | rate | examples |
+|---|---:|---|
+| any acute finding | **3.7%** | |
+| remote code execution / injection | 0.26% | SQLi, command, template injection |
+| data exposure | 2.73% | world readable managed backend, bulk PII |
+| secret or source file leak | 0.85% | served `.env`, `.git`, backups, keys |
+| source map disclosure (moderate) | 11% | production `.map` leaks original source |
+| chronic hygiene (representative) | 41 to 98% | headers, rate limiting, accessibility |
+
+Read the two ends together: **~4% of apps are exploitable, while 40 to 98% are missing basic hygiene.** The functionality is mostly there; the nonfunctional floor is pervasively absent. That is the empirical signature of AI era slop from the outside, chronic rot, not a field of smoking guns.
+
+### 4.4 Why the acute surface is so thin
+
+The low acute rate is not "these apps are safe." It is an artifact of **where the modern stack puts the danger.** Classify each app by what backend its traffic touches:
+
+| host tier | share of apps | injectable black-box? |
+|---|---:|---|
+| same-origin (static frontend) | 44% | no backend to inject |
+| third party vendor | 18% | not the app's surface |
+| opaque | 13% | unclassifiable |
+| **own backend** | **11%** | **yes** |
+| managed backend (Supabase / Firebase) | 10% | only via row-level security config |
+
+**Only 11% of apps even have an own injectable backend.** You cannot inject SQL into a static site, and a managed backend app's only misconfiguration knob is row-level security. So the classic acute classes (SQLi, RCE) have almost no surface to land on, and the genuine acute risk that remains is disproportionately **backend misconfiguration** (the 2.73% data exposure tier), which is exactly where a black-box probe can still reach it.
+
+By hosting platform, the population is dominated by Vercel:
+
+| platform | share |
+|---|---:|
+| Vercel (`*.vercel.app`) | 51% (floor) |
+| custom / other | 32% |
+| Netlify | 5% |
+| Streamlit | 4% |
+| GitHub Pages | 4% |
+
+The 51% is a lower bound (custom domains hide additional Vercel apps). A population heavy on Vercel also explains why bot challenges rarely interfered: Vercel's bot protection is opt-in, and hackathon teams almost never configure it.
+
+### 4.5 Measurement validity
+
+A ranking is only trustworthy if the ruler is stable. Two independent runs over the full corpus agree closely:
+
+| metric | value |
+|---|---:|
+| Spearman rank correlation | **0.974** |
+| deciles identical | 92.6% (96% within one) |
+| apps scoring exactly the same | 92% |
+| systematic drift | none (mean delta +0.15) |
+
+The residual movement is confined to the probes where black-box nondeterminism is unavoidable (stateful browser behavior, Core Web Vitals timing, and the security tail behind authentication); the deterministic surface holds.
+
+Coverage is reported per grade: the median app had **62%** of the battery apply to it, so the scores are legible as "clean," not "untested."
+
+## 5. Interpretation
+
+One number captures the thesis. The median app's **worst case slop** (the score it would carry if every applicable probe fired) is **906**, while its actual median score is **49**. The median app therefore realizes only about **5%** of its potential failure surface: it defends nearly everything it exposes, and fails on the diffuse hygiene it never thought about.
+
+So the story of this corpus is not "AI writes insecure code that gets exploited." From the black-box, it is "AI writes **functional** code that ships without the boring, universal, nonfunctional floor," no headers, no rate limiting, no accessibility, sometimes a leaked source map. The acute danger is real but rare and increasingly hidden behind authentication and vendor APIs, which is a finding about the modern stack as much as about the apps.
+
+## 6. Limitations (stated, not hidden)
+
+- **Unauthenticated surface only.** Defects behind a login the grader cannot establish are undercounted. The true acute rate is a floor.
+- **Recall is not yet audited.** This release guarantees **stability and precision** (the ruler repeats, and it does not invent slop). The false negative rate against ground truth is measured separately and is ongoing. A low finding rate for a class could mean "rare" or "our detector missed it," and only a recall benchmark distinguishes them.
+- **Intent-independent scope.** Sloptic grades the universal floor, not whether a feature is good. Originality, product quality, and creativity are out of scope by design.
+- **Population, not universe.** Hackathon submissions skew toward young, small apps that are heavy on the frontend. The distribution should not be read as representative of production software at large.
+
+## 7. Reproduce
+
+```sh
+# freeze the reference distribution from a corpus run
+uv run python scripts/benchmark.py build <run>.jsonl --version 2026.1 --status final
+
+# place any single app on that curve
+uv run python -m sloptic.cli --target https://your-app.example.com --out app.jsonl
+uv run python scripts/benchmark.py rank --results app.jsonl
+```
+
+## Sources
+
+Background figures on AI generated code are external; the corpus figures are this instrument's own measurements over the 2026.1 population.
+
+- [Veracode 2025 GenAI Code Security Report](https://www.veracode.com/resources/analyst-reports/2025-genai-code-security-report/) (45% of AI generated code introduces an OWASP Top 10 flaw; 2.74x more vulnerabilities than human written code)
+- [Veracode, Spring 2026 GenAI Code Security update](https://www.veracode.com/blog/spring-2026-genai-code-security/) (the 45% pass rate had not improved through early 2026)
+- [Cloud Security Alliance, AI generated code vulnerability research](https://labs.cloudsecurityalliance.org/research/csa-research-note-ai-codegen-vulnerability-debt-20260406-csa/) (62% carry a design flaw or known vulnerability)
+- [Vercel Bot Management docs](https://vercel.com/docs/bot-management) (bot protection is opt-in, which is why it rarely interfered)
+
+## Appendix A: the 60 hackathons
+
+Devpost event slugs, as ingested:
+
+```
+hack-brown-2026        ds-x                   bigred-hacks-2025      luddyhacks
+innovation-hacks-2     hackgt-12              hacktech-by-caltech-2026  mhacks-2025
+hacknyu-2025           vthacks-13             jumbohack-2025         devfest-2026
+hack-mit-2023          ai-hackathon-2026      hacktx2025             jumbohack-2026
+hackrice-15            hackprinceton-fall-2025  hackdartmouth-xi     hackbeanpot2025
+la-hacks-2026          la-hacks-2025          treehacks-2026         bostonhacks-2025
+hackharvard-2025       hackduke-code-for-good-2026  hackillinois-2026  hackcwru-012025
+beaverhacks            boilermake-xii         terrahacks-2025        hackpsu-spring-2026
+uwb-hacks-the-future   civic-hacks-2026       hackumass-xiii         uofthacks-13
+deltahacks-12          hack-western-12        nwhacks-2026           hackku26
+newhacks-2025          hacknc-2025            hacklondon-2026        hackupc-2026
+kenthackit             emory-hacks-2025-fall  interhackbcn           steminate-hacks-2026
+hackeurope             hack4her-mty           hackmty2025            hacknroll2026
+uncommon-hacks-2026    swamphacks-xi          hack-arizona-2026      wildhacks-2026
+nus-fintech-summit-2026  unihack2026          usaii-global-ai-hackathon-2026  hack-ireland-2025
+```
+
+*All figures are aggregate over the 2026.1 population. No per app identities are stored or reported.*
