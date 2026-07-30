@@ -1,9 +1,9 @@
 # Authoring probes
 
-How to add, change, and remove fuzz probes. The runner is a **fixed engine**; **probes are data**
+How to add, change, and remove probes. The engine is **fixed**; **probes are data**
 (`catalog/**/*.yaml`, loaded by `load_catalog()` at run time). Reusing existing detection needs no
-code change — only a *new* detection primitive touches Python. Canonical design lives in
-[../FUZZ_RUNNER_SPEC.md](../FUZZ_RUNNER_SPEC.md); this is the practical recipe.
+code change, only a *new* detection primitive touches Python. Canonical design lives in
+[FUZZ_RUNNER_SPEC.md](FUZZ_RUNNER_SPEC.md); this is the practical recipe.
 
 The live lists of detection primitives are **`MATCHERS` and `PREDICATES` in `sloptic/probes.py`**
 — that's the source of truth (this doc deliberately does not enumerate them, so it can't drift). Skim
@@ -112,7 +112,7 @@ case. A fake `ctx` is `type("C", (), {"base_url": url, "headers": None, "client"
 - **Detection logic** → edit the matcher/predicate (affects every probe that uses it — review
   accordingly).
 - **Pool flip** (public ↔ hidden) → change `pool:` and move the file between this public catalog and
-  the private `fuzz-catalog` repo.
+  the private hidden-probe catalog repo.
 
 ## Remove a probe
 Delete the YAML — the runner stops loading it. Remove its assertion in `tests/`. For an event-grade
@@ -157,5 +157,5 @@ need editing for a scoring change.
 
 ## Over time
 Versioning (semver + quarterly cadence), PR review, and public-vs-hidden governance are in
-[../FUZZ_RUNNER_SPEC.md](../FUZZ_RUNNER_SPEC.md). Hidden probes are authored the same way but live in the
-private `fuzz-catalog` repo, never this public one.
+[FUZZ_RUNNER_SPEC.md](FUZZ_RUNNER_SPEC.md). Hidden probes are authored the same way but live in the
+private hidden-probe catalog repo, never this public one.
