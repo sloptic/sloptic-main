@@ -46,7 +46,13 @@ def test_provenance_records_what_cannot_be_reconstructed_later():
     p = provenance.collect(flags={"browser_auth": True, "concurrency": "6"})
     assert p["run_id"] and p["run_id"] == provenance.run_id(), "run_id must be stable within a process"
     assert p["host"]["cores"] and p["host"]["platform"]
-    assert p["versions"]["python"] and p["versions"]["playwright"]
+    assert p["versions"]["python"]
+    # playwright is the OPTIONAL browser group. Provenance records it when installed and None otherwise, so a
+    # core-only clone is valid and must not fail here. But when the browser group IS present, its version has to
+    # be captured, or a browser-graded run (a11y / CWV / DOM-XSS) would be unreproducible.
+    import importlib.util
+    if importlib.util.find_spec("playwright") is not None:
+        assert p["versions"]["playwright"], "playwright is installed but provenance did not record its version"
     assert p["flags"]["browser_auth"] is True and p["flags"]["concurrency"] == "6"
 
 
