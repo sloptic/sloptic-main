@@ -100,3 +100,33 @@ def test_report_payload_carries_evidence():
 def test_fmt_evidence():
     assert _fmt_evidence({"ttfb_s": 0.03, "threshold_s": 0.8}) == "ttfb_s=0.03  threshold_s=0.8"
     assert _fmt_evidence({}) == ""
+
+
+def test_grade_record_places_a_single_app_on_the_curve_and_keeps_the_gate():
+    """--out writes the corpus record shape, so one graded app is rankable by benchmark.py. The record carries
+    the fired findings, so a catastrophe still gates after the round-trip. This is the single-app grade+rank flow."""
+    import pathlib
+    import sys
+
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
+    import benchmark  # noqa: E402
+
+    from sloptic.cli import _grade_record
+
+    report = Report(
+        slop_score=33, axis_slop={"security": 33},
+        surface={"has_login": True, "has_signup": False, "forms": 1, "accepts_text_input": True},
+        coverage={"applied": ["sec-xss-001", "sec-headers-001"], "ran_kinds": ["xss", "security-headers"],
+                  "probes_total": 91, "probes_applicable": 2, "by_kind": {}},
+        outcomes=[Outcome("sec-xss-001", "security", "xss", "slop_detected", 30, target="/search"),
+                  Outcome("sec-headers-001", "security", "security-headers", "clean", 0, target="/")])
+    rec = _grade_record(report, "https://app.example.com")
+    assert rec["deployed"] is True and rec["repo"] == "https://app.example.com"
+    assert [f["probe_id"] for f in rec["findings"]] == ["sec-xss-001"]     # only the fired outcome, not the clean one
+    assert rec["observed_surface"]["has_login"] is True
+
+    corpus = [{"deployed": True, "slop_score": s, "axis_slop": {"qa": s},
+               "coverage": {"applied": ["qa-a11y-001"]}, "findings": []} for s in (10, 20, 40, 80, 120)]
+    curve = benchmark.build(corpus, "t", "s")
+    res = benchmark.rank(curve, rec["slop_score"], rec)
+    assert "percentile" in res and res["absolute_gates"] == ["xss"]        # placed on the curve AND still gated

@@ -23,6 +23,13 @@ Four rules the design commits to, each because the obvious shortcut is wrong:
 * Never percentile a catastrophe. "You leaked a live key, but so did 30% of apps, so you're p70" is exactly
   backwards. Absolute-gate classes are reported as gates, whatever the rank says.
 
+Ties on the raw score are broken, best to worst, by: whether a catastrophe fired (clean first), then how much
+worst-case slop the app DEFENDED (`slop_potential`, the post-damped score it would carry if every applicable
+probe had fired, reconstructed so it damps identically to the real score), then the breadth of probe categories
+exercised. Two apps at the same number are not equal: one may have defended a large surface, another barely
+presented one. The curve stores the full empirical distribution, not only landmarks, so the overall percentile
+is exact and honours these keys.
+
 Excluded from the reference: anchors (deliberately-vulnerable calibration targets would drag the curve),
 --probe subset runs (their slop is a fraction of a full grade), dead URLs, and DNF/non-functional apps
 (ranked below every working app, never rescued to a flattering percentile).
@@ -33,8 +40,10 @@ import json
 import pathlib
 import statistics
 import sys
+from functools import lru_cache
 
 _HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE.parent))     # repo root on path, so the lazy `import sloptic` resolves when run as a script
 _DEFAULT_CURVE = _HERE.parent / "validation" / "benchmark-curve.json"
 _AXES = ("security", "qa", "performance")
 _PREFIX = {"sec-": "security", "qa-": "qa", "perf-": "performance"}
@@ -45,6 +54,18 @@ _ABSOLUTE = {"access-control", "backend-exposure", "secrets-exposure", "sql-inje
              "filter-injection",   # CWE-943: the caller controls what the data query matches
              "command-injection", "template-injection", "path-traversal", "file-upload", "ssrf", "xxe",
              "data-exposure"}
+# The `exposure` category is MIXED: sec-exposure-006 serves a source map (disclosure, not exploitable), but
+# 001/002/003/004/007 serve live secret files (.env, .git, config/backups, registry + CI creds) — a leaked key
+# is the canonical "never percentile a catastrophe" case. The category cannot gate without also gating 006, so
+# these five gate by probe id.
+_ABSOLUTE_PROBES = {"sec-exposure-001", "sec-exposure-002", "sec-exposure-003", "sec-exposure-004",
+                    "sec-exposure-007"}
+
+
+def _is_gate(finding: dict) -> bool:
+    """A fired finding meaning 'exploitable now', reported whatever the rank: an absolute-gate category, or a
+    named secret-file exposure inside the mixed `exposure` category."""
+    return finding.get("category") in _ABSOLUTE or finding.get("probe_id") in _ABSOLUTE_PROBES
 
 
 def _axis_of(probe_id: str) -> str | None:
@@ -85,16 +106,98 @@ def _pcts(values: list) -> dict:
     return out
 
 
+# ---- ranking signals beyond the raw score -------------------------------------------------------------------
+# Two apps at the same slop are not equal. The comparator, best -> worst: slop asc, catastrophe asc (a clean
+# composition beats one carrying an absolute-gate class at the same score), slop_potential desc (defended more
+# worst-case damage), categories-applied desc (exercised a broader surface). slop_potential is the score an app
+# WOULD carry if every applicable probe fired, reconstructed from coverage.applied through the SAME aggregation
+# the real score uses, so the dampers (a variant group fires once; per-category diminishing returns) apply
+# identically and slop_potential >= slop_score by construction. A record may also carry a native `slop_potential`
+# emitted at grade time; that wins over reconstruction.
+_COMPARATOR = ("slop_asc", "catastrophe_asc", "slop_potential_desc", "categories_desc")
+
+
+@lru_cache(maxsize=1)
+def _catalog_index() -> dict:
+    """probe_id -> (bundle, category, penalty, variant_group_id). Lazy: only `build` and record-aware `rank`
+    touch the catalog, so a bare `rank <score>` stays a pure read of the curve file."""
+    from sloptic.catalog import load_catalog
+    return {p.id: (p.bundle, p.category, p.penalty, p.variant_group_id)
+            for p in load_catalog(str(_HERE.parent))}
+
+
+def _slop_potential(record: dict, idx: dict) -> int:
+    """The post-damped worst case: what this app would score if every applicable probe fired. Reconstructed so
+    the dampers match the real score exactly (>= slop_score always). Prefers a native field when present."""
+    native = record.get("slop_potential")
+    if native is not None:
+        return native
+    from sloptic.aggregate import compute_slop_score
+    from sloptic.schema import Outcome
+    outs = []
+    for pid in (record.get("coverage") or {}).get("applied") or []:
+        meta = idx.get(pid)
+        if meta is None:                          # a probe in the record but not the current catalog: skip it
+            continue
+        bundle, category, penalty, vgid = meta
+        outs.append(Outcome(probe_id=pid, bundle=bundle, category=category,
+                            outcome="slop_detected", penalty=penalty, variant_group_id=vgid))
+    return compute_slop_score(outs) if outs else int(record.get("slop_score") or 0)
+
+
+def _has_catastrophe(record: dict) -> bool:
+    """Any fired finding that gates absolutely — the same set that drives certifiability."""
+    return any(_is_gate(f) for f in record.get("findings") or [])
+
+
+def _categories_applied(record: dict) -> int:
+    return len((record.get("coverage") or {}).get("ran_kinds") or [])
+
+
+def _key(slop, has_cat, potential, ncats) -> tuple:
+    """The rank key, LOWER is better: slop asc; clean (0) before catastrophe (1); MORE defended potential and
+    MORE categories rank earlier, so both are negated."""
+    return (slop, 1 if has_cat else 0, -potential, -ncats)
+
+
+def _rank_on_dist(dist: list, key: tuple) -> tuple:
+    """Exact position against the stored empirical distribution under the full comparator. Returns
+    (percentile, cleaner_than_pct): the share strictly BETTER (lower is better) and the share strictly worse.
+    An identical-key tie counts toward neither, so a tie group shares one position."""
+    n = len(dist)
+    better = sum(1 for row in dist if _key(*row) < key)
+    worse = sum(1 for row in dist if _key(*row) > key)
+    return round(100 * better / n), round(100 * worse / n)
+
+
+def _rank_score_only(dist: list, score) -> tuple:
+    """Overall position for a bare score with no record to supply the tiebreak keys: slop alone."""
+    n = len(dist)
+    better = sum(1 for row in dist if row[0] < score)
+    worse = sum(1 for row in dist if row[0] > score)
+    return round(100 * better / n), round(100 * worse / n)
+
+
 def build(recs: list, version: str, source: str, status: str = "provisional") -> dict:
     rows = [r for r in recs if _eligible(r)]
     if not rows:
         sys.exit("ERROR: no eligible rows (need deployed + scored + not anchor/subset/dead/DNF)")
+    idx = _catalog_index()
+    # the empirical distribution: one [slop, catastrophe(0/1), slop_potential, categories] row per app, no
+    # identities. This is what makes the overall percentile exact and the tiebreaks possible; the landmark
+    # summaries below stay for human reading and the per-axis (spiky, non-granular) ranks. Rows are sorted by
+    # the SAME comparator ranking uses (best -> worst), so file order is rank order — slop asc, then clean before
+    # catastrophe, then higher slop_potential, then more categories. (Ranking rescans and does not rely on this
+    # order; the sort is so the file reads the way it ranks.)
+    dist = [[r["slop_score"], 1 if _has_catastrophe(r) else 0,
+             _slop_potential(r, idx), _categories_applied(r)] for r in rows]
+    dist.sort(key=lambda row: _key(*row))
     # status rides ON the curve and into every ranked result. A curve built before the catalog's calibration
     # settles will be regraded, and a percentile quoted from it must say so: a provisional number presented as
     # final is the failure mode a versioned reference exists to prevent.
     curve = {"version": version, "source": source, "status": status,
-             "population": "live hackathon web apps",
-             "overall": _pcts([r["slop_score"] for r in rows]), "axes": {}}
+             "population": "live hackathon web apps", "n": len(rows), "comparator": list(_COMPARATOR),
+             "overall": _pcts([r["slop_score"] for r in rows]), "axes": {}, "dist": dist}
     for axis in _AXES:
         vals = [(r.get("axis_slop") or {}).get(axis, 0) for r in rows if _axis_applicable(r).get(axis)]
         if vals:
@@ -217,13 +320,26 @@ def reporting_bundle(record: dict) -> dict:
 def rank(curve: dict, score, record: dict | None = None) -> dict:
     """Place one app on the frozen curve. Lower slop is better, so a LOW percentile is good: pct is the share
     of the reference population this app is cleaner than... inverted at the end for readability."""
-    pct = _percentile_of(curve["overall"], score)
-    cleaner_than = 100 - pct
+    dist = curve.get("dist")
+    potential = ncats = None
+    if dist is not None and record is not None:
+        idx = _catalog_index()
+        potential, ncats = _slop_potential(record, idx), _categories_applied(record)
+        pct, cleaner_than = _rank_on_dist(dist, _key(int(score), _has_catastrophe(record), potential, ncats))
+    elif dist is not None:
+        pct, cleaner_than = _rank_score_only(dist, score)     # a bare score has no tiebreak keys: slop alone
+    else:
+        pct = _percentile_of(curve["overall"], score)         # legacy curve: landmarks, no stored distribution
+        cleaner_than = 100 - pct
     status = curve.get("status", "provisional")
     out = {"slop": score, "percentile": pct, "cleaner_than_pct": cleaner_than, "band": _band(pct),
            "reference": f"{curve['population']}, n={curve['overall']['n']}, {curve['version']}"
                         + (f" ({status.upper()})" if status != "final" else ""), "axes": {}}
     if record:
+        if potential is not None:
+            out["slop_potential"] = potential
+            out["defended"] = max(potential - int(score), 0)  # worst-case damage held off, the tiebreak signal
+            out["categories_applied"] = ncats
         applicable = _axis_applicable(record)
         for axis, part in curve["axes"].items():
             if not applicable.get(axis):
@@ -233,8 +349,7 @@ def rank(curve: dict, score, record: dict | None = None) -> dict:
             p = _percentile_of(part, a)
             out["axes"][axis] = {"applicable": True, "slop": a, "percentile": p,
                                  "cleaner_than_pct": 100 - p, "band": _band(p)}
-        gates = sorted({f["category"] for f in record.get("findings") or []
-                        if f.get("category") in _ABSOLUTE})
+        gates = sorted({f.get("category") for f in record.get("findings") or [] if _is_gate(f)})
         if gates:
             out["absolute_gates"] = gates      # reported REGARDLESS of rank; a percentile never excuses these
         # The band stays a factual statement about where this app sits among its peers. `certifiable` is the
@@ -252,6 +367,9 @@ def _report(res: dict) -> None:
     print(f"\n  slop {res['slop']}  ->  {res['band'].upper()}   (cleaner than {res['cleaner_than_pct']}% "
           f"of the reference population)")
     print(f"  reference: {res['reference']}")
+    if res.get("slop_potential") is not None:
+        print(f"  defended {res['defended']} of {res['slop_potential']} worst-case slop (had every applicable "
+              f"probe fired)  ·  {res['categories_applied']} probe categories exercised")
     if res.get("axes"):
         print("\n  per axis (ranked only where the axis had probes apply):")
         for axis, a in res["axes"].items():
@@ -311,6 +429,8 @@ def main() -> None:
               f"p90 {o['p90']}  p99 {o['p99']}  max {o['max']}")
         for axis, a in curve["axes"].items():
             print(f"  {axis:<12} n={a['n']:<5} median {a['p50']:<5} p90 {a['p90']:<5} max {a['max']}")
+        print(f"  stored the full distribution ({curve['n']} apps) for exact percentiles + tiebreaks on "
+              f"{', '.join(curve['comparator'])}")
         print("\n  bands: <=p25 pristine · <=p75 typical · <=p95 rough · >p95 catastrophic\n")
         return
 

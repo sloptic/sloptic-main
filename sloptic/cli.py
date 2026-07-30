@@ -35,6 +35,18 @@ def _report_payload(report) -> dict:
             "outcomes": [asdict(o) for o in report.outcomes]}
 
 
+def _grade_record(report, source: str) -> dict:
+    """One grade as a benchmark-RANKABLE record: the same shape the corpus writer emits, so a single app can be
+    placed on the frozen curve with `python scripts/benchmark.py rank --results <file>`. `findings` are the fired
+    outcomes — the ranker reads their category for the absolute gate and their probe_id for coverage; the rest
+    (axis_slop, coverage.applied/ran_kinds, observed_surface) drive the per-axis rank, slop_potential and the
+    completeness bundle."""
+    findings = [asdict(o) for o in report.outcomes if o.outcome == "slop_detected"]
+    return {"repo": source, "deployed": True, "slop_score": report.slop_score,
+            "axis_slop": report.axis_slop, "coverage": report.coverage,
+            "observed_surface": report.surface, "findings": findings}
+
+
 def _coverage_text(report) -> str:
     """Terminal view of test COVERAGE — what % of the battery applied, and which KINDS ran vs n/a — so a
     low slop score is legible as 'clean' or 'we had little to test'. Empty when no coverage was computed."""
@@ -157,6 +169,9 @@ def _score_breakdown_text(report, decay: float = CATEGORY_DECAY) -> str:
 
 
 def _print_report(report, source: str, args) -> None:
+    if getattr(args, "out", None):
+        from .jsonl import append_jsonl
+        append_jsonl(args.out, _grade_record(report, source))
     if args.json:
         print(json.dumps(_report_payload(report), indent=2))
         return
@@ -262,6 +277,9 @@ def main() -> None:
                          "--submission; use with --target when you also have the repo). Folds into the score.")
     out = ap.add_argument_group("output")
     out.add_argument("--json", action="store_true", help="print the full machine-readable JSON report")
+    out.add_argument("--out", metavar="FILE",
+                     help="append this grade as a JSONL record, then place it on the frozen curve with "
+                          "`python scripts/benchmark.py rank --results FILE`")
     out.add_argument("--failed", action="store_true", help="list only the probes that detected slop")
     out.add_argument("-v", "--verbose", action="store_true",
                      help="stream every probe/target outcome as it runs (stderr), and append the "

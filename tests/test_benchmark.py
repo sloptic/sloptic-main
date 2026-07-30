@@ -14,7 +14,8 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
-from benchmark import _axis_applicable, _band, _percentile_of, build, rank  # noqa: E402
+from benchmark import (  # noqa: E402
+    _axis_applicable, _band, _catalog_index, _key, _percentile_of, _slop_potential, build, rank)
 
 
 def _app(slop, security=0, qa=0, perf=0, applied=None, findings=None, **kw):
@@ -109,3 +110,58 @@ def test_a_curve_is_provisional_until_declared_final_and_says_so():
     # an older curve file without the field is treated as provisional, never silently as final
     legacy = {k: v for k, v in prov.items() if k != "status"}
     assert "PROVISIONAL" in rank(legacy, 50)["reference"]
+
+
+# ---- ties: two apps at the same slop are not equal -------------------------------------------------
+
+def test_slop_potential_reconstructs_via_the_real_damping_and_never_undercuts_the_score():
+    idx = _catalog_index()
+    # two applicable probes in DIFFERENT categories (headers-002 pen 8, ratelimit-001 pen 15); only one fired.
+    # worst case = both fire = 8 + 15 = 23, damped identically to the real score (no cross-category decay).
+    rec = {"slop_score": 8, "coverage": {"applied": ["sec-headers-002", "sec-ratelimit-001"]},
+           "findings": [{"probe_id": "sec-headers-002", "category": "security-headers"}]}
+    assert _slop_potential(rec, idx) == 23
+    assert _slop_potential(rec, idx) >= rec["slop_score"]        # the invariant: worst case never below actual
+    # a native field emitted at grade time wins over reconstruction
+    assert _slop_potential({"slop_potential": 42, "coverage": {"applied": []}}, idx) == 42
+
+
+def test_rank_key_puts_clean_before_catastrophe_and_rewards_defended_surface():
+    same = 50
+    clean_hi = _key(same, False, 300, 5)      # defended a big worst case
+    clean_lo = _key(same, False, 200, 5)      # defended a smaller one
+    catastro = _key(same, True, 300, 5)       # same score, but a catastrophe fired
+    assert clean_hi < clean_lo                # more defended potential ranks better at equal slop
+    assert clean_hi < catastro and clean_lo < catastro   # any clean tie beats a catastrophe tie
+    assert _key(49, True, 0, 0) < _key(50, False, 999, 99)   # slop still dominates every tiebreak
+
+
+def test_build_stores_the_distribution_and_ranks_exactly_off_it():
+    curve = build(_corpus(), "t", "s")
+    assert curve["n"] == 100 and len(curve["dist"]) == 100
+    assert curve["comparator"][0] == "slop_asc"
+    assert rank(curve, 8)["percentile"] == 0                 # below the whole population
+    assert rank(curve, 8)["cleaner_than_pct"] == 100         # cleaner than everyone
+    assert rank(curve, 500)["percentile"] == 100             # worse than the whole population
+
+
+def test_a_catastrophe_ranks_below_a_clean_app_at_the_very_same_score():
+    # the point of §6: 52-with-SQLi must not tie 52-clean. The comparator splits them in the percentile itself.
+    curve = build(_corpus(), "t", "s")
+    p50 = curve["overall"]["p50"]
+    clean = _app(p50, findings=[{"probe_id": "qa-a11y-001", "category": "accessibility"}])
+    leaky = _app(p50, findings=[{"probe_id": "sec-sqli-004", "category": "sql-injection"}])
+    assert rank(curve, p50, leaky)["percentile"] >= rank(curve, p50, clean)["percentile"]
+    assert "absolute_gates" in rank(curve, p50, leaky)      # and it is still flagged, whatever the rank
+
+
+def test_a_served_secret_file_gates_but_a_source_map_does_not():
+    # the `exposure` category is mixed: a served .env/.git/backup is a catastrophe, a source map is not, so the
+    # severe ones gate by probe id while exposure-006 (same category) stays out.
+    curve = build(_corpus(), "t", "s")
+    env = _app(12, findings=[{"probe_id": "sec-exposure-001", "category": "exposure"}])   # served .env
+    git = _app(12, findings=[{"probe_id": "sec-exposure-003", "category": "exposure"}])   # served .git
+    smap = _app(12, findings=[{"probe_id": "sec-exposure-006", "category": "exposure"}])  # source map
+    assert rank(curve, 12, env)["absolute_gates"] == ["exposure"]
+    assert rank(curve, 12, git)["absolute_gates"] == ["exposure"]
+    assert "absolute_gates" not in rank(curve, 12, smap)     # same category, not exploitable, not a gate
