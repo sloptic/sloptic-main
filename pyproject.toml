@@ -1,7 +1,7 @@
 [project]
 name = "sloptic"
 version = "1.0.0"
-description = "Sloptic — a black-box HTTP resilience grader: deploys a web app, probes it over HTTP, and emits a slop score (deduction-only, lower is better)."
+description = "Sloptic, a black-box HTTP resilience grader: deploys a web app, probes it over HTTP, and emits a slop score (deduction-only, lower is better)."
 requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.27",
@@ -15,17 +15,17 @@ Repository = "https://github.com/sloptic/sloptic-main"
 [dependency-groups]
 browser = [
     # 1.61 is the FLOOR because it is the release that added Ubuntu 26.04 ("Playwright now supports Ubuntu
-    # 26.04"). 1.60 cannot fetch a browser there at all — `playwright install chromium` dies with "does not
-    # support chromium on ubuntu26.04-x64" — and the >= constraint alone does NOT save you: uv.lock had 1.60.0
+    # 26.04"). 1.60 cannot fetch a browser there at all: `playwright install chromium` dies with "does not
+    # support chromium on ubuntu26.04-x64", and the >= constraint alone does NOT save you: uv.lock had 1.60.0
     # pinned, so `uv sync` on a fresh 26.04 box reproduced the failure exactly. Note this repo's own dev box is
     # 26.04 and ran on 1.60 only via _LAUNCH_ORDER's system chrome/msedge fallback; a fresh clone has no such
     # browser installed, so the fallback is not a substitute for the floor.
     #
     # MEASURED, not assumed: bumping 1.60 (system channel) -> 1.61 (bundled chromium 149.0.7827.55) left a
-    # supavulnbase grade byte-identical — slop 328, same axes, same 69 applicable, same 60/8/85 surface, same
+    # supavulnbase grade byte-identical: slop 328, same axes, same 69 applicable, same 60/8/85 surface, same
     # finding set. So this is not a known score confound. It is still the axes fed by rendering (qa-a11y via
     # axe-core, perf-cwv, sec-domxss-001) that would move first if a future bump ever does, and one target is
-    # not a corpus — re-check those three when the floor next changes.
+    # not a corpus, re-check those three when the floor next changes.
     "playwright>=1.61.0",
 ]
 dev = ["pytest>=8"]
