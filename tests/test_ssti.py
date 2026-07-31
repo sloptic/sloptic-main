@@ -1,5 +1,6 @@
-"""Server-side template / eval code injection — the injected 7*7 is EVALUATED (marker+49 appears); an
-app that merely reflects the literal (or escapes it) stays clean (reflection != evaluation)."""
+"""Server-side template / eval code injection — the injected HASH gadget is EXECUTED (the salt's exact digest
+appears); an app that merely reflects the literal, or an LLM that fabricates a hash, stays clean."""
+import hashlib
 import http.server
 import re
 import threading
@@ -12,11 +13,12 @@ from sloptic.schema import Endpoint, Profile
 
 
 def _render(val: str) -> str:
-    """A tiny template engine: evaluate {{N*M}} / ${N*M} expressions (like Jinja/Freemarker)."""
-    def mul(match):
-        return str(int(match.group(1)) * int(match.group(2)))
-    val = re.sub(r"\{\{\s*(\d+)\*(\d+)\s*\}\}", mul, val)
-    val = re.sub(r"\$\{\s*(\d+)\*(\d+)\s*\}", mul, val)
+    """A tiny vulnerable engine: when the input carries a hash/exec gadget it EXECUTES it and returns the salt's
+    real digest (what genuine server-side execution produces); otherwise it reflects the input unchanged."""
+    salt = re.search(r"hlssti[0-9a-f]+", val)
+    gadget = re.search(r"sha256sum|md5sum|hash\('sha256'|sha256\(b?'|md5\(|system\(|popen\(|Execute|`printf", val)
+    if salt and gadget:
+        return hashlib.sha256(salt.group(0).encode()).hexdigest()
     return val
 
 
@@ -39,10 +41,9 @@ class _App(http.server.BaseHTTPRequestHandler):
             self._send("<h1>Hello %s</h1>" % _render(name))
         elif u.path == "/safe":                    # input echoed as data, never evaluated
             self._send("<h1>Hello %s</h1>" % name)
-        elif u.path == "/ai":                      # an LLM endpoint: computes small arithmetic exactly (7*7->49)
-            #  but is WRONG on the hard 6x6-digit product, so the exact marker never appears -> no FP.
-            ans = re.sub(r"\{\{\s*7\*7\s*\}\}|7\*7", "49", name)
-            self._send("<h1>%s</h1>" % re.sub(r"\{\{\s*987654\*123456\s*\}\}|987654\*123456", "121931812225", ans))
+        elif u.path == "/ai":                      # an LLM endpoint: echoes and even FABRICATES a plausible
+            #  wrong 64-hex hash, but cannot hash the salt, so the salt's real digest never appears -> no FP.
+            self._send("<h1>%s</h1>" % ("b" * 64 if re.search(r"hlssti[0-9a-f]+", name) else name))
         else:
             self._send("ok")
 
@@ -64,18 +65,19 @@ def _ctx(url, path):
     return type("C", (), {"base_url": url, "profile": prof, "headers": None, "client": None, "evidence": {}})()
 
 
-def test_ssti_fires_when_expression_is_evaluated(app):
+def test_ssti_fires_when_gadget_is_executed(app):
+    # /tmpl runs the hash gadget and returns the salt's real digest -> injectable
     assert ssti_injectable(_ctx(app, "/tmpl"), _Probe()) is True
 
 
 def test_ssti_clean_on_reflection_only(app):
-    # /safe reflects "<marker>{{7*7}}" verbatim but never computes 49 -> not injectable
+    # /safe reflects the gadget payload verbatim but never executes it -> no digest -> not injectable
     assert ssti_injectable(_ctx(app, "/safe"), _Probe()) is False
 
 
-def test_ssti_clean_on_arithmetic_evaluator(app):
-    # an AI endpoint computes small arithmetic (7*7->49) but is unreliable on the hard 6x6-digit product, so
-    # the exact 12-digit marker that only a real template engine produces never appears -> the LLM can't fake it.
+def test_ssti_clean_on_llm_endpoint(app):
+    # an LLM endpoint echoes and even fabricates a plausible wrong hash, but cannot hash an arbitrary salt, so
+    # the salt's exact digest that only a real engine produces never appears -> the LLM can't fake a fire.
     assert ssti_injectable(_ctx(app, "/ai"), _Probe()) is False
 
 

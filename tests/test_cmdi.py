@@ -1,5 +1,6 @@
-"""Command injection — output-based (across shell separators / substitution) and blind time-based,
-plus the precision guard: an app that merely REFLECTS the payload (no shell) must stay clean."""
+"""Command injection — in-band hash oracle (across shell separators / substitution) and blind time-based,
+plus the precision guard: an app that REFLECTS the payload, or an LLM that fabricates a hash, must stay clean."""
+import hashlib
 import http.server
 import re
 import threading
@@ -13,18 +14,21 @@ from sloptic.schema import Form, Profile
 
 
 def _fake_shell(val: str) -> str:
-    """Mini POSIX-shell emulation: only 'runs' when a shell metacharacter is present (i.e. injection
-    happened), evaluating any $((N*M)) EXACTLY and honoring `echo`/`sleep`. Returns the command's stdout."""
+    """Mini POSIX-shell emulation: only 'runs' when a shell metacharacter is present (i.e. injection happened).
+    It HASHES `printf SALT | sha256sum|md5sum` EXACTLY (the deterministic execution oracle only a real shell can
+    produce) and honors `sleep` for dose-response. Returns the command's stdout."""
     if not any(ch in val for ch in ";|&`$\n"):
         return ""                                   # no metachar -> no injection -> no command ran
-    s = re.sub(r"\$\(\((\d+)\*(\d+)\)\)", lambda m: str(int(m.group(1)) * int(m.group(2))), val)  # exact arithmetic
-    if "sleep" in s:
-        m = re.search(r"sleep\s+(\d+)", s)
+    if "sleep" in val:
+        m = re.search(r"sleep\s+(\d+)", val)
         if m:
             time.sleep(min(int(m.group(1)), 4))     # a real sleep so dose-response scales (capped for test speed)
         return ""
-    m = re.search(r"echo\s+(\S+)", s)
-    return m.group(1) if m else ""
+    m = re.search(r"printf\s+(\S+)\s*\|\s*(sha256sum|md5sum)", val)
+    if m:
+        h = hashlib.sha256 if m.group(2) == "sha256sum" else hashlib.md5
+        return "%s  -" % h(m.group(1).encode()).hexdigest()   # coreutils stdout: "<digest>  -"
+    return ""
 
 
 class _App(http.server.BaseHTTPRequestHandler):
@@ -48,9 +52,10 @@ class _App(http.server.BaseHTTPRequestHandler):
             self._send("<pre>%s</pre>" % _fake_shell(v))
         elif path == "/safe":                        # reflects the literal only, never executes
             self._send("<pre>you searched: %s</pre>" % v)
-        elif path == "/ai":                          # an LLM endpoint: computes SMALL arithmetic (13*13 -> 169)
-            #  but is unreliable on the hard 6x6-digit product, so the exact marker never appears -> no FP.
-            self._send("Result: %s" % v.replace("$((13*13))", "169"))
+        elif path == "/ai":                          # an LLM endpoint: echoes and even FABRICATES a plausible
+            #  wrong hash (right length), but cannot hash an arbitrary salt, so the real digest never appears -> no FP.
+            self._send("Result: %s" % re.sub(r"printf\s+(\S+)\s*\|\s*(sha256sum|md5sum)",
+                                             lambda m: "a" * (64 if m.group(2) == "sha256sum" else 32), v))
         elif path.startswith("/api/"):               # a catch-all: EVERY path under /api serves the same shell,
             #  so a nonexistent sibling answers identically and the liveness gate must suppress the fire.
             self._send("<pre>%s</pre>" % _fake_shell(v))
@@ -75,19 +80,19 @@ def _ctx(url, form):
     return type("C", (), {"base_url": url, "profile": prof, "headers": None, "client": None, "evidence": {}})()
 
 
-def test_command_injection_output_based(app):
-    # a separator/substitution echo of an arithmetic expr executes -> the RESULT (169) appears
+def test_command_injection_in_band_hash(app):
+    # a separator/substitution `printf SALT | sha256sum` executes -> the salt's exact digest appears
     assert command_injection(_ctx(app, Form("/exec", "get", ["cmd"])), _Probe()) is True
 
 
 def test_command_injection_clean_on_reflection_only(app):
-    # /safe echoes the literal payload (incl. "$((13*13))") but never runs a shell -> not injectable
+    # /safe echoes the literal payload (incl. "printf SALT | sha256sum") but never runs a shell -> not injectable
     assert command_injection(_ctx(app, Form("/safe", "get", ["cmd"])), _Probe()) is False
 
 
-def test_command_injection_clean_on_arithmetic_evaluator(app):
-    # the AI-corpus FP: an LLM endpoint computes small arithmetic but is unreliable on a hard 6x6-digit
-    # product, so the exact marker that only a real shell produces never appears -> the LLM can't fake a fire.
+def test_command_injection_clean_on_llm_endpoint(app):
+    # the AI-corpus FP: an LLM endpoint echoes and even fabricates a plausible wrong hash, but cannot hash an
+    # arbitrary salt, so the exact digest that only a real shell produces never appears -> the LLM can't fake a fire.
     assert command_injection(_ctx(app, Form("/ai", "get", ["cmd"])), _Probe()) is False
 
 

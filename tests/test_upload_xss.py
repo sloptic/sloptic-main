@@ -119,9 +119,14 @@ def test_na_without_upload_form(app):
 
 
 def test_marker_is_distinct_from_the_rce_probe_marker():
-    # the two upload probes must not cross-trigger on each other's payloads
-    from sloptic.probes import _UPLOAD_MARK
-    assert _UPLOAD_XSS_MARK != _UPLOAD_MARK
+    # the two upload probes must not cross-trigger. The RCE probe now keys on a per-run `hlup<hex>` salt's
+    # digest; the stored-XSS token has non-hex chars after `hlup`, so it is neither a valid RCE salt nor present
+    # in the RCE webshell body -> neither probe's payload can satisfy the other's oracle.
+    import re
+
+    from sloptic.probes import _upload_shells
+    assert re.fullmatch(r"hlup[0-9a-f]+", _UPLOAD_XSS_MARK) is None
+    assert _UPLOAD_XSS_MARK not in _upload_shells("hlupdeadbeef")[0].decode()
 
 
 def test_catalog_wires_sec_upload_002_to_a_registered_predicate():

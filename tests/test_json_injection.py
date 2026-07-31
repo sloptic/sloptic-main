@@ -3,9 +3,11 @@ endpoint body fields — the SPA sink the form/query enumeration missed. A vulne
 the arithmetic / reads the file) fires; a safe endpoint that only echoes the literal reads clean; no JSON
 endpoint reads N/A. The arithmetic-result / file-signature oracles are content-type-agnostic, so a JSON echo
 of the literal payload (no evaluation) never false-fires."""
+import hashlib
 import http.server
 import json
 import pathlib
+import re
 import sys
 import threading
 from urllib.parse import urlparse
@@ -35,12 +37,18 @@ def _make_app(vuln):
             body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0) or 0)) or b"{}")
             if path == "/api/run":                       # shell sink
                 cmd = str(body.get("cmd", ""))
-                if vuln and "hlci$((987654*123456))" in cmd:
-                    return self._j({"out": "hlci121931812224"})   # a shell EVALUATED the arithmetic
-                return self._j({"out": cmd})             # safe: echo the literal (no 'hlci169')
+                m = re.search(r"printf\s+(\S+)\s*\|\s*(sha256sum|md5sum)", cmd)
+                if vuln and m:
+                    h = hashlib.sha256 if m.group(2) == "sha256sum" else hashlib.md5
+                    return self._j({"out": "%s  -" % h(m.group(1).encode()).hexdigest()})  # a shell HASHED the salt
+                return self._j({"out": cmd})             # safe: echo the literal
             if path == "/api/render":                    # template sink
                 tpl = str(body.get("tpl", ""))
-                return self._j({"out": tpl.replace("{{987654*123456}}", "121931812224") if vuln else tpl})
+                salt = re.search(r"hlssti[0-9a-f]+", tpl)
+                gadget = re.search(r"sha256sum|hash\('sha256'|sha256\(b?'|system\(|popen\(|Execute|`printf", tpl)
+                if vuln and salt and gadget:
+                    return self._j({"out": hashlib.sha256(salt.group(0).encode()).hexdigest()})  # engine HASHED the salt
+                return self._j({"out": tpl})
             if path == "/api/read":                      # file sink
                 p = str(body.get("path", ""))
                 if vuln and (".." in p or "etc/passwd" in p):

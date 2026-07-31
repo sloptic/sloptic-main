@@ -1,5 +1,6 @@
 """Insecure file upload — a webshell that EXECUTES server-side is RCE; a store-but-serve-as-source
-app (no execution) must stay clean, since the probe fires only on the executed arithmetic marker."""
+app (no execution) must stay clean, since the probe fires only on the executed salt-hash digest."""
+import hashlib
 import http.server
 import re
 import threading
@@ -9,13 +10,15 @@ import pytest
 from sloptic.probes import file_upload
 from sloptic.schema import Form, Profile
 
-_STORE = {}   # basename -> True if the stored bytes look like PHP
+_STORE = {}   # basename -> the embedded salt (str) if the stored bytes look like an executable webshell, else None
 
 
-def _basename_and_php(body: bytes):
+def _basename_and_salt(body: bytes):
     m = re.search(rb'filename="([^"]*)"', body)
     name = (m.group(1).decode() if m else "").split("\x00")[0].split("/")[-1]
-    return name, (b"<?php" in body)
+    is_shell = b"<?php" in body or b"getInstance" in body or b"BitConverter" in body   # php / jsp / aspx source
+    sm = re.search(rb"hlup[0-9a-f]+", body)
+    return name, (sm.group(0).decode() if (is_shell and sm) else None)
 
 
 class _App(http.server.BaseHTTPRequestHandler):
@@ -32,16 +35,18 @@ class _App(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
-        name, is_php = _basename_and_php(body)
-        _STORE[name] = is_php
+        name, salt = _basename_and_salt(body)
+        _STORE[name] = salt
         pfx = "/up/" if self.path == "/upload" else "/src/"   # /upload executes, /safe serves source
         self._send("saved to %s%s" % (pfx, name))
 
     def do_GET(self):
-        if self.path.startswith("/up/"):                      # executes PHP
-            self._send("hlup49x" if _STORE.get(self.path[4:]) else "not found")
-        elif self.path.startswith("/src/"):                   # serves the raw source, never executes
-            self._send("<?php echo 'hlup'.(7*7).'x'; ?>" if _STORE.get(self.path[5:]) else "not found")
+        if self.path.startswith("/up/"):                      # EXECUTES the shell -> outputs the salt's digest
+            salt = _STORE.get(self.path[4:])
+            self._send(hashlib.sha256(salt.encode()).hexdigest() if salt else "not found")
+        elif self.path.startswith("/src/"):                   # serves the raw SOURCE (literal hash() call), never executes
+            salt = _STORE.get(self.path[5:])
+            self._send(("<?php echo hash('sha256','%s');?>" % salt) if salt else "not found")
         else:
             self._send("ok")
 
@@ -74,7 +79,8 @@ def test_file_upload_executes_webshell(app):
 
 
 def test_file_upload_clean_when_served_as_source(app):
-    # stored + retrievable but NOT executed -> the arithmetic marker never resolves -> clean
+    # stored + retrievable but NOT executed -> the source shows the literal hash() call, the digest never
+    # appears -> clean (reflection of the payload cannot forge the salt's digest)
     assert file_upload(_ctx(app, "/safe"), _Probe()) is False
 
 
