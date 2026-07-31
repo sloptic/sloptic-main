@@ -14,14 +14,14 @@ from sloptic.schema import Form, Profile
 
 def _fake_shell(val: str) -> str:
     """Mini POSIX-shell emulation: only 'runs' when a shell metacharacter is present (i.e. injection
-    happened), evaluating $((13*13)) and honoring `echo`. Returns the command's stdout."""
+    happened), evaluating any $((N*M)) EXACTLY and honoring `echo`/`sleep`. Returns the command's stdout."""
     if not any(ch in val for ch in ";|&`$\n"):
         return ""                                   # no metachar -> no injection -> no command ran
-    s = val.replace("$((13*13))", "169")            # arithmetic evaluation
+    s = re.sub(r"\$\(\((\d+)\*(\d+)\)\)", lambda m: str(int(m.group(1)) * int(m.group(2))), val)  # exact arithmetic
     if "sleep" in s:
         m = re.search(r"sleep\s+(\d+)", s)
         if m:
-            time.sleep(min(int(m.group(1)), 3))
+            time.sleep(min(int(m.group(1)), 4))     # a real sleep so dose-response scales (capped for test speed)
         return ""
     m = re.search(r"echo\s+(\S+)", s)
     return m.group(1) if m else ""
@@ -48,9 +48,12 @@ class _App(http.server.BaseHTTPRequestHandler):
             self._send("<pre>%s</pre>" % _fake_shell(v))
         elif path == "/safe":                        # reflects the literal only, never executes
             self._send("<pre>you searched: %s</pre>" % v)
-        elif path == "/ai":                          # an LLM endpoint: helpfully computes the arithmetic in
-            #  ANY syntax and echoes it, with no shell involved. This is the dominant cmdi FP on an AI corpus.
-            self._send("Result: %s" % v.replace("$((13*13))", "169").replace("13*13", "169"))
+        elif path == "/ai":                          # an LLM endpoint: computes SMALL arithmetic (13*13 -> 169)
+            #  but is unreliable on the hard 6x6-digit product, so the exact marker never appears -> no FP.
+            self._send("Result: %s" % v.replace("$((13*13))", "169"))
+        elif path.startswith("/api/"):               # a catch-all: EVERY path under /api serves the same shell,
+            #  so a nonexistent sibling answers identically and the liveness gate must suppress the fire.
+            self._send("<pre>%s</pre>" % _fake_shell(v))
         else:
             self._send("ok")
 
@@ -83,10 +86,16 @@ def test_command_injection_clean_on_reflection_only(app):
 
 
 def test_command_injection_clean_on_arithmetic_evaluator(app):
-    # the AI-corpus FP: an LLM endpoint computes 13*13=169 and echoes hlci169 with OR without a shell
-    # separator, so the arithmetic marker alone is not proof of a shell. The plain-13*13 control reproduces
-    # the marker (a shell never would), so the fire is an evaluator, not command injection -> stays clean.
+    # the AI-corpus FP: an LLM endpoint computes small arithmetic but is unreliable on a hard 6x6-digit
+    # product, so the exact marker that only a real shell produces never appears -> the LLM can't fake a fire.
     assert command_injection(_ctx(app, Form("/ai", "get", ["cmd"])), _Probe()) is False
+
+
+def test_command_injection_gated_on_catch_all_phantom(app):
+    # a catch-all / soft-404 host serves the same shell for every path, so an injected marker would "fire" on
+    # an endpoint that does not exist server-side. The liveness gate compares the endpoint to a nonexistent
+    # sibling under its own prefix; they answer identically, so the phantom is suppressed (never reaches injection).
+    assert command_injection(_ctx(app, Form("/api/run", "get", ["cmd"])), _Probe()) is None
 
 
 def test_command_injection_na_when_no_input(app):

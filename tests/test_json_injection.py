@@ -35,8 +35,8 @@ def _make_app(vuln):
             body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0) or 0)) or b"{}")
             if path == "/api/run":                       # shell sink
                 cmd = str(body.get("cmd", ""))
-                if vuln and "hlci$((13*13))" in cmd:
-                    return self._j({"out": "hlci169"})   # a shell EVALUATED the arithmetic
+                if vuln and "hlci$((987654*123456))" in cmd:
+                    return self._j({"out": "hlci121931812224"})   # a shell EVALUATED the arithmetic
                 return self._j({"out": cmd})             # safe: echo the literal (no 'hlci169')
             if path == "/api/render":                    # template sink
                 tpl = str(body.get("tpl", ""))

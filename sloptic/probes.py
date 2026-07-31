@@ -1132,12 +1132,10 @@ def no_error_state(ctx, probe) -> bool | None:
 # substitution ($(...) and backticks), and a blind time-based fallback; one finding. Precision: the
 # marker is the RESULT of a shell-evaluated arithmetic expr (13*13 -> 169) — it appears ONLY if a shell
 # ran the payload, never from reflecting the literal (which shows the "$((13*13))" text). Execution, not echo.
-_CMD_OUT = "hlci169"
-_CMD_TAIL = "echo hlci$((13*13))"          # -> hlci169 when a POSIX shell evaluates it
-_CMD_CTRL = "echo hlci13*13"               # LLM DIFFERENTIAL: PLAIN 13*13, no $(( )) expansion, no separator.
-#   A shell never turns this into hlci169 (13*13 is not shell arithmetic, and echo is not at a command
-#   position). An AI endpoint (rife in this corpus) computes 13*13=169 and echoes hlci169 anyway. So if the
-#   marker appears from THIS control, the fire came from an evaluator, not a shell -> not command injection.
+_CMD_OUT = "hlci121931812224"               # 987654*123456. A POSIX shell computes this EXACTLY; an AI endpoint
+_CMD_TAIL = "echo hlci$((987654*123456))"   # that helpfully echoes arithmetic cannot (LLMs are unreliable at
+#   6x6-digit multiplication), so the exact 12-digit marker only appears from GENUINE shell execution. The old
+#   13*13 was trivial for an LLM -> false positives on AI endpoints (brightbet's /api/get-ai-opinion).
 # empty base so the host command fails FAST (`ping ;echo ...`), never hanging on a bogus host arg
 _CMD_SEPS = (";%s", "|%s", "||%s", "&&%s", "\n%s", "$(%s)", "`%s`")
 _CMD_TIME = (";sleep {d}", "$(sleep {d})", "`sleep {d}`", "&&sleep {d}", "|sleep {d}")
@@ -1153,10 +1151,37 @@ def _elapsed(c, method, action, data) -> float:
     return time.perf_counter() - t0
 
 
+def _cmd_time_scales(c, method, action, fields, field, delay) -> bool:
+    """Blind command injection via a DOSE-RESPONSE sleep: the 3x dose must add >= ~1.4*delay of latency on
+    BOTH trials, so a slow host or proxy with a fixed latency (that ignores the sleep argument) cannot fire it.
+    Mirrors the SQLi `_tech_time` invariant: a naturally-slow endpoint does not track the dose, a real sleep does."""
+    def elapsed(cmd):
+        data = {fn: (cmd if fn == field else _XSS_FILLER) for fn in fields}
+        t0 = time.perf_counter()
+        try:
+            _xss_send(c, method, action, data)
+        except (httpx.HTTPError, httpx.InvalidURL):
+            return None
+        return time.perf_counter() - t0
+    for tmpl in _CMD_TIME:
+        ok = True
+        for _ in range(2):
+            hi, lo = elapsed(tmpl.format(d=delay * 3)), elapsed(tmpl.format(d=delay))
+            if hi is None or lo is None or hi - lo < delay * 1.4:
+                ok = False
+                break
+        if ok:
+            return True
+    return False
+
+
 def command_injection(ctx, probe) -> bool | None:
-    """OS command injection across forms + query params + JSON API bodies. Injects `<sep> echo <arith>`
-    across shell separators and command-substitution; fires when the arithmetic RESULT (not the literal)
-    reflects — proving a shell executed it. Falls back to blind time-based sleep. N/A when no input surface."""
+    """OS command injection across forms + query params + JSON API bodies. OUTPUT-based: inject
+    `<sep> echo <marker>` where the marker is a HARD 6x6-digit product; a shell computes it exactly, but an
+    AI endpoint that helpfully echoes arithmetic cannot (LLMs are unreliable at large multiplication), so the
+    exact marker only appears from GENUINE execution. BLIND fallback: a DOSE-RESPONSE sleep whose delay must
+    SCALE with the injected duration (a slow host/proxy's latency ignores the argument). Gated on endpoint
+    liveness so a catch-all / soft-404 shell cannot invent a finding. N/A when no input surface."""
     targets = _injectable_targets(ctx.profile) + _json_body_targets(ctx.profile)
     if not targets:
         return None
@@ -1165,62 +1190,51 @@ def command_injection(ctx, probe) -> bool | None:
     tested = False
     checked = 0
     deep: list = []
-    with make_client(ctx.base_url, ctx.headers, timeout=max(15.0, delay + 8), follow_redirects=True) as c:
+    with make_client(ctx.base_url, ctx.headers, timeout=max(15.0, delay * 3 + 8), follow_redirects=True) as c:
         for action, method, fields in targets:
+            if budget <= 0:
+                break
+            filler = {fn: _XSS_FILLER for fn in fields}
+            try:
+                base = _xss_send(c, method, action, filler)
+            except (httpx.HTTPError, httpx.InvalidURL):
+                continue
+            if _CMD_OUT in base.text:
+                continue  # marker already present -> can't attribute to the injection
+            if _UPSTREAM_ERROR.search(base.text):
+                continue  # proxies a third-party API -> latency/output track the upstream, not a shell
+            if not _endpoint_is_live(ctx, c, action, method, base):
+                continue  # catch-all / soft-404 shell -> phantom endpoint, not a real command sink
             for field in fields:
                 if budget <= 0:
                     break
-                try:
-                    baseline = _xss_send(c, method, action, {fn: (_XSS_FILLER if fn != field else "1") for fn in fields})
-                except (httpx.HTTPError, httpx.InvalidURL):
-                    continue
-                if _CMD_OUT in baseline.text:
-                    continue  # already present -> can't attribute to the injection
                 checked += 1
                 for sep in _CMD_SEPS:
                     if budget <= 0:
                         break
                     budget -= 1
                     tested = True
-                    inject = sep % _CMD_TAIL
-                    data = {fn: (inject if fn == field else _XSS_FILLER) for fn in fields}
+                    data = {fn: (sep % _CMD_TAIL if fn == field else _XSS_FILLER) for fn in fields}
                     try:
                         if _CMD_OUT in _xss_send(c, method, action, data).text:
-                            # LLM GUARD: an AI endpoint computes 13*13 and echoes hlci169 with no shell involved.
-                            # Re-send the PLAIN-arithmetic control (no $(( )), no separator): a shell cannot
-                            # produce the marker from it, an evaluator can. If it does, this is not injection.
-                            ctrl = {fn: (_CMD_CTRL if fn == field else _XSS_FILLER) for fn in fields}
-                            try:
-                                evaluator = _CMD_OUT in _xss_send(c, method, action, ctrl).text
-                            except (httpx.HTTPError, httpx.InvalidURL):
-                                evaluator = False   # control inconclusive -> trust the primary injection signal
-                            if evaluator:
-                                continue            # arithmetic evaluator (LLM), not a shell -> not injectable
                             ctx.evidence.update(injectable=True, via="separator/substitution",
                                                 target=action, field=field)
-                            return True  # a shell evaluated echo hlci$((13*13)) -> hlci169 -> injectable
+                            return True  # a shell computed the exact 12-digit product -> real injection
                     except (httpx.HTTPError, httpx.InvalidURL):
                         continue
                 if len(deep) < _DEEP_SLOTS and method != "postjson":
-                    # the blind TIME-BASED fallback is NOT causally specific (a slow JSON endpoint's latency
-                    # variance ~= the sqli-FP failure mode) -> keep it OFF JSON API sinks; the deterministic
-                    # computed-output oracle (hlci169) still runs on them, and it IS causally specific.
+                    # blind time-based stays OFF JSON API sinks (a slow JSON endpoint's latency variance ~= the
+                    # FP failure mode); the deterministic hard-product oracle still runs on them and IS specific.
                     deep.append((action, method, fields, field))
-            if budget <= 0:
-                break
-        for action, method, fields, field in deep:  # blind time-based (no observable output)
-            base_time = _elapsed(c, method, action, {fn: (_XSS_FILLER if fn != field else "x") for fn in fields})
-            for tmpl in _CMD_TIME:
-                data = {fn: (tmpl.format(d=delay) if fn == field else _XSS_FILLER) for fn in fields}
-                # delta vs THIS slot's baseline (the host command itself may be slow, e.g. ping) so a
-                # naturally-slow endpoint can't false-positive; confirm twice to reject jitter
-                if all(_elapsed(c, method, action, data) - base_time >= delay * 0.7 for _ in range(2)):
-                    ctx.evidence.update(injectable=True, via="time-based", target=action, field=field,
-                                        repro=_form_repro(ctx, method, action, data,
-                                                          matched="response delayed ~%ds (blind command injection)" % delay))
-                    return True
+        for action, method, fields, field in deep:  # blind: DOSE-RESPONSE sleep (delay must scale with the dose)
+            if _cmd_time_scales(c, method, action, fields, field, delay):
+                data = {fn: (_CMD_TIME[0].format(d=delay) if fn == field else _XSS_FILLER) for fn in fields}
+                ctx.evidence.update(injectable=True, via="time-based", target=action, field=field,
+                                    repro=_form_repro(ctx, method, action, data,
+                                                      matched="response delay scaled with the injected sleep (blind command injection)"))
+                return True
     ctx.evidence.update(injectable=False, fields_tested=checked,
-                        techniques=["separator", "substitution", "time-based"])
+                        techniques=["separator", "substitution", "dose-response-time"])
     return False if tested else None
 
 
