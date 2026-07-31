@@ -10,6 +10,24 @@ was built with.
 uv run python -m sloptic.cli --target https://your-app.example.com
 ```
 
+## Why
+
+Merriam-Webster made *slop* its 2025 word of the year, the low effort content generative AI now
+churns out in bulk, the junk images and filler text clogging every feed. Software is the same
+phenomenon one layer down. AI-assisted building made shipping a web app nearly free, and hackathon
+galleries fill with submissions that look finished but were never hardened. Studies of AI generated
+code bear out the worry, finding a vulnerability in roughly half of it. Yet when we graded 1,537
+real submissions ourselves, the failure was rarely a dramatic exploit. Far more often it was the
+boring, pervasive floor left undone, no security headers, no rate limiting, broken accessibility, a
+dev build in production. App slop, it turns out, is chronic rather than acute.
+
+Hence the name.
+
+> **sloptic** */ˈslɒp.tɪk/* *n.* a coinage from *slop*, 2025's word of the year for the low effort
+> output of generative AI, and *optic*, an instrument for bringing something into focus. The
+> apparatus by which slop of the software kind, the app that ships functional but unhardened, is
+> resolved into a single comparable number, serenely indifferent to whatever it was meant to be.
+
 ## The niche
 
 Most tools that probe a web app are fuzzers or scanners. They hunt for bugs in one app and hand you
@@ -23,8 +41,8 @@ for any hackathon organizer who wants an objective, consistent quality measure a
 human judge cannot hold a hundred stacks in their head. Sloptic grades them all the same way and places
 each one on a single curve.
 
-The name is for AI slop. Sloptic grades the observable consequences of slop, the failures that are
-wrong no matter what the app is for, not the code that produced them.
+Sloptic grades the observable consequences of slop, the failures that are wrong no matter what
+the app is for, not the code that produced them.
 
 ## What it grades
 
