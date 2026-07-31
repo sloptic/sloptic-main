@@ -48,6 +48,9 @@ class _App(http.server.BaseHTTPRequestHandler):
             self._send("<pre>%s</pre>" % _fake_shell(v))
         elif path == "/safe":                        # reflects the literal only, never executes
             self._send("<pre>you searched: %s</pre>" % v)
+        elif path == "/ai":                          # an LLM endpoint: helpfully computes the arithmetic in
+            #  ANY syntax and echoes it, with no shell involved. This is the dominant cmdi FP on an AI corpus.
+            self._send("Result: %s" % v.replace("$((13*13))", "169").replace("13*13", "169"))
         else:
             self._send("ok")
 
@@ -77,6 +80,13 @@ def test_command_injection_output_based(app):
 def test_command_injection_clean_on_reflection_only(app):
     # /safe echoes the literal payload (incl. "$((13*13))") but never runs a shell -> not injectable
     assert command_injection(_ctx(app, Form("/safe", "get", ["cmd"])), _Probe()) is False
+
+
+def test_command_injection_clean_on_arithmetic_evaluator(app):
+    # the AI-corpus FP: an LLM endpoint computes 13*13=169 and echoes hlci169 with OR without a shell
+    # separator, so the arithmetic marker alone is not proof of a shell. The plain-13*13 control reproduces
+    # the marker (a shell never would), so the fire is an evaluator, not command injection -> stays clean.
+    assert command_injection(_ctx(app, Form("/ai", "get", ["cmd"])), _Probe()) is False
 
 
 def test_command_injection_na_when_no_input(app):

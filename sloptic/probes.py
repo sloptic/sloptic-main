@@ -1134,6 +1134,10 @@ def no_error_state(ctx, probe) -> bool | None:
 # ran the payload, never from reflecting the literal (which shows the "$((13*13))" text). Execution, not echo.
 _CMD_OUT = "hlci169"
 _CMD_TAIL = "echo hlci$((13*13))"          # -> hlci169 when a POSIX shell evaluates it
+_CMD_CTRL = "echo hlci13*13"               # LLM DIFFERENTIAL: PLAIN 13*13, no $(( )) expansion, no separator.
+#   A shell never turns this into hlci169 (13*13 is not shell arithmetic, and echo is not at a command
+#   position). An AI endpoint (rife in this corpus) computes 13*13=169 and echoes hlci169 anyway. So if the
+#   marker appears from THIS control, the fire came from an evaluator, not a shell -> not command injection.
 # empty base so the host command fails FAST (`ping ;echo ...`), never hanging on a bogus host arg
 _CMD_SEPS = (";%s", "|%s", "||%s", "&&%s", "\n%s", "$(%s)", "`%s`")
 _CMD_TIME = (";sleep {d}", "$(sleep {d})", "`sleep {d}`", "&&sleep {d}", "|sleep {d}")
@@ -1182,6 +1186,16 @@ def command_injection(ctx, probe) -> bool | None:
                     data = {fn: (inject if fn == field else _XSS_FILLER) for fn in fields}
                     try:
                         if _CMD_OUT in _xss_send(c, method, action, data).text:
+                            # LLM GUARD: an AI endpoint computes 13*13 and echoes hlci169 with no shell involved.
+                            # Re-send the PLAIN-arithmetic control (no $(( )), no separator): a shell cannot
+                            # produce the marker from it, an evaluator can. If it does, this is not injection.
+                            ctrl = {fn: (_CMD_CTRL if fn == field else _XSS_FILLER) for fn in fields}
+                            try:
+                                evaluator = _CMD_OUT in _xss_send(c, method, action, ctrl).text
+                            except (httpx.HTTPError, httpx.InvalidURL):
+                                evaluator = False   # control inconclusive -> trust the primary injection signal
+                            if evaluator:
+                                continue            # arithmetic evaluator (LLM), not a shell -> not injectable
                             ctx.evidence.update(injectable=True, via="separator/substitution",
                                                 target=action, field=field)
                             return True  # a shell evaluated echo hlci$((13*13)) -> hlci169 -> injectable
@@ -1253,6 +1267,17 @@ def ssti_injectable(ctx, probe) -> bool | None:
                     data = {fn: (p if fn == field else _XSS_FILLER) for fn in fields}
                     try:
                         if detect in _xss_send(c, method, action, data).text:
+                            # LLM GUARD (as in command injection): an AI endpoint computes 7*7=49 and echoes
+                            # <marker>49 with no template engine involved. Control with PLAIN 7*7 (no template
+                            # delimiters): a template engine cannot evaluate that, an evaluator does. If the
+                            # marker survives, this is an evaluator (LLM), not template/code injection.
+                            ctrl = {fn: (m + "7*7" if fn == field else _XSS_FILLER) for fn in fields}
+                            try:
+                                evaluator = detect in _xss_send(c, method, action, ctrl).text
+                            except (httpx.HTTPError, httpx.InvalidURL):
+                                evaluator = False
+                            if evaluator:
+                                continue
                             ctx.evidence.update(injectable=True, target=action, field=field)
                             return True  # 7*7 was evaluated server-side -> template/code injection
                     except (httpx.HTTPError, httpx.InvalidURL):

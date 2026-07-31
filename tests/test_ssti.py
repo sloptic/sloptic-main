@@ -39,6 +39,9 @@ class _App(http.server.BaseHTTPRequestHandler):
             self._send("<h1>Hello %s</h1>" % _render(name))
         elif u.path == "/safe":                    # input echoed as data, never evaluated
             self._send("<h1>Hello %s</h1>" % name)
+        elif u.path == "/ai":                      # an LLM endpoint: computes 7*7 in ANY syntax (braces OR
+            #  bare) and echoes it contiguously, no template engine involved. The AI-corpus SSTI FP.
+            self._send("<h1>%s</h1>" % re.sub(r"\{\{\s*7\*7\s*\}\}|\$\{\s*7\*7\s*\}|7\*7", "49", name))
         else:
             self._send("ok")
 
@@ -67,6 +70,13 @@ def test_ssti_fires_when_expression_is_evaluated(app):
 def test_ssti_clean_on_reflection_only(app):
     # /safe reflects "<marker>{{7*7}}" verbatim but never computes 49 -> not injectable
     assert ssti_injectable(_ctx(app, "/safe"), _Probe()) is False
+
+
+def test_ssti_clean_on_arithmetic_evaluator(app):
+    # an AI endpoint computes 7*7=49 whether or not template delimiters are present, so <marker>49 alone is
+    # not proof of a template engine. The plain-7*7 control (no {{ }}) reproduces the marker -> evaluator,
+    # not SSTI -> stays clean.
+    assert ssti_injectable(_ctx(app, "/ai"), _Probe()) is False
 
 
 def test_ssti_na_when_no_input(app):
