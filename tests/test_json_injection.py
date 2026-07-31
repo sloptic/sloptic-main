@@ -40,7 +40,7 @@ def _make_app(vuln):
                 return self._j({"out": cmd})             # safe: echo the literal (no 'hlci169')
             if path == "/api/render":                    # template sink
                 tpl = str(body.get("tpl", ""))
-                return self._j({"out": tpl.replace("{{7*7}}", "49") if vuln else tpl})
+                return self._j({"out": tpl.replace("{{987654*123456}}", "121931812224") if vuln else tpl})
             if path == "/api/read":                      # file sink
                 p = str(body.get("path", ""))
                 if vuln and (".." in p or "etc/passwd" in p):

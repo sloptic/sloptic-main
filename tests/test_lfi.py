@@ -46,6 +46,9 @@ class _App(http.server.BaseHTTPRequestHandler):
             b = b'var x={root:1};t=":0:0:";p="root:x:0:0:root:/root:/bin/bash";fn=function(){return x.root};'
             self.send_response(200); self.send_header("Content-Type", "application/javascript")
             self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+        elif u.path.startswith("/api/"):                   # a catch-all: EVERY path under /api includes the param,
+            #  so a nonexistent sibling answers identically -> the liveness gate must suppress the phantom.
+            self._send("<html>%s</html>" % _include(page))
         else:
             self._send("ok")
 
@@ -73,6 +76,13 @@ def test_lfi_reads_system_file(app):
 
 def test_lfi_clean_on_whitelisting_app(app):
     assert path_traversal(_ctx(app, "/safe"), _Probe()) is False
+
+
+def test_lfi_gated_on_catch_all_phantom(app):
+    # a catch-all host serves the file for every path, so a traversal payload would "fire" on an endpoint that
+    # does not exist server-side. The liveness gate compares it to a nonexistent sibling under its own prefix;
+    # they answer identically, so the phantom is suppressed before injection (this also stops an LLM-fabricated passwd).
+    assert path_traversal(_ctx(app, "/api/read"), _Probe()) is None
 
 
 def test_lfi_na_when_no_surface(app):

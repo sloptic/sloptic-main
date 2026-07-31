@@ -39,9 +39,10 @@ class _App(http.server.BaseHTTPRequestHandler):
             self._send("<h1>Hello %s</h1>" % _render(name))
         elif u.path == "/safe":                    # input echoed as data, never evaluated
             self._send("<h1>Hello %s</h1>" % name)
-        elif u.path == "/ai":                      # an LLM endpoint: computes 7*7 in ANY syntax (braces OR
-            #  bare) and echoes it contiguously, no template engine involved. The AI-corpus SSTI FP.
-            self._send("<h1>%s</h1>" % re.sub(r"\{\{\s*7\*7\s*\}\}|\$\{\s*7\*7\s*\}|7\*7", "49", name))
+        elif u.path == "/ai":                      # an LLM endpoint: computes small arithmetic exactly (7*7->49)
+            #  but is WRONG on the hard 6x6-digit product, so the exact marker never appears -> no FP.
+            ans = re.sub(r"\{\{\s*7\*7\s*\}\}|7\*7", "49", name)
+            self._send("<h1>%s</h1>" % re.sub(r"\{\{\s*987654\*123456\s*\}\}|987654\*123456", "121931812225", ans))
         else:
             self._send("ok")
 
@@ -73,9 +74,8 @@ def test_ssti_clean_on_reflection_only(app):
 
 
 def test_ssti_clean_on_arithmetic_evaluator(app):
-    # an AI endpoint computes 7*7=49 whether or not template delimiters are present, so <marker>49 alone is
-    # not proof of a template engine. The plain-7*7 control (no {{ }}) reproduces the marker -> evaluator,
-    # not SSTI -> stays clean.
+    # an AI endpoint computes small arithmetic (7*7->49) but is unreliable on the hard 6x6-digit product, so
+    # the exact 12-digit marker that only a real template engine produces never appears -> the LLM can't fake it.
     assert ssti_injectable(_ctx(app, "/ai"), _Probe()) is False
 
 
