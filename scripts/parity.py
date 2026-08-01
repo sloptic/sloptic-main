@@ -166,14 +166,38 @@ def main():
     gp = group_parity(web, args.by)
     spots = blind_spots(web, args.by)
 
+    # ASSESSABILITY: parity CONTRASTS stacks against source-derived expected-surface labels. The url-ingest
+    # path grades a bare URL with no source, so it emits no expected_surface and one flat stack -> there is
+    # nothing to contrast. Report that honestly instead of a silent one-row "clean" (an unassessable file is
+    # NOT a clean bill). The SPA-vs-server-rendered false-negative comparison is the group-by-routing columns
+    # below; it needs >1 routing class AND expected labels, i.e. deploy_and_grade records, to appear.
+    has_expected = any(r[f"exp_{t}"] is not None for r in web for t in _TYPES)
+    single_stack = len(gp) <= 1
+    assessable = has_expected and not single_stack
+
     if args.json:
         kinds = Counter(r["app_kind"] for r in rows)
         print(json.dumps({"n_apps": len(rows), "web_gradeable": len(web),
                           "app_kinds": dict(kinds), "group_by": args.by,
+                          "assessable": assessable, "has_expected_labels": has_expected,
+                          "single_stack": single_stack,
                           "groups": gp, "blind_spots": spots}, indent=2))
         return
 
     print(f"\n═══ cross-stack parity — {len(rows)} apps ({len(web)} web-gradeable), grouped by {args.by} ═══")
+
+    if not assessable:
+        print("\n⚠ CANNOT ASSESS CROSS-STACK PARITY on this results file (this is not a clean bill):")
+        if single_stack:
+            only = repr(next(iter(gp))) if gp else "?"
+            print(f"    all {len(web)} web-gradeable apps are a SINGLE stack ({only}) — parity contrasts stacks,")
+            print("    so there is nothing to contrast. The SPA-vs-server-rendered false-negative comparison is")
+            print(f"    the group-by-{args.by} columns below and needs >1 class to appear.")
+        if not has_expected:
+            print("    NO source-derived expected-surface labels are present (the url-ingest path grades a bare")
+            print("    URL with no source, so it emits none) — observed-vs-expected parity and blind spots are")
+            print("    undefined without them.")
+        print("    → re-run via deploy_and_grade with --submission <source> to produce assessable records.")
 
     # APP-KIND distribution — how much of the field is even a web app? (out-of-scope ≠ blind spot)
     print("\nAPP-KIND DISTRIBUTION  (only web apps are gradeable; the rest are out of scope, not blind spots)")
@@ -222,8 +246,12 @@ def main():
 
     # blind-spot ranking (prevalence × brokenness = # apps where we missed a surface the source implies)
     print("\nBLIND SPOTS  (fix order — apps where the source says a surface exists but we didn't see it)")
-    if not spots:
-        print("  (none — observed surface matches expected across every stack, or no expected labels)")
+    if not has_expected:
+        print("  CANNOT ASSESS — no source-derived expected-surface labels in this file (url-ingest emits")
+        print("  none). This is an unassessable condition, NOT a clean bill; blind spots are undefined without")
+        print("  ground truth. Re-run deploy_and_grade with --submission <source> to assess.")
+    elif not spots:
+        print("  (none — observed surface matches expected across every assessed stack)")
     for s in spots[:12]:
         print(f"  {s['stack']:16} {s['type']:8} missed {s['missed']}/{s['expected']} apps "
               f"(saw {s['observed']})")

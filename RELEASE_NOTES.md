@@ -75,7 +75,12 @@ limits are reported, not hidden.
 
 The recall audit (measuring the false-negative rate against ground-truth benchmarks
 across the full catalog) is in progress and continues in a follow-up release. This
-release's guarantees are stability and precision; the recall number is not yet claimed.
+release guarantees stability (the ruler repeats) and precision on the classes that
+carry explicit precision rules; findings elsewhere are unaudited rather than vouched.
+That unaudited mass is dominated by deterministic presence checks where false-positive
+risk is structurally low, but since the audit cannot distinguish "no rule needed" from
+"no rule written," we report it as unaudited rather than claim a precision we have not
+checked. The recall number is not yet claimed.
 
 ## Install
 

@@ -10,7 +10,7 @@
 
 - On a corpus of **1,537** live web apps graded black-box, AI era "slop" is overwhelmingly **chronic**, not **acute**. Pervasive missing hygiene, not exploitable holes.
 - **98%** ship no Content-Security-Policy, **41%** never rate limit a login, **70%** have a critical accessibility violation. But only **3.7%** expose any exploitable vulnerability, and just **0.26%** a remote code execution class.
-- The acute danger has not disappeared. It **relocated behind authentication and vendor boundaries**: only **11%** of apps even have an own injectable backend, so a black-box grader mostly cannot reach the dangerous surface.
+- The acute danger has not disappeared. It **relocated behind authentication and vendor boundaries**: only **16%** of the apps with observed runtime traffic (175 of 1,066) even have an own injectable backend, so a black-box grader mostly cannot reach the dangerous surface.
 - The overall score is smooth and unimodal (good for ranking), but the security axis is **bimodal**, two "header flat tax" values account for **70%** of it.
 - The median app defends **~95%** of its worst case failure surface. Slop is the rare exception, not the rule, per app.
 
@@ -104,17 +104,17 @@ Read the two ends together: **~4% of apps are exploitable, while 40 to 98% are m
 
 ### 4.4 Why the acute surface is so thin
 
-The low acute rate is not "these apps are safe." It is an artifact of **where the modern stack puts the danger.** Classify each app by what backend its traffic touches:
+The low acute rate is not "these apps are safe." It is an artifact of **where the modern stack puts the danger.** Of the graded apps, **1,066 exposed observed runtime traffic** we could classify by host tier. An app's traffic routinely spans several tiers at once (a same-origin API *and* a managed BaaS *and* a consumed vendor), so **the tiers OVERLAP: each row counts how many of the 1,066 have *any* host of that tier, not a slice of a pie. They sum to 1,485 tier-memberships across 1,066 apps (≈139%), not to 100%, and must not be read as shares of a whole.**
 
-| host tier | share of apps | injectable black-box? |
+| host tier | apps with this tier (% of the 1,066 classified) | injectable black-box? |
 |---|---:|---|
-| same-origin (static frontend) | 44% | no backend to inject |
-| third party vendor | 18% | not the app's surface |
-| opaque | 13% | unclassifiable |
-| **own backend** | **11%** | **yes** |
-| managed backend (Supabase / Firebase) | 10% | only via row-level security config |
+| same-origin (static frontend) | ~63% | no backend to inject |
+| third-party vendor (consumed) | ~26% | not the app's surface |
+| opaque (unattributable off-origin) | ~19% | not probed (flagged, no clean-bill credit) |
+| **own backend (attributed)** | **175 (16.4%)** | **yes** |
+| managed backend (Supabase / Firebase) | ~14% | only via row-level security config |
 
-**Only 11% of apps even have an own injectable backend.** You cannot inject SQL into a static site, and a managed backend app's only misconfiguration knob is row-level security. So the classic acute classes (SQLi, RCE) have almost no surface to land on, and the genuine acute risk that remains is disproportionately **backend misconfiguration** (the 2.73% data exposure tier), which is exactly where a black-box probe can still reach it.
+**Only 16.4% of the classified apps (175 of 1,066 with observed runtime traffic) have an own injectable backend** — and that is already a share of the traffic-bearing subset, not of the full corpus. You cannot inject SQL into a static site, and a managed backend app's only misconfiguration knob is row-level security. So the classic acute classes (SQLi, RCE) have almost no surface to land on, and the genuine acute risk that remains is disproportionately **backend misconfiguration** (the data-exposure tier), which is exactly where a black-box probe can still reach it. (Tier counts are off-score diagnostics from `scripts/stats.py`; the ~ figures are the overlapping tiers rebased on the 1,066 classified population.)
 
 By hosting platform, the population is dominated by Vercel:
 
@@ -152,7 +152,7 @@ So the story of this corpus is not "AI writes insecure code that gets exploited.
 ## 6. Limitations (stated, not hidden)
 
 - **Unauthenticated surface only.** Defects behind a login the grader cannot establish are undercounted. The true acute rate is a floor.
-- **Recall is not yet audited.** This release guarantees **stability and precision** (the ruler repeats, and it does not invent slop). The false negative rate against ground truth is measured separately and is ongoing. A low finding rate for a class could mean "rare" or "our detector missed it," and only a recall benchmark distinguishes them.
+- **Recall is not audited, and precision is vouched, not blanket.** This release guarantees **stability** (the ruler repeats) and **precision on the classes that carry explicit precision rules**; findings elsewhere are **unaudited, not endorsed**. That unaudited mass (most of the in-score penalty by count) is dominated by **deterministic presence checks** (a security header is absent, a `.map` resolves, a control is dead) where false-positive risk is structurally low. But the audit cannot distinguish "no rule needed" from "no rule written," and we can, so we report it as unaudited rather than claim a precision we have not checked. The false-negative rate against ground truth is measured separately and is ongoing: a low finding rate for a class could mean "rare" or "our detector missed it," and only a recall benchmark distinguishes them.
 - **Intent-independent scope.** Sloptic grades the universal floor, not whether a feature is good. Originality, product quality, and creativity are out of scope by design.
 - **Population, not universe.** Hackathon submissions skew toward young, small apps that are heavy on the frontend. The distribution should not be read as representative of production software at large.
 
