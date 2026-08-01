@@ -2,32 +2,56 @@
 name = "sloptic"
 version = "1.1.0"
 description = "Sloptic, a black-box HTTP resilience grader: deploys a web app, probes it over HTTP, and emits a slop score (deduction-only, lower is better)."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.27",
     "pydantic>=2",
     "pyyaml>=6",
 ]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: Security",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Software Development :: Testing",
+]
+
+[project.optional-dependencies]
+# Browser-rendered probes (SPA form discovery, axe-core accessibility, Core Web Vitals, DOM XSS). Optional:
+# the base install grades everything reachable over httpx. `pip install sloptic[browser]`, then
+# `playwright install chromium`. 1.61 is the FLOOR because it is the release that added Ubuntu 26.04 support
+# (microsoft/playwright#40117); 1.60 cannot fetch a browser there at all, and the >= alone does not save you
+# if a lockfile pins 1.60. Bumping 1.60->1.61 left a supavulnbase grade byte-identical (slop 328, same axes /
+# applicable / surface / findings), so it is not a known score confound; the rendering-fed axes (qa-a11y via
+# axe-core, perf-cwv, sec-domxss-001) would move first if a future bump ever does, so re-check those three then.
+browser = ["playwright>=1.61.0"]
+
+[project.scripts]
+sloptic = "sloptic.cli:main"
 
 [project.urls]
+Homepage = "https://github.com/sloptic/sloptic-main"
 Repository = "https://github.com/sloptic/sloptic-main"
 
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["sloptic"]
+# probes are DATA (catalog/**/*.yaml), a sibling of the package in the repo; ship it INSIDE the wheel at
+# sloptic/catalog so an installed grader has its battery. The loader (catalog.default_catalog_dir) checks the
+# packaged copy first, then the repo-root sibling used in development. NOTE: build/publish from the PUBLIC
+# mirror only -- the exclude drops any local hidden pool, but the mirror is the authoritative clean source.
+exclude = ["**/hidden/**", "**/catalog-hidden/**"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"catalog" = "sloptic/catalog"
+
 [dependency-groups]
-browser = [
-    # 1.61 is the FLOOR because it is the release that added Ubuntu 26.04 ("Playwright now supports Ubuntu
-    # 26.04"). 1.60 cannot fetch a browser there at all: `playwright install chromium` dies with "does not
-    # support chromium on ubuntu26.04-x64", and the >= constraint alone does NOT save you: uv.lock had 1.60.0
-    # pinned, so `uv sync` on a fresh 26.04 box reproduced the failure exactly. Note this repo's own dev box is
-    # 26.04 and ran on 1.60 only via _LAUNCH_ORDER's system chrome/msedge fallback; a fresh clone has no such
-    # browser installed, so the fallback is not a substitute for the floor.
-    #
-    # MEASURED, not assumed: bumping 1.60 (system channel) -> 1.61 (bundled chromium 149.0.7827.55) left a
-    # supavulnbase grade byte-identical: slop 328, same axes, same 69 applicable, same 60/8/85 surface, same
-    # finding set. So this is not a known score confound. It is still the axes fed by rendering (qa-a11y via
-    # axe-core, perf-cwv, sec-domxss-001) that would move first if a future bump ever does, and one target is
-    # not a corpus, re-check those three when the floor next changes.
-    "playwright>=1.61.0",
-]
 dev = ["pytest>=8"]
 
 [tool.pytest.ini_options]

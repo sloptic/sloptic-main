@@ -89,7 +89,7 @@ intent-dependent behavior, and it says so rather than implying comprehensiveness
 
 ```sh
 uv sync                      # core
-uv sync --group browser      # adds Playwright, for the accessibility, CWV, and DOM-XSS probes
+uv sync --extra browser      # adds Playwright, for the accessibility, CWV, and DOM-XSS probes
 uv run playwright install chromium
 ```
 

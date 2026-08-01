@@ -16,7 +16,7 @@ from dataclasses import asdict
 
 from . import browser, safety
 from .aggregate import CATEGORY_DECAY
-from .catalog import ProbeSelectionError, load_catalog, select_probes
+from .catalog import ProbeSelectionError, default_catalog_dir, load_catalog, select_probes
 from .deploy import DockerDeployer, RemoteDeployer, SubprocessDeployer
 from .ingest import SubmissionError, extract_submission
 from .pipeline import run
@@ -254,7 +254,7 @@ def main() -> None:
     src.add_argument("--submission", metavar="ZIP", help="a submission .zip (built + sandboxed via Docker)")
     src.add_argument("--target", metavar="URL", help="an already-running URL (dogfooding; no Docker)")
     src.add_argument("--app", metavar="PATH", help="a trusted reference app.py (subprocess; dev/CI)")
-    ap.add_argument("--catalog", metavar="DIR", default=str(_ROOT / "catalog"), help="probe catalog dir")
+    ap.add_argument("--catalog", metavar="DIR", default=str(default_catalog_dir()), help="probe catalog dir")
     ap.add_argument("--probe", metavar="PATTERN", action="append", default=[],
                     help="run ONLY these probes (repeatable): an id glob (sec-sqli-004, sec-sqli-*, sec-*), "
                          "or bundle:security / category:xss for groupings an id glob can't express. Answers "

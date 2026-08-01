@@ -14,6 +14,17 @@ class ProbeSelectionError(ValueError):
     target with zero probes and report slop 0, which reads as 'clean' rather than 'nothing ran'."""
 
 
+_PKG = pathlib.Path(__file__).resolve().parent   # the installed sloptic/ directory
+
+
+def default_catalog_dir() -> pathlib.Path:
+    """Where the probe catalog lives. Inside an installed wheel it is bundled at sloptic/catalog (see the
+    force-include in pyproject); running from a source checkout it is the repo-root sibling `catalog/`. Prefer
+    the packaged copy so a pip-installed grader has its battery; fall back to the sibling for development."""
+    packaged = _PKG / "catalog"
+    return packaged if packaged.is_dir() else _PKG.parent / "catalog"
+
+
 def load_catalog(root: str | pathlib.Path) -> list[Probe]:
     probes: list[Probe] = []
     for path in sorted(pathlib.Path(root).rglob("*.yaml")):
