@@ -1,4 +1,4 @@
-# Sloptic v1.0.0
+# Sloptic v1.1.0
 
 Sloptic grades any deployed web app, whatever its stack or purpose, and returns one
 **slop score** you can compare across apps (lower is better, `0` means nothing found),
@@ -6,8 +6,27 @@ along with where that app ranks against a frozen population of others. It reads 
 and needs no spec, so the same grade applies to every submission no matter what each one
 was built with.
 
-This is the first stable release. The engine, the catalog, and the scoring model are
-settled, and the grade is reproducible run to run.
+This builds on the v1.0 engine. The scoring model and the frozen reference curve (2026.1) are
+unchanged, so grades stay comparable to v1.0; the changes below are precision and diagnostics,
+not a new ruler.
+
+## What's new in 1.1.0
+
+- **Injection oracles hardened against LLM echo.** The command-injection, SSTI, path-traversal, XXE,
+  and file-upload detectors moved from an arithmetic marker to a salted-hash oracle: a real shell or
+  template hashes a random salt exactly, but a language model in the response path cannot, so an AI
+  endpoint that echoes or fabricates a value can no longer trigger a false positive. Validated on the
+  full corpus, the two standing command-injection false positives are gone with no regressions.
+- **Platform identifier (off-score diagnostic).** Each app is classified by hosting platform (Vercel,
+  Netlify, Railway, Render, Lovable, ...) from response headers and origin suffix, and by AI builder
+  (Lovable, Bolt) from served markup. It surfaces a new corpus finding: Lovable-built apps carry a
+  statistically significant slop premium, and it is entirely performance.
+- **Honesty fixes.** The parity dashboard now reports "cannot assess" when a run lacks the ground-truth
+  labels to measure, instead of a silent clean result; the corpus report's backend-tier denominator is
+  corrected with the tier overlap made explicit; and the guarantee is stated precisely as stability plus
+  precision vouched on the classes with explicit rules, unaudited elsewhere.
+
+The frozen reference curve stays **2026.1** (the score distribution did not move).
 
 ## Highlights
 
