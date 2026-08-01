@@ -26,6 +26,13 @@ not a new ruler.
   corrected with the tier overlap made explicit; and the guarantee is stated precisely as stability plus
   precision vouched on the classes with explicit rules, unaudited elsewhere.
 
+- **`--passive-only` grading tier.** Every probe is classified passive or active in `sloptic/safety.py` (37
+  passive, 54 active). A passive probe changes no state and fetches nothing hidden: it reads only what the app
+  serves to every visitor and reports leaks found there. An active probe mutates, sends a payload, needs
+  multiple identities, or goes fetching hidden data. `--passive-only` runs the passive subset, so a target can
+  be graded on its universal floor without being actively tested. Fail-closed (an unclassified probe is treated
+  active) and CI-locked. A passive grade is a subset, not comparable to a full grade.
+
 The frozen reference curve stays **2026.1** (the score distribution did not move).
 
 ## Highlights
