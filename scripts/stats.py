@@ -148,6 +148,9 @@ def main():
     ap.add_argument("--audit", metavar="PROBE", help="list every app + evidence where PROBE fired, then exit")
     ap.add_argument("--json", action="store_true", help="emit a machine-readable summary instead of the report")
     ap.add_argument("--sigma", type=float, default=2.0, help="high-outlier threshold in stdevs (default 2)")
+    ap.add_argument("--charts", action="store_true",
+                    help="render the corpus-writeup PNG charts (+ sibling CSVs) to docs/charts/, then exit "
+                         "(needs matplotlib: run via `uv run --with matplotlib`)")
     args = ap.parse_args()
 
     recs = load(args.results)
@@ -155,6 +158,15 @@ def main():
         sys.exit("no records")
     if args.audit:
         audit(recs, args.audit)
+        return
+    if args.charts:
+        import pathlib
+
+        from charts import render_all
+        written = render_all(recs, run_name=pathlib.Path(args.results).name)
+        print(f"wrote {len(written)} charts + sibling CSVs to docs/charts/ (run: {pathlib.Path(args.results).name})")
+        for p in written:
+            print("  " + p)
         return
 
     # cohorts: REPO apps are cloned + deploy-tested from source (the reproducibility metric applies to
