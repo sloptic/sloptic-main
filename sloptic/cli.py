@@ -14,7 +14,7 @@ import textwrap
 from collections import defaultdict
 from dataclasses import asdict
 
-from . import browser
+from . import browser, safety
 from .aggregate import CATEGORY_DECAY
 from .catalog import ProbeSelectionError, load_catalog, select_probes
 from .deploy import DockerDeployer, RemoteDeployer, SubprocessDeployer
@@ -262,6 +262,11 @@ def main() -> None:
                          "expected vulnerability class is known without spending the whole battery's traffic "
                          "on it. RECALL ONLY: the score is a subset, not comparable to a full grade. A "
                          "pattern that matches nothing is a fatal error, never an empty catalog.")
+    ap.add_argument("--passive-only", action="store_true",
+                    help="run ONLY passive probes (observation a normal visitor does: headers/TLS/a11y/perf/"
+                         "exposure GETs). Excludes every ACTIVE probe (injection, mutation, fault-induction, "
+                         "hammering, multi-account). For grading a target whose ownership is NOT verified, "
+                         "e.g. the public web product. A passive grade is a SUBSET, not comparable to a full grade.")
     ap.add_argument("--browser", action="store_true",
                     help="render pages with a headless browser (finds SPA/client-rendered forms)")
     ap.add_argument("--header", action="append", metavar="H", default=[],
@@ -291,6 +296,11 @@ def main() -> None:
         catalog = select_probes(load_catalog(args.catalog), args.probe)
     except ProbeSelectionError as e:
         sys.exit(f"ERROR: {e}")
+    if args.passive_only:   # safe-on-unverified subset: drop every active probe before anything runs
+        n_full = len(catalog)
+        catalog = safety.passive_catalog(catalog)
+        sys.stderr.write(f"  passive-only: {len(catalog)} of {n_full} probes (active probes excluded). "
+                         f"This score is a SUBSET and is not comparable to a full grade.\n")
     if args.probe:   # a subset run: say so, because the score is NOT a full grade
         sys.stderr.write(f"  probe filter: {', '.join(args.probe)} -> {len(catalog)} of "
                          f"{len(load_catalog(args.catalog))} probes. Recall check only; this score is a "
