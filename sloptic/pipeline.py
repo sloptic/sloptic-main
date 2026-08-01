@@ -12,7 +12,7 @@ from dataclasses import dataclass, field, replace
 
 import httpx
 
-from . import auth, secretscan
+from . import auth, platform_id, secretscan
 from .aggregate import compute_axis_slop, compute_slop_score, coverage_metrics
 from .deploy import Deployer
 from .discovery import discover, surface_metrics
@@ -273,11 +273,14 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
                 outcomes.extend(probe_outcomes)
                 if on_progress:
                     on_progress(i + 1, total, probe, probe_outcomes)  # done: i+1 probes completed
+            # OFF-SCORE diagnostic: identify the hosting platform + AI builder from one origin fetch (headers +
+            # served HTML). Inside the client block so it reuses the session; never raises -> never DNFs a grade.
+            plat = platform_id.classify_live(client, origin)
         if source_dir:   # static source scan (submission zip / --source DIR); absent for a bare --target
             outcomes.append(_source_secret_outcome(source_dir))
         return Report(slop_score=compute_slop_score(outcomes), outcomes=outcomes,
                       axis_slop=compute_axis_slop(outcomes), surface=surface_metrics(profile),
-                      coverage=coverage_metrics(outcomes), trace=trace_sink or [])
+                      coverage=coverage_metrics(outcomes), platform=plat, trace=trace_sink or [])
     finally:
         deployer.teardown()
 

@@ -32,7 +32,7 @@ _DEPLOY_FAILURES = (RuntimeError, TimeoutError, subprocess.SubprocessError, OSEr
 def _report_payload(report) -> dict:
     return {"slop_score": report.slop_score, "axis_slop": report.axis_slop,
             "surface": report.surface, "coverage": report.coverage,
-            "outcomes": [asdict(o) for o in report.outcomes]}
+            "platform": report.platform, "outcomes": [asdict(o) for o in report.outcomes]}
 
 
 def _grade_record(report, source: str) -> dict:
@@ -44,7 +44,7 @@ def _grade_record(report, source: str) -> dict:
     findings = [asdict(o) for o in report.outcomes if o.outcome == "slop_detected"]
     return {"repo": source, "deployed": True, "slop_score": report.slop_score,
             "axis_slop": report.axis_slop, "coverage": report.coverage,
-            "observed_surface": report.surface, "findings": findings}
+            "observed_surface": report.surface, "platform": report.platform, "findings": findings}
 
 
 def _coverage_text(report) -> str:

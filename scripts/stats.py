@@ -272,6 +272,23 @@ def main():
     own_hosts = Counter(h for t in tiered for h in (t.get("own_hosts") or []))
     opaque_hosts = Counter(h for t in tiered for h in (t.get("opaque_hosts") or []))
 
+    # PLATFORM + BUILDER (off-score, platform_id): host platform (headers+suffix), AI builder (served markup),
+    # and the payoff -- slop BY builder (are AI-built apps sloppier than hand-deployed ones?). Empty on records
+    # graded before the field existed (old runs) -> the section self-suppresses.
+    platted = [(r, r["platform"]) for r in recs if isinstance(r.get("platform"), dict) and r["platform"]]
+    host_dist = Counter((p.get("host_platform") or "unknown") for _, p in platted)
+    edge_dist = Counter(p["edge"] for _, p in platted if p.get("edge"))
+    builder_dist = Counter((p.get("builder") or "none / hand-built") for _, p in platted)
+
+    def _slop_by(keyfn):
+        b = defaultdict(list)
+        for r, p in platted:
+            if r.get("slop_score") is not None:
+                b[keyfn(p)].append(r["slop_score"])
+        return sorted(((k, len(v), round(statistics.median(v), 1)) for k, v in b.items()), key=lambda x: -x[1])
+    slop_by_builder = _slop_by(lambda p: p.get("builder") or "none / hand-built")
+    slop_by_host = _slop_by(lambda p: p.get("host_platform") or "unknown")
+
     models = Counter(r.get("model") for r in recs if r.get("model"))   # LLM(s) used (a file may mix runs)
 
     if args.json:
@@ -555,6 +572,18 @@ def main():
             print("    top own-backend hosts: " + ", ".join(f"{h}({c})" for h, c in own_hosts.most_common(6)))
         if opaque_hosts:
             print("    top opaque hosts:      " + ", ".join(f"{h}({c})" for h, c in opaque_hosts.most_common(6)))
+        print()
+
+    # (i4) PLATFORM + AI BUILDER (off-score) — WHERE it is served and WHAT built it, plus slop-by-builder
+    if platted:
+        n_pl = len(platted)
+        print(f"(i4) PLATFORM + AI BUILDER (off-score) — {n_pl} apps classified")
+        print("    host platform: " + ", ".join(f"{k} {c}({c/n_pl*100:.0f}%)" for k, c in host_dist.most_common()))
+        if edge_dist:
+            print("    edge / CDN:    " + ", ".join(f"{k} {c}" for k, c in edge_dist.most_common()))
+        print("    AI builder:    " + ", ".join(f"{k} {c}({c/n_pl*100:.0f}%)" for k, c in builder_dist.most_common()))
+        print("    slop by builder (median|n): " + "  ".join(f"{k}={med}(n{n})" for k, n, med in slop_by_builder))
+        print("    slop by host   (median|n): " + "  ".join(f"{k}={med}(n{n})" for k, n, med in slop_by_host[:8]))
         print()
 
 
