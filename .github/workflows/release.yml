@@ -1,21 +1,28 @@
-# Publish sloptic to PyPI on a version tag, via PyPI Trusted Publishing (OIDC).
-# No API token is stored anywhere: `id-token: write` mints a short-lived OIDC token that PyPI trusts because
-# this repo + workflow are registered as a trusted publisher (pypi.org -> project sloptic -> Publishing).
-# The build runs on this PUBLIC repo, so the wheel is built from the clean source (no hidden probe pool).
-name: Publish to PyPI
+# On a version tag: build sloptic, publish it to PyPI via Trusted Publishing (OIDC, no stored token), and
+# cut a GitHub Release with an auto-generated changelog + the built wheel/sdist attached.
+# Trusted Publishing: `id-token: write` mints a short-lived OIDC token PyPI trusts because this repo + workflow
+# are registered as a trusted publisher (pypi.org -> project sloptic -> Publishing). The build runs on this
+# PUBLIC repo, so the wheel is built from clean source (no hidden probe pool).
+name: Release
 
 on:
   push:
     tags: ["v*"]
 
 jobs:
-  publish:
+  release:
     runs-on: ubuntu-latest
     permissions:
-      id-token: write   # required for Trusted Publishing
-      contents: read
+      id-token: write   # PyPI Trusted Publishing
+      contents: write   # create the GitHub Release
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history so the changelog can diff against the previous tag
       - uses: astral-sh/setup-uv@v5
       - run: uv build
       - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true   # "What's Changed" since the previous tag
+          files: dist/*                  # attach the wheel + sdist to the release
