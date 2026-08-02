@@ -1,0 +1,21 @@
+# Publish sloptic to PyPI on a version tag, via PyPI Trusted Publishing (OIDC).
+# No API token is stored anywhere: `id-token: write` mints a short-lived OIDC token that PyPI trusts because
+# this repo + workflow are registered as a trusted publisher (pypi.org -> project sloptic -> Publishing).
+# The build runs on this PUBLIC repo, so the wheel is built from the clean source (no hidden probe pool).
+name: Publish to PyPI
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # required for Trusted Publishing
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv build
+      - uses: pypa/gh-action-pypi-publish@release/v1

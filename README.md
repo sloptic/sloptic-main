@@ -7,7 +7,8 @@ needs no spec, so the same grade applies to every submission in a hackathon no m
 was built with.
 
 ```sh
-uv run python -m sloptic.cli --target https://your-app.example.com
+pip install sloptic
+sloptic --target https://your-app.example.com
 ```
 
 ## Why
@@ -16,7 +17,7 @@ Merriam-Webster made *slop* its 2025 word of the year, the low effort content ge
 churns out in bulk, the junk images and filler text clogging every feed. Software is the same
 phenomenon one layer down. AI-assisted building made shipping a web app nearly free, and hackathon
 galleries fill with submissions that look finished but were never hardened. Studies of AI generated
-code bear out the worry, finding a vulnerability in roughly half of it. Yet when we graded 1,537
+code bear out the worry, finding a vulnerability in roughly half of it. Yet when we graded 1,528
 real submissions ourselves, the failure was rarely a dramatic exploit. Far more often it was the
 boring, pervasive floor left undone, no security headers, no rate limiting, broken accessibility, a
 dev build in production. App slop, it turns out, is chronic rather than acute.
@@ -88,34 +89,40 @@ intent-dependent behavior, and it says so rather than implying comprehensiveness
 ## Install
 
 ```sh
-uv sync                      # core
-uv sync --extra browser      # adds Playwright, for the accessibility, CWV, and DOM-XSS probes
-uv run playwright install chromium
+pip install sloptic                # core (grades everything reachable over HTTP)
+pip install "sloptic[browser]"     # + Playwright, for the accessibility, CWV, and DOM-XSS probes
+playwright install chromium        # only needed with [browser]
 ```
 
 ## Usage
 
-Grade a live URL (deploys nothing, tears nothing down, and only test targets you own or are
-authorized to test):
+Grade a live URL from the command line (deploys nothing, tears nothing down, and only test targets
+you own or are authorized to test):
 
 ```sh
-uv run python -m sloptic.cli --target https://your-app.example.com
+sloptic --target https://your-app.example.com
 ```
 
-Grade a submission (a zip containing a `Dockerfile`), built and run in a sandbox, then graded:
+Or drive it as a library:
+
+```python
+from sloptic.catalog import load_catalog, default_catalog_dir
+from sloptic.deploy import RemoteDeployer
+from sloptic.pipeline import run
+
+report = run(RemoteDeployer("https://your-app.example.com"), load_catalog(default_catalog_dir()))
+print(report.slop_score, report.axis_slop)
+```
+
+Grade a submission (a zip containing a `Dockerfile`), built and run in a sandbox, then graded (needs
+Docker):
 
 ```sh
-uv run python -m sloptic.cli --submission team.zip
+sloptic --submission team.zip
 ```
 
 A submission that will not unzip, has no `Dockerfile`, will not build, or never answers `$PORT`
 yields a `DNF` record and exits non-zero. It never crashes the grader.
-
-Run the calibration suite against the bundled reference apps:
-
-```sh
-uv run pytest -q
-```
 
 ## How it deploys
 
@@ -142,7 +149,8 @@ Two instruments, because they answer different questions:
    present. A corpus of real apps tells you how often a defect occurs, but only a benchmark with
    ground truth tells you the detector works.
 
-`uv run pytest -q` runs the calibration suite (848 tests).
+From a source checkout, `uv sync` then `uv run pytest -q` runs the full calibration suite against the
+bundled reference apps (`references/`, not shipped in the pip package).
 
 ## Scope, honestly
 
