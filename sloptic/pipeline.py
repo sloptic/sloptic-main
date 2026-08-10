@@ -16,7 +16,7 @@ from . import auth, platform_id, secretscan
 from .aggregate import compute_axis_slop, compute_slop_score, coverage_metrics
 from .deploy import Deployer
 from .discovery import discover, surface_metrics
-from .net import make_client, set_trace_probe, start_trace
+from .net import is_bot_challenge, make_client, set_trace_probe, start_trace
 from .probes import MATCHERS, PREDICATES, _repro_from_resp, describe
 from .schema import Form, Outcome, Probe, Profile, Report
 
@@ -257,6 +257,17 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
         #                                   make_client so the shared declarative client is hooked too.
         with make_client(origin, headers, timeout=15.0, follow_redirects=True) as client:
             ctx = _Ctx(origin, client, profile, headers, browser_register=browser_register)
+            # ENTRY GATE: if the target answers with a bot-challenge / WAF interstitial / sleeping-app page,
+            # grading it draws false findings from its HTML AND hides the real surface (false cleans). Withhold
+            # the grade instead of scoring the interstitial. The record is flagged bot_challenge -> excluded
+            # from the score distribution, never read as a clean grade.
+            try:
+                if is_bot_challenge(client.get(origin)):
+                    return Report(slop_score=0, outcomes=[], surface=surface_metrics(profile),
+                                  platform=platform_id.classify_live(client, origin),
+                                  bot_challenge=True, trace=trace_sink or [])
+            except Exception:   # best-effort side check: a failed probe fetch must never gate the grade
+                pass
             for i, probe in enumerate(catalog):
                 if trace:
                     set_trace_probe(probe.id)                  # tag every request this probe makes (fired or not)
@@ -276,11 +287,19 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
             # OFF-SCORE diagnostic: identify the hosting platform + AI builder from one origin fetch (headers +
             # served HTML). Inside the client block so it reuses the session; never raises -> never DNFs a grade.
             plat = platform_id.classify_live(client, origin)
+            # END RE-CHECK: our own active traffic (rate-limit hammering, load burst) can trip a DDoS/bot
+            # mitigation MID-grade -- after which later probes read the interstitial and report false cleans.
+            # If the origin is now challenging us, flag the whole grade unreliable.
+            try:
+                challenged = is_bot_challenge(client.get(origin))
+            except Exception:
+                challenged = False
         if source_dir:   # static source scan (submission zip / --source DIR); absent for a bare --target
             outcomes.append(_source_secret_outcome(source_dir))
         return Report(slop_score=compute_slop_score(outcomes), outcomes=outcomes,
                       axis_slop=compute_axis_slop(outcomes), surface=surface_metrics(profile),
-                      coverage=coverage_metrics(outcomes), platform=plat, trace=trace_sink or [])
+                      coverage=coverage_metrics(outcomes), platform=plat, bot_challenge=challenged,
+                      trace=trace_sink or [])
     finally:
         deployer.teardown()
 

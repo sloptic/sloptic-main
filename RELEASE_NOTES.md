@@ -1,4 +1,4 @@
-# Sloptic v1.1.0
+# Sloptic v1.2.0
 
 Sloptic grades any deployed web app, whatever its stack or purpose, and returns one
 **slop score** you can compare across apps (lower is better, `0` means nothing found),
@@ -7,8 +7,20 @@ and needs no spec, so the same grade applies to every submission no matter what 
 was built with.
 
 This builds on the v1.0 engine. The scoring model and the frozen reference curve (2026.1) are
-unchanged, so grades stay comparable to v1.0; the changes below are precision and diagnostics,
-not a new ruler.
+unchanged across 1.1 and 1.2, so grades stay comparable; the changes below are precision and
+diagnostics, not a new ruler.
+
+## What's new in 1.2.0
+
+- **Bot-challenge / interstitial guard.** A CDN or WAF sometimes serves a challenge page ("Just a
+  moment...", a Cloudflare `cf-mitigated` response), and a sleeping app can serve a wake-up page,
+  in place of the real app. Grading that is doubly wrong: its HTML draws false findings, and it
+  hides the real surface so every later probe reports a false clean. Sloptic now detects these
+  interstitials (`net.is_bot_challenge`): if the target answers with one, the grade is **withheld**
+  and flagged `bot_challenge` rather than scored, and a mitigation that trips *mid-grade* (from the
+  grader's own active traffic) is caught by an end-of-run re-check. Flagged records are excluded
+  from corpus statistics. Conservative by design: a genuine 403 or error page is not treated as a
+  challenge, so a real grade is never withheld.
 
 ## What's new in 1.1.0
 

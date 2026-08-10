@@ -181,7 +181,8 @@ def main():
     nonfunctional = [r for r in recs if r.get("functional") is False]
     disputed = [r for r in recs if r.get("disputed_broken") and r.get("functional") is not False]  # veto: scored, flagged
     graded = [r for r in recs if r.get("deployed") and "slop_score" in r and r.get("functional") is not False
-              and not r.get("recon")]   # recon records carry host_tiers only (no probes) -> not a real grade
+              and not r.get("recon")      # recon records carry host_tiers only (no probes) -> not a real grade
+              and not r.get("bot_challenge")]   # a WAF/challenge/sleep page was served -> grade unreliable, excluded
     ungraded = [r for r in deployed if "slop_score" not in r]   # repo app came up but grading aborted
     scores = [r["slop_score"] for r in graded]
     # (g) pairing: a submission graded BOTH ways — keyed by project, the delta is the reproducibility signal

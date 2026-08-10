@@ -104,3 +104,30 @@ def make_client(base_url: str, headers: dict | None = None, **kwargs) -> httpx.C
         for name, value in cookies.items():
             client.cookies.set(name, value, domain=domain, path="/")
     return client
+
+
+# A CDN/WAF interstitial or a sleeping-app wake page served IN PLACE OF the real app. Grading it is doubly
+# wrong: its (uncompressed) HTML draws false findings, and it HIDES the real surface so every probe after it
+# reads a false clean. Detection is header-first (cheap, high-confidence) then a specific-marker body scan.
+_CHALLENGE_MARKERS = (
+    "just a moment", "checking your browser", "cf-browser-verification", "cf_chl_opt", "__cf_chl",
+    "attention required!", "enable javascript and cookies to continue", "verifying you are human",
+    "ddos protection by", "vercel security checkpoint", "please wait while we verify",
+    "this app has gone to sleep", "get this app back up",   # Streamlit Community Cloud sleep page
+)
+
+
+def is_bot_challenge(resp) -> bool:
+    """True when `resp` is a bot-challenge / WAF interstitial / sleeping-app page, not the app itself. Callers
+    should treat it as UNAVAILABLE (N/A / withhold the grade), never as content. Conservative: only fires on a
+    Cloudflare mitigation header or a specific known interstitial marker, so a real 403/error page is not one."""
+    try:
+        if "cf-mitigated" in resp.headers:
+            return True
+        ctype = resp.headers.get("content-type", "").lower()
+        if "html" not in ctype and "text" not in ctype:
+            return False   # a challenge page is HTML; skip JSON/binary/asset responses
+        body = resp.text[:8192].lower()
+    except (httpx.HTTPError, ValueError, UnicodeError):
+        return False
+    return any(m in body for m in _CHALLENGE_MARKERS)

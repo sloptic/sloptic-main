@@ -139,6 +139,7 @@ class Report:
     surface: dict = field(default_factory=dict)            # what discovery SAW (discovery.surface_metrics)
     coverage: dict = field(default_factory=dict)           # how much of the battery APPLIED (coverage_metrics)
     platform: dict = field(default_factory=dict)           # OFF-SCORE: host platform + AI builder (platform_id)
+    bot_challenge: bool = False                            # target answered with a WAF/challenge/sleep page -> grade unreliable
     trace: list = field(default_factory=list)              # --trace only: every request each probe sent (net.start_trace)
 
     @property
