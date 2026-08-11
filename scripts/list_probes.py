@@ -20,6 +20,7 @@ sys.path.insert(0, str(_ROOT))   # so `sloptic` imports when run as scripts/list
 from sloptic.aggregate import compute_slop_score  # noqa: E402
 from sloptic.catalog import load_catalog  # noqa: E402
 from sloptic.probes import describe  # noqa: E402
+from sloptic.reportcard import card_copy  # noqa: E402
 from sloptic.schema import Outcome  # noqa: E402
 
 
@@ -68,10 +69,15 @@ def main() -> None:
     fmt = ap.add_mutually_exclusive_group()
     fmt.add_argument("--csv", action="store_true", help="emit CSV")
     fmt.add_argument("--json", action="store_true", help="emit JSON")
+    ap.add_argument("-v", "--verbose", action="store_true",   # composes with --csv/--json, or stands alone
+                    help="show the team REPORT-CARD copy (expected / indicates / remediation) per probe")
     args = ap.parse_args()
 
     catalog = load_catalog(args.catalog)
     data = list(_rows(catalog))
+    if args.verbose:   # fold the report-card copy into every record (json/csv columns; human blocks below)
+        for r in data:
+            r["card_expected"], r["card_indicates"], r["card_remediation"] = card_copy(r["id"], r["why"])
 
     if args.json:
         print(json.dumps(data, indent=2))
@@ -80,6 +86,15 @@ def main() -> None:
         w = csv.DictWriter(sys.stdout, fieldnames=list(data[0].keys()))
         w.writeheader()
         w.writerows(data)
+        return
+    if args.verbose:   # human: a report-card block per probe instead of the table
+        for r in data:
+            print(f"\n{r['id']}  [{r['bundle']}/{r['category']}]  penalty {r['penalty']}"
+                  + (f"  ·  {r['variant_group']}" if r["variant_group"] else ""))
+            print(f"  EXPECTED:    {r['card_expected']}")
+            print(f"  INDICATES:   {r['card_indicates']}")
+            print(f"  REMEDIATION: {r['card_remediation']}")
+        print(f"\n{len(catalog)} probes.")
         return
 
     header = "  ".join(h.ljust(w) for _, h, w in _COLS)

@@ -15,7 +15,7 @@ import textwrap
 from collections import defaultdict
 from dataclasses import asdict
 
-from . import browser, safety
+from . import browser, runcache, safety
 from .aggregate import CATEGORY_DECAY
 from .catalog import ProbeSelectionError, default_catalog_dir, load_catalog, select_probes
 from .deploy import DockerDeployer, RemoteDeployer, SubprocessDeployer
@@ -327,6 +327,11 @@ def main() -> None:
                      help="stream every probe/target outcome as it runs (stderr), and append the "
                           "score breakdown showing the variant-group + within-category dampers")
     out.add_argument("-q", "--quiet", action="store_true", help="suppress the live progress bar")
+    cache = ap.add_argument_group("run cache")
+    cache.add_argument("--refresh", action="store_true",
+                       help="ignore any cached grade for this target and re-probe (then overwrite the cache)")
+    cache.add_argument("--no-cache", action="store_true",
+                       help="do not read or write the run cache at all (always grade fresh)")
     args = ap.parse_args()
 
     try:
@@ -355,24 +360,41 @@ def main() -> None:
     if args.source and not pathlib.Path(args.source).exists():
         _fail(args, "bad-arg", f"--source path does not exist: {args.source}")
 
+    # Run cache: a second grade of the same target (grade-affecting flags + code/catalog unchanged) reuses the
+    # stored Report, so switching the OUTPUT view (--failed / --report-card / --json) doesn't re-probe the app.
+    key = None if args.no_cache else runcache.cache_key(
+        source, args.catalog, probes=args.probe, passive_only=args.passive_only, browser=args.browser,
+        headers=args.header, source_dir=args.source, harden=args.harden)
+    report = None
+    if key and not args.refresh:
+        hit = runcache.load(key)
+        if hit:
+            report, age = hit
+            sys.stderr.write(f"  ✓ cached grade ({runcache.human_age(age)} old) — --refresh to re-grade\n")
+    if report is None:
+        report = _grade(args, source, catalog, render, auth_headers, progress)
+        if key:
+            runcache.save(key, report, source)
+    _clear_bar(args)
+    _print_report(report, source, args)
+
+
+def _grade(args, source, catalog, render, auth_headers, progress):
+    """Deploy the source (subprocess / remote URL / sandboxed submission) and run the battery, returning the
+    Report. Deploy/build/health failure -> _fail (SystemExit). Factored out so main() can short-circuit to the
+    run cache before this ever executes."""
     # Trusted reference app: subprocess, no Docker.
     if args.app:
-        report = run(SubprocessDeployer(args.app), catalog, render=render, headers=auth_headers,
-                     on_progress=progress, source_dir=args.source)
-        _clear_bar(args)
-        _print_report(report, source, args)
-        return
+        return run(SubprocessDeployer(args.app), catalog, render=render, headers=auth_headers,
+                   on_progress=progress, source_dir=args.source)
 
     # Already-running URL: dogfooding, no Docker, no teardown of the target.
     if args.target:
         try:
-            report = run(RemoteDeployer(args.target), catalog, render=render, headers=auth_headers,
-                         on_progress=progress, source_dir=args.source)
+            return run(RemoteDeployer(args.target), catalog, render=render, headers=auth_headers,
+                       on_progress=progress, source_dir=args.source)
         except _DEPLOY_FAILURES as e:
             _fail(args, "unreachable", str(e)[:500])
-        _clear_bar(args)
-        _print_report(report, source, args)
-        return
 
     # Untrusted submission: unzip -> build -> sandboxed run -> fuzz.
     try:
@@ -385,14 +407,12 @@ def main() -> None:
             read_only=args.harden,
             network=args.network if args.harden else None,
         )
-        report = run(deployer, catalog, render=render, headers=auth_headers, on_progress=progress,
-                     source_dir=args.source or str(sub.context_dir))  # scan the submission's own source
+        return run(deployer, catalog, render=render, headers=auth_headers, on_progress=progress,
+                   source_dir=args.source or str(sub.context_dir))  # scan the submission's own source
     except _DEPLOY_FAILURES as e:
         _fail(args, "DNF", str(e)[:500])
     finally:
         sub.cleanup()
-    _clear_bar(args)
-    _print_report(report, source, args)
 
 
 if __name__ == "__main__":

@@ -320,6 +320,16 @@ _GENERIC = ("A durability check for this issue passed on well-built apps.",
 _AXIS_TITLE = {"security": "Security", "qa": "Quality & Correctness", "performance": "Performance"}
 
 
+def card_copy(probe_id: str, reason: str = "") -> tuple[str, str, str]:
+    """The authored (expected, indicates, remediation) triple for a probe_id, with the same generic fallback
+    the report card uses. `reason` (the catalog 'why') fills the 'indicates' line for an unauthored probe.
+    Public so `scripts/list_probes.py --verbose` renders the exact copy a team would see, without a finding."""
+    expected, indicates, remediation = _CONTENT.get(probe_id, _GENERIC)
+    if not indicates:
+        indicates = reason or "an issue a durable app avoids"
+    return expected, indicates, remediation
+
+
 def _pool_map(catalog_root: str | pathlib.Path) -> dict[str, str]:
     """probe_id -> pool ('public' | 'hidden'), from the catalog. Missing -> 'public' (fail-open to disclosure
     would over-share, so callers that can't load the catalog should treat everything as public deliberately)."""
