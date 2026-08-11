@@ -1,0 +1,14 @@
+id: perf-font-001
+bundle: performance
+category: font-loading
+pool: public
+evidence_model: provable
+penalty: 6    # PROVISIONAL (v2.0 Family 4 -- rank_variance + re-price before the 2026.3 freeze): a web font with
+              # no non-blocking font-display (swap/optional/fallback) causes FOIT -- invisible text then reflow
+              # (~32% of font pages; Lighthouse font-display). A font-LOADING strategy, decorrelated from size.
+applicability:
+  requires: [at_least_one_http_endpoint_exists]   # further self-gated: N/A when the page loads no web font
+probe:
+  # parse @font-face (inline + same-origin CSS) + Google Fonts <link>s; fire when a web font lacks a good display.
+  predicate: font_display_missing
+  target: /

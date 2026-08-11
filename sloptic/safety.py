@@ -22,14 +22,22 @@ PASSIVE_PROBES = frozenset({
     # performance -- all measure timing/weight/requests from ordinary loads (no burst)
     "perf-cache-001", "perf-compress-001", "perf-loadtime-001", "perf-weight-001", "perf-weight-002",
     "perf-requests-001", "perf-ttfb-001", "perf-ttfb-002", "perf-ttfb-003", "perf-cwv-001", "perf-cwv-002",
+    "perf-lcp-001", "perf-dom-001", "perf-font-001",   # v2.0 Family 4: render/observe or parse CSS -- no state change
     # qa -- render / static-analyse / GET; nothing submitted, created, or malformed
     "qa-a11y-001", "qa-a11y-002", "qa-links-001", "qa-console-001", "qa-ctype-001", "qa-devbuild-001",
     "qa-http-001", "qa-http-002", "qa-seo-001", "qa-backnav-001", "qa-chunk-001", "qa-deeplink-001",
+    "perf-minify-001",   # fetches the homepage's same-origin .css/.js and measures minification (plain GETs)
+    "qa-deploy-001",   # static-analyses the already-served client bundle for a dev/private backend URL
+    "qa-deploy-002",   # follows redirects from the homepage/links like a normal visitor (no mutation/payload)
+    "qa-deploy-003",   # reads the served OAuth authorize URL / follows an auth route one hop (never completes it)
+
     # security -- config/hygiene + leaks OBSERVED in what the app already serves to every visitor (headers,
     # bundle, normal responses, a served source map). No payload, no mutation, no FETCHING of hidden files.
     "sec-headers-001", "sec-headers-002", "sec-headers-003", "sec-headers-004", "sec-headers-005",
     "sec-headers-006", "sec-csp-001", "sec-cors-001", "sec-mixed-001", "sec-deps-001", "sec-secrets-001",
     "sec-secrets-002", "sec-exposure-005", "sec-exposure-006",
+    "sec-tls-001",   # observes the origin's scheme + whether it upgrades to https (a plain GET, no payload)
+    "sec-sri-001",   # parses the served homepage HTML for cross-origin subresources without integrity (a GET)
 })
 
 # Sends a payload / mutates / induces a fault / hammers / needs accounts / pulls exposed data.

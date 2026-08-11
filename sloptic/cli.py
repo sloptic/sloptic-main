@@ -1,7 +1,8 @@
 """Deploy/target an app, probe it over HTTP, and report a slop score (lower is better).
 
 Default output is a human-readable summary; --failed lists the probes that detected slop; --json
-prints the full machine-readable report. See --help for all options.
+prints the full machine-readable report; --report-card renders the team-facing durability card
+(what was expected, what we saw, what it indicates, how to fix, per finding). See --help.
 """
 from __future__ import annotations
 
@@ -42,9 +43,18 @@ def _grade_record(report, source: str) -> dict:
     (axis_slop, coverage.applied/ran_kinds, observed_surface) drive the per-axis rank, slop_potential and the
     completeness bundle."""
     findings = [asdict(o) for o in report.outcomes if o.outcome == "slop_detected"]
-    return {"repo": source, "deployed": True, "slop_score": report.slop_score,
-            "axis_slop": report.axis_slop, "coverage": report.coverage, "observed_surface": report.surface,
-            "platform": report.platform, "bot_challenge": report.bot_challenge, "findings": findings}
+    rec = {"repo": source, "deployed": True, "slop_score": report.slop_score,
+           "axis_slop": report.axis_slop, "coverage": report.coverage, "observed_surface": report.surface,
+           "platform": report.platform, "bot_challenge": report.bot_challenge, "findings": findings}
+    # v2.0 Family 2: carry the OFF-SCORE a11y advisory candidates even when a11y is CLEAN (so not in `findings`).
+    # The decorrelated apps are exactly the ones clean on the scored a11y carrier but failing an advisory rule,
+    # so the re-grade needs their advisory data to measure decorrelation before promoting any of it to the score.
+    for o in report.outcomes:
+        adv = (o.evidence or {}).get("advisory_a11y")
+        if adv:
+            rec["advisory_a11y"] = adv
+            break
+    return rec
 
 
 def _coverage_text(report) -> str:
@@ -168,10 +178,28 @@ def _score_breakdown_text(report, decay: float = CATEGORY_DECAY) -> str:
     return "\n".join(lines)
 
 
+def _render_card(report, source: str, args) -> None:
+    """Team-facing durability report card. Markdown to stdout (--report-card), or written to a file whose
+    extension picks the format (.html -> a shareable page, else markdown). Reuses the corpus-shaped grade
+    record, so the CLI card is byte-identical to the batch `scripts/report_card.py` output for the same app."""
+    from .reportcard import build_card, to_html, to_markdown
+    card = build_card(_grade_record(report, source), catalog_root=args.catalog, organizer=args.organizer)
+    dest = args.report_card
+    if dest and dest != "-":
+        text = to_html(card) if dest.lower().endswith((".html", ".htm")) else to_markdown(card)
+        pathlib.Path(dest).write_text(text)
+        print(f"  report card written to {dest}")
+    else:
+        print(to_markdown(card))
+
+
 def _print_report(report, source: str, args) -> None:
     if getattr(args, "out", None):
         from .jsonl import append_jsonl
         append_jsonl(args.out, _grade_record(report, source))
+    if getattr(args, "report_card", None) is not None:
+        _render_card(report, source, args)
+        return
     if args.json:
         print(json.dumps(_report_payload(report), indent=2))
         return
@@ -245,6 +273,7 @@ def main() -> None:
               %(prog)s --app references/vulnerable/app.py     # trusted ref, no Docker
               %(prog)s --submission team.zip --harden         # untrusted zip, sandboxed (Docker host)
               %(prog)s --target https://example.com --failed  # an already-running URL
+              %(prog)s --app references/vulnerable/app.py --report-card card.html  # shareable team card
 
             Only fuzz targets you own or are authorized to test.
             """
@@ -286,6 +315,14 @@ def main() -> None:
                      help="append this grade as a JSONL record, then place it on the frozen curve with "
                           "`python scripts/benchmark.py rank --results FILE`")
     out.add_argument("--failed", action="store_true", help="list only the probes that detected slop")
+    out.add_argument("--report-card", metavar="FILE", nargs="?", const="-",
+                     help="render the team durability report card instead of the summary: markdown to stdout "
+                          "(bare --report-card), or to a file (--report-card card.md, or card.html for a "
+                          "shareable page). Per finding: what was expected, what we observed, what it "
+                          "indicates, and how to fix it.")
+    out.add_argument("--organizer", action="store_true",
+                     help="with --report-card, reveal hidden-pool (anti-gaming) findings in full; "
+                          "without it they are an opaque withheld count")
     out.add_argument("-v", "--verbose", action="store_true",
                      help="stream every probe/target outcome as it runs (stderr), and append the "
                           "score breakdown showing the variant-group + within-category dampers")

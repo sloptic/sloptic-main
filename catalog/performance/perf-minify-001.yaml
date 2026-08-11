@@ -1,0 +1,17 @@
+id: perf-minify-001
+bundle: performance
+category: minification
+pool: public
+evidence_model: provable
+penalty: 10   # PROVISIONAL (v2.0 Family 4 -- re-price from the corpus footrule + rank_variance before the
+              # 2026.3 freeze): a production asset shipped unminified wastes bytes + parse time every load
+              # (Lighthouse unminified-css / unminified-javascript). Must PROVE it is not just re-measuring
+              # "heavy page" (decorrelated from the weight/compress/cwv cluster) to stay scored -> rank_variance.
+applicability:
+  requires: [at_least_one_http_endpoint_exists]   # further self-gated: N/A with no sizeable same-origin asset
+probe:
+  # fetch the homepage's same-origin .css/.js; fire when a sizeable one (>8KB) is unminified (avg line length
+  # well under any formatted source). same-origin only; cross-origin CDN files are the vendor's concern.
+  predicate: unminified_assets
+  target: /
+  max_attempts: 6

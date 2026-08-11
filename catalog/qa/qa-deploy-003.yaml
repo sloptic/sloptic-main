@@ -1,0 +1,18 @@
+id: qa-deploy-003
+bundle: qa
+category: availability
+pool: public
+evidence_model: provable
+penalty: 24   # PROVISIONAL (v2.0 Family 1 -- re-price from the corpus footrule before the 2026.3 freeze): the
+              # sign-in flow is dead for every visitor (the OAuth provider redirects them to a host that does
+              # not exist in prod), so a core feature is unusable. Between a dead href (12) and a dead backend
+              # (34): scoped to auth, not the whole data layer. Gate-shaped (rare, decisive), not middle-band.
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  # find the OAuth authorization URL in the served homepage or by following a same-origin auth route one hop
+  # (never completing the flow); fire when its redirect_uri host is localhost/private/unset AND differs from
+  # the app's own origin (a localhost target using a localhost callback is not punished).
+  predicate: oauth_redirect_localhost
+  target: /
+  max_attempts: 30

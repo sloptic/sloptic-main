@@ -1,0 +1,18 @@
+id: qa-deploy-002
+bundle: qa
+category: availability
+pool: public
+evidence_model: provable
+penalty: 30   # PROVISIONAL (v2.0 Family 1 -- re-price from the corpus footrule before the 2026.3 freeze):
+              # a redirect loop makes the route unreachable for EVERY visitor (the browser aborts with
+              # ERR_TOO_MANY_REDIRECTS), so it is more severe than a single dead href (qa-links-001, 12) and
+              # near the dead-backend gate (qa-deploy-001, 34). Gate-shaped (rare, decisive), not middle-band.
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  # follow redirects manually from the homepage + each same-origin link it declares; fire on a cycle or on
+  # exceeding the browser redirect cap. same-origin only (never chase a redirect off-origin with auth headers).
+  predicate: redirect_loop
+  target: /
+  max_hops: 20
+  max_attempts: 40

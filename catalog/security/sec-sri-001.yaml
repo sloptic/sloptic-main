@@ -1,0 +1,17 @@
+id: sec-sri-001
+bundle: security
+category: supply-chain
+pool: public
+evidence_model: provable
+penalty: 12   # PROVISIONAL (v2.0 Family 4 -- re-price from the corpus footrule + rank_variance before the
+              # 2026.3 freeze): a middle-band supply-chain hygiene gap, not an active exploit. Cite the W3C SRI
+              # recommendation, not our judgment. CONDITIONALLY prevalent (only apps loading cross-origin
+              # script/style), so it may be a low-variance tax among applicable apps -> rank_variance decides
+              # whether it stays scored and at what price. Anchored: a cross-origin script with/without integrity.
+applicability:
+  requires: [at_least_one_http_endpoint_exists]   # further self-gated by the predicate: N/A with no cross-origin subresource
+probe:
+  # parse the served homepage HTML; fire when a cross-origin <script src> or <link rel=stylesheet|preload|
+  # modulepreload> ships without an integrity= hash. same-origin resources need no SRI. N/A when none exist.
+  predicate: subresource_integrity_missing
+  target: /

@@ -1,0 +1,14 @@
+id: perf-lcp-001
+bundle: performance
+category: lcp-strategy
+pool: public
+evidence_model: oracle
+penalty: 8    # PROVISIONAL (v2.0 Family 4 -- rank_variance + re-price before the 2026.3 freeze): loading=lazy on
+              # the LCP image defers the one image that defines first paint (~15% of sites; Lighthouse). A
+              # loading-STRATEGY mistake, decorrelated from the weight/timing carriers -> must prove it in rank_variance.
+applicability:
+  requires: [browser]   # needs a render + LCP observer; N/A without --browser
+probe:
+  # render once, observe the LCP element; fire when it is an <img loading="lazy">. N/A when LCP isn't an image.
+  predicate: lcp_image_lazy_loaded
+  target: /

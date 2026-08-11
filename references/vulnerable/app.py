@@ -91,9 +91,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path == "/":
             return self._send(200, HOME)
         if self.path == "/config.js":  # leaks a (fake, non-placeholder) AWS key in client JS — classic slop;
-            # also ships a jQuery with a known XSS CVE (sec-deps-001 supply-chain) via its license banner
+            # ships a jQuery with a known XSS CVE (sec-deps-001) via its license banner, AND points its API at
+            # localhost + an unset build-time env var (qa-deploy-001: backend dead for every real visitor)
             return self._send(200, '/*! jQuery v1.12.4 | (c) jQuery Foundation | jquery.org/license */\n'
-                                    'const AWS_KEY = "AKIAZ3PK7NBQWXYZ1234";\n', "application/javascript")
+                                    'const AWS_KEY = "AKIAZ3PK7NBQWXYZ1234";\n'
+                                    'const API_BASE = "http://localhost:8000/api";\n'
+                                    'const CDN_URL = "https://undefined/assets";\n', "application/javascript")
         if self.path == "/.env":  # secrets file served at the webroot — deployment slop
             return self._send(
                 200, "DATABASE_URL=postgres://app:hunter2@db/app\nDJANGO_SECRET_KEY=insecure-dev-key\n",

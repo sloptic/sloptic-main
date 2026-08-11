@@ -855,10 +855,14 @@ def first_contentful_paint(url: str, headers=None, timeout: float = 12.0) -> flo
 # `incomplete` (needs a human to decide). We take `violations` only, filtered to the WCAG 2 A/AA
 # conformance target (excludes best-practice opinions + aspirational AAA) — so the ingested corpus lands
 # squarely on our objective/intent-independent axis, and `incomplete` is left to the human judge.
-# WCAG 2.0/2.1 A/AA — the established conformance target (ADA / Section 508 / EN 301 549). We omit the
-# newer WCAG 2.2 rules (e.g. target-size), which fire on default-sized controls across most well-built
-# desktop pages and would false-positive; 2.2 can be revisited once we can gauge its precision on real apps.
+# WCAG 2.0/2.1 A/AA — the established conformance target (ADA / Section 508 / EN 301 549), the SCORED set.
 _AXE_WCAG_TAGS = ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"]
+# v2.0 FAMILY 2: the candidate expansion (WCAG 2.2 AA + axe best-practice: target-size, landmarks, heading
+# order, skip links, ...). Run alongside the scored set but captured OFF-SCORE (see a11y_violations_present),
+# so the next corpus re-grade can measure each rule's DECORRELATION from the existing a11y carrier before any
+# of it is promoted to the score. This is the "gauge its precision on real apps first" the old comment asked
+# for. target-size is enabled explicitly (axe ships it disabled by default).
+_AXE_ADVISORY_TAGS = ["wcag22aa", "best-practice"]
 _AXE_JS_CACHE: str | None = None
 
 
@@ -948,9 +952,9 @@ def _contrast_data(violation) -> list:
 
 
 def a11y_violations(url: str, headers=None, timeout: float = 12.0) -> list | None:
-    """Render url, inject axe-core, and return its WCAG 2 A/AA violations as [{id, impact}] — the
-    gold-standard deterministic a11y ruleset (~100 rules incl. contrast, ARIA, structure). None if no
-    browser or the render fails."""
+    """Render url, inject axe-core, and return its violations as [{id, impact, tags}] — the WCAG 2 A/AA SCORED
+    ruleset (~100 rules incl. contrast, ARIA, structure) PLUS the Family-2 advisory candidates (WCAG 2.2 AA +
+    axe best-practice). `tags` lets the caller partition scored-vs-advisory. None if no browser / render fails."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -970,10 +974,11 @@ def a11y_violations(url: str, headers=None, timeout: float = 12.0) -> list | Non
                     page.wait_for_timeout(300)                    # violations (and the count flaps between runs)
                 page.add_script_tag(content=_axe_js())            # defines window.axe
                 results = page.evaluate(
-                    "() => axe.run(document, {runOnly: {type: 'tag', values: %s}})" % json.dumps(_AXE_WCAG_TAGS))
+                    "() => axe.run(document, {runOnly: {type: 'tag', values: %s}, "
+                    "rules: {'target-size': {enabled: true}}})" % json.dumps(_AXE_WCAG_TAGS + _AXE_ADVISORY_TAGS))
                 out = []
                 for v in results.get("violations", []):
-                    rec = {"id": v["id"], "impact": v.get("impact")}
+                    rec = {"id": v["id"], "impact": v.get("impact"), "tags": v.get("tags") or []}
                     if v["id"] == "color-contrast":
                         # axe fixes this rule's impact at "serious" regardless of HOW unreadable the text is,
                         # so 4.4:1 (a hair under AA) and 1.1:1 (effectively invisible) arrive identical. Keep
@@ -1020,19 +1025,56 @@ _RENDER_HEALTH_JS = r"""() => {
 }"""
 
 
+# v2.0 Family 3 -- widen console capture beyond uncaught throws. A CSP that blocks the app's OWN resource and a
+# React hydration mismatch are real functional breakages a browser reports as console.error (NOT pageerror), so
+# the old pageerror-only hook dropped them (qa-console-001 fired only ~39x on the corpus). Curated to two
+# high-precision classes, NOT all console.error, so library log-spam / benign warnings never register.
+_CSP_VIOLATION = re.compile(r"Content Security Policy|Refused to (?:load|execute|apply|connect|frame)", re.I)
+_HYDRATION_ERROR = re.compile(
+    r"Hydration failed|Text content does not match|error while hydrating|did not match\. Server|"
+    r"Minified React error #(?:418|423|425)", re.I)   # React hydration error codes
+
+
+def _console_failure(text: str, origin: str) -> str | None:
+    """Classify a console.error the pageerror hook misses. A hydration / React error is the app's OWN -> 'first'.
+    A CSP violation is 'first' ONLY when it blocks a SAME-ORIGIN resource (the app's own CSP against its own
+    code); a third-party-only block is the CSP working as intended -> 'third'; an unattributable inline block
+    (no URL -- could be an injected third-party inline the CSP correctly stopped) -> None. Anything else -> None
+    (log spam, a 404'd beacon, a benign lib warning), so this never widens into noise."""
+    if _HYDRATION_ERROR.search(text):
+        return "first"
+    if _CSP_VIOLATION.search(text):
+        urls = re.findall(r"https?://[^\s'\"]+", text)
+        if any(urllib.parse.urlparse(u).netloc == origin for u in urls):
+            return "first"                        # a same-origin resource the app's own CSP blocked -> breakage
+        return "third" if urls else None          # third-party block = CSP working; inline = unattributable -> drop
+    return None
+
+
+def _tally_console(pageerrors: list, console_errors_text: list, origin: str) -> dict:
+    """Fold pageerror throws + curated console.error failures into first/third/total counts. Factored out (pure)
+    for testing. `sources` records how many first-party came from each channel, so a widened fire is auditable."""
+    pe_fp = sum(1 for msg, stack in pageerrors if _first_party_error(msg, stack, origin))
+    classes = [_console_failure(t, origin) for t in console_errors_text]
+    c_fp = sum(1 for c in classes if c == "first")
+    c_tp = sum(1 for c in classes if c == "third")
+    return {"first_party": pe_fp + c_fp, "third_party": (len(pageerrors) - pe_fp) + c_tp,
+            "total": len(pageerrors) + c_fp + c_tp, "sources": {"pageerror": pe_fp, "console": c_fp}}
+
+
 def console_errors(url: str, headers=None, timeout: float = 12.0) -> dict | None:
-    """Render url and capture uncaught JavaScript errors thrown on load (pageerror), split into FIRST-PARTY
-    (the app's own code threw -> a real breakage) and THIRD-PARTY (a widget/analytics script on another
-    origin threw, or the browser sanitized a cross-origin error -> benign noise). Returns
-    {"first_party", "third_party", "total"} or None if no browser / the render fails. Only pageerror is
-    captured, so console.log spam, a 404'd analytics fetch, and a missing source map never register."""
+    """Render url and capture the app's OWN load-time JavaScript failures: uncaught throws (pageerror) PLUS the
+    curated console.error classes a throw hook misses -- a self-blocking CSP and a React hydration mismatch
+    (v2.0 Family 3). Split FIRST-PARTY (real breakage) vs THIRD-PARTY (a cross-origin widget the app renders
+    without -> benign). Returns {first_party, third_party, total, sources, content_len, error_overlay} or None
+    if no browser / render fails. Still ignores console.log spam, a 404'd beacon, and missing source maps."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
         return None
     origin = urllib.parse.urlparse(url).netloc
     try:
-        errs = []
+        errs, console = [], []
         with sync_playwright() as pw:
             b = _launch(pw)
             if b is None:
@@ -1041,6 +1083,7 @@ def console_errors(url: str, headers=None, timeout: float = 12.0) -> dict | None
                 page = b.new_page()
                 page.on("pageerror", lambda e: errs.append((str(getattr(e, "message", "") or e),
                                                             str(getattr(e, "stack", "") or ""))))
+                page.on("console", lambda m: console.append(m.text) if m.type == "error" else None)
                 _apply_auth(page, url, headers)
                 page.goto(url, timeout=timeout * 1000, wait_until="load")
                 page.wait_for_timeout(500)  # let late/async errors surface
@@ -1050,9 +1093,55 @@ def console_errors(url: str, headers=None, timeout: float = 12.0) -> dict | None
                     health = {}
             finally:
                 b.close()
-        fp = sum(1 for msg, stack in errs if _first_party_error(msg, stack, origin))
-        return {"first_party": fp, "third_party": len(errs) - fp, "total": len(errs),
-                "content_len": health.get("content_len"), "error_overlay": bool(health.get("error_overlay"))}
+        res = _tally_console(errs, console, origin)
+        res["content_len"] = health.get("content_len")
+        res["error_overlay"] = bool(health.get("error_overlay"))
+        return res
+    except Exception:
+        return None
+
+
+# v2.0 FAMILY 4 -- page-quality metrics from one render: (1) is the LCP element an <img>, and its loading attr
+# (loading=lazy on the LCP image DELAYS first paint -- a modern anti-pattern the observer catches), and (2) the
+# total DOM node count (an excessive DOM slows layout/style/interaction -- Lighthouse dom-size). The LCP
+# observer is injected BEFORE load so it captures the real paint.
+_METRICS_JS = """(() => {
+  window.__hlm = {lcp_is_img: false, lcp_loading: ''};
+  const obs = (t, cb) => { try { new PerformanceObserver(cb).observe({type: t, buffered: true}); } catch (e) {} };
+  obs('largest-contentful-paint', l => {
+    const es = l.getEntries(); if (!es.length) return;
+    const el = es[es.length - 1].element;
+    window.__hlm.lcp_is_img = !!(el && el.tagName === 'IMG');
+    window.__hlm.lcp_loading = (el && el.getAttribute && (el.getAttribute('loading') || '').toLowerCase()) || '';
+  });
+})()"""
+
+
+def render_metrics(url: str, headers=None, timeout: float = 15.0) -> dict | None:
+    """Render url once and return {lcp_is_img, lcp_loading, dom_nodes}. None if no browser / the render fails."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return None
+    try:
+        with sync_playwright() as pw:
+            b = _launch(pw)
+            if b is None:
+                return None
+            try:
+                page = b.new_page()
+                page.add_init_script(_METRICS_JS)                 # observe LCP from before the page loads
+                _apply_auth(page, url, headers)
+                page.goto(url, timeout=timeout * 1000, wait_until="load")
+                try:
+                    page.wait_for_load_state("networkidle", timeout=6000)   # let the SPA settle so LCP is final
+                except Exception:
+                    page.wait_for_timeout(400)
+                return page.evaluate(
+                    "() => ({lcp_is_img: window.__hlm.lcp_is_img, lcp_loading: window.__hlm.lcp_loading, "
+                    "dom_nodes: document.getElementsByTagName('*').length})")
+            finally:
+                b.close()
     except Exception:
         return None
 

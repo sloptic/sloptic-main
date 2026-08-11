@@ -23,7 +23,14 @@ def test_detects_cloudflare_mitigation_header():
 
 def test_detects_known_interstitial_markers():
     for marker in ("Just a moment...", "Checking your browser", "Verifying you are human",
-                   "This app has gone to sleep", "Get this app back up"):
+                   "This app has gone to sleep", "Get this app back up",
+                   "We're verifying your browser: Vercel Security Checkpoint",   # Vercel Attack Challenge Mode
+                   "Request unsuccessful. Incapsula incident ID: 1234",          # Imperva/Incapsula
+                   "Sucuri WebSite Firewall - Access Denied",                    # Sucuri
+                   "Our systems have detected unusual traffic",                  # Google/reCAPTCHA rate-limit
+                   '<div id="px-captcha"></div>',                                # PerimeterX
+                   '<iframe src="https://geo.captcha-delivery.com/...">',        # DataDome
+                   '<script src="https://ca9c7d43.captcha.awswaf.com/...">'):    # AWS WAF
         assert is_bot_challenge(_Resp({"content-type": "text/html"}, f"<html>{marker}</html>")) is True, marker
 
 

@@ -1,9 +1,12 @@
 """CLI output renderers — pure text builders, no server/Docker, so they run on the dev box."""
+import types
+
 from sloptic.aggregate import compute_axis_slop, compute_slop_score, coverage_metrics
 from sloptic.cli import (
     _coverage_text,
     _failed_text,
     _fmt_evidence,
+    _render_card,
     _report_payload,
     _score_breakdown_text,
     _summary_text,
@@ -100,6 +103,32 @@ def test_report_payload_carries_evidence():
 def test_fmt_evidence():
     assert _fmt_evidence({"ttfb_s": 0.03, "threshold_s": 0.8}) == "ttfb_s=0.03  threshold_s=0.8"
     assert _fmt_evidence({}) == ""
+
+
+def _card_report() -> Report:
+    return Report(slop_score=40, axis_slop={"security": 40}, outcomes=[
+        Outcome("sec-sqli-001", "security", "sql-injection", "slop_detected", 40, target="/login",
+                reason="login query is injectable"),
+        Outcome("sec-headers-001", "security", "security-headers", "clean", 0, target="/")])
+
+
+def test_report_card_markdown_to_stdout(capsys):
+    # bare --report-card -> markdown card on stdout with the AUTHORED copy for the finding (not the generic fallback)
+    args = types.SimpleNamespace(report_card="-", organizer=False, catalog=None)
+    _render_card(_card_report(), "https://app.example.com", args)
+    out = capsys.readouterr().out
+    assert "Durability Report Card" in out
+    assert "parameterized" in out.lower()                       # authored SQLi remediation rendered
+    assert "an issue a durable app avoids" not in out           # did NOT fall back to generic copy
+
+
+def test_report_card_html_to_file(tmp_path):
+    dest = tmp_path / "card.html"
+    args = types.SimpleNamespace(report_card=str(dest), organizer=False, catalog=None)
+    _render_card(_card_report(), "https://app.example.com", args)
+    html = dest.read_text()
+    assert "<style>" in html and "</div>" in html          # a self-contained styled HTML card fragment
+    assert "parameterized" in html.lower()
 
 
 def test_grade_record_places_a_single_app_on_the_curve_and_keeps_the_gate():

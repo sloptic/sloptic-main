@@ -1,0 +1,13 @@
+id: qa-deploy-001
+bundle: qa
+category: availability
+pool: public
+evidence_model: provable
+penalty: 34   # PROVISIONAL (v2.0 Family 1 -- re-price from the corpus footrule before the 2026.3 freeze): the
+              # app's data layer is dead for every real visitor (localhost / private-IP / unset-env backend URL
+              # shipped to prod). A shipped-broken deployment: more severe than diffuse hygiene, but the page
+              # still renders so it is not a crash. Gate-shaped (rare, decisive), not middle-band.
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  predicate: unreachable_backend_reference

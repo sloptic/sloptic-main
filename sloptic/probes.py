@@ -544,10 +544,16 @@ def _tech_error(c, method, reqfn):
     payload that produced it), else (None, None). Reporting the payload keeps the repro honest: with more than
     one candidate, naming the wrong one hands the auditor a request that does not reproduce. The signature set
     is specific DB strings a validation error or SPA shell can't produce, so a match is a high-confidence
-    leak."""
+    leak. PAIRED CANARY (v2.0 foundation #2): a candidate match is confirmed only if a bare literal with NO SQL
+    syntax does NOT also produce the signature; if it does, the string is reflected/generated (an LLM describing
+    a SQL error, an echoed error template) rather than caused by the quote -> not causally specific -> suppress."""
     for payload in _SQLI_ERROR_PAYLOADS:
         m = _SQL_ERROR.search(_do(c, method, reqfn(payload)).text)
         if m:
+            if _SQL_ERROR.search(_do(c, method, reqfn(_SQLI_NOISE_A)).text):
+                return None, None   # bare literal (no quote) reproduces the error signature -> not attributable (#2)
+            if not _reproduces(lambda: _do(c, method, reqfn(payload)), lambda r: _SQL_ERROR.search(r.text)):
+                return None, None   # the quote's error does not reproduce -> nondeterministic endpoint (#1)
             return m.group(0), payload
     return None, None
 
@@ -575,6 +581,16 @@ def _diverges(a, b) -> bool:
         return True
     hi, lo = max(len(a.text), len(b.text)), min(len(a.text), len(b.text))
     return hi - lo > max(64, hi * 0.15)
+
+
+def _reproduces(send, signal) -> bool:
+    """Determinism gate (v2.0 LLM-echo foundation #1): re-send the IDENTICAL request that just matched; its
+    boolean oracle SIGNAL must reproduce. A content-oracle match on a nondeterministic endpoint (a flaky
+    upstream, per-request generation, an LLM in the response path) does not reproduce -> can't-assess, not a
+    fire. Comparing the SIGNAL (does the DB-error / file-content pattern match), not the raw body, tolerates
+    benign nonces / timestamps / request-ids that vary without moving it. Together with the caller's original
+    send this is the roadmap's 'send each request twice'; `send()` issues it, `signal(resp)` is the feature."""
+    return bool(signal(send()))
 
 
 def _tech_boolean(c, method, reqfn) -> bool:
@@ -1259,13 +1275,17 @@ def command_injection(ctx, probe) -> bool | None:
 # hashing app hashes the wrong bytes -> no LLM / reflection / echo FP. `{S}` is the salt placeholder (replaced,
 # not %-formatted, so the engine braces survive). BARE-ARITHMETIC template eval (no eval / RCE / hash reachable)
 # is deliberately NOT probed: a computed value is LLM-fakeable and therefore cannot be an execution oracle.
+# (engine, template): the gadget is engine-specific, so the payload that yields the digest also NAMES the
+# engine that executed it — an execution-PROVEN fingerprint, recorded as evidence (no extra round-trip, and
+# more granular than a bare {{7*'7'}} arithmetic probe). The hash still does the firing; the engine only labels.
 _SSTI_HASH_TMPL = (
-    "<?php echo hash('sha256','{S}');?>", "<?php echo md5('{S}');?>",                              # PHP eval
-    ";print(__import__('hashlib').sha256(b'{S}').hexdigest())#",                                   # Python eval
-    "{{cycler.__init__.__globals__.os.popen('printf {S}|sha256sum').read()}}",                     # Jinja2 (Python)
-    "{{['printf {S}|sha256sum']|map('system')|join('')}}",                                         # Twig (PHP)
-    "<%= `printf {S}|sha256sum` %>",                                                               # ERB (Ruby)
-    '<#assign x="freemarker.template.utility.Execute"?new()>${x("printf {S}|sha256sum")}',         # Freemarker (Java)
+    ("php-eval",    "<?php echo hash('sha256','{S}');?>"),                                          # PHP eval
+    ("php-eval",    "<?php echo md5('{S}');?>"),                                                    # PHP eval
+    ("python-eval", ";print(__import__('hashlib').sha256(b'{S}').hexdigest())#"),                   # Python eval
+    ("jinja2",      "{{cycler.__init__.__globals__.os.popen('printf {S}|sha256sum').read()}}"),     # Jinja2 (Python)
+    ("twig",        "{{['printf {S}|sha256sum']|map('system')|join('')}}"),                         # Twig (PHP)
+    ("erb",         "<%= `printf {S}|sha256sum` %>"),                                               # ERB (Ruby)
+    ("freemarker",  '<#assign x="freemarker.template.utility.Execute"?new()>${x("printf {S}|sha256sum")}'),  # Java
 )
 
 
@@ -1274,7 +1294,9 @@ def ssti_injectable(ctx, probe) -> bool | None:
     eval shape (PHP/Python eval, Jinja2/Twig/ERB/Freemarker RCE gadget); fires when the salt's exact digest
     reflects — a value only genuine server-side execution produces, which an LLM cannot fake (unlike the old
     arithmetic marker, which a capable model just computes). N/A when no input surface. Query params are tested
-    before forms (template/render sinks are usually GET params)."""
+    before forms (template/render sinks are usually GET params). On a fire, evidence records `engine` — the
+    gadget that produced the digest names the engine that executed it (jinja2/twig/erb/freemarker/php/python-eval),
+    an execution-proven fingerprint (the v2.0 LLM-echo foundation, item 4)."""
     q = [(e.raw_path, "get", list(e.query_params)) for e in ctx.profile.endpoints
          if e.method.lower() == "get" and e.query_params]
     forms = [(f.action, (f.method or "get").lower(), list(f.fields)) for f in ctx.profile.forms if f.fields]
@@ -1286,14 +1308,14 @@ def ssti_injectable(ctx, probe) -> bool | None:
         return None
     salt = "hlssti" + secrets.token_hex(6)
     wanted = (hashlib.sha256(salt.encode()).hexdigest(), hashlib.md5(salt.encode()).hexdigest())
-    payloads = [t.replace("{S}", salt) for t in _SSTI_HASH_TMPL]
+    payloads = [(engine, t.replace("{S}", salt)) for engine, t in _SSTI_HASH_TMPL]
     budget = probe.probe.get("max_attempts", 160)
     tested = False
     fields_seen = set()
     with make_client(ctx.base_url, ctx.headers, timeout=10.0, follow_redirects=True) as c:
         for action, method, fields in targets:
             for field in fields:
-                for p in payloads:
+                for engine, p in payloads:
                     if budget <= 0:
                         break
                     budget -= 1
@@ -1302,7 +1324,8 @@ def ssti_injectable(ctx, probe) -> bool | None:
                     data = {fn: (p if fn == field else _XSS_FILLER) for fn in fields}
                     try:
                         if any(w in _xss_send(c, method, action, data).text for w in wanted):
-                            ctx.evidence.update(injectable=True, via="hash oracle", target=action, field=field)
+                            ctx.evidence.update(injectable=True, via="hash oracle", engine=engine,
+                                                target=action, field=field)
                             return True  # the engine hashed the salt to its exact digest -> real injection
                     except (httpx.HTTPError, httpx.InvalidURL):
                         continue
@@ -1494,6 +1517,17 @@ _LFI_PAYLOADS = (
     "php://filter/convert.base64-encode/resource=/etc/passwd",
 )
 
+# PAIRED CANARY (v2.0 foundation #2): the firing payload with traversal/absolute/encoded/null-byte/php-wrapper
+# SYNTAX stripped -> a bare RELATIVE filename. A genuine include resolves it to a nonexistent local path (./etc/
+# passwd), so the file signature vanishes; an endpoint that REFLECTS or HALLUCINATES the signature keys on the
+# filename token and emits it again for the bare literal -> the canary reproduces the signature -> suppress.
+_LFI_SYNTAX = re.compile(r"\.\.\.\.//|\.\.[\\/]|\.\.%2f|%00.*$|php://filter/[^=]*resource=", re.I)
+
+
+def _lfi_canary(payload: str) -> str:
+    bare = _LFI_SYNTAX.sub("", payload).lstrip("/\\").replace("\\", "/")
+    return re.sub(r"(?i)^[a-z]:/", "", bare) or "etc/passwd"   # drop a leading drive letter (C:/)
+
 
 def path_traversal(ctx, probe) -> bool | None:
     """Path traversal / LFI across forms, discovered query params, common filename params on
@@ -1537,7 +1571,18 @@ def path_traversal(ctx, probe) -> bool | None:
                         if "javascript" in ct or "css" in ct:
                             continue
                         if _LFI_SIG.search(r.text):
-                            ctx.evidence.update(found=True, target=action, field=field)
+                            # paired canary: the bare filename (traversal stripped) must NOT also return the
+                            # file signature; if it does, the content is reflected/hallucinated, not traversed.
+                            cdata = {fn: (_lfi_canary(payload) if fn == field else _XSS_FILLER) for fn in fields}
+                            try:
+                                if _LFI_SIG.search(_xss_send(c, method, action, cdata).text):
+                                    continue   # not caused by traversal -> reflection/hallucination -> suppress (#2)
+                                if not _reproduces(lambda: _xss_send(c, method, action, data),
+                                                   lambda rr: _LFI_SIG.search(rr.text)):
+                                    continue   # file signature does not reproduce -> nondeterministic (#1)
+                            except (httpx.HTTPError, httpx.InvalidURL):
+                                pass       # control probe unreachable -> fall through and fire on direct evidence
+                            ctx.evidence.update(found=True, target=action, field=field, canary_clean=True)
                             return True  # returned the contents of a system file -> traversal/LFI
                     except (httpx.HTTPError, httpx.InvalidURL):
                         continue
@@ -2627,6 +2672,146 @@ def bundle_leaks_secret(ctx, probe) -> bool | None:
         return True
     ctx.evidence.update(secret_kinds=[], scanned_bytes=len(blob))
     return False
+
+
+# v2.0 FAMILY 1 -- deploy-time "works on my machine" failure. A dev host / private IP / unset env var stringified
+# into a backend URL: the page renders but its data layer is dead for every visitor, invisible to a "does it
+# load" check. Requires the URL form (https?://...), so a bare `("0.0.0.0", PORT)` bind or a `hostname ===
+# 'localhost'` dev-check string does NOT match; the host lookahead rejects `localhosting.com` / `undefined.io`.
+_PRIVATE_HOST = re.compile(
+    r"""https?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]|"""
+    r"""10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2})"""
+    r"""(?::\d+)?(?=[/"'\s)]|$)""", re.I)
+_UNSET_ENV_HOST = re.compile(r"""https?://(?:undefined|null)(?::\d+)?(?=[/"'\s)]|$)""", re.I)
+
+
+def unreachable_backend_reference(ctx, probe) -> bool | None:
+    """DEPLOY-TIME "works on my machine": the shipped client bundle points its backend at a host no visitor can
+    reach -- localhost / 127.0.0.1 / 0.0.0.0 / a private RFC1918 IP (the developer's own machine), or
+    `https://undefined` / `https://null` (an unset NEXT_PUBLIC_/VITE_ build-time env var stringified into the
+    URL). The front page still renders, so the app's data layer being dead for everyone but the developer is
+    invisible to a "does it load" check. Reads the app's OWN served bundle (ethical). N/A when there is no bundle."""
+    blob = _client_bundle(ctx)
+    if not blob.strip():
+        return None
+    private = sorted({m.group(0) for m in _PRIVATE_HOST.finditer(blob)})
+    unset = sorted({m.group(0) for m in _UNSET_ENV_HOST.finditer(blob)})
+    if private or unset:
+        ctx.evidence.update(private_backends=private[:5], unset_env_backends=unset[:5], source="client-bundle")
+        return True
+    ctx.evidence.update(private_backends=[], unset_env_backends=[], scanned_bytes=len(blob))
+    return False
+
+
+# v2.0 FAMILY 1 -- OAuth sign-in dead in prod. The app hands the browser an authorization URL whose
+# redirect_uri points at localhost / a private IP / an unset env var: after the user authenticates, the
+# provider bounces them to a host that does not exist in production, so sign-in is broken for every visitor
+# (invisible to a "does the login button render" check). HSTS / mixed-content / unreachable-backend all miss it.
+_OAUTH_PROVIDER = re.compile(
+    r"accounts\.google\.com/o/oauth2|github\.com/login/oauth/authorize|"
+    r"(?:www\.)?facebook\.com/(?:v[\d.]+/)?dialog/oauth|login\.microsoftonline\.com|"
+    r"appleid\.apple\.com/auth/authorize|[a-z0-9.-]+\.auth0\.com/authorize|"
+    r"[a-z0-9.-]+/oauth2?/(?:v\d/)?authorize|/oauth2?/authorize", re.I)
+_OAUTH_URL = re.compile(r"""https?://[^\s"'<>()]+""")
+_OAUTH_ROUTES = ("/auth/google", "/auth/github", "/login/google", "/login/github", "/api/auth/signin/google",
+                 "/api/auth/signin/github", "/oauth/google", "/oauth/authorize", "/auth/signin", "/.auth/login/google")
+_OAUTH_ROUTEHINT = re.compile(r"/(?:auth|oauth|login|signin|sso)(?:/|$|\?)", re.I)
+_REDIRECT_PARAM = ("redirect_uri", "redirect_url", "callback_url", "redirecturi")
+
+
+def _oauth_redirect_uri(url: str) -> str | None:
+    """The decoded redirect_uri of an OAuth authorization URL, if `url` looks like one (a known provider host,
+    or a redirect_uri alongside client_id / response_type). None otherwise. Unescapes &amp; so an HTML-embedded
+    href parses like a raw Location header."""
+    parsed = urllib.parse.urlparse(url.replace("&amp;", "&"))
+    q = urllib.parse.parse_qs(parsed.query)
+    ru = next((q[k][0] for k in _REDIRECT_PARAM if k in q), None)
+    if ru and (_OAUTH_PROVIDER.search(url) or "client_id" in q or "response_type" in q):
+        return ru
+    return None
+
+
+def oauth_redirect_localhost(ctx, probe) -> bool | None:
+    """DEPLOY-TIME "works on my machine" for sign-in: an OAuth authorization URL the app hands the browser sets
+    redirect_uri to localhost / a private RFC1918 IP / an unset env var (`https://undefined`). After the user
+    authenticates, the provider redirects to a host that does not exist in prod, so sign-in is dead for every
+    visitor. Finds the authorization URL in the served homepage or by following a same-origin auth route ONE hop
+    (never completing the flow, zero payload). Fires only when the redirect_uri host differs from the app's own
+    origin -- a localhost target legitimately using a localhost callback is not punished. N/A when no OAuth flow."""
+    origin_netloc = urllib.parse.urlparse(ctx.base_url).netloc.lower()
+    budget = probe.probe.get("max_attempts", 30)
+    candidates: set[str] = set()
+    with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=False) as c:
+        try:
+            candidates.update(_OAUTH_URL.findall(c.get(_home_path(ctx, probe)).text))
+        except (httpx.HTTPError, httpx.InvalidURL):
+            pass
+        routes = list(dict.fromkeys(list(_OAUTH_ROUTES)
+                                    + [r for r in ctx.profile.routes if _OAUTH_ROUTEHINT.search(r)]))
+        for route in routes[:budget]:
+            try:
+                loc = c.get(route).headers.get("location", "")
+            except (httpx.HTTPError, httpx.InvalidURL):
+                continue
+            if loc:
+                candidates.add(loc)
+    found = False
+    for url in candidates:
+        ru = _oauth_redirect_uri(url)
+        if not ru:
+            continue
+        found = True
+        if (_PRIVATE_HOST.search(ru) or _UNSET_ENV_HOST.search(ru)) \
+                and urllib.parse.urlparse(ru).netloc.lower() != origin_netloc:
+            ctx.evidence.update(oauth_redirect_uri=ru, authorize_url=url[:160], origin=ctx.base_url)
+            return True
+    return False if found else None
+
+
+# v2.0 FAMILY 1 -- a PUBLIC origin served over plain http:// with no upgrade to TLS: every visitor's
+# credentials and session cookies cross the network in the clear. HSTS (sec-headers-003) and mixed-content
+# (sec-mixed-001) both assume https and miss a no-TLS origin entirely. A localhost / private-IP / *.local dev
+# or preview target is http by nature, so it is exempt (the "gate to public origins" caveat).
+_LOCAL_HOST = re.compile(
+    r"^(?:localhost|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|0\.0\.0\.0|\[?::1\]?|"
+    r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|"
+    r"172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|"
+    r"[^.]+\.(?:local|test|localhost))$", re.I)
+
+
+def _is_local_host(host: str) -> bool:
+    return bool(_LOCAL_HOST.match(host or ""))
+
+
+def _no_tls_decision(base_url: str, status: int | None, location: str) -> bool | None:
+    """Verdict from the origin + the homepage response, factored out for testing. None = not applicable (already
+    https, or a local/preview host); False = http that upgrades to https (TLS enforced); True = a public origin
+    that serves cleartext http with no upgrade."""
+    o = urllib.parse.urlparse(base_url)
+    if o.scheme != "http" or _is_local_host(o.hostname or ""):
+        return None
+    if status is not None and 300 <= status < 400 and (location or "").lower().startswith("https://"):
+        return False
+    return True
+
+
+def no_tls_origin(ctx, probe) -> bool | None:
+    """DEPLOY-TIME cleartext transport: a PUBLIC origin reached over plain http:// that does not upgrade to
+    https, so credentials / session cookies transit unencrypted. N/A for an https origin (HSTS / mixed-content
+    cover those) or a localhost / private-IP / *.local dev target (http is expected there). Clean when the
+    http origin redirects to https."""
+    o = urllib.parse.urlparse(ctx.base_url)
+    if o.scheme != "http" or _is_local_host(o.hostname or ""):
+        return None                          # fast path: no network for an https or local/preview target
+    with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=False) as c:
+        try:
+            r = c.get(_home_path(ctx, probe))
+        except (httpx.HTTPError, httpx.InvalidURL):
+            return None                      # unreachable -> can't assess
+    verdict = _no_tls_decision(ctx.base_url, r.status_code, r.headers.get("location", ""))
+    ctx.evidence.update(no_tls=(verdict is True), status=r.status_code, upgrades_to_https=(verdict is False),
+                        origin=ctx.base_url)
+    return verdict
 
 
 def vulnerable_dependency(ctx, probe) -> bool | None:
@@ -4004,20 +4189,29 @@ def _console_broken_render(res: dict) -> bool:
 
 
 def console_errors_present(ctx, probe) -> bool:
-    """Browser oracle: the page throws an uncaught JavaScript error FROM ITS OWN CODE on load. A third-party
-    widget/analytics script throwing (cross-origin, browser-sanitized to "Script error.") is common on
-    working apps and does NOT count — only first-party errors are the team's durability failure. The penalty
-    is SCALED by render impact (see _console_broken_render): full when the error visibly broke the page,
+    """Browser oracle: the app's OWN code fails on load -- an uncaught JavaScript throw (pageerror), OR a
+    console.error the throw hook misses: a CSP that blocks its own resource, or a React hydration mismatch
+    (v2.0 Family 3 widening). A third-party widget throwing (cross-origin, browser-sanitized to "Script error.")
+    is common on working apps and does NOT count -- only first-party failures are the team's durability defect.
+    The penalty is SCALED by render impact (see _console_broken_render): full when it visibly broke the page,
     reduced when the app rendered fine despite it (a real but non-fatal defect). Browser-gated."""
     url = ctx.base_url.rstrip("/") + _home_path(ctx, probe)
     res = browser.console_errors(url, headers=ctx.headers)
     if res is None:
         return False   # no browser / render failed -> can't test (browser-gated)
     ctx.evidence.update(js_errors=res["total"], first_party=res["first_party"],
-                        third_party=res["third_party"], engine="pageerror")
+                        third_party=res["third_party"], sources=res.get("sources"),
+                        engine="pageerror+console")
     if res["first_party"] <= 0:
         return False
     broken = _console_broken_render(res)
+    # A console-sourced failure (a self-blocking CSP / a React hydration mismatch) is a weaker, flakier signal
+    # than an uncaught throw, so it counts ONLY when it VISIBLY broke the render (error overlay / near-empty
+    # body). A pageerror throw is high-confidence and fires regardless (scaled down on an intact render). This
+    # also neutralizes a flaky hydration error that didn't break anything -> it won't fire.
+    pe_fp = (res.get("sources") or {}).get("pageerror", res["first_party"])
+    if pe_fp <= 0 and not broken:
+        return False
     ctx.evidence.update(content_len=res.get("content_len"), error_overlay=bool(res.get("error_overlay")),
                         render_broken=broken,
                         penalty_override=probe.penalty if broken else max(1, round(probe.penalty * _CONSOLE_INTACT_SCALE)))
@@ -4111,30 +4305,51 @@ def _contrast_level(contrast: list):
     return "minor", worst
 
 
+_A11Y_SCORED_TAGS = frozenset(browser._AXE_WCAG_TAGS)   # WCAG 2 A/AA -> the SCORED set; everything else is advisory
+
+
+def _a11y_scored(v: dict) -> bool:
+    """A violation counts toward the SCORE iff it carries a scored WCAG 2 A/AA tag. The Family-2 candidates
+    (WCAG 2.2 AA / best-practice only) are advisory. Missing tags -> scored, to preserve the pre-expansion set."""
+    tags = set(v.get("tags") or [])
+    return not tags or bool(tags & _A11Y_SCORED_TAGS)
+
+
 def a11y_violations_present(ctx, probe) -> bool:
     """Browser oracle: WCAG 2 A/AA accessibility violations from axe-core (its deterministic `violations`
     set) above the threshold. Browser-gated; axe reports only algorithmically-determinable failures, so
     it stays intent-independent (the `incomplete`/needs-review rules are excluded). The penalty is a
     per-rule severity-tiered SUM (see _a11y_penalty) so a multi-barrier page outscores a single-barrier
-    one and a lone cosmetic issue isn't charged the full exclusion penalty."""
+    one and a lone cosmetic issue isn't charged the full exclusion penalty. The WCAG 2.2 / best-practice
+    candidates ride along as OFF-SCORE `advisory_a11y` (v2.0 Family 2), for re-grade decorrelation analysis:
+    they never touch the fire or the penalty until the corpus proves them decorrelated from this carrier."""
     url = ctx.base_url.rstrip("/") + _home_path(ctx, probe)
     viols = browser.a11y_violations(url, headers=ctx.headers)
     if viols is None:
         return False
+    scored = [v for v in viols if _a11y_scored(v)]
+    advisory = [v for v in viols if not _a11y_scored(v)]
     impacts: dict[str, int] = {}
     worst_shortfall = None
-    for v in viols:
+    for v in scored:
         level = v.get("impact")
         if v["id"] == "color-contrast":
             graded = _contrast_level(v.get("contrast") or [])
             if graded:
                 level, worst_shortfall = graded
         impacts[level] = impacts.get(level, 0) + 1
-    ctx.evidence.update(violations=len(viols), rules=sorted({v["id"] for v in viols})[:15],
+    ctx.evidence.update(violations=len(scored), rules=sorted({v["id"] for v in scored})[:15],
                         impacts=impacts, engine="axe-core", penalty_override=_a11y_penalty(impacts))
     if worst_shortfall is not None:
         ctx.evidence["contrast_shortfall"] = round(worst_shortfall, 2)
-    return len(viols) > probe.probe.get("threshold", 0)
+    if advisory:   # OFF-SCORE: captured for the 2026.3 re-grade to measure decorrelation, never scored here
+        adv_impacts: dict[str, int] = {}
+        for v in advisory:
+            adv_impacts[v.get("impact")] = adv_impacts.get(v.get("impact"), 0) + 1
+        ctx.evidence["advisory_a11y"] = {
+            "rules": sorted({v["id"] for v in advisory})[:20], "impacts": adv_impacts,
+            "note": "v2.0 Family 2 candidate (wcag22aa / best-practice) -- OFF-SCORE, for re-grade decorrelation"}
+    return len(scored) > probe.probe.get("threshold", 0)
 
 
 def dead_controls_present(ctx, probe) -> bool:
@@ -4726,31 +4941,39 @@ def a11y_hard_fails(ctx, probe) -> bool | None:
 _ANCHOR_HREF = re.compile(r"""<a\b[^>]*\bhref\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
 
 
-def broken_links(ctx, probe) -> bool | None:
-    """Fetch each same-origin <a href> link on the homepage; fire if one lands on a 4xx dead end. N/A
-    when the page has no internal links to follow."""
-    budget = probe.probe.get("max_attempts", 40)
+def _same_origin_links(c, ctx, probe) -> list[str] | None:
+    """Same-origin <a href> paths on the homepage (deduped, the self-link + logout dropped). None when the
+    target isn't HTML or has no internal links -> the caller returns N/A. Shared by the 4xx dead-link probe and
+    the redirect-loop probe so both crawl the app's declared navigation identically."""
     target = _home_path(ctx, probe)
     base = urllib.parse.urlparse(ctx.base_url)
+    try:
+        r = c.get(target)
+    except (httpx.HTTPError, httpx.InvalidURL):
+        return None
+    if "html" not in r.headers.get("content-type", "").lower():
+        return None
+    links = []
+    for href in _ANCHOR_HREF.findall(r.text):
+        href = href.split("#")[0].strip()
+        if not href or href.startswith(("mailto:", "tel:", "javascript:", "data:")):
+            continue
+        if re.search(r"log[-_]?out|sign[-_]?out", href, re.IGNORECASE):
+            continue                                   # never GET a logout link (would drop the session)
+        t = urllib.parse.urlparse(urllib.parse.urljoin("%s://%s%s" % (base.scheme, base.netloc, target), href))
+        if t.netloc == base.netloc and t.path:
+            links.append(t.path + ("?" + t.query if t.query else ""))
+    links = [p for p in dict.fromkeys(links) if p != target]   # dedupe, drop the self-link
+    return links or None
+
+
+def broken_links(ctx, probe) -> bool | None:
+    """Fetch each same-origin <a href> link on the homepage; fire if one lands on a 4xx dead end. N/A
+    when the page has no internal links to follow (5xx is out of scope here -> redirect_loop / crash probes)."""
+    budget = probe.probe.get("max_attempts", 40)
     with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
-        try:
-            r = c.get(target)
-        except (httpx.HTTPError, httpx.InvalidURL):
-            return None
-        if "html" not in r.headers.get("content-type", "").lower():
-            return None
-        links = []
-        for href in _ANCHOR_HREF.findall(r.text):
-            href = href.split("#")[0].strip()
-            if not href or href.startswith(("mailto:", "tel:", "javascript:", "data:")):
-                continue
-            if re.search(r"log[-_]?out|sign[-_]?out", href, re.IGNORECASE):
-                continue                                   # never GET a logout link (would drop the session)
-            t = urllib.parse.urlparse(urllib.parse.urljoin("%s://%s%s" % (base.scheme, base.netloc, target), href))
-            if t.netloc == base.netloc and t.path:
-                links.append(t.path + ("?" + t.query if t.query else ""))
-        links = [p for p in dict.fromkeys(links) if p != target]   # dedupe, drop the self-link
-        if not links:
+        links = _same_origin_links(c, ctx, probe)
+        if links is None:
             return None
         for path in links[:budget]:
             try:
@@ -4762,6 +4985,56 @@ def broken_links(ctx, probe) -> bool | None:
                 continue
     ctx.evidence.update(broken=False, links_checked=len(links[:budget]))
     return False
+
+
+# ERR_TOO_MANY_REDIRECTS -- a route redirects without ever resolving (a self-loop, a cycle A->B->A, or an
+# unbounded chain), so a browser hits its ~20-hop redirect cap and shows an error page. The route is
+# unreachable for every visitor. Classic deploy causes: an auth guard that bounces / -> /login -> / when a
+# session cookie can't be set, a trailing-slash loop, or a base-URL/proxy misconfig that flips http<->https.
+_REDIRECT_CAP = 20   # matches the redirect limit real browsers enforce before ERR_TOO_MANY_REDIRECTS
+
+
+def redirect_loop(ctx, probe) -> bool | None:
+    """The homepage or a same-origin route it links to redirects endlessly (cycle or over the browser cap), so
+    a visitor gets ERR_TOO_MANY_REDIRECTS instead of the page. Follows redirects manually, same-origin only
+    (never chasing a redirect off-origin with the caller's auth headers); fires on a revisited URL (cycle) or on
+    exceeding the browser redirect cap. N/A when no reachable entry point / links. A loop is deterministic by
+    construction, so no separate reproduce gate is needed."""
+    cap = probe.probe.get("max_hops", _REDIRECT_CAP)
+    budget = probe.probe.get("max_attempts", 40)
+    base = urllib.parse.urlparse(ctx.base_url)
+    with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=False) as c:
+        starts = [_home_path(ctx, probe)]
+        links = _same_origin_links(c, ctx, probe)
+        if links is None and not starts:
+            return None
+        starts += (links or [])[:budget]
+        reachable = False
+        for start in dict.fromkeys(starts):
+            url = urllib.parse.urljoin(ctx.base_url, start)
+            seen: set[str] = set()
+            for _ in range(cap + 1):
+                if urllib.parse.urlparse(url).netloc not in ("", base.netloc):
+                    break                                  # left our origin -> resolves elsewhere, not our loop
+                if url in seen:                            # revisited a URL we already fetched -> cycle
+                    ctx.evidence.update(loop=True, entry=start, hops=len(seen),
+                                        reason="redirect cycle", cycle_to=urllib.parse.urlparse(url).path)
+                    return True
+                seen.add(url)
+                try:
+                    r = c.get(url)
+                except (httpx.HTTPError, httpx.InvalidURL):
+                    break
+                reachable = True
+                if not (300 <= r.status_code < 400 and "location" in r.headers):
+                    break                                  # resolved to a final (non-redirect) response
+                url = urllib.parse.urljoin(url, r.headers["location"])
+            else:
+                ctx.evidence.update(loop=True, entry=start, hops=cap + 1,
+                                    reason="exceeded the browser redirect cap (ERR_TOO_MANY_REDIRECTS)")
+                return True                                # never resolved within the cap -> unbounded chain
+    ctx.evidence.update(loop=False, routes_checked=len(dict.fromkeys(starts)))
+    return False if reachable else None
 
 
 # Mixed content — an HTTPS page that LOADS a subresource over plain http:// . A man-in-the-middle can
@@ -4799,6 +5072,207 @@ def mixed_content(ctx, probe) -> bool | None:
     insecure = _http_subresources(r.text, str(r.url))
     ctx.evidence.update(mixed=bool(insecure), http_subresources=insecure[:5])
     return True if insecure else False
+
+
+# v2.0 FAMILY 4 -- Subresource Integrity (SRI, a W3C recommendation). A CROSS-ORIGIN <script src> / stylesheet
+# loaded without an `integrity=` hash is an unguarded supply-chain risk: if that CDN is compromised or the
+# domain is hijacked, arbitrary code runs in the app's origin with full access to its DOM, cookies, and tokens.
+# Same-origin resources need no SRI (you already control them). Static: parsed from the served HTML.
+def _sri_scan(html: str, page_url: str) -> tuple[list[str], int]:
+    """(cross-origin script/stylesheet URLs that ship WITHOUT integrity=, count of ALL cross-origin such
+    resources). The second value separates 'no third-party resources -> N/A' from 'all of them are protected
+    -> clean'. Only <script src> and <link rel=stylesheet|preload|modulepreload> -- the resource kinds SRI
+    covers; <img>/<iframe> are out of scope (SRI does not apply)."""
+    origin = urllib.parse.urlparse(page_url).netloc.lower()
+    gaps: list[str] = []
+    total = 0
+    tags = [(m.group(1), "src") for m in re.finditer(r"<script\b([^>]*)>", html, re.I)]
+    for m in re.finditer(r"<link\b([^>]*)>", html, re.I):
+        rel = re.search(r"\brel\s*=\s*[\"']?([^\"'>\s]+)", m.group(1), re.I)
+        if rel and rel.group(1).lower() in ("stylesheet", "preload", "modulepreload"):
+            tags.append((m.group(1), "href"))
+    for attrs, urlattr in tags:
+        ref = re.search(r"\b" + urlattr + r"\s*=\s*[\"']([^\"']+)[\"']", attrs, re.I)
+        if not ref:
+            continue
+        p = urllib.parse.urlparse(urllib.parse.urljoin(page_url, ref.group(1).strip()))
+        if p.scheme not in ("http", "https") or not p.netloc or p.netloc.lower() == origin:
+            continue                                     # relative / same-origin -> no SRI needed
+        total += 1
+        if not re.search(r"\bintegrity\s*=\s*[\"']", attrs, re.I):
+            gaps.append(p.geturl())
+    return list(dict.fromkeys(gaps)), total
+
+
+def subresource_integrity_missing(ctx, probe) -> bool | None:
+    """A cross-origin <script>/<stylesheet> loaded WITHOUT Subresource Integrity. If that CDN is compromised or
+    its domain hijacked, arbitrary code runs in the app's origin -- the unguarded supply-chain risk SRI (a W3C
+    recommendation) exists to close. Same-origin resources need no SRI. N/A when the page loads no cross-origin
+    script/stylesheet at all (nothing to guard); clean when every one carries an integrity hash. Static HTML."""
+    with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
+        try:
+            r = c.get(_home_path(ctx, probe))
+        except (httpx.HTTPError, httpx.InvalidURL):
+            return None
+    if "html" not in r.headers.get("content-type", "").lower():
+        return None
+    gaps, total = _sri_scan(r.text, str(r.url))
+    if total == 0:
+        return None                                      # no cross-origin subresources -> nothing to protect
+    if gaps:
+        ctx.evidence.update(sri_missing=gaps[:8], cross_origin_subresources=total)
+        return True
+    ctx.evidence.update(sri_missing=[], cross_origin_subresources=total)
+    return False
+
+
+# v2.0 FAMILY 4 -- unminified CSS/JS shipped to production (Lighthouse unminified-css / unminified-javascript).
+# Wasted bytes + parse time on every load. Distinct from the dev-build probe (an HMR/dev-server client): this is
+# a production asset that simply wasn't minified. Same-origin only (the app's OWN build output; a third-party
+# CDN file is the vendor's concern). Size-gated so a small hand-written script isn't charged.
+_MIN_ASSET_BYTES = 8192     # below this, minification savings are negligible and the file is often hand-authored
+_MINIFY_EXT = re.compile(r"\.(?:js|css)(?:\?|#|$)", re.I)   # (distinct from _ASSET_REF, the perf asset-ref regex)
+
+
+def _minified(text: str) -> bool:
+    """A minified asset packs code onto very long lines; hand/prettier source wraps at ~40-80 chars. True when
+    the average line length is well past any formatted source (>200) -> minified. The wide gap (minified bundles
+    run into the thousands) keeps the middle band unfired rather than guessing."""
+    return len(text) / (text.count("\n") + 1) > 200
+
+
+def _same_origin_assets(html: str, page_url: str) -> list[str]:
+    """Same-origin .css/.js the page references (<script src>, <link rel=stylesheet>). A cross-origin CDN asset
+    is excluded -- minifying the vendor's file is not the app's call."""
+    origin = urllib.parse.urlparse(page_url).netloc.lower()
+    refs = re.findall(r"<script\b[^>]*\bsrc\s*=\s*[\"']([^\"']+)[\"']", html, re.I)
+    for m in re.finditer(r"<link\b([^>]*)>", html, re.I):
+        if re.search(r"\brel\s*=\s*[\"']?stylesheet", m.group(1), re.I):
+            href = re.search(r"\bhref\s*=\s*[\"']([^\"']+)[\"']", m.group(1), re.I)
+            if href:
+                refs.append(href.group(1))
+    out = []
+    for ref in refs:
+        full = urllib.parse.urljoin(page_url, ref.strip())
+        p = urllib.parse.urlparse(full)
+        if p.netloc.lower() == origin and _MINIFY_EXT.search(p.path or ""):
+            out.append(full)
+    return list(dict.fromkeys(out))
+
+
+def unminified_assets(ctx, probe) -> bool | None:
+    """A sizeable SAME-ORIGIN .css/.js asset shipped to production UNMINIFIED -- wasted bytes + parse time on
+    every load (Lighthouse unminified-css / unminified-javascript). Same-origin only; small files are skipped
+    (savings negligible, often hand-written). N/A when the page references no sizeable same-origin script/style.
+    A DISTINCT hygiene signal from the dev-build probe: a production asset the build simply left unminified."""
+    with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
+        try:
+            r = c.get(_home_path(ctx, probe))
+        except (httpx.HTTPError, httpx.InvalidURL):
+            return None
+        if "html" not in r.headers.get("content-type", "").lower():
+            return None
+        unmin, checked = [], 0
+        for url in _same_origin_assets(r.text, str(r.url))[:probe.probe.get("max_attempts", 6)]:
+            try:
+                a = c.get(url)
+            except (httpx.HTTPError, httpx.InvalidURL):
+                continue
+            ct = a.headers.get("content-type", "").lower()
+            if not ("javascript" in ct or "css" in ct) or len(a.text) < _MIN_ASSET_BYTES:
+                continue                                 # not a real asset (html error shell) / too small to matter
+            checked += 1
+            if not _minified(a.text):
+                unmin.append(url)
+    if checked == 0:
+        return None                                      # no sizeable same-origin asset -> nothing to assess
+    ctx.evidence.update(unminified=unmin[:6], assets_checked=checked)
+    return bool(unmin)
+
+
+# v2.0 FAMILY 4 -- lazy-loading the LCP image. `loading="lazy"` on the element that DEFINES first paint makes
+# the browser defer the one image it should fetch first, delaying LCP for every visitor (~15% of sites do this;
+# Lighthouse flags it). Decorrelated from page weight -- a loading-STRATEGY mistake, not a size one.
+def lcp_image_lazy_loaded(ctx, probe) -> bool | None:
+    """The Largest Contentful Paint element is an <img> marked loading="lazy" -> the browser defers the very
+    image that defines first paint. Browser-gated. N/A when the LCP element isn't an image (nothing to
+    lazy-load) or the render fails; clean when the LCP image loads eagerly."""
+    m = browser.render_metrics(ctx.base_url.rstrip("/") + _home_path(ctx, probe), headers=ctx.headers)
+    if m is None:
+        return None
+    if not m.get("lcp_is_img"):
+        return None                                      # text/other LCP -> no LCP image to mis-load
+    ctx.evidence.update(lcp_is_img=True, lcp_loading=m.get("lcp_loading") or "eager", engine="lcp-observer")
+    return m.get("lcp_loading") == "lazy"
+
+
+# v2.0 FAMILY 4 -- excessive DOM size (Lighthouse dom-size). Too many nodes slow style/layout/interaction on
+# every update, independent of transfer bytes -> decorrelated from the weight carrier. Conservative threshold.
+_DOM_NODE_LIMIT = 1400     # Lighthouse's excessive-DOM threshold; only a genuinely heavy DOM fires
+
+
+def excessive_dom_size(ctx, probe) -> bool | None:
+    """The rendered page carries an excessive DOM (> Lighthouse's ~1400-node threshold): style/layout/interaction
+    cost scales with node count, independent of page weight. Browser-gated. N/A when the render fails."""
+    m = browser.render_metrics(ctx.base_url.rstrip("/") + _home_path(ctx, probe), headers=ctx.headers)
+    if m is None:
+        return None
+    n = m.get("dom_nodes") or 0
+    limit = probe.probe.get("max_nodes", _DOM_NODE_LIMIT)
+    ctx.evidence.update(dom_nodes=n, threshold=limit, engine="dom-count")
+    return n > limit
+
+
+# v2.0 FAMILY 4 -- web font without a non-blocking font-display (FOIT). A @font-face / Google Fonts load with no
+# font-display: swap|optional|fallback leaves text INVISIBLE while the font downloads, then reflows (Lighthouse
+# font-display; ~32% of font pages use a blocking value). Decorrelated: a font-LOADING strategy, not size.
+_FONT_FACE_BLOCK = re.compile(r"@font-face\b[^{]*\{([^}]*)\}", re.I | re.S)
+_FONT_HAS_SRC = re.compile(r"\bsrc\s*:", re.I)
+_GOOD_FONT_DISPLAY = re.compile(r"font-display\s*:\s*(?:swap|optional|fallback)\b", re.I)
+_GFONTS_LINK = re.compile(r"fonts\.googleapis\.com/css2?\?[^\"'<>\s)]+", re.I)
+_GFONTS_DISPLAY = re.compile(r"[?&]display=(?:swap|optional|fallback)\b", re.I)
+
+
+def font_display_missing(ctx, probe) -> bool | None:
+    """A web font loaded WITHOUT a non-blocking font-display (swap/optional/fallback) -> FOIT: text is invisible
+    while the font downloads, then reflows. Checks @font-face in the inline + same-origin CSS and Google Fonts
+    <link>s. N/A when the page loads no web font; clean when every one sets a good display. Static HTML/CSS."""
+    with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
+        try:
+            r = c.get(_home_path(ctx, probe))
+        except (httpx.HTTPError, httpx.InvalidURL):
+            return None
+        if "html" not in r.headers.get("content-type", "").lower():
+            return None
+        html = r.text
+        origin = urllib.parse.urlparse(str(r.url)).netloc.lower()
+        blobs = [html]                                   # inline <style> @font-face live here
+        for m in re.finditer(r"<link\b([^>]*)>", html, re.I):
+            if not re.search(r"\brel\s*=\s*[\"']?stylesheet", m.group(1), re.I):
+                continue
+            href = re.search(r"\bhref\s*=\s*[\"']([^\"']+)[\"']", m.group(1), re.I)
+            if href:
+                full = urllib.parse.urljoin(str(r.url), href.group(1).strip())
+                if urllib.parse.urlparse(full).netloc.lower() == origin:
+                    try:
+                        blobs.append(c.get(full).text)
+                    except (httpx.HTTPError, httpx.InvalidURL):
+                        pass
+    web_fonts, offenders = 0, []
+    for blob in blobs:
+        for fb in _FONT_FACE_BLOCK.finditer(blob):
+            if _FONT_HAS_SRC.search(fb.group(1)):
+                web_fonts += 1
+                if not _GOOD_FONT_DISPLAY.search(fb.group(1)):
+                    offenders.append("@font-face")
+    for g in _GFONTS_LINK.findall(html):                 # Google Fonts defaults to a blocking display unless set
+        web_fonts += 1
+        if not _GFONTS_DISPLAY.search(g):
+            offenders.append(g[:80])
+    if web_fonts == 0:
+        return None
+    ctx.evidence.update(foit_sources=offenders[:6], web_fonts=web_fonts)
+    return bool(offenders)
 
 
 # SEO / discoverability meta — objective presence checks on best-practice head tags. Viewport is the
@@ -5337,6 +5811,9 @@ PREDICATES = {
     "backend_schema_disclosed": backend_schema_disclosed,
     "authenticated_backend_readable": authenticated_backend_readable,
     "bundle_leaks_secret": bundle_leaks_secret,
+    "unreachable_backend_reference": unreachable_backend_reference,
+    "oauth_redirect_localhost": oauth_redirect_localhost,
+    "no_tls_origin": no_tls_origin,
     "vulnerable_dependency": vulnerable_dependency,
     "source_map_exposed": source_map_exposed,
     "session_cookie_missing_flag": session_cookie_missing_flag,
@@ -5359,7 +5836,13 @@ PREDICATES = {
     "http_soft_404": http_soft_404,
     "a11y_hard_fails": a11y_hard_fails,
     "broken_links": broken_links,
+    "redirect_loop": redirect_loop,
     "mixed_content": mixed_content,
+    "subresource_integrity_missing": subresource_integrity_missing,
+    "unminified_assets": unminified_assets,
+    "lcp_image_lazy_loaded": lcp_image_lazy_loaded,
+    "excessive_dom_size": excessive_dom_size,
+    "font_display_missing": font_display_missing,
     "seo_meta_missing": seo_meta_missing,
     "http_conformance": http_conformance,
     "slow_first_paint": slow_first_paint,
@@ -5430,6 +5913,9 @@ _PREDICATE_REASONS = {
                                "root, or database errors naming columns)",
     "authenticated_backend_readable": "any logged-in user reads every other user's data -> broken authenticated-tier RLS/Rules (the IDOR equivalent on a BaaS app; missing per-user row filtering)",
     "bundle_leaks_secret": "a hardcoded SECRET key (Stripe sk_ / OpenAI / AWS secret / GitHub PAT / private key) is shipped in the client JS bundle -> account/DB takeover (public anon/publishable keys are not flagged)",
+    "unreachable_backend_reference": "the shipped client bundle calls a backend no visitor can reach (localhost / a private IP / an unset env var) -> the app renders but its data layer is dead in production",
+    "oauth_redirect_localhost": "the OAuth sign-in sets redirect_uri to localhost / a private IP / an unset env var -> after authenticating, the provider bounces the user to a host that doesn't exist in production, so login is dead for every visitor",
+    "no_tls_origin": "the public origin is served over plain http:// with no upgrade to https -> every visitor's credentials and session cookies cross the network in the clear",
     "vulnerable_dependency": "the app ships a client library with a KNOWN CVE (retire.js-style: jQuery / AngularJS / Bootstrap / Axios / Moment / Handlebars / DOMPurify) -> supply-chain risk the team chose; upgrade per the finding",
     "source_map_exposed": "a production JS bundle serves its .map -> the original source is reconstructable (business logic, hidden endpoints, and secrets a minified scan misses)",
     "session_cookie_missing_flag": "session cookie missing the {flag} flag",
@@ -5451,13 +5937,19 @@ _PREDICATE_REASONS = {
     "http_soft_404": "a nonexistent static asset returned 2xx instead of 404 (soft-404 -> pollutes caches / crawlers / monitoring)",
     "a11y_hard_fails": "accessibility hard-fail (missing lang / alt / form-control name / page title, or text below the 3:1 contrast floor)",
     "broken_links": "an internal link leads to a 4xx dead end (broken navigation)",
+    "redirect_loop": "the homepage or a route it links to redirects endlessly (ERR_TOO_MANY_REDIRECTS) -- the page never loads for any visitor",
     "mixed_content": "an https page loads a subresource over plain http:// (mixed content -> MITM-tamperable; active mixed content is browser-blocked, breaking the page)",
+    "subresource_integrity_missing": "a cross-origin script/stylesheet loads without a Subresource Integrity hash -> a compromised or hijacked CDN can run arbitrary code in the app's origin (supply-chain risk)",
+    "unminified_assets": "a sizeable same-origin .css/.js is shipped to production unminified -> wasted bytes and parse time on every page load",
+    "lcp_image_lazy_loaded": "the largest-contentful-paint image is marked loading=lazy -> the browser defers the very image that defines first paint, delaying it for every visitor",
+    "excessive_dom_size": "the page renders an excessive DOM (over ~1400 nodes) -> style/layout/interaction slow on every update, independent of page weight",
+    "font_display_missing": "a web font loads without font-display: swap/optional/fallback -> text is invisible while the font downloads, then reflows (FOIT)",
     "seo_meta_missing": "missing a best-practice meta tag (viewport -> unusable on mobile, or description -> no search snippet)",
     "http_conformance": "HTML response served with no declared charset (browser must guess the encoding -> mojibake / UTF-7 XSS surface)",
     "slow_first_paint": "First Contentful Paint exceeded the gate",
     "slow_core_web_vitals": "Core Web Vitals poor on the best of N throttled samples (slow LCP / layout shift / main-thread blocking)",
     "login_no_rate_limit": "repeated wrong-password logins were never throttled",
-    "console_errors_present": "threw an uncaught JavaScript error on load",
+    "console_errors_present": "the app's own code fails on load (an uncaught JS error, a CSP that blocks its own resource, or a React hydration mismatch)",
     "dead_controls_present": "clickable controls wired to nothing (no effect on click) — non-functional UI",
     "a11y_violations_present": "accessibility violations (missing alt / form label / lang / control name)",
     "open_redirect": "a user-controlled parameter redirects to an arbitrary external host",

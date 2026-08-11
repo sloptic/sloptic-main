@@ -112,8 +112,16 @@ def make_client(base_url: str, headers: dict | None = None, **kwargs) -> httpx.C
 _CHALLENGE_MARKERS = (
     "just a moment", "checking your browser", "cf-browser-verification", "cf_chl_opt", "__cf_chl",
     "attention required!", "enable javascript and cookies to continue", "verifying you are human",
-    "ddos protection by", "vercel security checkpoint", "please wait while we verify",
+    "ddos protection by", "vercel security checkpoint", "verifying your browser", "please wait while we verify",
     "this app has gone to sleep", "get this app back up",   # Streamlit Community Cloud sleep page
+    # other WAF / bot-manager block+challenge pages -- each string appears ONLY on the interstitial, never on a
+    # real app merely served THROUGH the vendor, so precision holds (a plain vendor header/cookie is NOT enough).
+    "incapsula incident id",                        # Imperva / Incapsula block page
+    "sucuri website firewall",                      # Sucuri WAF block page
+    "our systems have detected unusual traffic",    # Google / reCAPTCHA rate-limit interstitial
+    "px-captcha",                                   # PerimeterX / HUMAN challenge (the element id, not the vendor name)
+    "captcha-delivery.com",                         # DataDome captcha page
+    "captcha.awswaf.com",                           # AWS WAF CAPTCHA
 )
 
 

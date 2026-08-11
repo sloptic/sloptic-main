@@ -1,0 +1,16 @@
+id: sec-tls-001
+bundle: security
+category: transport-security
+pool: public
+evidence_model: provable
+penalty: 25   # PROVISIONAL (v2.0 Family 1 -- re-price from the corpus footrule before the 2026.3 freeze): a
+              # public origin served over plain http:// sends every visitor's credentials + session cookies in
+              # cleartext (network attacker reads/replays them). Complements HSTS (sec-headers-003, https-only)
+              # and mixed-content (sec-mixed-001, https-only), which both miss a no-TLS origin. Gate-shaped.
+applicability:
+  requires: [at_least_one_http_endpoint_exists]   # further self-gated by the predicate to public http origins
+probe:
+  # fire when the graded origin is plain http on a PUBLIC host and does not redirect to https. N/A for an https
+  # origin (HSTS/mixed-content cover those) or a localhost / private-IP / *.local dev/preview target.
+  predicate: no_tls_origin
+  target: /

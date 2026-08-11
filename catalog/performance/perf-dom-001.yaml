@@ -1,0 +1,14 @@
+id: perf-dom-001
+bundle: performance
+category: dom-size
+pool: public
+evidence_model: oracle
+penalty: 7    # PROVISIONAL (v2.0 Family 4 -- rank_variance + re-price before the 2026.3 freeze): an excessive DOM
+              # (>~1400 nodes, Lighthouse dom-size) slows style/layout/interaction independent of transfer bytes
+              # -> decorrelated from the weight carrier IN THEORY; rank_variance must confirm it isn't just "big app".
+applicability:
+  requires: [browser]   # needs a rendered DOM to count nodes; N/A without --browser
+probe:
+  predicate: excessive_dom_size
+  target: /
+  max_nodes: 1400

@@ -304,6 +304,20 @@ def main():
 
     models = Counter(r.get("model") for r in recs if r.get("model"))   # LLM(s) used (a file may mix runs)
 
+    # BOT-CHALLENGE / TAINT (net.is_bot_challenge): apps that answered with a WAF/challenge/sleep interstitial
+    # instead of the app. Excluded from `graded`, but COUNTED here per host platform so a disproportionately-
+    # challenged platform (e.g. Vercel Attack Challenge Mode) is visible as a taint signal -- rather than
+    # inferred from the compression proxy. Rate = challenged / (all records on that platform).
+    def _host_of(r):
+        p = r.get("platform")
+        return (p.get("host_platform") if isinstance(p, dict) else None) or "unknown"
+    challenged = [r for r in recs if r.get("bot_challenge")]
+    chal_by_host = Counter(_host_of(r) for r in challenged)
+    host_totals = Counter(_host_of(r) for r in recs)
+    challenge_by_host = sorted(
+        ((h, n, host_totals[h], round(100 * n / (host_totals[h] or 1), 1)) for h, n in chal_by_host.items()),
+        key=lambda x: -x[1])
+
     if args.json:
         print(json.dumps({
             "n_records": len(recs), "n_repo": len(repo_recs), "n_url": len(url_apps),
@@ -315,6 +329,9 @@ def main():
                        "median": round(statistics.median(scores), 1) if scores else None,
                        "stdev": round(sd, 1), "min": min(scores) if scores else None,
                        "max": max(scores) if scores else None},
+            "bot_challenge": {"n": len(challenged), "pct": round(100 * len(challenged) / (len(recs) or 1), 1),
+                              "by_host": {h: {"challenged": n, "total": t, "pct": pct}
+                                          for h, n, t, pct in challenge_by_host}},
             "category_concentration": {k: round(v, 1) for k, v in sorted(cat_total.items(), key=lambda x: -x[1])},
             "probe_fire_frequency": {pid: n for pid, n in freq},
             "winners": {"n": len(win_scores), "avg": round(statistics.mean(win_scores), 1) if win_scores else None},
@@ -597,6 +614,15 @@ def main():
         print("    AI builder:    " + ", ".join(f"{k} {c}({c/n_pl*100:.0f}%)" for k, c in builder_dist.most_common()))
         print("    slop by builder (median|n): " + "  ".join(f"{k}={med}(n{n})" for k, n, med in slop_by_builder))
         print("    slop by host   (median|n): " + "  ".join(f"{k}={med}(n{n})" for k, n, med in slop_by_host[:8]))
+        print()
+
+    # (i5) BOT-CHALLENGE / TAINT — how many apps served a WAF/challenge/sleep page (excluded from the grade),
+    # broken down by host platform so a disproportionately-challenged platform is visible as a taint signal.
+    if challenged:
+        print(f"(i5) BOT-CHALLENGE / TAINT — {len(challenged)} of {len(recs)} records "
+              f"({100 * len(challenged) / (len(recs) or 1):.1f}%) served a challenge/interstitial, excluded from the grade")
+        print("    by host (challenged / total on platform): "
+              + "  ".join(f"{h}={n}/{t}({pct:.0f}%)" for h, n, t, pct in challenge_by_host))
         print()
 
 
