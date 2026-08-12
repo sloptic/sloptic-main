@@ -488,6 +488,12 @@ def main():
                          "no Docker, so 6-10 is a big overnight speedup; the results append is lock-guarded so "
                          "concurrent writes won't corrupt it. REPO jobs always run serially (fixed Docker "
                          "container names can't coexist), regardless of this value.")
+    ap.add_argument("--retry-blocked", action="store_true", dest="retry_blocked",
+                    help="AFTER the run, re-grade each WAF-blocked app's tail (the ~10-min Vercel reset is long "
+                         "elapsed by then) via retry_blocked.py and fold recovered outcomes into a "
+                         "<results>.merged.jsonl — clears the incomplete flag where the tail came back clean, "
+                         "surfaces anything that fires. Injection almost never fires, so mostly turns "
+                         "'incomplete' into 'tested clean'. The main results file is never mutated.")
     ap.add_argument("--tldr", action="store_true",
                     help="terse progress: suppress each app's full grading dump; print ONE line per app "
                          "(count · slop score / DNF / FAIL · what the coverage-audit says the fuzzer missed · "
@@ -598,6 +604,19 @@ def main():
     print(f"\n\n{'=' * 60}\nCROSS-STACK PARITY (is a low score clean, or were we blind?)\n{'=' * 60}",
           flush=True)
     subprocess.run(PY + [str(_HERE / "parity.py"), args.results])
+
+    # 4) (opt) retry the WAF-blocked tails now that every app's ~10-min reset has elapsed; writes a SEPARATE
+    #    <results>.merged.jsonl (main results untouched). Mirrors the run's discovery flags so the subset
+    #    grade sees the same surface (esp. --browser-auth for session-gated probes).
+    if getattr(args, "retry_blocked", False):
+        print(f"\n\n{'=' * 60}\nRETRY BLOCKED TAILS (post-run — WAF reset elapsed)\n{'=' * 60}", flush=True)
+        rcmd = PY + [str(_HERE / "retry_blocked.py"), "--results", args.results,
+                     "--concurrency", str(args.concurrency)]
+        if getattr(args, "browser_auth", False):
+            rcmd += ["--browser-auth"]
+        if not getattr(args, "browser", True):
+            rcmd += ["--no-browser"]
+        subprocess.run(rcmd)
 
 
 if __name__ == "__main__":
