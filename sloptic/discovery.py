@@ -13,7 +13,7 @@ from urllib.parse import parse_qs, urljoin, urlparse
 
 import httpx
 
-from . import jsmine, openapi
+from . import jsmine, openapi, platform_id
 from .auth import is_password_change_form, login_form
 from .net import make_client
 from .schema import Endpoint, Form, Profile
@@ -1242,6 +1242,11 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
         # exists; the predicate self-gates to N/A when it can't establish a session, so widening here never
         # false-fires — it just lets the auth-probe cluster reach the CTA-login SPAs a password-form check missed.
         "has_auth_entrypoint": has_pw or auth[0] or auth[1],
+        # NOT on a managed-edge host (vercel/netlify/cloudflare/firebase/... or any WAF-CDN-fronted origin).
+        # The hosting-layer probes (rate-limit, load-burst) require this: on a managed edge those protections
+        # are the VENDOR's (the app inherits them), so grading them measures the platform not the team -- and
+        # the burst trips the vendor's WAF. Self-hosted PaaS (railway/render/fly/...) is NOT edge-managed -> live.
+        "not_edge_managed": not platform_id.edge_managed(platform_id.classify(base_url, headers, None)),
     }
     # Landing page for the universal homepage probes (target: /). When --target names a sub-path
     # (user.github.io/Project/) whose origin ROOT is a 404 — GitHub Pages with no user-site repo, a

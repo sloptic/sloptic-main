@@ -261,7 +261,11 @@ def _tldr_line(done, total, label, rec, secs, eta, tail):
         score = "—"
     missed = audit.get("missed") or []
     miss = ("missed: " + ", ".join(dict.fromkeys(m.get("kind", "?") for m in missed))) if missed else ""
-    return f"{prog} {label:<30} {score:<20} {miss:<26} ·{secs:4.0f}s {eta_s}"
+    if rec.get("bot_challenge"):   # WAF tripped: show WHERE (onset probe) + whether the grade was kept or withheld
+        onset = rec.get("challenge_onset") or "end"
+        kept = "kept" if rec.get("challenge_stage") == "late" else "withheld"
+        miss = f"⚠ challenge@{onset} ({kept})"
+    return f"{prog} {label:<30} {score:<20} {miss:<34} ·{secs:4.0f}s {eta_s}"
 
 
 def _build_cmd(j, args, ckpt):

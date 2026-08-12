@@ -1161,6 +1161,13 @@ _CMD_HASH = ("printf {s} | sha256sum", "printf {s} | md5sum")
 _CMD_SEPS = (";%s", "|%s", "||%s", "&&%s", "\n%s", "$(%s)", "`%s`")
 _CMD_TIME = (";sleep {d}", "$(sleep {d})", "`sleep {d}`", "&&sleep {d}", "|sleep {d}")
 
+# The injection fan-out probes follow redirects (to see a PRG result page carrying the oracle), but httpx fires
+# the response hook PER HOP, so a redirect-heavy origin multiplies BOTH the wire traffic and the request tally
+# (the 1626-request cmdi / 504-request ssti outliers -- both far above their payload budgets -- are hop-
+# inflated, not extra payloads). A genuine injection result is <=1-2 hops away (POST->302->GET), so cap the
+# chain: bounds the amplification and fails fast on a redirect loop (which is dinged elsewhere anyway).
+_INJECT_MAX_REDIRECTS = 4
+
 
 def _elapsed(c, method, action, data) -> float:
     """Seconds for one request; a large sentinel on error so it can't look like a fast baseline."""
@@ -1207,14 +1214,16 @@ def command_injection(ctx, probe) -> bool | None:
     targets = _injectable_targets(ctx.profile) + _json_body_targets(ctx.profile)
     if not targets:
         return None
-    budget = probe.probe.get("max_attempts", 120)
+    targets = targets[: probe.probe.get("max_targets", 40)]   # cap the per-target baseline/liveness fan-out
+    budget = probe.probe.get("max_attempts", 100)             # payload cap (100 seps x 2 hashes); modest trim
     delay = probe.probe.get("time_delay", 3)
     salt = "hlci" + secrets.token_hex(6)
     wanted = (hashlib.sha256(salt.encode()).hexdigest(), hashlib.md5(salt.encode()).hexdigest())
     tested = False
     checked = 0
     deep: list = []
-    with make_client(ctx.base_url, ctx.headers, timeout=max(15.0, delay * 3 + 8), follow_redirects=True) as c:
+    with make_client(ctx.base_url, ctx.headers, timeout=max(15.0, delay * 3 + 8),
+                     follow_redirects=True, max_redirects=_INJECT_MAX_REDIRECTS) as c:
         for action, method, fields in targets:
             if budget <= 0:
                 break
@@ -1306,13 +1315,15 @@ def ssti_injectable(ctx, probe) -> bool | None:
     targets = q + forms + s + _json_body_targets(ctx.profile)   # + JSON API bodies (SPA sink)
     if not targets:
         return None
+    targets = targets[: probe.probe.get("max_targets", 40)]   # cap the per-target fan-out
     salt = "hlssti" + secrets.token_hex(6)
     wanted = (hashlib.sha256(salt.encode()).hexdigest(), hashlib.md5(salt.encode()).hexdigest())
     payloads = [(engine, t.replace("{S}", salt)) for engine, t in _SSTI_HASH_TMPL]
     budget = probe.probe.get("max_attempts", 160)
     tested = False
     fields_seen = set()
-    with make_client(ctx.base_url, ctx.headers, timeout=10.0, follow_redirects=True) as c:
+    with make_client(ctx.base_url, ctx.headers, timeout=10.0,
+                     follow_redirects=True, max_redirects=_INJECT_MAX_REDIRECTS) as c:
         for action, method, fields in targets:
             for field in fields:
                 for engine, p in payloads:
@@ -1542,10 +1553,12 @@ def path_traversal(ctx, probe) -> bool | None:
     targets = q + incl + forms + _json_body_targets(ctx.profile)   # + JSON API bodies (SPA sink)
     if not targets:
         return None
+    targets = targets[: probe.probe.get("max_targets", 40)]   # cap the per-target baseline/liveness fan-out
     budget = probe.probe.get("max_attempts", 200)
     tested = False
     fields_seen = set()
-    with make_client(ctx.base_url, ctx.headers, timeout=10.0, follow_redirects=True) as c:
+    with make_client(ctx.base_url, ctx.headers, timeout=10.0,
+                     follow_redirects=True, max_redirects=_INJECT_MAX_REDIRECTS) as c:
         for action, method, fields in targets:
             filler = {fn: _XSS_FILLER for fn in fields}
             try:

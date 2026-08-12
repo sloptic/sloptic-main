@@ -62,9 +62,36 @@ ACTIVE_PROBES = frozenset({
 })
 
 
+# The injection / stress probes whose request volume = payloads x fields x targets (or a deliberate burst).
+# They generate the bulk of a grade's traffic and are the most likely to trip an adaptive WAF's cumulative-
+# volume detection, so they run LAST (see order_weight). NOT a safety tier -- purely a run-ORDER tier; every
+# id here is already in ACTIVE_PROBES (test_safety asserts the subset).
+HIGH_VOLUME_PROBES = frozenset({
+    "sec-cmdi-001", "sec-lfi-001", "sec-ssti-001", "sec-xxe-001", "sec-ssrf-001",
+    "sec-sqli-001", "sec-sqli-002", "sec-sqli-003", "sec-sqli-004", "sec-sqli-005",
+    "sec-xss-001", "sec-xss-002", "sec-domxss-001", "sec-filterinj-001", "sec-split-001",
+    "sec-upload-001", "sec-upload-002", "sec-redirect-001",
+    "sec-dos-001", "sec-ratelimit-001", "perf-load-001",
+})
+
+
 def is_passive(probe_id: str) -> bool:
     """True only for explicitly-passive ids. Fail-closed: unknown -> active -> excluded from passive-only."""
     return probe_id in PASSIVE_PROBES
+
+
+def order_weight(probe_id: str) -> int:
+    """Run-order tier within a grade: PASSIVE (0, lowest volume) first, ordinary active (1) next, HIGH-VOLUME
+    injection/stress (2) LAST. On an adaptive-WAF host the challenge then trips during the tail, so the low-
+    volume probes (headers/a11y/perf + the high-value exposure fetchers) have already completed and the
+    recovery keeps their outcomes (the pipeline scores only PRE-onset). A fully-completed grade's score is
+    order-independent (compute_slop_score aggregates by category), so reordering only ever HELPS the WAF case
+    and never changes a clean grade. Fail-safe: an unclassified id sorts into the middle tier, never the tail."""
+    if probe_id in PASSIVE_PROBES:
+        return 0
+    if probe_id in HIGH_VOLUME_PROBES:
+        return 2
+    return 1
 
 
 def passive_catalog(catalog: list) -> list:

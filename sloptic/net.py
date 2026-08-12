@@ -19,6 +19,44 @@ import httpx
 _trace_sink: contextvars.ContextVar = contextvars.ContextVar("hl_trace_sink", default=None)
 _trace_counts: contextvars.ContextVar = contextvars.ContextVar("hl_trace_counts", default=None)
 _trace_probe: contextvars.ContextVar = contextvars.ContextVar("hl_trace_probe", default="")
+# challenge onset: the FIRST probe whose request hit a WAF/challenge status. Always-on (status+header only, no
+# body read -> negligible cost), surfaced only when the grade is CONFIRMED a bot_challenge -> names the probe
+# whose traffic tripped the mitigation, so the corpus can show WHICH probes to gate/reorder on WAF-fronted hosts.
+_challenge_onset: contextvars.ContextVar = contextvars.ContextVar("hl_challenge_onset", default=None)
+# per-probe request TALLY (always-on, cheap): surfaces which probes send abnormally many requests -- the
+# cumulative-volume trigger for a WAF, and the pacing/trim candidates.
+_req_counts: contextvars.ContextVar = contextvars.ContextVar("hl_req_counts", default=None)
+_CHALLENGE_STATUS = frozenset({403, 429, 503})
+
+
+def _watch_challenge(response) -> None:
+    counts = _req_counts.get()                      # tally this request against the probe that sent it
+    if counts is not None:
+        p = _trace_probe.get() or "?"
+        counts[p] = counts.get(p, 0) + 1
+    if _challenge_onset.get() is not None:
+        return
+    if "cf-mitigated" in response.headers:
+        _challenge_onset.set(_trace_probe.get() or "?")
+    elif response.status_code in _CHALLENGE_STATUS:
+        # BODY-CONFIRM it's a challenge, not a plain auth-403: a challenge/block page carries the markers, an
+        # auth 403 does not. A blocked response is small + non-streaming, so reading it here is safe.
+        try:
+            response.read()
+            if is_bot_challenge(response):
+                _challenge_onset.set(_trace_probe.get() or "?")
+        except Exception:
+            pass
+
+
+def challenge_onset() -> str | None:
+    """The probe id whose request first hit a CONFIRMED WAF/challenge response this grade (None if none)."""
+    return _challenge_onset.get()
+
+
+def request_counts() -> dict | None:
+    """{probe_id: request count} for this grade (None if not started)."""
+    return _req_counts.get()
 # The cap is PER PROBE, not global: a global cap lets a high-fan-out probe (cmdi/lfi/crash send 100s of
 # requests) monopolize the budget and STARVE every probe later in the catalog to zero — which defeats the
 # whole point (you couldn't inspect the clean probe you cared about). Per-probe keeps EVERY probe represented.
@@ -34,6 +72,8 @@ def start_trace(enabled: bool = True) -> list | None:
     sink: list | None = [] if enabled else None
     _trace_sink.set(sink)
     _trace_counts.set({} if enabled else None)
+    _challenge_onset.set(None)   # reset per-grade onset + request tally regardless of --trace (runs every grade)
+    _req_counts.set({})
     return sink
 
 
@@ -89,10 +129,12 @@ def make_client(base_url: str, headers: dict | None = None, **kwargs) -> httpx.C
     # certs are normal for an app under test) -- cert validity is a separate concern, not a connection
     # blocker. Default to not verifying TLS; callers can still override via kwargs.
     kwargs.setdefault("verify", False)
-    if _trace_sink.get() is not None:   # --trace active -> record every request this client makes (tagged by probe)
-        eh = dict(kwargs.get("event_hooks") or {})
-        eh["response"] = list(eh.get("response") or []) + [_trace_response]
-        kwargs["event_hooks"] = eh
+    eh = dict(kwargs.get("event_hooks") or {})
+    hooks = list(eh.get("response") or []) + [_watch_challenge]   # always: cheap status watch for challenge onset
+    if _trace_sink.get() is not None:   # --trace active -> ALSO record every request this client makes (by probe)
+        hooks.append(_trace_response)
+    eh["response"] = hooks
+    kwargs["event_hooks"] = eh
     client = httpx.Client(base_url=base_url, headers=headers, **kwargs)
     if cookies:
         # Seed under the SAME domain http.cookiejar assigns to the server's own Set-Cookie, so a rotated

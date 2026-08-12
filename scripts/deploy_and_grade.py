@@ -1377,7 +1377,10 @@ def main():
             findings.append(f)
         result.update(slop_score=report.slop_score, axis_slop=report.axis_slop,
                       observed_surface=report.surface, coverage=report.coverage,
-                      platform=report.platform, bot_challenge=report.bot_challenge, findings=findings)
+                      platform=report.platform, bot_challenge=report.bot_challenge,
+                      challenge_stage=report.challenge_stage, challenge_onset=report.challenge_onset,
+                      request_counts=report.request_counts, blocked_probes=report.blocked_probes,
+                      incomplete_axes=report.incomplete_axes, findings=findings)
         if report.trace:   # --trace only: per-probe request log (payloads/endpoints), viewable via stats.py --audit
             result["trace"] = report.trace
         if args.recon:

@@ -7,7 +7,7 @@ penalty: 15   # no brute-force protection on login -> credential stuffing / pass
 applicability:
   # not gated on a discovered HTML password form: the predicate itself finds the login surface
   # (HTML form OR JSON-API endpoint like /rest/user/login) and returns N/A when neither exists.
-  requires: [at_least_one_http_endpoint_exists]
+  requires: [at_least_one_http_endpoint_exists, not_edge_managed]   # v2.0: N/A on managed-edge hosts (vercel/netlify/cloudflare/...) -- the platform owns rate-limiting/scaling, not the team
 probe:
   predicate: login_no_rate_limit
   attempts: 10   # wrong-password logins to fire; slop if none is throttled (429/423)

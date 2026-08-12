@@ -33,7 +33,10 @@ _DEPLOY_FAILURES = (RuntimeError, TimeoutError, subprocess.SubprocessError, OSEr
 def _report_payload(report) -> dict:
     return {"slop_score": report.slop_score, "axis_slop": report.axis_slop,
             "surface": report.surface, "coverage": report.coverage, "platform": report.platform,
-            "bot_challenge": report.bot_challenge, "outcomes": [asdict(o) for o in report.outcomes]}
+            "bot_challenge": report.bot_challenge, "challenge_stage": report.challenge_stage,
+            "challenge_onset": report.challenge_onset, "request_counts": report.request_counts,
+            "blocked_probes": report.blocked_probes, "incomplete_axes": report.incomplete_axes,
+            "outcomes": [asdict(o) for o in report.outcomes]}
 
 
 def _grade_record(report, source: str) -> dict:
@@ -45,7 +48,10 @@ def _grade_record(report, source: str) -> dict:
     findings = [asdict(o) for o in report.outcomes if o.outcome == "slop_detected"]
     rec = {"repo": source, "deployed": True, "slop_score": report.slop_score,
            "axis_slop": report.axis_slop, "coverage": report.coverage, "observed_surface": report.surface,
-           "platform": report.platform, "bot_challenge": report.bot_challenge, "findings": findings}
+           "platform": report.platform, "bot_challenge": report.bot_challenge,
+           "challenge_stage": report.challenge_stage, "challenge_onset": report.challenge_onset,
+           "request_counts": report.request_counts, "blocked_probes": report.blocked_probes,
+           "incomplete_axes": report.incomplete_axes, "findings": findings}
     # v2.0 Family 2: carry the OFF-SCORE a11y advisory candidates even when a11y is CLEAN (so not in `findings`).
     # The decorrelated apps are exactly the ones clean on the scored a11y carrier but failing an advisory rule,
     # so the re-grade needs their advisory data to measure decorrelation before promoting any of it to the score.
@@ -73,9 +79,12 @@ def _coverage_text(report) -> str:
 
 
 def _axis_line(report) -> str:
-    # per-axis decomposition of the total (unbounded, same units); subtotals sum to slop_score
+    # per-axis decomposition of the total (unbounded, same units); subtotals sum to slop_score. An axis a
+    # challenge cut short is flagged ⚠ — its subtotal is a floor (untested probes could only ADD slop).
     order = ["security", "qa", "performance"]
-    parts = [f"{b} {report.axis_slop.get(b, 0)}" for b in order if b in report.axis_slop]
+    inc = set(report.incomplete_axes or [])
+    parts = [f"{b} {report.axis_slop.get(b, 0)}{' ⚠' if b in inc else ''}"
+             for b in order if b in report.axis_slop or b in inc]
     return "    " + " · ".join(parts) if parts else ""
 
 
@@ -92,6 +101,13 @@ def _summary_text(report, source: str) -> str:
     ]
     if report.axis_slop:
         lines.append(_axis_line(report))
+    if report.incomplete_axes:   # a challenge cut the grade short -> say so LOUDLY; never let it read as clean
+        axes = ", ".join(report.incomplete_axes)
+        n = len(report.blocked_probes or [])
+        lines += ["",
+                  f"  ⚠ {axes} INCOMPLETE — {n} probes edge-blocked by a challenge"
+                  f"{f' at {report.challenge_onset}' if report.challenge_onset else ''}.",
+                  f"    Partial grade: a low {axes} score here is NOT a clean bill of health."]
     cov = _coverage_text(report)
     if cov:
         lines += ["", cov]

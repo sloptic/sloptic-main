@@ -5,7 +5,8 @@ probe consciously classified, new ones forced to choose), the dangerous families
 import pathlib
 
 from sloptic.catalog import load_catalog
-from sloptic.safety import ACTIVE_PROBES, PASSIVE_PROBES, is_passive, passive_catalog
+from sloptic.safety import (ACTIVE_PROBES, HIGH_VOLUME_PROBES, PASSIVE_PROBES, is_passive, order_weight,
+                            passive_catalog)
 
 _CATALOG = load_catalog(str(pathlib.Path(__file__).resolve().parent.parent / "catalog"))
 _IDS = {p.id for p in _CATALOG}
@@ -47,3 +48,24 @@ def test_is_passive_is_fail_closed():
     assert is_passive("sec-headers-002") is True
     assert is_passive("sec-cmdi-001") is False
     assert is_passive("brand-new-unclassified-probe") is False   # unknown -> treated active, not run passive
+
+
+def test_high_volume_is_a_subset_of_active():
+    # the ordering tail is a run-order tier, not a safety tier: every high-volume id must already be ACTIVE
+    # (a passive probe in the tail would be a classification bug), and all must be live ids.
+    assert HIGH_VOLUME_PROBES <= ACTIVE_PROBES, HIGH_VOLUME_PROBES - ACTIVE_PROBES
+    assert HIGH_VOLUME_PROBES <= _IDS, HIGH_VOLUME_PROBES - _IDS
+
+
+def test_order_weight_tiers_passive_first_high_volume_last():
+    assert order_weight("sec-headers-001") == 0                   # passive -> first
+    assert order_weight("sec-idor-001") == 1                      # ordinary active -> middle
+    assert order_weight("sec-cmdi-001") == 2                      # injection fan-out -> last
+    assert order_weight("brand-new-unclassified-probe") == 1      # fail-safe: unknown -> middle, never the tail
+    # a full sort keeps passive strictly before the high-volume tail
+    ordered = sorted(_CATALOG, key=lambda p: order_weight(p.id))
+    weights = [order_weight(p.id) for p in ordered]
+    assert weights == sorted(weights)
+    last_passive = max(i for i, w in enumerate(weights) if w == 0)
+    first_tail = min(i for i, w in enumerate(weights) if w == 2)
+    assert last_passive < first_tail

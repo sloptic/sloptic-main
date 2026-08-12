@@ -180,9 +180,14 @@ def main():
     # working submission, so it's EXCLUDED from the score distribution (never rescued to a low slop score).
     nonfunctional = [r for r in recs if r.get("functional") is False]
     disputed = [r for r in recs if r.get("disputed_broken") and r.get("functional") is not False]  # veto: scored, flagged
+    # An ENTRY challenge (interstitial from the first fetch) is ungradeable -> excluded. A LATE challenge (all
+    # probes ran, THEN the origin challenged) is a VALID completed grade (v17: score+profile identical to clean)
+    # -> KEPT. Legacy records carry bot_challenge with no stage -> treated as entry (old conservative behavior).
+    def _ungradeable_challenge(r):
+        return r.get("challenge_stage") == "entry" or (r.get("bot_challenge") and not r.get("challenge_stage"))
     graded = [r for r in recs if r.get("deployed") and "slop_score" in r and r.get("functional") is not False
               and not r.get("recon")      # recon records carry host_tiers only (no probes) -> not a real grade
-              and not r.get("bot_challenge")]   # a WAF/challenge/sleep page was served -> grade unreliable, excluded
+              and not _ungradeable_challenge(r)]
     ungraded = [r for r in deployed if "slop_score" not in r]   # repo app came up but grading aborted
     scores = [r["slop_score"] for r in graded]
     # (g) pairing: a submission graded BOTH ways — keyed by project, the delta is the reproducibility signal
@@ -312,7 +317,19 @@ def main():
         p = r.get("platform")
         return (p.get("host_platform") if isinstance(p, dict) else None) or "unknown"
     challenged = [r for r in recs if r.get("bot_challenge")]
+    entry_ch = [r for r in challenged if _ungradeable_challenge(r)]         # withheld (ungradeable)
+    late_ch = [r for r in challenged if r.get("challenge_stage") == "late"]  # RECOVERED -> counted in `graded`
     chal_by_host = Counter(_host_of(r) for r in challenged)
+    # WHICH probe's traffic first tripped the WAF (net.challenge_onset) -> the gate/reorder candidates
+    onset_by_probe = Counter(r["challenge_onset"] for r in challenged if r.get("challenge_onset"))
+    # per-probe REQUEST VOLUME (net.request_counts): which probes send abnormally many requests (the WAF-trip /
+    # pacing / trim candidates). Median across apps that ran the probe, + the worst single app.
+    probe_reqs: dict = defaultdict(list)
+    for r in recs:
+        for pid, k in (r.get("request_counts") or {}).items():
+            probe_reqs[pid].append(k)
+    req_rank = sorted(((pid, statistics.median(v), max(v), len(v)) for pid, v in probe_reqs.items() if v),
+                      key=lambda x: -x[1])
     host_totals = Counter(_host_of(r) for r in recs)
     challenge_by_host = sorted(
         ((h, n, host_totals[h], round(100 * n / (host_totals[h] or 1), 1)) for h, n in chal_by_host.items()),
@@ -331,7 +348,8 @@ def main():
                        "max": max(scores) if scores else None},
             "bot_challenge": {"n": len(challenged), "pct": round(100 * len(challenged) / (len(recs) or 1), 1),
                               "by_host": {h: {"challenged": n, "total": t, "pct": pct}
-                                          for h, n, t, pct in challenge_by_host}},
+                                          for h, n, t, pct in challenge_by_host},
+                              "tripped_by_probe": dict(onset_by_probe.most_common())},
             "category_concentration": {k: round(v, 1) for k, v in sorted(cat_total.items(), key=lambda x: -x[1])},
             "probe_fire_frequency": {pid: n for pid, n in freq},
             "winners": {"n": len(win_scores), "avg": round(statistics.mean(win_scores), 1) if win_scores else None},
@@ -620,9 +638,25 @@ def main():
     # broken down by host platform so a disproportionately-challenged platform is visible as a taint signal.
     if challenged:
         print(f"(i5) BOT-CHALLENGE / TAINT — {len(challenged)} of {len(recs)} records "
-              f"({100 * len(challenged) / (len(recs) or 1):.1f}%) served a challenge/interstitial, excluded from the grade")
+              f"({100 * len(challenged) / (len(recs) or 1):.1f}%) served a challenge/interstitial")
+        print(f"    LATE (all probes ran, then challenged -> grade VALID, KEPT): {len(late_ch)}"
+              f"   ·   ENTRY (challenged from the start -> withheld): {len(entry_ch)}")
         print("    by host (challenged / total on platform): "
               + "  ".join(f"{h}={n}/{t}({pct:.0f}%)" for h, n, t, pct in challenge_by_host))
+        inc_axis = [r for r in recs if r.get("incomplete_axes")]   # KEPT grades whose severe tail was edge-blocked
+        if inc_axis:
+            axc = Counter(a for r in inc_axis for a in (r.get("incomplete_axes") or []))
+            print(f"    INCOMPLETE axes (grade KEPT but that axis NOT clean-tested, severe edge-blocked): "
+                  f"{len(inc_axis)} apps  ·  " + "  ".join(f"{a}={n}" for a, n in axc.most_common()))
+        if onset_by_probe:   # which probe's traffic first tripped the WAF -> the gate/reorder candidates
+            print("    tripped BY probe (first challenge status): "
+                  + "  ".join(f"{p}={n}" for p, n in onset_by_probe.most_common(8)))
+        print()
+
+    if req_rank:   # (i6) which probes send the most requests -> WAF-trip / pacing / trim candidates
+        print("(i6) REQUEST VOLUME per probe (median across apps · worst single app) — the high-fan-out probes")
+        for pid, med, mx, n in req_rank[:12]:
+            print(f"    {pid:<22} median {med:>5.0f}   worst {mx:>5}   (n={n} apps)")
         print()
 
 

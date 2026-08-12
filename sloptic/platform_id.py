@@ -127,6 +127,22 @@ def classify(base_url: str, headers: dict | None, html: str | None) -> dict:
     }
 
 
+# Hosts that provide DDoS mitigation / rate-limiting / auto-scaling AT THE EDGE, which the app INHERITS. On
+# these, "does the app rate-limit / survive a burst" measures the VENDOR, not the team (and sending the burst
+# also trips their WAF), so the hosting-layer probes (sec-ratelimit-001 / perf-load-001) go N/A. A self-hosted
+# PaaS that runs the team's container (railway / render / fly / heroku / replit) is NOT here: there the app
+# owns its own rate-limiting + capacity, so those probes stay live.
+_EDGE_MANAGED_HOSTS = frozenset({"vercel", "netlify", "cloudflare-pages", "cloudflare-workers", "firebase",
+                                 "github-pages", "amplify"})
+_EDGE_CDNS = frozenset({"cloudflare", "fastly", "cloudfront"})
+
+
+def edge_managed(plat: dict) -> bool:
+    """True when the host provides edge DDoS/rate-limiting/scaling the app inherits (a managed-edge platform, or
+    ANY origin fronted by a WAF CDN). Used to gate the hosting-layer probes off -- test the config, not the vendor."""
+    return plat.get("host_platform") in _EDGE_MANAGED_HOSTS or plat.get("edge") in _EDGE_CDNS
+
+
 def classify_live(client, origin: str) -> dict:
     """Fetch the origin once and classify. Never raises (a dead/blocked origin -> URL-only classification)."""
     headers, html = {}, ""

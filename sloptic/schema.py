@@ -139,7 +139,18 @@ class Report:
     surface: dict = field(default_factory=dict)            # what discovery SAW (discovery.surface_metrics)
     coverage: dict = field(default_factory=dict)           # how much of the battery APPLIED (coverage_metrics)
     platform: dict = field(default_factory=dict)           # OFF-SCORE: host platform + AI builder (platform_id)
-    bot_challenge: bool = False                            # target answered with a WAF/challenge/sleep page -> grade unreliable
+    bot_challenge: bool = False                            # target served a WAF/challenge/sleep page at some point
+    challenge_stage: str = ""                              # "entry" (challenge from the first fetch -> ungradeable, excluded)
+    #                                                        vs "late" (all probes ran, THEN the origin challenged -> the
+    #                                                        grade completed and is VALID -> kept). "" = no challenge.
+    challenge_onset: str = ""                              # probe whose traffic first tripped a WAF status (diagnose the trigger)
+    request_counts: dict = field(default_factory=dict)     # {probe_id: request count} — which probes send abnormally many
+    blocked_probes: list = field(default_factory=list)     # probes that DID NOT run because a challenge tripped mid-grade
+    #                                                        (a THIRD state distinct from clean/n-a: not tested, not absent-
+    #                                                        surface). A multi-pass grade re-runs these; whatever stays here
+    #                                                        after passes exhaust is honestly UNTESTED -> never a false clean.
+    incomplete_axes: list = field(default_factory=list)    # bundles with >=1 blocked probe -> that axis is PARTIAL, must not
+    #                                                        rank as clean (e.g. "security: partial — N severe edge-blocked")
     trace: list = field(default_factory=list)              # --trace only: every request each probe sent (net.start_trace)
 
     @property
