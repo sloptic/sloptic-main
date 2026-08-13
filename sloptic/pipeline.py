@@ -145,7 +145,12 @@ def _run_probe(probe: Probe, ctx: _Ctx, client: httpx.Client, profile: Profile) 
     client.cookies.clear()  # each probe starts from a clean session (no cross-probe leak)
     target = probe.probe.get("target", "")
     if not _applicable(probe, profile):
-        return [_outcome(probe, "not_applicable", 0, target)]
+        # name the exact surface precondition(s) the app lacked. Most probes gate HERE, and without a reason
+        # they reported N/A blank -> the "(no reason recorded)" that dominated the coverage audit. Now the
+        # fresh run can size WHY each family didn't apply (missing endpoint / form / password field / ...).
+        unmet = [r for r in probe.applicability.requires if not profile.capabilities.get(r, False)]
+        ev = {"na_reason": "requires unmet: " + ", ".join(unmet)} if unmet else {}
+        return [_outcome(probe, "not_applicable", 0, target, evidence=ev)]
     if "predicate" in probe.probe:
         # RESOLVED OUTSIDE THE GUARD BELOW, deliberately. A name the registry doesn't know is OUR bug — a
         # catalog/probes mismatch — not something the target did, and it must not be laundered into an N/A
@@ -161,7 +166,8 @@ def _run_probe(probe: Probe, ctx: _Ctx, client: httpx.Client, profile: Profile) 
             # a predicate drives an UNTRUSTED target; a hostile/edge-case response must degrade this
             # one probe to N/A, never crash the whole grade (run must not DNF). Calibration is the
             # backstop: a predicate that ALWAYS raises fails the suite.
-            return [_outcome(probe, "not_applicable", 0, target)]
+            return [_outcome(probe, "not_applicable", 0, target,
+                             evidence={"na_reason": "predicate raised on the target response"})]
         ev = dict(ctx.evidence)   # snapshot regardless of verdict — clean/n/a stats are the point here
         if slop is None:
             # the predicate couldn't establish the conditions to test (e.g. self-registration failed

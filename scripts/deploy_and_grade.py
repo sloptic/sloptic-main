@@ -868,6 +868,23 @@ _DEAD_PAGE = re.compile(
 # broken/missing root route). Only visible in the RENDERED dom — the static shell doesn't carry it. Match
 # the not-found message as the page's main content, tolerant of the exact wording (React/Vue/Angular defaults).
 _GHOST_PATH = "/__hacklet_nonexistent_probe_9z8x7q__"   # a path no real app serves -> reveals catch-all/404 behavior
+
+# Free-tier PaaS that SPIN DOWN idle apps and COLD-START on the first request (~20-40s), holding the connection
+# while the app boots. A default ~10s reachability timeout marks a live-but-cold app 'unreachable' -> dead_url:
+# on the v17 corpus 30% of Render 'dead' apps were simply cold (HTTP 200 after 20-31s). Give the READ a long
+# window (connect stays short, so a genuinely-down host still fails fast) so a cold app gets graded, not lost.
+_COLD_START_SUFFIX = ("onrender.com", "render.com", "railway.app", "fly.dev", "koyeb.app", "cyclic.app",
+                      "adaptable.app")
+_COLD_START_READ = 45.0
+
+
+def _reach_timeout(url: str, base_timeout: float):
+    """A cold-start-serving PaaS host gets a long READ timeout (connect stays short) so a spinning-up app isn't
+    written off as dead; every other host keeps the base timeout."""
+    host = urlsplit(url).netloc.lower().split(":")[0]
+    if any(host == s or host.endswith("." + s) for s in _COLD_START_SUFFIX):
+        return httpx.Timeout(connect=min(base_timeout, 10.0), read=_COLD_START_READ, write=10.0, pool=10.0)
+    return base_timeout
 _CLIENT_404 = re.compile(
     r"page not ?found|could(n'?t| not) be found|this page (does ?n'?t|does not) exist|"
     r"404\D{0,40}(not ?found|error|does ?n'?t exist)|nothing (to see )?here|"
@@ -1030,7 +1047,7 @@ def _dead_url_reason(url: str, render=None, timeout: float = 10.0, platform_host
     if non_app:
         return non_app
     try:
-        r = httpx.get(url, timeout=timeout, follow_redirects=True, verify=False,
+        r = httpx.get(url, timeout=_reach_timeout(url, timeout), follow_redirects=True, verify=False,
                       headers={"User-Agent": _UA})
     except httpx.HTTPError as e:
         return f"unreachable ({type(e).__name__})"
