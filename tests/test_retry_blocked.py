@@ -2,12 +2,14 @@
 orchestration needs live URLs (can't unit-test), but the MERGE is pure and must be exactly right: it moves
 recovered probes out of `blocked`, clears an axis only when its whole blocked share came back, adds any new
 findings, and recomputes the score, while an empty retry reproduces the record untouched."""
+import json
 import pathlib
 import sys
+from collections import Counter
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
-from retry_blocked import _status, _to_outcome, merge  # noqa: E402
+from retry_blocked import _fold_and_summary, _load_jobs, _status, _to_outcome, merge  # noqa: E402
 
 from sloptic.aggregate import compute_slop_score  # noqa: E402
 
@@ -16,8 +18,11 @@ BUNDLE = {"sec-cmdi-001": "security", "sec-ssti-001": "security", "sec-idor-002"
 
 
 def _f(pid, cat, pen, bundle="security", vg=None):
-    return {"probe_id": pid, "bundle": bundle, "category": cat, "outcome": "slop_detected",
-            "penalty": pen, "variant_group_id": vg, "target": "", "reason": "", "evidence": {}}
+    # Mirror the PRODUCTION finding serialization (deploy_and_grade.py _record): the variant group is stored
+    # under "group", and there is NO "outcome" key (every finding is a fired slop). Earlier fixtures used the
+    # dataclass field name "variant_group_id", so they never exercised the key merge() actually parses.
+    return {"probe_id": pid, "bundle": bundle, "category": cat, "penalty": pen, "group": vg,
+            "target": "", "reason": "", "count": 1, "targets": [], "evidence": {}}
 
 
 def _scored(findings, blocked, incomplete):
@@ -78,6 +83,31 @@ def test_status_separates_full_partial_none_dnf():
     assert _status(blocked, None)[0] == "dnf"
 
 
+def test_variant_group_collapses_through_the_serialized_group_key():
+    # REGRESSION: the serialized key is "group", not "variant_group_id". One flaw probed via several SQLi
+    # syntaxes (same group) must count ONCE at its max penalty on recompute — not once per variant. If merge
+    # reads the wrong key the group scatters into singles and every recovered app with multi-variant findings
+    # inflates (here 40 -> 78).
+    main = _scored([], ["sec-sqli-001"], ["security"])
+    retry = _retry([], [_f("sec-sqli-001", "sql-injection", 40, vg="sqli"),
+                        _f("sec-sqli-002", "sql-injection", 40, vg="sqli"),
+                        _f("sec-sqli-003", "sql-injection", 40, vg="sqli")])
+    m = merge(main, retry, BUNDLE)
+    assert m["slop_score"] == 40                       # one group fire, not 3 (would be 78 with decay)
+
+
+def test_clean_recovery_preserves_the_exact_stored_score():
+    # A clean recovery adds no finding -> the merged score must be main's stored value EXACTLY (not a
+    # from-scratch recompute, which drifts off the deduped findings). Stored score is deliberately offset
+    # from what the findings recompute to, to prove merge kept the stored number rather than recomputing.
+    main = _scored([_f("sec-headers-001", "security-headers", 6)], ["sec-cmdi-001"], ["security"])
+    main["slop_score"] = 999                            # a value the findings do NOT recompute to
+    m = merge(main, _retry([], []), BUNDLE)
+    assert m["slop_score"] == 999                       # preserved, not recomputed
+    assert m["blocked_probes"] == []                    # coverage still updates
+    assert m["incomplete_axes"] == []
+
+
 def test_retry_never_invents_a_block_outside_the_original():
     # a retry that (spuriously) reports a block the main run never had must not add it
     main = _scored([], ["sec-cmdi-001"], ["security"])
@@ -97,3 +127,28 @@ def test_dnf_retry_recovers_nothing():
     assert m["incomplete_axes"] == ["security"]                     # still incomplete
     assert m["retry"]["recovered"] == []                           # nothing recovered
     assert m["slop_score"] == main["slop_score"]
+
+
+def test_load_jobs_dedups_by_url_and_skips_unblocked():
+    recs = [{"repo": "https://a", "blocked_probes": ["sec-cmdi-001"]},
+            {"repo": "https://a", "blocked_probes": ["sec-cmdi-001"]},   # dup url -> once
+            {"repo": "https://b", "blocked_probes": []},                 # not blocked -> skip
+            {"repo": "local-ingest-id", "blocked_probes": ["sec-cmdi-001"]},  # non-url repo -> skip
+            {"repo": "https://c", "blocked_probes": ["sec-ssti-001"]}]
+    assert [u for u, _ in _load_jobs(recs)] == ["https://a", "https://c"]
+
+
+def test_fold_and_summary_folds_blocked_and_copies_the_rest(tmp_path):
+    # the shared fold (also the --remerge path): a blocked app with a clean-recovery retry record is folded
+    # (block cleared, retry key added); an app that was never blocked is written back untouched.
+    main = [{"repo": "https://blk", "blocked_probes": ["sec-cmdi-001"], "findings": [], "slop_score": 7,
+             "incomplete_axes": ["security"], "axis_slop": {"security": 7}},
+            {"repo": "https://clean", "findings": [], "slop_score": 5}]     # never blocked
+    collected = {"https://blk": _retry([], [])}                            # tail ran, nothing fired
+    out = tmp_path / "m.jsonl"
+    _fold_and_summary(main, collected, Counter(), str(out), "run.jsonl", "run.retry.jsonl")
+    rows = [json.loads(x) for x in out.read_text().splitlines()]
+    assert rows[0]["blocked_probes"] == [] and rows[0]["incomplete_axes"] == []   # folded
+    assert rows[0]["retry"]["recovered"] == ["sec-cmdi-001"]
+    assert rows[0]["slop_score"] == 7                                             # clean recovery -> exact
+    assert rows[1] == main[1]                                                     # unblocked app untouched
