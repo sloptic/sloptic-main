@@ -216,6 +216,61 @@ def _drive_actions(page, max_actions: int = 5, per_wait_ms: int = 450) -> None:
                 acted += 1
 
 
+# --- websocket-rendered SPAs (Streamlit) -----------------------------------------------------------------
+# Streamlit is NOT a canvas app: it's a React frontend that paints REAL DOM elements from Protocol-Buffer
+# "deltas" over a websocket, but only AFTER `load` fires on the static shell, and Community Cloud parks idle
+# apps behind a "get this app back up" page. So a `wait_until="load"` + 300ms capture snapshots the ~108-node
+# bootstrap shell every time — which made every Streamlit app grade identically (the framework, not the
+# submission). Wake a sleeping app, then wait for the real app to paint, crash, or exhaust the budget, so the
+# surface probe sees the actual app — or an honest "won't come up" failure, which is exactly what a judge
+# hitting a slept app sees too.
+_ST_HOST = ".streamlit.app"
+_ST_SLEEP = re.compile(r"gone to sleep|get this app back up", re.I)
+_ST_ERROR = re.compile(r"error running app|oh no\s*[.,]|connection error", re.I)
+# the app has really painted: the view container exists AND several st-widgets rendered (the shell alone has none)
+_ST_READY_JS = ('() => !!document.querySelector(\'[data-testid="stAppViewContainer"]\') '
+                '&& document.querySelectorAll(\'[data-testid^="st"]\').length > 5')
+
+
+def _looks_streamlit(page, url: str) -> bool:
+    """Cheap gate so the slow await only runs for Streamlit (host suffix, or a Streamlit root in the DOM)."""
+    if _ST_HOST in (url or ""):
+        return True
+    try:
+        return bool(page.query_selector('[data-testid="stApp"], [data-testid="stAppViewContainer"]'))
+    except Exception:
+        return False
+
+
+def await_streamlit(page, budget_s: float = 60.0) -> str:
+    """Drive a Streamlit page to a terminal state and return it:
+      'rendered' — the real app painted (view container + real widgets)
+      'error'    — Streamlit's "Oh no. Error running app." crash screen (a genuine functional failure)
+      'stuck'    — never came up within budget_s (asleep-and-won't-wake / too slow / dead)
+    Wakes a sleeping Community-Cloud app first. Bounded by budget_s so a dead app can't stall the crawl."""
+    t0 = time.monotonic()
+    woke = False
+    while time.monotonic() - t0 < budget_s:
+        try:
+            txt = (page.evaluate("() => document.body ? document.body.innerText : ''") or "")[:3000]
+            if _ST_ERROR.search(txt):
+                return "error"
+            if not woke and _ST_SLEEP.search(txt):
+                for sel in ('button:has-text("get this app back up")', 'button:has-text("back up")'):
+                    el = page.query_selector(sel)
+                    if el:
+                        el.click()
+                        woke = True
+                        break
+            elif page.evaluate(_ST_READY_JS):
+                page.wait_for_timeout(600)   # let the last deltas settle before the DOM snapshot
+                return "rendered"
+        except Exception:
+            pass
+        page.wait_for_timeout(1500)
+    return "stuck"
+
+
 def render_routes(base_url: str, paths, headers=None, timeout: float = 12.0,
                   total_timeout: float = 60.0, interact: bool = True,
                   interact_routes: int = 6, net_sink: list | None = None,
@@ -264,7 +319,11 @@ def render_routes(base_url: str, paths, headers=None, timeout: float = 12.0,
                     url = base_url.rstrip("/") + path
                     with contextlib.suppress(Exception):
                         page.goto(url, timeout=timeout * 1000, wait_until="load")
-                        page.wait_for_timeout(300)  # let client JS paint the route's forms/inputs
+                        if idx == 0 and _looks_streamlit(page, url):
+                            # websocket-rendered SPA: wake + wait for the real app, bounded by the crawl deadline
+                            await_streamlit(page, budget_s=max(8.0, deadline - time.monotonic()))
+                        else:
+                            page.wait_for_timeout(300)  # let client JS paint the route's forms/inputs
                         dom = page.content()
                         if interact and idx < interact_routes:  # bound: reveal-clicking every route on a big
                             dom += _reveal_hidden_controls(page)  # SPA is the grade-timeout — cap to the first N
