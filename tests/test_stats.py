@@ -7,7 +7,9 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
-from stats import _is_graded, _ungradeable_challenge  # noqa: E402
+from stats import _is_graded  # noqa: E402
+
+from sloptic.eligibility import is_ungradeable_challenge  # noqa: E402
 
 
 def _rec(**kw):
@@ -19,19 +21,19 @@ def _rec(**kw):
 def test_entry_challenge_withhold_is_not_graded():
     # withheld at an entry challenge -> scores 0 and is NOT distribution-eligible. THIS is the record that
     # leaked into (d) as min=0 while (b) correctly dropped it (min=8).
-    assert _ungradeable_challenge({"challenge_stage": "entry"})
+    assert is_ungradeable_challenge({"challenge_stage": "entry"})
     assert not _is_graded(_rec(slop_score=0, challenge_stage="entry", bot_challenge=True))
 
 
 def test_late_challenge_is_a_valid_grade():
     # all probes ran, THEN the origin challenged -> a real completed grade, kept in the distribution
-    assert not _ungradeable_challenge({"challenge_stage": "late", "bot_challenge": True})
+    assert not is_ungradeable_challenge({"challenge_stage": "late", "bot_challenge": True})
     assert _is_graded(_rec(challenge_stage="late", bot_challenge=True))
 
 
 def test_legacy_bot_challenge_without_stage_is_ungradeable():
     # old records: bot_challenge set, no stage -> conservatively treated as entry
-    assert _ungradeable_challenge({"bot_challenge": True})
+    assert is_ungradeable_challenge({"bot_challenge": True})
     assert not _is_graded(_rec(bot_challenge=True))
 
 

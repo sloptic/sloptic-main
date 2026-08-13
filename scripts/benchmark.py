@@ -31,8 +31,10 @@ presented one. The curve stores the full empirical distribution, not only landma
 is exact and honours these keys.
 
 Excluded from the reference: anchors (deliberately-vulnerable calibration targets would drag the curve),
---probe subset runs (their slop is a fraction of a full grade), dead URLs, and DNF/non-functional apps
-(ranked below every working app, never rescued to a flattering percentile).
+--probe subset runs (their slop is a fraction of a full grade), dead URLs, DNF/non-functional apps
+(ranked below every working app, never rescued to a flattering percentile), entry-challenge withholds
+(a bot-interstitial on the first fetch -> nothing graded, scored 0), and canvas-shell hosts like Streamlit
+(the probe only ever sees the framework's uniform shell, so the grade is the framework, not the app).
 """
 import argparse
 import collections
@@ -44,6 +46,7 @@ from functools import lru_cache
 
 _HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))     # repo root on path, so the lazy `import sloptic` resolves when run as a script
+from sloptic.eligibility import is_shell_only, is_ungradeable_challenge  # noqa: E402  (needs the path insert above)
 _DEFAULT_CURVE = _HERE.parent / "validation" / "benchmark-curve.json"
 _AXES = ("security", "qa", "performance")
 _PREFIX = {"sec-": "security", "qa-": "qa", "perf-": "performance"}
@@ -83,6 +86,8 @@ def _eligible(r: dict) -> bool:
         and not r.get("dead_url") and not r.get("recon")
         and r.get("functional") is not False     # DNF ranks below every working app, not inside the curve
         and not str(r.get("project") or "").startswith("anchor-")
+        and not is_ungradeable_challenge(r)      # entry-challenge withhold -> scored 0, nothing was graded
+        and not is_shell_only(r)                 # canvas-shell host (Streamlit) -> graded the framework, not the app
     )
 
 
@@ -359,7 +364,9 @@ def rank(curve: dict, score, record: dict | None = None) -> dict:
         # every completed one regardless of its trivially-low raw slop, so it can never be a credential.
         b = reporting_bundle(record)
         out["reporting"] = b
-        out["certifiable"] = (b["status"] == "completed" and not b["untested_families"] and not gates)
+        out["shell_only"] = is_shell_only(record)   # canvas-shell host (Streamlit): graded the framework, not the app
+        out["certifiable"] = (b["status"] == "completed" and not b["untested_families"]
+                              and not gates and not out["shell_only"])
     return out
 
 

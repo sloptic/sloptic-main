@@ -25,6 +25,7 @@ sys.path.insert(0, str(_ROOT))
 
 from sloptic.aggregate import CATEGORY_DECAY, _damped_total  # noqa: E402
 from sloptic.catalog import load_catalog  # noqa: E402
+from sloptic.eligibility import is_ungradeable_challenge  # noqa: E402
 from sloptic.schema import Outcome  # noqa: E402
 
 
@@ -142,21 +143,15 @@ def audit(recs, probe_id):
           f"{'' if any(True for r in recs for f in r.get('findings', []) if f['probe_id'] == probe_id and (f.get('evidence') or {}).get('repro')) else '  (no repro records — re-grade to capture replayable requests)'}")
 
 
-def _ungradeable_challenge(r):
-    """An ENTRY challenge (interstitial from the first fetch) is ungradeable -> excluded. A LATE challenge (all
-    probes ran, THEN the origin challenged) is a VALID completed grade (v17: score+profile identical to clean)
-    -> KEPT. Legacy records carry bot_challenge with no stage -> treated as entry (old conservative behavior)."""
-    return r.get("challenge_stage") == "entry" or (r.get("bot_challenge") and not r.get("challenge_stage"))
-
-
 def _is_graded(r):
     """A real, distribution-eligible grade: came up, scored, not DNF/recon, and not withheld at an ENTRY
     challenge (which scores 0). The (b) distribution, (c) fire-freq, (d) winner split and (e) anomalies all
     share this ONE predicate so they can't drift — (d) once omitted the entry-challenge clause and reported
-    min=0 while (b) reported min=8, because the 6 entry-withheld apps (5 scoring 0) leaked into (d) alone."""
+    min=0 while (b) reported min=8, because the 6 entry-withheld apps (5 scoring 0) leaked into (d) alone.
+    The entry-challenge rule lives in sloptic.eligibility, shared with the curve (benchmark.py)."""
     return (r.get("deployed") and "slop_score" in r and r.get("functional") is not False
             and not r.get("recon")   # recon records carry host_tiers only (no probes) -> not a real grade
-            and not _ungradeable_challenge(r))
+            and not is_ungradeable_challenge(r))
 
 
 def main():
@@ -325,7 +320,7 @@ def main():
         p = r.get("platform")
         return (p.get("host_platform") if isinstance(p, dict) else None) or "unknown"
     challenged = [r for r in recs if r.get("bot_challenge")]
-    entry_ch = [r for r in challenged if _ungradeable_challenge(r)]         # withheld (ungradeable)
+    entry_ch = [r for r in challenged if is_ungradeable_challenge(r)]       # withheld (ungradeable)
     late_ch = [r for r in challenged if r.get("challenge_stage") == "late"]  # RECOVERED -> counted in `graded`
     chal_by_host = Counter(_host_of(r) for r in challenged)
     # WHICH probe's traffic first tripped the WAF (net.challenge_onset) -> the gate/reorder candidates
