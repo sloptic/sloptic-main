@@ -142,6 +142,23 @@ def audit(recs, probe_id):
           f"{'' if any(True for r in recs for f in r.get('findings', []) if f['probe_id'] == probe_id and (f.get('evidence') or {}).get('repro')) else '  (no repro records — re-grade to capture replayable requests)'}")
 
 
+def _ungradeable_challenge(r):
+    """An ENTRY challenge (interstitial from the first fetch) is ungradeable -> excluded. A LATE challenge (all
+    probes ran, THEN the origin challenged) is a VALID completed grade (v17: score+profile identical to clean)
+    -> KEPT. Legacy records carry bot_challenge with no stage -> treated as entry (old conservative behavior)."""
+    return r.get("challenge_stage") == "entry" or (r.get("bot_challenge") and not r.get("challenge_stage"))
+
+
+def _is_graded(r):
+    """A real, distribution-eligible grade: came up, scored, not DNF/recon, and not withheld at an ENTRY
+    challenge (which scores 0). The (b) distribution, (c) fire-freq, (d) winner split and (e) anomalies all
+    share this ONE predicate so they can't drift — (d) once omitted the entry-challenge clause and reported
+    min=0 while (b) reported min=8, because the 6 entry-withheld apps (5 scoring 0) leaked into (d) alone."""
+    return (r.get("deployed") and "slop_score" in r and r.get("functional") is not False
+            and not r.get("recon")   # recon records carry host_tiers only (no probes) -> not a real grade
+            and not _ungradeable_challenge(r))
+
+
 def main():
     ap = argparse.ArgumentParser(description="Aggregate deploy_and_grade results into auditable statistics.")
     ap.add_argument("results", help="the JSONL from deploy_and_grade --record")
@@ -180,14 +197,7 @@ def main():
     # working submission, so it's EXCLUDED from the score distribution (never rescued to a low slop score).
     nonfunctional = [r for r in recs if r.get("functional") is False]
     disputed = [r for r in recs if r.get("disputed_broken") and r.get("functional") is not False]  # veto: scored, flagged
-    # An ENTRY challenge (interstitial from the first fetch) is ungradeable -> excluded. A LATE challenge (all
-    # probes ran, THEN the origin challenged) is a VALID completed grade (v17: score+profile identical to clean)
-    # -> KEPT. Legacy records carry bot_challenge with no stage -> treated as entry (old conservative behavior).
-    def _ungradeable_challenge(r):
-        return r.get("challenge_stage") == "entry" or (r.get("bot_challenge") and not r.get("challenge_stage"))
-    graded = [r for r in recs if r.get("deployed") and "slop_score" in r and r.get("functional") is not False
-              and not r.get("recon")      # recon records carry host_tiers only (no probes) -> not a real grade
-              and not _ungradeable_challenge(r)]
+    graded = [r for r in recs if _is_graded(r)]
     ungraded = [r for r in deployed if "slop_score" not in r]   # repo app came up but grading aborted
     scores = [r["slop_score"] for r in graded]
     # (g) pairing: a submission graded BOTH ways — keyed by project, the delta is the reproducibility signal
@@ -231,12 +241,10 @@ def main():
         return [r for r in recs if r.get("winner") is True and pred(r)], \
                [r for r in recs if r.get("winner") is False and pred(r)]
     win_all, non_all = split(lambda r: True)
-    # SAME population as (b) graded — exclude non-functional/DNF (they carry a slop_score but are banished from
-    # the distribution) and recon records, so the winner comparison isn't contaminated by broken high-slop apps.
-    win_scores = [r["slop_score"] for r in win_all
-                  if r.get("deployed") and "slop_score" in r and r.get("functional") is not False and not r.get("recon")]
-    non_scores = [r["slop_score"] for r in non_all
-                  if r.get("deployed") and "slop_score" in r and r.get("functional") is not False and not r.get("recon")]
+    # SAME population as (b) graded, via the shared _is_graded — excludes non-functional/DNF, recon, AND
+    # entry-challenge withholds, so the winner comparison isn't contaminated and its min can't disagree with (b).
+    win_scores = [r["slop_score"] for r in win_all if _is_graded(r)]
+    non_scores = [r["slop_score"] for r in non_all if _is_graded(r)]
 
     # ---- (e) anomalies ----
     mean = statistics.mean(scores) if scores else 0
