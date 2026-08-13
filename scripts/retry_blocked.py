@@ -16,10 +16,15 @@ calibration data.
 One pass by default (recovers most of the tail on fresh-budget apps; sticky apps stay flagged, honestly).
 """
 import argparse
+import hashlib
 import json
+import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -96,19 +101,37 @@ def merge(main_rec, retry_rec, bundle_of):
     return merged
 
 
-def _retry_one(url, blocked, retry_file, extra_flags, grade_timeout):
-    cmd = PY + [str(_HERE / "deploy_and_grade.py"), url, "--url", "--record", retry_file,
+def _status(blocked, rec):
+    """How the retry went for one app: (kind, recovered, total, onset). kind is
+      full    — every blocked probe ran; the WAF did NOT re-challenge
+      partial — got SOME back, then re-challenged (fresh-budget app, tail too long for one pass)
+      none    — re-challenged immediately, recovered nothing (sticky/collapse app)
+      dnf     — the retry grade itself failed (dead url / timeout) -> recovered nothing, NOT a WAF verdict"""
+    total = len(blocked)
+    if not _graded(rec):
+        return "dnf", 0, total, None
+    still = set(rec.get("blocked_probes") or []) & set(blocked)
+    recovered = total - len(still)
+    onset = rec.get("challenge_onset") or ""
+    if not still:
+        return "full", recovered, total, onset
+    return ("partial" if recovered else "none"), recovered, total, onset
+
+
+def _retry_one(url, blocked, tmpdir, extra_flags, grade_timeout):
+    """Subset re-grade one app to its OWN temp record, read it back, return (url, blocked, record|None)."""
+    rec_path = os.path.join(tmpdir, hashlib.md5(url.encode()).hexdigest() + ".jsonl")
+    cmd = PY + [str(_HERE / "deploy_and_grade.py"), url, "--url", "--record", rec_path,
                 "--grade-timeout", str(grade_timeout)]
     for pid in blocked:
         cmd += ["--probe", pid]
     cmd += extra_flags
     try:
         subprocess.run(cmd, timeout=grade_timeout + 300, capture_output=True)
-        return url, True
-    except Exception as e:
-        with _print_lock:
-            print(f"  retry FAILED {url}: {type(e).__name__}", flush=True)
-        return url, False
+        recs = _read_jsonl(rec_path)
+        return url, blocked, (recs[-1] if recs else None)
+    except Exception:
+        return url, blocked, None   # DNF -> _status reports dnf, merge recovers nothing
 
 
 def main():
@@ -134,42 +157,51 @@ def main():
         print("nothing blocked — no retry needed."); return
 
     retry_file = args.results + ".retry.jsonl"
-    Path(retry_file).write_text("")   # fresh
+    merged_file = args.results + ".merged.jsonl"
     extra = (["--browser-auth"] if args.browser_auth else []) + (["--no-browser"] if args.no_browser else [])
+    tmpdir = tempfile.mkdtemp(prefix="sloptic-retry-")
 
+    collected = {}                    # url -> retry record (None on DNF)
+    tally = Counter()
     done = 0
     with ThreadPoolExecutor(max_workers=args.concurrency) as ex:
-        futs = [ex.submit(_retry_one, url, bp, retry_file, extra, args.grade_timeout) for url, bp in jobs]
+        futs = [ex.submit(_retry_one, url, bp, tmpdir, extra, args.grade_timeout) for url, bp in jobs]
         for f in as_completed(futs):
             done += 1
-            url, ok = f.result()
+            url, blocked, rec = f.result()
+            collected[url] = rec
+            kind, n, tot, onset = _status(blocked, rec)
+            tally[kind] += 1
+            mark = {"full": "✓ FULL", "partial": "~ part", "none": "✗ none", "dnf": "· dnf "}[kind]
+            note = f" re-challenge@{onset}" if kind in ("partial", "none") and onset else ""
             with _print_lock:
-                print(f"  [{done}/{len(jobs)}] {'ok ' if ok else 'ERR'} {url}", flush=True)
+                print(f"  [{done}/{len(jobs)}] {mark} {n:>2}/{tot:<2}{note:<28} {url}", flush=True)
 
-    # merge phase (reads the appended retry records; matches to the main records by url)
-    retry_by_url = {}
-    for r in _read_jsonl(retry_file):
-        u = _url_of(r)
-        if u:
-            retry_by_url[u] = r   # last write wins (one subset grade per url)
+    # persist raw retry records (for inspection) + fold into the merged grades (main results untouched)
+    with open(retry_file, "w") as rf:
+        for rec in collected.values():
+            if rec is not None:
+                rf.write(json.dumps(rec) + "\n")
     bundle_of = {p.id: p.bundle for p in load_catalog(str(_ROOT / "catalog"))}
-    merged_file = args.results + ".merged.jsonl"
-    n_recovered = n_fired = n_apps_touched = 0
+    n_recovered = n_fired = n_apps = 0
     with open(merged_file, "w") as out:
         for r in records:
             url = _url_of(r)
-            if r.get("blocked_probes") and url in retry_by_url:
-                r = merge(r, retry_by_url[url], bundle_of)
-                n_apps_touched += 1
+            if r.get("blocked_probes") and collected.get(url) is not None:
+                r = merge(r, collected[url], bundle_of)
+                n_apps += 1
                 n_recovered += len(r["retry"]["recovered"])
                 n_fired += len(r["retry"]["fired"])
             out.write(json.dumps(r) + "\n")
+    shutil.rmtree(tmpdir, ignore_errors=True)
 
-    print(f"\nRETRY DONE — {n_apps_touched} apps folded in · {n_recovered} probes recovered · "
-          f"{n_fired} NEW findings")
+    print(f"\nRETRY DONE — apps: FULL={tally['full']}  partial={tally['partial']}  none={tally['none']}  "
+          f"dnf={tally['dnf']}   ·   {n_recovered} probes recovered · {n_fired} NEW findings")
     if n_fired:
-        print("  ⚠ NEW findings surfaced on previously-blocked apps — inspect .merged.jsonl (retry.fired)")
-    print(f"  merged grades -> {merged_file}   (main results untouched: {args.results})")
+        print("  ⚠ NEW findings on previously-blocked apps — inspect .merged.jsonl (retry.fired)")
+    if not n_recovered:
+        print("  (NO recovery — every blocked app re-challenged or DNF'd; blocked tails stay flagged)")
+    print(f"  merged -> {merged_file}   ·   raw retry -> {retry_file}   ·   main untouched: {args.results}")
 
 
 if __name__ == "__main__":

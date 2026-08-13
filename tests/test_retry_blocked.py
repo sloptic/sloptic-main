@@ -7,7 +7,7 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
-from retry_blocked import _to_outcome, merge  # noqa: E402
+from retry_blocked import _status, _to_outcome, merge  # noqa: E402
 
 from sloptic.aggregate import compute_slop_score  # noqa: E402
 
@@ -65,6 +65,17 @@ def test_partial_recovery_with_a_real_injection_finding():
     assert set(m["retry"]["recovered"]) == {"sec-cmdi-001", "sec-ssti-001"}
     assert m["retry"]["fired"] == ["sec-cmdi-001"]
     assert any(f["probe_id"] == "sec-cmdi-001" for f in m["findings"])
+
+
+def test_status_separates_full_partial_none_dnf():
+    blocked = ["sec-cmdi-001", "sec-ssti-001", "sec-idor-002"]
+    assert _status(blocked, _retry([], []))[:3] == ("full", 3, 3)            # whole tail ran, no re-challenge
+    k, n, tot, onset = _status(blocked, {"deployed": True, "slop_score": 0,
+                                         "blocked_probes": ["sec-idor-002"], "challenge_onset": "sec-idor-002"})
+    assert (k, n, tot, onset) == ("partial", 2, 3, "sec-idor-002")           # got 2 back, then re-challenged
+    assert _status(blocked, {"deployed": True, "slop_score": 0, "blocked_probes": blocked})[0] == "none"  # re-tripped at once
+    assert _status(blocked, {"deployed": False})[0] == "dnf"                 # grade failed
+    assert _status(blocked, None)[0] == "dnf"
 
 
 def test_retry_never_invents_a_block_outside_the_original():
