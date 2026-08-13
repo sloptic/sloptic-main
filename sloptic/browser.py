@@ -271,10 +271,23 @@ def await_streamlit(page, budget_s: float = 60.0) -> str:
     return "stuck"
 
 
+def _await_if_shell(page, url: str, budget_s: float = 45.0) -> None:
+    """Post-goto hook for the MEASURING renders (perf): if this is a websocket-rendered shell host (Streamlit),
+    wait for the real app to paint so the metric reflects the app, not the framework shell. No-op otherwise
+    (cheap gate first). The server is already warm here — discovery's render woke it — so the client render
+    lands fast; without this the perf probes score Streamlit's cold shell (unfairly poor LCP/FCP) instead of
+    the app a warm judge actually sees."""
+    try:
+        if _looks_streamlit(page, url):
+            await_streamlit(page, budget_s=budget_s)
+    except Exception:
+        pass
+
+
 def render_routes(base_url: str, paths, headers=None, timeout: float = 12.0,
                   total_timeout: float = 60.0, interact: bool = True,
                   interact_routes: int = 6, net_sink: list | None = None,
-                  script_sink: list | None = None) -> dict[str, str]:
+                  script_sink: list | None = None, meta_sink: dict | None = None) -> dict[str, str]:
     """Render each same-origin path in ONE reused browser session and return {path: rendered_DOM}.
     Paths that fail to load are omitted; {} if no browser is available. A single launch is amortized
     across all routes — a launch-per-route helper would relaunch (and re-warm) the browser each time.
@@ -321,7 +334,9 @@ def render_routes(base_url: str, paths, headers=None, timeout: float = 12.0,
                         page.goto(url, timeout=timeout * 1000, wait_until="load")
                         if idx == 0 and _looks_streamlit(page, url):
                             # websocket-rendered SPA: wake + wait for the real app, bounded by the crawl deadline
-                            await_streamlit(page, budget_s=max(8.0, deadline - time.monotonic()))
+                            st_state = await_streamlit(page, budget_s=max(8.0, deadline - time.monotonic()))
+                            if meta_sink is not None:      # rendered|error|stuck -> the record's shell_only signal
+                                meta_sink["render_state"] = st_state
                         else:
                             page.wait_for_timeout(300)  # let client JS paint the route's forms/inputs
                         dom = page.content()
@@ -898,6 +913,7 @@ def first_contentful_paint(url: str, headers=None, timeout: float = 12.0) -> flo
                 page = b.new_page()
                 _apply_auth(page, url, headers)
                 page.goto(url, timeout=timeout * 1000, wait_until="load")
+                _await_if_shell(page, url)    # Streamlit: paint the app before measuring FCP
                 page.wait_for_timeout(2500)  # allow delayed/contentful paint to occur
                 return page.evaluate(
                     "() => { const e = performance.getEntriesByName('first-contentful-paint')[0];"
@@ -1192,6 +1208,7 @@ def render_metrics(url: str, headers=None, timeout: float = 15.0) -> dict | None
                 page.add_init_script(_METRICS_JS)                 # observe LCP from before the page loads
                 _apply_auth(page, url, headers)
                 page.goto(url, timeout=timeout * 1000, wait_until="load")
+                _await_if_shell(page, url)    # Streamlit: paint the app before reading LCP / dom-size
                 try:
                     page.wait_for_load_state("networkidle", timeout=6000)   # let the SPA settle so LCP is final
                 except Exception:
@@ -1247,6 +1264,7 @@ def web_vitals(url: str, headers=None, timeout: float = 25.0, samples: int = 3) 
                         page.add_init_script(script=_VITALS_JS)   # observers up before any page script
                         _apply_auth(page, url, headers)
                         page.goto(url, timeout=timeout * 1000, wait_until="load")
+                        _await_if_shell(page, url)    # Streamlit: paint the app before sampling CWV (warm, not cold shell)
                         page.wait_for_timeout(2000)   # let LCP finalize + late layout shifts settle (throttled)
                         v = page.evaluate("() => window.__hlv")
                         out.append({"lcp_ms": round(v["lcp"]), "cls": round(v["cls"], 3), "tbt_ms": round(v["tbt"])})

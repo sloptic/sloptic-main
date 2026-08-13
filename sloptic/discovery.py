@@ -385,12 +385,40 @@ _MULTI_SUFFIX = {
     "vercel.app", "netlify.app", "github.io", "pages.dev", "web.app", "firebaseapp.com", "surge.sh",
     "onrender.com", "render.com", "herokuapp.com", "railway.app", "fly.dev", "workers.dev", "run.app",
     "deno.dev", "koyeb.app", "cyclic.app", "adaptable.app", "glitch.me", "replit.app",
+    "modal.run", "hf.space", "ondigitalocean.app", "azurewebsites.net", "elasticbeanstalk.com",
+    "pythonanywhere.com",
 }
 # Self-hosting PaaS where teams deploy their OWN BACKEND -> an off-origin host here is the app's responsibility
 # (the outsourced-backend case: probe it). Excludes pure frontend/static hosts (vercel/netlify/github.io), whose
 # own serverless API is same-origin and whose cross-origin siblings are ambiguous -> those fall to 'opaque'.
 _BACKEND_PAAS = {"onrender.com", "render.com", "herokuapp.com", "railway.app", "fly.dev", "workers.dev",
-                 "run.app", "deno.dev", "koyeb.app", "cyclic.app", "adaptable.app"}
+                 "run.app", "deno.dev", "koyeb.app", "cyclic.app", "adaptable.app",
+                 # per-project subdomains where a team deploys its OWN backend (the username-and-app-name
+                 # pattern makes ownership unambiguous): Modal, HF Spaces, DO App Platform, Azure, AWS EB, PA.
+                 "modal.run", "hf.space", "ondigitalocean.app", "azurewebsites.net", "elasticbeanstalk.com",
+                 "pythonanywhere.com"}
+# Generic host tokens that carry NO ownership signal — excluded from sibling-deploy name-matching so a shared
+# word can never attribute (and then attack) an unrelated third party. Only a distinctive ≥5-char app-name
+# token shared with a DEPLOY-host backend attributes it.
+_GENERIC_HOST_TOK = frozenset({
+    "frontend", "backend", "front", "server", "client", "api", "app", "apps", "web", "site", "www", "vercel",
+    "netlify", "github", "pages", "streamlit", "render", "onrender", "railway", "herokuapp", "firebase",
+    "cloudflare", "workers", "prod", "production", "staging", "demo", "main", "test", "https", "http",
+    "modal", "space", "azurewebsites", "pythonanywhere", "ondigitalocean", "elasticbeanstalk",
+})
+
+
+def _name_tokens(host: str) -> set:
+    """Distinctive (≥5-char, non-generic) lowercase tokens in a hostname — the app-name signal used to match a
+    sibling frontend and backend (beatsaber-frontend -> beatsaber-backend) without matching on infra words."""
+    return {t for t in re.findall(r"[a-z0-9]{5,}", host.split(":")[0].lower()) if t not in _GENERIC_HOST_TOK}
+
+
+# Deploy platforms where a team's sibling frontend + backend live (frontend/static hosts + backend PaaS). The
+# name-match ONLY attributes a token-sharing backend on one of THESE — a third-party SaaS is on its own domain,
+# never here, so a shared word like "health" can't cause us to attribute (and then probe) a third party.
+_DEPLOY_SUFFIX = _BACKEND_PAAS | {"vercel.app", "netlify.app", "github.io", "pages.dev", "web.app",
+                                  "firebaseapp.com", "surge.sh", "glitch.me", "replit.app"}
 
 
 def _registrable_domain(host: str) -> str:
@@ -416,6 +444,7 @@ def _classify_hosts(observed, base_url) -> dict:
     it (still yours), but an unlisted vendor slips safely into opaque rather than getting attacked."""
     app_host = urlparse(base_url).netloc
     app_site = _registrable_domain(app_host.split(":")[0])
+    app_tokens = _name_tokens(app_host)              # distinctive app-name tokens, for sibling-deploy attribution
     counts = {"same_origin": 0, "own_backend": 0, "managed_baas": 0, "vendor": 0, "opaque": 0}
     own, baas, opaque = set(), set(), set()
     for _method, url, _pd in observed:
@@ -428,9 +457,11 @@ def _classify_hosts(observed, base_url) -> dict:
             baas.add(h)
         elif _VENDOR_HOSTS.search(h):
             counts["vendor"] += 1
-        elif _registrable_domain(hp) == app_site or ".".join(hp.split(".")[-2:]) in _BACKEND_PAAS:
-            counts["own_backend"] += 1                   # same site OR a self-hosting PaaS deploy -> the app's own
-            own.add(h)
+        elif (_registrable_domain(hp) == app_site or ".".join(hp.split(".")[-2:]) in _BACKEND_PAAS
+              or (".".join(hp.split(".")[-2:]) in _DEPLOY_SUFFIX and _name_tokens(hp) & app_tokens)):
+            counts["own_backend"] += 1                   # same site, a self-host PaaS deploy, OR a sibling deploy
+            own.add(h)                                   #   (distinctive name shared on a deploy host) -> the app's own
+
         else:
             counts["opaque"] += 1                        # unknown branded off-origin -> unattributable: DON'T probe, flag
             opaque.add(h)
@@ -1050,6 +1081,7 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
             routes.setdefault(ep.path, None)
 
     browser_ok = False
+    render_state = None        # Streamlit render outcome (rendered|error|stuck) -> the capture-based shell_only signal
     backend_tables: list = []  # managed-backend tables the app's own runtime traffic read (RLS probe input)
     host_tiers: dict = {}     # off-score: where the app's runtime traffic goes (same-origin / BaaS / vendor /
     if render is not None:    # other off-origin) — populated from the observed net once the browser render runs
@@ -1071,8 +1103,11 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
             _auth = _crawl_auth_headers(base_url, forms)
             if _auth:
                 render_headers = {**(headers or {}), **_auth}
+        render_meta: dict = {}
         rendered = render(base_url, [start_path], headers=render_headers,   # .js URLs (native ESM import() chunks a
-                          net_sink=observed_net, script_sink=observed_scripts) or {}   # static <script> scan can't see)
+                          net_sink=observed_net, script_sink=observed_scripts,
+                          meta_sink=render_meta) or {}   # static <script> scan can't see; meta = Streamlit state
+        render_state = render_meta.get("render_state")
         if rendered:
             browser_ok = True  # a real render returned HTML -> the browser actually launched/works
             any_response = True
@@ -1270,7 +1305,7 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
             pass
     return Profile(base_url=base_url, landing_path=landing_path, routes=list(routes), forms=forms,
                    capabilities=capabilities, endpoints=endpoints, host_tiers=host_tiers,
-                   backend_tables=backend_tables)
+                   backend_tables=backend_tables, render_state=render_state)
 
 
 def surface_metrics(profile: Profile) -> dict:
@@ -1357,4 +1392,5 @@ def surface_metrics(profile: Profile) -> dict:
         "catch_all": bool(caps.get("catch_all")),    # phantom server-side surface was suppressed (soft-404/SPA)
         "host_tiers": profile.host_tiers,            # off-score: backend-tier map (where runtime traffic GOES) —
                                                      # batch-aggregates to size the SPA off-origin gap (Move 2)
+        "render_state": profile.render_state,        # Streamlit: rendered|error|stuck (None = not a canvas-shell host)
     }

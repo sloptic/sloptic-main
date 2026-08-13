@@ -35,3 +35,21 @@ def test_normal_hosts_are_not_shell_only():
         assert not is_shell_only({"platform": {"host_platform": host}})
     assert not is_shell_only({})                                    # no platform block -> not shell-only
     assert not is_shell_only({"platform": {}})
+
+
+def test_render_state_is_capture_based_and_overrides_platform():
+    # once the render-await runs, the record's render_state decides — a RENDERED Streamlit app is a real grade
+    # that counts (not shell-only), even though its platform is streamlit; error/stuck stay excluded.
+    def st(rs):
+        return {"platform": {"host_platform": "streamlit"}, "observed_surface": {"render_state": rs}}
+    assert not is_shell_only(st("rendered"))     # real app painted -> counts in the curve
+    assert is_shell_only(st("error"))            # Streamlit crash screen -> excluded
+    assert is_shell_only(st("stuck"))            # never came up -> excluded
+
+
+def test_legacy_streamlit_without_render_state_falls_back_to_platform():
+    # v17 records predate render_state -> the platform heuristic still excludes them (pre-render-fix behaviour)
+    assert is_shell_only({"platform": {"host_platform": "streamlit"}, "observed_surface": {}})
+    assert is_shell_only({"platform": {"host_platform": "streamlit"}})
+    # a non-streamlit new record: render_state absent -> platform fallback -> not shell-only
+    assert not is_shell_only({"platform": {"host_platform": "vercel"}, "observed_surface": {"render_state": None}})

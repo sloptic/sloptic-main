@@ -27,6 +27,12 @@ def is_ungradeable_challenge(rec: dict) -> bool:
 
 
 def is_shell_only(rec: dict) -> bool:
-    """True when the host renders a canvas shell the surface probe can't see past (Streamlit et al.): the grade
-    reflects the framework, not the app, so it is excluded from the reference distribution and never certifiable."""
+    """True when the grade is a canvas-shell (Streamlit) capture rather than the real app, so it's excluded from
+    the reference distribution and never certifiable. CAPTURE-BASED: once the render-await runs it records a
+    `render_state`, and the app is shell-only iff we never reached it — 'error' (Streamlit crash screen) or
+    'stuck' (won't come up); 'rendered' is a REAL grade that counts. Legacy records predate render_state, so
+    fall back to the platform heuristic (exclude every Streamlit app), the pre-render-fix behaviour."""
+    rs = (rec.get("observed_surface") or {}).get("render_state")
+    if rs is not None:
+        return rs in ("error", "stuck")
     return ((rec.get("platform") or {}).get("host_platform") or "") in SHELL_ONLY_PLATFORMS

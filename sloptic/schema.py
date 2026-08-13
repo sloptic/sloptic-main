@@ -73,6 +73,7 @@ class Profile:
     backend_tables: list[str] = field(default_factory=list)  # managed-backend (Supabase/Firestore) collections the
     #     app's OWN runtime traffic read — OBSERVED, so a minified or dynamically-built table name that never
     #     appears as a bundle string literal is still testable by the RLS probes. Never guessed.
+    render_state: str | None = None  # canvas-shell host (Streamlit) render outcome: rendered|error|stuck; None otherwise
 
     @property
     def form_endpoints(self) -> list[str]:  # back-compat for predicates that target form actions
@@ -99,6 +100,7 @@ def profile_to_dict(profile: Profile) -> dict:
         "endpoints": [asdict(e) for e in profile.endpoints],
         "host_tiers": dict(profile.host_tiers),   # off-score telemetry, frozen with the surface so a cached re-grade reports the same backend map
         "backend_tables": list(profile.backend_tables),
+        "render_state": profile.render_state,
     }
 
 
@@ -113,7 +115,8 @@ def profile_from_dict(d: dict) -> Profile:
                    routes=list(d.get("routes") or []), forms=forms,
                    capabilities=dict(d.get("capabilities") or {}), endpoints=endpoints,
                    host_tiers=dict(d.get("host_tiers") or {}),
-                   backend_tables=list(d.get("backend_tables") or []))
+                   backend_tables=list(d.get("backend_tables") or []),
+                   render_state=d.get("render_state"))
 
 
 @dataclass
