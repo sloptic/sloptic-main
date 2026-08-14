@@ -1108,6 +1108,13 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
                           net_sink=observed_net, script_sink=observed_scripts,
                           meta_sink=render_meta) or {}   # static <script> scan can't see; meta = Streamlit state
         render_state = render_meta.get("render_state")
+        if render_state in ("error", "stuck"):
+            # canvas-shell host (Streamlit) whose real app didn't render — 'error' (crash) or 'stuck' (won't come
+            # up). Crawling the rest of the FRAMEWORK shell (its ~125 fake routes, no real forms) costs ~100s and
+            # the pipeline then runs a full battery against it (~300s) and DNFs on the timeout — for a record
+            # is_shell_only EXCLUDES from the curve regardless. Return NOW with just the state so the pipeline
+            # short-circuits. A 'rendered' shell falls through and is crawled + graded normally.
+            return Profile(base_url=base_url, landing_path=start_path, render_state=render_state)
         if rendered:
             browser_ok = True  # a real render returned HTML -> the browser actually launched/works
             any_response = True
