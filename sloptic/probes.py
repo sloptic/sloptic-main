@@ -1229,9 +1229,10 @@ def command_injection(ctx, probe) -> bool | None:
     checked = 0
     deep: list = []
 
+    _pid = getattr(probe, "id", "")   # a unit-test mock probe may lack .id -> no request_counts entry -> uncapped
     def _capped():   # ACTUAL requests this probe has already sent (net.request_counts tallies every hop)
         rc = request_counts()
-        return rc is not None and rc.get(probe.id, 0) >= max_req
+        return rc is not None and rc.get(_pid, 0) >= max_req
     with make_client(ctx.base_url, ctx.headers, timeout=max(15.0, delay * 3 + 8),
                      follow_redirects=True, max_redirects=_INJECT_MAX_REDIRECTS) as c:
         for action, method, fields in targets:
