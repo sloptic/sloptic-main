@@ -23,7 +23,7 @@ from dataclasses import replace
 import httpx
 
 from . import auth, baas, browser, depscan, oob, perf, secretscan
-from .net import make_client
+from .net import make_client, request_counts
 from .schema import Endpoint
 from .discovery import _CATCHALL_PROBE, _body_sig
 
@@ -1167,6 +1167,11 @@ _CMD_TIME = (";sleep {d}", "$(sleep {d})", "`sleep {d}`", "&&sleep {d}", "|sleep
 # inflated, not extra payloads). A genuine injection result is <=1-2 hops away (POST->302->GET), so cap the
 # chain: bounds the amplification and fails fast on a redirect loop (which is dinged elsewhere anyway).
 _INJECT_MAX_REDIRECTS = 4
+# cmdi TOTAL-request cap. The payload budget below counts logical attempts, but the per-target baseline/liveness
+# fan-out + redirect HOPS (each one a request the WAF sees, tallied by net.request_counts) let a redirecting app
+# reach ~874 requests (v18 sample outlier). Bound the ACTUAL request count so no app exceeds this — the v18
+# median was 80, so it only trims the outlier tail, not typical apps. (Same intent as the upload fan-out caps.)
+_CMDI_MAX_REQUESTS = 150
 
 
 def _elapsed(c, method, action, data) -> float:
@@ -1216,16 +1221,21 @@ def command_injection(ctx, probe) -> bool | None:
         return None
     targets = targets[: probe.probe.get("max_targets", 40)]   # cap the per-target baseline/liveness fan-out
     budget = probe.probe.get("max_attempts", 100)             # payload cap (100 seps x 2 hashes); modest trim
+    max_req = probe.probe.get("max_requests", _CMDI_MAX_REQUESTS)   # hard cap on ACTUAL WAF-visible requests (hops incl.)
     delay = probe.probe.get("time_delay", 3)
     salt = "hlci" + secrets.token_hex(6)
     wanted = (hashlib.sha256(salt.encode()).hexdigest(), hashlib.md5(salt.encode()).hexdigest())
     tested = False
     checked = 0
     deep: list = []
+
+    def _capped():   # ACTUAL requests this probe has already sent (net.request_counts tallies every hop)
+        rc = request_counts()
+        return rc is not None and rc.get(probe.id, 0) >= max_req
     with make_client(ctx.base_url, ctx.headers, timeout=max(15.0, delay * 3 + 8),
                      follow_redirects=True, max_redirects=_INJECT_MAX_REDIRECTS) as c:
         for action, method, fields in targets:
-            if budget <= 0:
+            if budget <= 0 or _capped():
                 break
             filler = {fn: _XSS_FILLER for fn in fields}
             try:
@@ -1239,11 +1249,11 @@ def command_injection(ctx, probe) -> bool | None:
             if not _endpoint_is_live(ctx, c, action, method, base):
                 continue  # catch-all / soft-404 shell -> phantom endpoint, not a real command sink
             for field in fields:
-                if budget <= 0:
+                if budget <= 0 or _capped():
                     break
                 checked += 1
                 for sep in _CMD_SEPS:
-                    if budget <= 0:
+                    if budget <= 0 or _capped():
                         break
                     budget -= 1
                     tested = True
@@ -1261,6 +1271,8 @@ def command_injection(ctx, probe) -> bool | None:
                     # FP failure mode); the deterministic hard-product oracle still runs on them and IS specific.
                     deep.append((action, method, fields, field))
         for action, method, fields, field in deep:  # blind: DOSE-RESPONSE sleep (delay must scale with the dose)
+            if _capped():
+                break
             if _cmd_time_scales(c, method, action, fields, field, delay):
                 data = {fn: (_CMD_TIME[0].format(d=delay) if fn == field else _XSS_FILLER) for fn in fields}
                 ctx.evidence.update(injectable=True, via="time-based", target=action, field=field,

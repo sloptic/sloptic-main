@@ -80,15 +80,25 @@ def is_passive(probe_id: str) -> bool:
     return probe_id in PASSIVE_PROBES
 
 
+# The upload probes are the most WAF-antagonizing (a burst of webshell / active-file multipart uploads is
+# maximally attack-shaped) AND fire ~never, so they run DEAD LAST — after every injection probe (xss/xxe/ssti/
+# sqli/cmdi) has completed — so a WAF trip on the upload burst blocks only themselves (and they're recovered by
+# the post-run retry). The v18 sample confirmed upload was the top re-challenge onset.
+RUN_LAST_PROBES = frozenset({"sec-upload-001", "sec-upload-002"})
+
+
 def order_weight(probe_id: str) -> int:
     """Run-order tier within a grade: PASSIVE (0, lowest volume) first, ordinary active (1) next, HIGH-VOLUME
-    injection/stress (2) LAST. On an adaptive-WAF host the challenge then trips during the tail, so the low-
-    volume probes (headers/a11y/perf + the high-value exposure fetchers) have already completed and the
-    recovery keeps their outcomes (the pipeline scores only PRE-onset). A fully-completed grade's score is
-    order-independent (compute_slop_score aggregates by category), so reordering only ever HELPS the WAF case
-    and never changes a clean grade. Fail-safe: an unclassified id sorts into the middle tier, never the tail."""
+    injection/stress (2), then the WAF-antagonizing-but-zero-value upload burst (3) DEAD LAST. On an adaptive-WAF
+    host the challenge then trips during the tail, so the low-volume probes (headers/a11y/perf + the high-value
+    exposure fetchers) AND the injection probes have already completed, and the recovery keeps their outcomes
+    (the pipeline scores only PRE-onset). A fully-completed grade's score is order-independent (compute_slop_score
+    aggregates by category), so reordering only ever HELPS the WAF case and never changes a clean grade. Fail-safe:
+    an unclassified id sorts into the middle tier, never the tail."""
     if probe_id in PASSIVE_PROBES:
         return 0
+    if probe_id in RUN_LAST_PROBES:
+        return 3
     if probe_id in HIGH_VOLUME_PROBES:
         return 2
     return 1
