@@ -271,12 +271,15 @@ def await_streamlit(page, budget_s: float = 60.0) -> str:
     return "stuck"
 
 
-def _await_if_shell(page, url: str, budget_s: float = 45.0) -> None:
+def _await_if_shell(page, url: str, budget_s: float = 12.0) -> None:
     """Post-goto hook for the MEASURING renders (perf): if this is a websocket-rendered shell host (Streamlit),
     wait for the real app to paint so the metric reflects the app, not the framework shell. No-op otherwise
-    (cheap gate first). The server is already warm here — discovery's render woke it — so the client render
-    lands fast; without this the perf probes score Streamlit's cold shell (unfairly poor LCP/FCP) instead of
-    the app a warm judge actually sees."""
+    (cheap gate first). The server is already warm here — discovery's render woke it — so a rendered app paints
+    in a few seconds; the budget is SHORT on purpose (this runs in EVERY perf render, and web_vitals runs it
+    per sample) so a genuinely-STUCK Streamlit app can't stack 45s x N waits and blow the grade timeout — it
+    just measures the shell, which is excluded from the curve anyway (render_state was set once in discovery)."""
+    if budget_s <= 0:
+        return   # caller opted out (discovery already found this app error/stuck -> don't re-wait, just measure)
     try:
         if _looks_streamlit(page, url):
             await_streamlit(page, budget_s=budget_s)
@@ -333,8 +336,10 @@ def render_routes(base_url: str, paths, headers=None, timeout: float = 12.0,
                     with contextlib.suppress(Exception):
                         page.goto(url, timeout=timeout * 1000, wait_until="load")
                         if idx == 0 and _looks_streamlit(page, url):
-                            # websocket-rendered SPA: wake + wait for the real app, bounded by the crawl deadline
-                            st_state = await_streamlit(page, budget_s=max(8.0, deadline - time.monotonic()))
+                            # websocket-rendered SPA: wake + wait for the real app. Bounded to ~35s (covers a
+                            # cold-start wake; a slower app is marked 'stuck', not waited on) so a mostly-dead
+                            # Streamlit corpus can't burn the run — still within the crawl deadline.
+                            st_state = await_streamlit(page, budget_s=max(8.0, min(35.0, deadline - time.monotonic())))
                             if meta_sink is not None:      # rendered|error|stuck -> the record's shell_only signal
                                 meta_sink["render_state"] = st_state
                         else:
@@ -897,7 +902,7 @@ def inert_controls(url: str, headers=None, timeout: float = 12.0, max_controls: 
         return None
 
 
-def first_contentful_paint(url: str, headers=None, timeout: float = 12.0) -> float | None:
+def first_contentful_paint(url: str, headers=None, timeout: float = 12.0, shell_await: bool = True) -> float | None:
     """Render url and return First Contentful Paint in milliseconds (the user-facing 'time to see
     something' metric). None if no browser, render fails, or nothing ever paints."""
     try:
@@ -913,7 +918,7 @@ def first_contentful_paint(url: str, headers=None, timeout: float = 12.0) -> flo
                 page = b.new_page()
                 _apply_auth(page, url, headers)
                 page.goto(url, timeout=timeout * 1000, wait_until="load")
-                _await_if_shell(page, url)    # Streamlit: paint the app before measuring FCP
+                _await_if_shell(page, url, budget_s=12.0 if shell_await else 0.0)  # skip if discovery found it dead
                 page.wait_for_timeout(2500)  # allow delayed/contentful paint to occur
                 return page.evaluate(
                     "() => { const e = performance.getEntriesByName('first-contentful-paint')[0];"
@@ -1192,7 +1197,7 @@ _METRICS_JS = """(() => {
 })()"""
 
 
-def render_metrics(url: str, headers=None, timeout: float = 15.0) -> dict | None:
+def render_metrics(url: str, headers=None, timeout: float = 15.0, shell_await: bool = True) -> dict | None:
     """Render url once and return {lcp_is_img, lcp_loading, dom_nodes}. None if no browser / the render fails."""
     try:
         from playwright.sync_api import sync_playwright
@@ -1208,7 +1213,7 @@ def render_metrics(url: str, headers=None, timeout: float = 15.0) -> dict | None
                 page.add_init_script(_METRICS_JS)                 # observe LCP from before the page loads
                 _apply_auth(page, url, headers)
                 page.goto(url, timeout=timeout * 1000, wait_until="load")
-                _await_if_shell(page, url)    # Streamlit: paint the app before reading LCP / dom-size
+                _await_if_shell(page, url, budget_s=12.0 if shell_await else 0.0)  # skip if discovery found it dead
                 try:
                     page.wait_for_load_state("networkidle", timeout=6000)   # let the SPA settle so LCP is final
                 except Exception:
@@ -1240,7 +1245,7 @@ _VITALS_JS = """(() => {
 _CWV_THROTTLE = {"offline": False, "latency": 150, "downloadThroughput": 200_000, "uploadThroughput": 93_750}
 
 
-def web_vitals(url: str, headers=None, timeout: float = 25.0, samples: int = 3) -> list | None:
+def web_vitals(url: str, headers=None, timeout: float = 25.0, samples: int = 3, shell_await: bool = True) -> list | None:
     """Sample Core Web Vitals over N throttled renders; return [{lcp_ms, cls, tbt_ms}] per run (the caller
     scores off the player-favorable edge). None if no browser or the render fails."""
     try:
@@ -1264,7 +1269,7 @@ def web_vitals(url: str, headers=None, timeout: float = 25.0, samples: int = 3) 
                         page.add_init_script(script=_VITALS_JS)   # observers up before any page script
                         _apply_auth(page, url, headers)
                         page.goto(url, timeout=timeout * 1000, wait_until="load")
-                        _await_if_shell(page, url)    # Streamlit: paint the app before sampling CWV (warm, not cold shell)
+                        _await_if_shell(page, url, budget_s=12.0 if shell_await else 0.0)  # skip if discovery found it dead
                         page.wait_for_timeout(2000)   # let LCP finalize + late layout shifts settle (throttled)
                         v = page.evaluate("() => window.__hlv")
                         out.append({"lcp_ms": round(v["lcp"]), "cls": round(v["cls"], 3), "tbt_ms": round(v["tbt"])})

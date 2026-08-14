@@ -4187,7 +4187,8 @@ def slow_first_paint(ctx, probe) -> bool:
     # median of N renders, not one sample: FCP is wall-clock timing (JIT warmup, CPU/network jitter),
     # so a single sample near the gate flips between runs -> non-deterministic score. The isinstance
     # filter also drops any non-numeric value a hostile page could inject (would raise TypeError).
-    samples = [browser.first_contentful_paint(url, headers=ctx.headers) for _ in range(3)]
+    _sa = _shell_ok(ctx)
+    samples = [browser.first_contentful_paint(url, headers=ctx.headers, shell_await=_sa) for _ in range(3)]
     vals = [s for s in samples if isinstance(s, (int, float))]
     if not vals:
         return False
@@ -4195,6 +4196,14 @@ def slow_first_paint(ctx, probe) -> bool:
     threshold = probe.probe.get("threshold_ms", 1000)
     ctx.evidence.update(fcp_ms=round(fcp), threshold_ms=threshold)
     return fcp > threshold
+
+
+def _shell_ok(ctx) -> bool:
+    """Whether the perf probes should AWAIT a Streamlit render: only if discovery didn't already find the app
+    dead (render_state error/stuck). Skipping a known-dead app stops each perf probe re-waiting ~12s on an app
+    that will never paint (which stacked up across render_metrics/web_vitals/FCP and DNF'd stuck Streamlit apps
+    on the grade timeout). A rendered app (or a non-Streamlit one) still awaits/normal-renders."""
+    return getattr(getattr(ctx, "profile", None), "render_state", None) not in ("error", "stuck")
 
 
 def slow_core_web_vitals(ctx, probe) -> bool:
@@ -4206,7 +4215,8 @@ def slow_core_web_vitals(ctx, probe) -> bool:
     if not _served(ctx, target):
         target = _landing(ctx)
     url = ctx.base_url.rstrip("/") + target
-    samples = browser.web_vitals(url, headers=ctx.headers, samples=probe.probe.get("samples", 3))
+    samples = browser.web_vitals(url, headers=ctx.headers, samples=probe.probe.get("samples", 3),
+                                 shell_await=_shell_ok(ctx))
     if not samples:
         return False
     best_lcp = min(s["lcp_ms"] for s in samples)   # lower is better -> take the player's best run
@@ -5244,7 +5254,8 @@ def lcp_image_lazy_loaded(ctx, probe) -> bool | None:
     """The Largest Contentful Paint element is an <img> marked loading="lazy" -> the browser defers the very
     image that defines first paint. Browser-gated. N/A when the LCP element isn't an image (nothing to
     lazy-load) or the render fails; clean when the LCP image loads eagerly."""
-    m = browser.render_metrics(ctx.base_url.rstrip("/") + _home_path(ctx, probe), headers=ctx.headers)
+    m = browser.render_metrics(ctx.base_url.rstrip("/") + _home_path(ctx, probe), headers=ctx.headers,
+                               shell_await=_shell_ok(ctx))
     if m is None:
         return None
     if not m.get("lcp_is_img"):
@@ -5261,7 +5272,8 @@ _DOM_NODE_LIMIT = 1400     # Lighthouse's excessive-DOM threshold; only a genuin
 def excessive_dom_size(ctx, probe) -> bool | None:
     """The rendered page carries an excessive DOM (> Lighthouse's ~1400-node threshold): style/layout/interaction
     cost scales with node count, independent of page weight. Browser-gated. N/A when the render fails."""
-    m = browser.render_metrics(ctx.base_url.rstrip("/") + _home_path(ctx, probe), headers=ctx.headers)
+    m = browser.render_metrics(ctx.base_url.rstrip("/") + _home_path(ctx, probe), headers=ctx.headers,
+                               shell_await=_shell_ok(ctx))
     if m is None:
         return None
     n = m.get("dom_nodes") or 0
