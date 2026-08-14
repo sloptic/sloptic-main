@@ -25,7 +25,7 @@ sys.path.insert(0, str(_ROOT))
 
 from sloptic.aggregate import CATEGORY_DECAY, _damped_total  # noqa: E402
 from sloptic.catalog import load_catalog  # noqa: E402
-from sloptic.eligibility import is_ungradeable_challenge  # noqa: E402
+from sloptic.eligibility import is_shell_only, is_ungradeable_challenge  # noqa: E402
 from sloptic.schema import Outcome  # noqa: E402
 
 
@@ -148,10 +148,12 @@ def _is_graded(r):
     challenge (which scores 0). The (b) distribution, (c) fire-freq, (d) winner split and (e) anomalies all
     share this ONE predicate so they can't drift — (d) once omitted the entry-challenge clause and reported
     min=0 while (b) reported min=8, because the 6 entry-withheld apps (5 scoring 0) leaked into (d) alone.
-    The entry-challenge rule lives in sloptic.eligibility, shared with the curve (benchmark.py)."""
+    The entry-challenge rule lives in sloptic.eligibility, shared with the curve (benchmark.py) — as does the
+    shell-only rule (a canvas-shell Streamlit graded 0 by the short-circuit is excluded here too, so it doesn't
+    show as a spurious '0' in the descriptive distribution; a RENDERED Streamlit is a real grade and stays)."""
     return (r.get("deployed") and "slop_score" in r and r.get("functional") is not False
             and not r.get("recon")   # recon records carry host_tiers only (no probes) -> not a real grade
-            and not is_ungradeable_challenge(r))
+            and not is_ungradeable_challenge(r) and not is_shell_only(r))
 
 
 def main():

@@ -47,3 +47,13 @@ def test_dnf_recon_undeployed_and_unscored_are_not_graded():
 def test_a_plain_url_grade_including_score_zero_is_graded():
     assert _is_graded(_rec(slop_score=8))
     assert _is_graded(_rec(slop_score=0))   # a genuine 0 (no challenge) IS a real grade, kept
+
+
+def test_shell_only_streamlit_is_not_a_graded_entry_but_a_rendered_one_is():
+    # a short-circuited error/stuck Streamlit scores 0 but is NOT a real grade -> kept out of the descriptive
+    # distribution (so it can't show as a spurious 0); a RENDERED Streamlit is a real grade and stays.
+    for rs in ("error", "stuck"):
+        assert not _is_graded(_rec(slop_score=0, observed_surface={"render_state": rs},
+                                   platform={"host_platform": "streamlit"}))
+    assert _is_graded(_rec(slop_score=40, observed_surface={"render_state": "rendered"},
+                           platform={"host_platform": "streamlit"}))
