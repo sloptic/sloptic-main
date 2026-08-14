@@ -1758,17 +1758,24 @@ def upload_stored_xss(ctx, probe) -> bool | None:
         ctx.evidence["na_reason"] = (NO_UPLOAD_FORM % len(ctx.profile.forms or []))
         return None
     tested = False
+    sent = 0
     with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
         for f in forms:
             for filename, ctype, body in _upload_xss_variants():
+                if sent >= _UPLOAD_BUDGET:
+                    break
                 tested = True
                 files = {ff: (filename, body, ctype) for ff in f.file_fields}
                 data = {fn: _XSS_FILLER for fn in f.fields if fn not in f.file_fields}
+                sent += 1
                 try:
                     resp = c.request((f.method or "post").upper(), f.action, files=files, data=data)
                 except (httpx.HTTPError, httpx.InvalidURL):
                     continue
                 for url in _locate_upload(resp.text, filename):
+                    if sent >= _UPLOAD_BUDGET:
+                        break
+                    sent += 1
                     try:
                         got = c.get(url)
                     except (httpx.HTTPError, httpx.InvalidURL):
@@ -1779,7 +1786,9 @@ def upload_stored_xss(ctx, probe) -> bool | None:
                                             repro=_repro_from_resp(got, matched="served %s inline (not attachment)"
                                                                    % got.headers.get("content-type", "")))
                         return True  # user-uploaded active content served executable in-origin -> stored XSS
-    ctx.evidence.update(stored_xss=False, forms=len(forms))
+            if sent >= _UPLOAD_BUDGET:
+                break
+    ctx.evidence.update(stored_xss=False, forms=len(forms), requests=sent)
     return False if tested else None
 
 
