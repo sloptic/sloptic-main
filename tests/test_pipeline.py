@@ -278,10 +278,12 @@ def test_a_predicate_can_override_its_penalty_absolutely(monkeypatch):
     prof = Profile(base_url="http://x")
     client = httpx.Client(base_url="http://x")
 
-    def run_one(override):
+    def run_one(override, report_only=False):
         def pred(ctx, probe):
             if override is not None:
                 ctx.evidence["penalty_override"] = override
+            if report_only:
+                ctx.evidence["report_only"] = True
             return True
         monkeypatch.setitem(PREDICATES, "_hl_override_test", pred)
         p = Probe(id="t", bundle="qa", category="c", penalty=26, probe={"predicate": "_hl_override_test"})
@@ -291,7 +293,8 @@ def test_a_predicate_can_override_its_penalty_absolutely(monkeypatch):
         assert run_one(None) == 26            # no override -> the nominal catalog penalty
         assert run_one(18) == 18              # below nominal -> down (a lone serious barrier)
         assert run_one(48) == 48              # ABOVE nominal -> up (barriers sum past the ceiling — the point)
-        assert run_one(0) == 1                # bounded to >= 1
+        assert run_one(0) == 1                # a normal fire is bounded to >= 1 (a fire is never free)
+        assert run_one(0, report_only=True) == 0   # ...UNLESS report_only: an OFF-SCORE diagnostic fire is 0
         assert run_one(9999) == _PENALTY_CAP  # runaway-guarded
     finally:
         client.close()

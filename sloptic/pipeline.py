@@ -177,7 +177,8 @@ def _run_probe(probe: Probe, ctx: _Ctx, client: httpx.Client, profile: Profile) 
         pen = probe.penalty
         override = ev.get("penalty_override")   # a predicate MAY set an ABSOLUTE penalty that can EXCEED the
         if slop and isinstance(override, (int, float)) and override >= 0:   # nominal ceiling (the a11y per-rule
-            pen = max(1, min(round(override), _PENALTY_CAP))                # severity sum); runaway-guarded
+            floor = 0 if ev.get("report_only") else 1                       # report_only fires are OFF-SCORE (a
+            pen = max(floor, min(round(override), _PENALTY_CAP))            # visible diagnostic at 0); else >=1, guarded
         return [_outcome(probe, "slop_detected" if slop else "clean", pen if slop else 0,
                          target, reason=describe(probe) if slop else "", evidence=ev)]
     na_if_absent = probe.probe.get("na_if_absent", False)
