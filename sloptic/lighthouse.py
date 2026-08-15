@@ -26,9 +26,21 @@ PSI_ENDPOINT = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
 LIGHTHOUSE_VERSION = "13.4.1"
 
 # Median-of-N over the timing metrics: the config audits are single-run byte-stable, but FCP/CLS/speed-index
-# swing run-to-run (measured: SI 4x, CLS band-flips), so the score is a MEDIAN of this many runs. Settable;
-# 3 tames a single pathological run (median ignores the outlier), the corpus freeze can raise it.
-DEFAULT_RUNS = 3
+# swing run-to-run (measured: SI 4x, CLS band-flips), so the score is a MEDIAN of this many runs. 3 tames a
+# single pathological run (median ignores the outlier). Overridable via SLOPTIC_LIGHTHOUSE_RUNS: under the
+# --concurrency Lighthouse lock the trace lane is serial, so N is the per-app cost on that lane -- dropping to
+# 2 or 1 speeds a big corpus / overnight run (a faster clean trace) at the price of per-app jitter smoothing,
+# which a population/curve averages out anyway. Garbage / <1 -> 3. Whatever you pick, keep it fixed across a
+# run: it is part of the curve's definition (each grade records the actual `runs` it achieved).
+def _env_runs(default: int = 3) -> int:
+    try:
+        n = int(os.environ.get("SLOPTIC_LIGHTHOUSE_RUNS", ""))
+        return n if n >= 1 else default
+    except ValueError:
+        return default
+
+
+DEFAULT_RUNS = _env_runs()
 
 # Audit ids the perf axis maps onto — VERIFIED against a live 13.4.1 response (do not trust from memory; they
 # rename). score: 1=pass, <1=needs-improvement, 0=fail; scoreDisplayMode: metricSavings | informative | numeric.

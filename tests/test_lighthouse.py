@@ -30,7 +30,16 @@ def test_missing_report_is_empty_not_crash():
 def test_mapped_audit_ids_are_declared_and_versions_pinned():
     ids = lh.INSIGHT_AUDITS + lh.NUMERIC_AUDITS + lh.METRIC_AUDITS
     assert len(ids) == 19 and all(isinstance(a, str) and a for a in ids)
-    assert lh.LIGHTHOUSE_VERSION and lh.DEFAULT_RUNS == 3   # pinned version + median default
+    assert lh.LIGHTHOUSE_VERSION and lh.DEFAULT_RUNS == 3   # pinned version + median default (env unset)
+
+
+def test_runs_env_override(monkeypatch):
+    # SLOPTIC_LIGHTHOUSE_RUNS dials median-of-N (throughput vs per-app smoothing on the serialized trace lane)
+    monkeypatch.delenv("SLOPTIC_LIGHTHOUSE_RUNS", raising=False)
+    assert lh._env_runs() == 3
+    for val, exp in [("1", 1), ("2", 2), ("5", 5), ("0", 3), ("-2", 3), ("junk", 3), ("", 3)]:
+        monkeypatch.setenv("SLOPTIC_LIGHTHOUSE_RUNS", val)
+        assert lh._env_runs() == exp, val
 
 
 def _rep(lcp_score, lcp_ms, cls_score, cls_num, perf):
