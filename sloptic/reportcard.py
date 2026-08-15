@@ -274,8 +274,8 @@ _CONTENT: dict[str, tuple[str, str, str]] = {
                        "Stale UI: a created object did not appear until a hard refresh, so the interface lies about the current state and users re-submit or assume failure.",
                        "Re-fetch or optimistically update the view after a successful write; invalidate the relevant client cache/query on mutation."),
     # ---- performance -------------------------------------------------------------------------------
-    "perf-lighthouse-001": ("Overall Lighthouse performance is at/near 100 — the app loads fast.",
-                            "Lighthouse's weighted performance score has real headroom; slop = its distance from a perfect 100.",
+    "perf-lighthouse-001": ("Overall Lighthouse performance is green (90+); the app loads fast.",
+                            "Lighthouse's weighted performance score is below its green line; slop = the shortfall under 90.",
                             "See the per-metric breakdown (LCP/CLS/TBT/speed-index) for which metric to fix first."),
     "perf-cwv-001": ("First Contentful Paint is within the Core Web Vitals threshold.",
                      "The page paints slowly — users perceive it as sluggish and are more likely to bounce.",

@@ -1,7 +1,8 @@
-"""The perf axis is scored ONCE, off Lighthouse's overall weighted headline, inverted to slop: slop = round(
-(1 - score) * 100 * scale). A 100 -> 0 (clean), an 84 -> 16, a 25 -> 75. This replaces summing the per-audit
-tiers (which double-counted metrics the headline already weighed and penalized apps Lighthouse rates fast).
-The per-metric breakdown rides along as OFF-SCORE diagnostics only."""
+"""The perf axis is scored ONCE, off Lighthouse's overall weighted headline: slop = round(max(0, green_floor -
+score) * 100 * scale) -- the shortfall below Lighthouse's own green line (0.90). At/above green -> 0 (clean),
+an 84 -> 6, a 25 -> 65. Flooring at green (not a perfect 100) refuses to score the 90-100 jitter and keeps a
+clean sheet achievable. This replaces summing the per-audit tiers (which double-counted metrics the headline
+already weighed and penalized apps Lighthouse rates good). The per-metric breakdown rides along OFF-SCORE."""
 from sloptic import lighthouse as lh
 from sloptic.probes import lighthouse_perf_score
 
@@ -21,14 +22,18 @@ def _rep(perf, audits=None, runs=3):
                                  "audits": audits or {}}, "runs": runs}
 
 
-def test_perfect_score_is_clean():
-    ctx = _Ctx(_rep(1.0))
-    assert lighthouse_perf_score(ctx, _Probe()) is False       # a perfect 100 -> 0 slop -> clean, no finding
-    assert ctx.evidence["penalty_override"] == 0 and ctx.evidence["performance"] == 100
+def test_green_is_clean():
+    # at/above Lighthouse's green line (0.90) -> 0 slop -> CLEAN (no finding). A green sheet is achievable;
+    # 90-100 is within measurement jitter, so we don't score a 95 vs a 92.
+    for perf in (1.0, 0.95, 0.90):
+        ctx = _Ctx(_rep(perf))
+        assert lighthouse_perf_score(ctx, _Probe()) is False
+        assert ctx.evidence["penalty_override"] == 0 and ctx.evidence["tier"] == "good"
+        assert ctx.evidence["performance"] == round(perf * 100)
 
 
-def test_distance_from_100_is_the_slop():
-    for perf, slop, tier in [(0.84, 16, "needs-improvement"), (0.25, 75, "poor"), (0.95, 5, "good")]:
+def test_shortfall_below_green_is_the_slop():
+    for perf, slop, tier in [(0.84, 6, "needs-improvement"), (0.50, 40, "needs-improvement"), (0.25, 65, "poor")]:
         ctx = _Ctx(_rep(perf))
         assert lighthouse_perf_score(ctx, _Probe()) is True
         assert ctx.evidence["penalty_override"] == slop and ctx.evidence["tier"] == tier
@@ -38,7 +43,7 @@ def test_distance_from_100_is_the_slop():
 def test_scale_dials_the_axis_without_touching_the_mapping():
     ctx = _Ctx(_rep(0.50))
     assert lighthouse_perf_score(ctx, _Probe(scale=0.5)) is True
-    assert ctx.evidence["penalty_override"] == 25          # (1-0.5)*100*0.5
+    assert ctx.evidence["penalty_override"] == 20          # max(0, 0.90-0.50)*100*0.5
 
 
 def test_breakdown_rides_along_as_offscore_diagnostics():

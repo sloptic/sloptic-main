@@ -3,11 +3,13 @@ bundle: performance
 category: overall
 pool: public
 evidence_model: oracle
-penalty: 50   # NOMINAL only. The real slop = penalty_override = round((1 - lighthouse_perf_score) * 100 * scale),
-              # i.e. the app's distance from a perfect 100 (a 100 -> 0, an 84 -> 16, a 25 -> 75). Lighthouse does
-              # the scoring off its own calibrated weights; we invert the headline into slop. Median-of-3.
+penalty: 50   # NOMINAL only. The real slop = penalty_override = round(max(0, green_floor - perf_score) * 100 * scale):
+              # the SHORTFALL below Lighthouse's own green line (0.90). At/above green -> 0; an 84 -> 6, a 25 -> 65.
+              # Lighthouse does the scoring off its calibrated weights; we charge only the distance below "good". Median-of-3.
 applicability:
   requires: [lighthouse]
 probe:
   predicate: lighthouse_perf_score
-  scale: 1.0   # the one dial: 1.0 = pure 100-N; drop below 1.0 to weigh the perf axis less without touching code
+  green_floor: 0.90   # Lighthouse's green cutoff: score >= this -> no perf slop (a clean, achievable, meaningful 0);
+                      # flooring at green (not 100) also refuses to score the 90-100 measurement jitter
+  scale: 1.0          # weigh the whole perf axis: 1.0 = full; drop below 1.0 to soften it without touching code

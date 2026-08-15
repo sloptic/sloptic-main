@@ -5790,12 +5790,14 @@ def lighthouse_audit(ctx, probe) -> bool | None:
 
 
 def lighthouse_perf_score(ctx, probe) -> bool | None:
-    """The perf axis's SCORING probe: slop = round((1 - overall_perf_score) * 100 * scale) -- i.e. the app's
-    DISTANCE from a perfect Lighthouse score (a 100 -> 0 slop, an 84 -> 16, a 25 -> 75). Lighthouse already did
-    the scoring off its own calibrated weights; we just invert the headline into slop instead of re-summing the
-    per-audit tiers (which double-counted metrics the headline already weighed, and penalized apps Lighthouse
-    itself rates fast). `scale` (default 1.0) is the one dial if the axis ever needs to weigh less. The metric
-    breakdown rides along in evidence as OFF-SCORE diagnostics. N/A when there is no Lighthouse result."""
+    """The perf axis's SCORING probe: slop = round(max(0, green_floor - overall_perf_score) * 100 * scale) --
+    the app's SHORTFALL below Lighthouse's own green line (0.90 = "good"). At/above green -> 0 slop, CLEAN (an
+    84 -> 6, a 50 -> 40, a 25 -> 65). Lighthouse already did the scoring off its calibrated weights; we charge
+    only the distance below its "good" threshold, rather than re-summing the per-audit tiers (which double-
+    counted metrics the headline already weighed AND penalized apps Lighthouse itself rates good). Flooring at
+    green (not a perfect 100) refuses to score the 90-100 measurement jitter and makes a clean perf sheet
+    achievable + meaningful. `green_floor` / `scale` are the dials. The metric breakdown rides along in evidence
+    as OFF-SCORE diagnostics. N/A when there is no Lighthouse result."""
     rep = getattr(ctx, "lighthouse", None)
     if not rep:
         ctx.evidence["na_reason"] = "no lighthouse result (url unreachable or the run failed)"
@@ -5805,7 +5807,8 @@ def lighthouse_perf_score(ctx, probe) -> bool | None:
         ctx.evidence["na_reason"] = "lighthouse produced no overall performance score"
         return None
     scale = probe.probe.get("scale", 1.0)
-    slop = round((1.0 - score) * 100 * scale)
+    floor = probe.probe.get("green_floor", 0.90)      # Lighthouse's green cutoff: at/above it -> no perf slop
+    slop = round(max(0.0, floor - score) * 100 * scale)
     ctx.evidence.update(performance=round(score * 100), runs=rep.get("runs"), versions=rep.get("versions"),
                         metrics=lighthouse.metric_breakdown(rep),
                         tier=("good" if score >= 0.90 else "needs-improvement" if score >= 0.50 else "poor"),
@@ -5904,7 +5907,7 @@ _MATCHER_REASONS = {
 
 _PREDICATE_REASONS = {
     "lighthouse_audit": "a Lighthouse performance audit is below its passing threshold",
-    "lighthouse_perf_score": "the overall Lighthouse performance score is below a perfect 100 (slop = its distance from 100)",
+    "lighthouse_perf_score": "the overall Lighthouse performance score is below the green line (slop = its shortfall under 90)",
     "sqli_auth_bypass": "login bypassed by a SQL-injection payload",
     "api_sqli": "a parameter is SQL-injectable (error / boolean / UNION / time-based)",
     "xss_injectable": "an input reflects unescaped into HTML (XSS: script / img / svg / attribute / stored)",
