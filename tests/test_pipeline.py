@@ -5,6 +5,7 @@ surface), and not_applicable on the minimal app where the surface is absent. Thi
 exercises both aggregation dampers end-to-end: a SQLi variant group (fires once) and a
 crash-resistance category (diminishing returns).
 """
+import fcntl
 import pathlib
 
 from sloptic.catalog import load_catalog
@@ -270,17 +271,35 @@ def test_progress_callback_fires_per_probe():
 
 def test_lighthouse_lock_noops_without_env_and_serializes_with(tmp_path, monkeypatch):
     # the cross-process semaphore around the Lighthouse trace: no env var -> a plain no-op (serial runs pay
-    # nothing); env set -> flock the file EXCLUSIVE for the trace's duration, released after so it's re-acquirable.
+    # nothing); env set -> grab a slot flock for the trace's duration, released after so it's re-acquirable.
     from sloptic.pipeline import _lighthouse_lock
     monkeypatch.delenv("SLOPTIC_LIGHTHOUSE_LOCK", raising=False)
-    with _lighthouse_lock():                       # unset -> no-op, must not raise or block
+    with _lighthouse_lock():                        # unset -> no-op, must not raise or block
         pass
     lock = tmp_path / "lh.lock"
     monkeypatch.setenv("SLOPTIC_LIGHTHOUSE_LOCK", str(lock))
-    with _lighthouse_lock():                        # acquires the exclusive lock
-        assert lock.exists()
-    with _lighthouse_lock():                        # released above -> re-acquirable in-process (no deadlock)
+    monkeypatch.delenv("SLOPTIC_LIGHTHOUSE_SLOTS", raising=False)   # default 1 -> strict mutex
+    with _lighthouse_lock():                         # acquires the single lane (slot 0)
+        assert (tmp_path / "lh.lock.0").exists()
+    with _lighthouse_lock():                         # released above -> re-acquirable in-process (no deadlock)
         pass
+
+
+def test_lighthouse_lock_counting_semaphore_allows_N_concurrent(tmp_path, monkeypatch):
+    # SLOPTIC_LIGHTHOUSE_SLOTS=2 -> two traces may run at once. Hold slot 0 externally; the CM must fall
+    # through to slot 1 rather than block (proving it's a counting semaphore, not a plain mutex).
+    from sloptic.pipeline import _lighthouse_lock
+    lock = tmp_path / "lh.lock"
+    monkeypatch.setenv("SLOPTIC_LIGHTHOUSE_LOCK", str(lock))
+    monkeypatch.setenv("SLOPTIC_LIGHTHOUSE_SLOTS", "2")
+    other = open(f"{lock}.0", "w")
+    fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)   # occupy lane 0
+    try:
+        with _lighthouse_lock():                        # must acquire lane 1, not deadlock
+            assert (tmp_path / "lh.lock.1").exists()
+    finally:
+        fcntl.flock(other, fcntl.LOCK_UN)
+        other.close()
 
 
 def test_needs_lighthouse_keys_on_the_declared_capability_not_the_predicate_name():

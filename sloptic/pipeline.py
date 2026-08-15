@@ -99,23 +99,43 @@ def _needs_lighthouse(catalog: list[Probe]) -> bool:
 
 @contextlib.contextmanager
 def _lighthouse_lock():
-    """Serialize the Lighthouse perf trace across concurrent grade PROCESSES. run_batch shells one
-    deploy_and_grade per repo, so a thread lock wouldn't help -- this is a cross-process file lock. When
-    SLOPTIC_LIGHTHOUSE_LOCK names a path, flock it EXCLUSIVE around measure() so only ONE Chrome trace runs
-    host-wide at a time: two concurrent traces on a shared CPU wreck each other's LCP/TBT (and median-of-3
-    can't rescue three contended runs). Unset -> no lock, no cost, the right thing for serial runs. NOTE this
-    covers Lighthouse-vs-Lighthouse only, not a docker build running alongside a trace; --concurrency 1 stays
-    the pristine-timing choice on a CPU-bound box."""
+    """Cross-process THROTTLE on the Lighthouse perf trace, so concurrent grades don't corrupt each other's
+    LCP/TBT timing. run_batch shells one grade per job, so a thread lock wouldn't reach across them -- this is
+    a counting semaphore over N flock files. SLOPTIC_LIGHTHOUSE_LOCK names the base path (run_batch sets it
+    under --concurrency); SLOPTIC_LIGHTHOUSE_SLOTS is how many traces may run AT ONCE:
+      1 (default) = strict mutex, one clean trace at a time -- best fidelity, slowest lane;
+      2-3 on a many-thread box = a few near-clean lanes -- the overnight sweet spot;
+      >= --concurrency = effectively unthrottled -- fastest, most contended (the pre-lock behavior).
+    Each slot is an EXCLUSIVE flock, so the OS frees it if a grade dies mid-trace: no stranded slots, no
+    deadlock, no manual cleanup. Unset lock path -> no-op. Pick the slot count by MEASURING contention on your
+    box (grade a subset at slots=1 vs wide and compare the perf distributions), not by guessing."""
     path = os.environ.get("SLOPTIC_LIGHTHOUSE_LOCK")
     if not path or fcntl is None:
         yield
         return
-    with open(path, "w") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)   # blocks until the other grade's trace finishes
-        try:
-            yield
-        finally:
-            fcntl.flock(fh, fcntl.LOCK_UN)
+    try:
+        slots = max(1, int(os.environ.get("SLOPTIC_LIGHTHOUSE_SLOTS", "1")))
+    except ValueError:
+        slots = 1
+    fhs = [open(f"{path}.{i}", "w") for i in range(slots)]
+    held = None
+    try:
+        while held is None:
+            for fh in fhs:                                  # grab any free lane
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    held = fh
+                    break
+                except OSError:
+                    continue
+            if held is None:
+                time.sleep(0.25)                            # all lanes busy; trivial wait vs a ~minute-long trace
+        yield
+    finally:
+        if held is not None:
+            fcntl.flock(held, fcntl.LOCK_UN)
+        for fh in fhs:
+            fh.close()
 
 
 def _fetch_path(probe: Probe, client: httpx.Client, path: str) -> httpx.Response:
