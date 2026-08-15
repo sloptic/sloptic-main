@@ -156,6 +156,32 @@ def test_boolean_fires_on_stable_endpoint_with_true_false_split(monkeypatch):
     assert probes._tech_boolean(None, "GET", lambda v: v) is True
 
 
+def test_boolean_suppressed_on_nondeterministic_llm_endpoint(monkeypatch):
+    # v18 live FP — guardian-pink-one /api/case-update feeds new_status_label to an LLM that writes fresh
+    # bilingual guidance every call (it even narrated 'the update appears to contain a SQL injection attempt').
+    # The noise pair can match by luck, and the old 'reproduce on a second pair' ALWAYS held (any two LLM
+    # outputs differ), so it scored a 40-pt phantom. The determinism gate — the SAME payload twice — kills it.
+    import itertools
+    from sloptic import probes
+    true_sizes = itertools.chain([621, 444], itertools.repeat(500))   # identical TRUE requests -> different bodies
+    def gen(c, m, v):
+        n = next(true_sizes) if v == probes._SQLI_TRUE else 40        # noise + FALSE stable-by-luck (passes gate 1)
+        return httpx.Response(200, text="x" * n)
+    monkeypatch.setattr(probes, "_do", gen)
+    assert probes._tech_boolean(None, "POST", lambda v: v) is False
+
+
+def test_boolean_suppressed_on_fuzzy_search_with_reversed_direction(monkeypatch):
+    # v18 live FP — roadio /api/locations/search is a geocoder that fuzzy-matches each query STRING to a
+    # different place. High-entropy noise uniformly misses (empty -> stable noise floor) and it is deterministic,
+    # so gates 1-2 pass; but the direction is BACKWARDS for SQL: FALSE ('1'='2') returned 2023B (Guatemala) >
+    # TRUE ('1'='1') 312B (Iceland). A real OR-1=1 split has TRUE (all rows) >= FALSE; the directional gate rejects it.
+    from sloptic import probes
+    sizes = {probes._SQLI_NOISE_A: 39, probes._SQLI_NOISE_B: 39, probes._SQLI_TRUE: 312, probes._SQLI_FALSE: 2023}
+    monkeypatch.setattr(probes, "_do", lambda c, m, v: httpx.Response(200, text="x" * sizes.get(v, 39)))
+    assert probes._tech_boolean(None, "GET", lambda v: v) is False
+
+
 def test_upstream_error_regex_matches_the_proxy_fp_bodies():
     # the two proxy FPs (the-angle NewsAPI 429, oversightusa OpenStates 504) must be suppressed by naming an
     # upstream vendor error; a real DB result must NOT match.
@@ -194,6 +220,8 @@ def _resp(text, status=200, ctype="application/json"):
 def test_credential_leak_fires_on_password_field_and_hash():
     assert response_leaks_credentials(_resp('{"user":"a","password":"hunter2"}')) is True
     assert response_leaks_credentials(_resp('{"pw":"$2b$12$' + "a" * 53 + '"}')) is True  # bcrypt hash
+    # a real leaked credential with symbols/digits still fires (edy /api/pedidos leaked "EdyDemo6717!")
+    assert response_leaks_credentials(_resp('{"user":"a","password":"EdyDemo6717!"}')) is True
 
 
 def test_credential_leak_precision_no_false_positives():
@@ -209,6 +237,9 @@ def test_credential_leak_precision_no_false_positives():
     # a JS bundle's Angular password-toggle (hide?"password":"text") is code, not a data leak
     js = 'x("type",n.hide?"password":"text"),l(2)'
     assert response_leaks_credentials(_resp(js, ctype="application/javascript")) is False
+    # an i18n / UI LABEL from a /api/translate strings endpoint is not a credential (wayfinder's FP)
+    assert response_leaks_credentials(_resp('{"password":"Password","passwordPlaceholder":"x"}')) is False
+    assert response_leaks_credentials(_resp('{"password":"Enter your password"}')) is False
 
 
 def test_data_exposure_probe_fires_on_leaky_endpoint():

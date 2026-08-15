@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import gzip
 import hashlib
+import html
 import json
 import re
 import secrets
@@ -22,7 +23,7 @@ from dataclasses import replace
 
 import httpx
 
-from . import auth, baas, browser, depscan, oob, perf, secretscan
+from . import auth, baas, browser, depscan, lighthouse, oob, secretscan
 from .net import make_client, request_counts
 from .schema import Endpoint
 from .discovery import _CATCHALL_PROBE, _body_sig
@@ -97,9 +98,6 @@ _DEBUG_FINGERPRINT = re.compile(
 
 # ---- declarative matchers -------------------------------------------------------------------
 
-def ttfb_at_least(resp, arg) -> bool:
-    # This matcher uses one sample; the production TTFB path samples N and takes the median.
-    return resp.elapsed.total_seconds() >= float(arg)
 
 
 def response_contains(resp, arg) -> bool:
@@ -187,25 +185,6 @@ def response_server_error(resp, arg=None) -> bool:
     return resp.status_code in (500, 502, 503, 504)
 
 
-def response_uncompressed(resp, arg=1024) -> bool:
-    # Slop: a sizeable TEXT response served with no Content-Encoding (gzip/br/deflate) -> wasted
-    # bandwidth and slower loads. Gate on size — small bodies don't benefit from compression, so a
-    # server that skips them is correct, not slop. httpx always sends Accept-Encoding and keeps the
-    # Content-Encoding header, so its presence means the server compressed.
-    if not _policy_applies(resp):
-        return False
-    ctype = resp.headers.get("content-type", "").lower()
-    if not any(t in ctype for t in ("text/", "javascript", "json", "xml", "svg")):
-        return False
-    # `identity` is HTTP's explicit token for "no transformation applied" (RFC 9110 8.4.1), so the header
-    # being PRESENT is not evidence of compression — its VALUE is. Measured on supavulnbase's perf-001
-    # fixture, which serves 124,879 bytes of text/plain with `content-encoding: identity` even when we send
-    # `Accept-Encoding: gzip, deflate, br`: their verify.sh asserts it is uncompressed and passes, and we
-    # read the header, saw it existed and reported clean.
-    enc = resp.headers.get("content-encoding", "").strip().lower()
-    if enc and enc != "identity":
-        return False
-    return len(resp.content) > int(arg)
 
 
 # sec-headers-006 (X-Powered-By) scope: presence is only a MEANINGFUL leak when the VALUE discloses more
@@ -245,9 +224,13 @@ def response_leaks_secret(resp, arg=None) -> bool:
 # (***, xxxx, [REDACTED]) and the OpenAPI spec's own schema examples are excluded.
 _CRED_FIELD = re.compile(
     r'"(?:password|passwd|pwd|hashed_password|password_hash|pwd_hash|user_password|'
-    r'plaintext_password)"\s*:\s*"(?!\s*(?:\*{2,}|x{4,}|redacted|hidden|\.{3})\s*")[^"]{2,}"',
+    r'plaintext_password)"\s*:\s*"(?!\s*(?:\*{2,}|x{4,}|redacted|hidden|\.{3})\s*")([^"]{2,})"',
     re.IGNORECASE,
 )
+# a UI/i18n LABEL, not a credential: a `/api/translate`-style strings endpoint returns "password":"Password" /
+# "Enter your password". A phrase of words ending in "password" (letters+spaces only) or a bullet placeholder is
+# a label; a real value ("EdyDemo6717!", "P@ssw0rd") has digits/symbols and is NOT excluded.
+_CRED_LABEL = re.compile(r"^(?:[a-z]+\s)*passwords?$|^[•●·*]+$", re.IGNORECASE)
 _CRED_HASH = re.compile(
     r"\$2[aby]\$\d\d\$[./A-Za-z0-9]{53}"   # bcrypt
     r"|\$argon2(?:id|i|d)\$"                # argon2
@@ -270,7 +253,11 @@ def response_leaks_credentials(resp, arg=None) -> bool:
         return False
     if _OPENAPI_DOC.search(body[:4000]):
         return False  # a served spec naming a "password" field in its schema isn't a data leak
-    return bool(_CRED_FIELD.search(body) or _CRED_HASH.search(body))
+    if _CRED_HASH.search(body):
+        return True   # a password HASH in the body is unambiguous
+    # a populated "password":"<value>" -- but only if the value is a real credential, not a UI/i18n label
+    # ("password":"Password" from a /api/translate strings endpoint). A real value (EdyDemo6717!) still fires.
+    return any(not _CRED_LABEL.match(m.group(1).strip()) for m in _CRED_FIELD.finditer(body))
 
 
 # Files that must never be served at the webroot (deploying with .env / .git present is classic
@@ -304,14 +291,12 @@ def response_is_git_head(resp, arg=None) -> bool:
 
 
 MATCHERS = {
-    "ttfb_at_least": ttfb_at_least,
     "response_contains": response_contains,
     "response_missing_header": response_missing_header,
     "response_missing_clickjacking_defense": response_missing_clickjacking_defense,
     "response_csp_weak": response_csp_weak,
     "response_cors_misconfigured": response_cors_misconfigured,
     "response_server_error": response_server_error,
-    "response_uncompressed": response_uncompressed,
     "response_has_header": response_has_header,
     "response_is_aws_credentials": response_is_aws_credentials,
     "response_leaks_secret": response_leaks_secret,
@@ -583,6 +568,21 @@ def _diverges(a, b) -> bool:
     return hi - lo > max(64, hi * 0.15)
 
 
+def _boolean_split(t, f) -> bool:
+    """A DIRECTIONAL boolean-blind split. `col='1' OR '1'='1'` (TRUE) selects EVERY row; `col='1' OR '1'='2'`
+    (FALSE) selects only the col='1' subset — so TRUE returns a SUPERSET of FALSE and a genuine split has the
+    TRUE body DOMINATING FALSE: a status flip (rows vs none), or, at equal status, a TRUE body no smaller than
+    FALSE. The retired symmetric `_diverges` also fired when a fuzzy search returned a different-SIZED hit per
+    query STRING with no ordering — roadio's geocoder answered FALSE='1'='2' with 2023B (Guatemala) > TRUE with
+    312B (Iceland), a v18 false positive. Requiring the direction rejects that while still catching a real
+    result-set gate (the reversed case is not how `OR 1=1` vs `OR 1=2` behaves)."""
+    if not _diverges(t, f):
+        return False
+    if t.status_code != f.status_code:
+        return True                       # a true/false STATUS flip (both payloads are quote-shaped) is SQL-specific
+    return len(t.text) >= len(f.text)     # equal status -> TRUE (all rows) must be at least as large as FALSE
+
+
 def _reproduces(send, signal) -> bool:
     """Determinism gate (v2.0 LLM-echo foundation #1): re-send the IDENTICAL request that just matched; its
     boolean oracle SIGNAL must reproduce. A content-oracle match on a nondeterministic endpoint (a flaky
@@ -594,17 +594,25 @@ def _reproduces(send, signal) -> bool:
 
 
 def _tech_boolean(c, method, reqfn) -> bool:
-    """Strict boolean-blind, gated on the endpoint's own NOISE FLOOR. First send two DIFFERENT inert benign
-    values; if THEY already diverge, the output is content-driven (an LLM/TTS/proxy varies with the input),
-    not a SQL result set, so a true/false split is meaningless -> suppress (error-based still runs). Only on a
-    stable endpoint: fire when the structurally-identical TRUE vs FALSE pair (one boolean apart) diverges AND
-    the split REPRODUCES on a second independent pair (rejects one-off flakiness). This is the differential-
-    control form of the causal-specificity invariant above — a content-reflective endpoint can't fake it."""
+    """Strict boolean-blind, gated THREE ways against the AI-corpus confounds — a content-reflective search or
+    an LLM in the response path can fake a true/false split, and both did on v18 (0/2 scored boolean fires were
+    real). (1) NOISE FLOOR: two DIFFERENT inert benign values; if THEY already diverge the output is content-
+    driven (an LLM/TTS/proxy varies with the input) -> suppress (error-based still runs). (2) DETERMINISM: the
+    SAME payload sent twice must reproduce — guardian's /api/case-update feeds new_status_label to an LLM that
+    writes fresh guidance each call, so identical requests diverge; its true/false gap is generation variance,
+    not a boolean, and the old 'reproduce on a second pair' passed because ANY two LLM outputs differ. (3)
+    DIRECTIONAL SPLIT: TRUE (OR 1=1, every row) must DOMINATE FALSE (OR 1=2, a subset), reproduced on a second
+    pair — roadio's geocoder returned a different-sized place per string (FALSE > TRUE, the wrong direction) and
+    tripped the old symmetric divergence. This is the differential-control form of the causal-specificity
+    invariant above; the three gates together are what a content-reflective endpoint cannot fake."""
     if _diverges(_do(c, method, reqfn(_SQLI_NOISE_A)), _do(c, method, reqfn(_SQLI_NOISE_B))):
-        return False   # content-reflective / non-deterministic endpoint -> the differential oracle is confounded
-    if not _diverges(_do(c, method, reqfn(_SQLI_TRUE)), _do(c, method, reqfn(_SQLI_FALSE))):
-        return False
-    return _diverges(_do(c, method, reqfn(_SQLI_TRUE)), _do(c, method, reqfn(_SQLI_FALSE)))  # reproduce the split
+        return False   # (1) content-reflective endpoint -> the differential oracle is confounded
+    true1 = _do(c, method, reqfn(_SQLI_TRUE))
+    if _diverges(true1, _do(c, method, reqfn(_SQLI_TRUE))):
+        return False   # (2) identical requests already diverge -> generative/LLM endpoint, not a SQL result set
+    if not _boolean_split(true1, _do(c, method, reqfn(_SQLI_FALSE))):
+        return False   # (3) TRUE must select a SUPERSET of FALSE, not merely differ in size (rejects the geocoder)
+    return _boolean_split(_do(c, method, reqfn(_SQLI_TRUE)), _do(c, method, reqfn(_SQLI_FALSE)))  # reproduce the split
 
 
 # UNION is CUT from api_sqli: its oracle (a concatenated marker appears in the body) is unsalvageable on an
@@ -934,6 +942,20 @@ def back_nav_broken(ctx, probe) -> bool | None:
 
 
 _SCRIPT_SRC = re.compile(r"""<script\b[^>]*\bsrc=["']([^"']+)["']""", re.I)
+# dev-server / HMR / build-tool script references that a prod deploy shouldn't have. Their absence (404) does
+# NOT stop the app rendering, so they are not a "dead bundle" -- unlike the app's real hashed bundle.
+_DEV_SCRIPT = re.compile(r"livereload|/@vite/|/@react-refresh|hot-update|webpack-dev-server|__vite|/@id/|"
+                         r"\.local\.js\b|/node_modules/", re.I)
+
+
+def _registrable(netloc: str) -> str:
+    """The registrable domain (last two labels ~ eTLD+1) of a netloc, so an apex<->www canonical redirect reads
+    as the SAME site (foo.com == www.foo.com) while a move to a DIFFERENT domain does not (basementhost.com !=
+    tensordock.com). IPs and single-label hosts compare whole (port stripped)."""
+    h = (netloc or "").split(":")[0].lower().rstrip(".")
+    if re.match(r"^\d+(?:\.\d+)*$", h) or len(h.split(".")) < 3:
+        return h                          # IPv4 / apex domain / single label -> compare the whole host
+    return ".".join(h.split(".")[-2:])    # www.foo.com / a.b.foo.com -> foo.com
 
 
 # DEVELOPMENT BUILD SHIPPED TO PRODUCTION — the HMR client is the categorical tell.
@@ -1054,10 +1076,18 @@ def dead_bundle_chunk(ctx, probe) -> bool | None:
             pu = urllib.parse.urlparse(urllib.parse.urljoin(ctx.base_url.rstrip("/") + "/", src.strip()))
             if pu.netloc and pu.netloc != host:
                 continue   # a CDN/vendor script -> not the app's own bundle
+            if _DEV_SCRIPT.search(pu.path):
+                continue   # a dev-server / HMR / node_modules artifact (livereload, /@vite/, *.local.js) -> not
+                #            the app's prod bundle; its 404 in a static deploy doesn't stop the app rendering
             try:
                 r = c.get(pu.path)
             except (httpx.HTTPError, httpx.InvalidURL):
                 continue
+            final = urllib.parse.urlparse(str(r.url)).netloc
+            if final and _registrable(final) != _registrable(host):
+                continue   # the fetch redirected to a DIFFERENT registrable domain (a parked/moved site's HTML,
+                #            basementhost -> tensordock) -> not a dead chunk of THIS app. An apex<->www canonical
+                #            redirect stays SAME-site, so a real dead chunk on a www-canonical app still fires.
             checked += 1
             ct = r.headers.get("content-type", "").lower()
             # dead = an honest 404/410/5xx, OR a catch-all host serving the HTML shell where JS should be
@@ -1096,6 +1126,8 @@ def deep_link_shell(ctx, probe) -> bool | None:
     routes = [r for r in ctx.profile.routes
               if r not in ("/", "") and not r.startswith(("/_next/", "/static/", "/assets/"))
               and not _DL_API_ROUTE.search(r)                              # /api,/v1,/graphql,... = endpoint, not a view
+              and "/api/" not in r.lower()                                 # a MID-PATH api call (/x/api/feedback) too
+              and "index.htm" not in r.split("?")[0].lower()               # the entry alias, not a deep-link sub-view
               and r.split("?")[0].rstrip("/") not in endpoint_paths        # discovered as an API endpoint -> not a view
               and not r.split("?")[0].lower().endswith(_DL_NONVIEW_EXT)]    # a JS/media/doc asset, not a view
     if not routes:
@@ -2420,6 +2452,39 @@ def _create_collection(path: str) -> str:
     return clean
 
 
+def _is_record_list(v) -> bool:
+    """A list of records: empty (a legitimately-empty collection) or holding objects. A list of scalars
+    ({"tags":["a"]}) is config, not a resource collection."""
+    return isinstance(v, list) and (not v or isinstance(v[0], dict))
+
+
+def _has_record_array(resp) -> bool:
+    """The read-back body is an actual resource COLLECTION -- a top-level record array, or an envelope object
+    carrying one ({"submissions":[...]}, {"data":[...]}). A stateless RPC result, a status/config doc or an API
+    index ({"encounterId":""}, {"hasApiKey":false}) is NOT a collection, so 'it did not change after a 2xx' is
+    not data loss -- nothing was ever persisted there. This is what made 3 of 4 v18 fires false."""
+    try:
+        doc = resp.json()
+    except ValueError:
+        return False
+    if _is_record_list(doc):
+        return True
+    return isinstance(doc, dict) and any(_is_record_list(v) for v in doc.values())
+
+
+_AUTH_FIELD = re.compile(r"pass(?:word|wd)?|pwd", re.I)
+_AUTH_PATH = re.compile(r"/(?:auth|login|signin|sign-in|signup|sign-up|register|token|session|oauth|logout)\b", re.I)
+
+
+def _is_auth_endpoint(e) -> bool:
+    """A login / register / token endpoint. Its 'collection' is not a public data list (you cannot list users
+    anonymously), so 'the record is absent from a list' is meaningless here -- fahimni's /backend/auth.php fired
+    exactly this way. A password-family field or an auth-verb path is the tell."""
+    if any(_AUTH_FIELD.search(f) for f in (e.body_fields or [])):
+        return True
+    return bool(_AUTH_PATH.search(e.raw_path or e.path or ""))
+
+
 def data_integrity_list_roundtrip(ctx, probe) -> bool | None:
     """Persistence correctness on a JSON API with NO read-by-{id} route — the common SPA shape
     data_integrity_roundtrip can't test (UUID keys / list-only API). Create an object carrying a unique
@@ -2427,7 +2492,8 @@ def data_integrity_list_roundtrip(ctx, probe) -> bool | None:
     a create reports success (2xx) but the object is absent from its own list -> silent data loss. N/A when
     there's no JSON create endpoint whose collection returns an array, or no create succeeds. Variant group
     data-durability with qa-integrity-001 (read-by-id) -> the two collapse to one data-loss finding."""
-    creates = [e for e in ctx.profile.endpoints if e.method.lower() == "post" and e.body_fields]
+    creates = [e for e in ctx.profile.endpoints if e.method.lower() == "post" and e.body_fields
+               and not _is_auth_endpoint(e)]   # a login/register POST is not a listable-data create
     if not creates:
         ctx.evidence["na_reason"] = "no JSON create endpoint to round-trip through its collection"
         return None
@@ -2448,6 +2514,8 @@ def data_integrity_list_roundtrip(ctx, probe) -> bool | None:
                 before = client.get(collection)
                 if not _is_json_ok(before):
                     continue      # the collection isn't a readable JSON resource -> can't verify here
+                if not _has_record_array(before):
+                    continue      # sibling is an RPC result / status / index, not a resource list -> not durable-testable
                 created, body = _accepted_create(client, c, marker, ctx.profile.endpoints)
                 if created is None or created.status_code not in (200, 201):
                     continue   # create didn't succeed -> nothing durable to read back on this endpoint
@@ -2468,7 +2536,7 @@ def data_integrity_list_roundtrip(ctx, probe) -> bool | None:
             except (httpx.HTTPError, httpx.InvalidURL):
                 continue
         if not tested:
-            ctx.evidence["na_reason"] = "no create accepted a write whose collection could be read back"
+            ctx.evidence["na_reason"] = "no create round-tripped through a readable record collection"
             return None
         ctx.evidence.update(tested=True, durable=True)
         return False
@@ -2838,9 +2906,15 @@ def _no_tls_decision(base_url: str, status: int | None, location: str) -> bool |
     o = urllib.parse.urlparse(base_url)
     if o.scheme != "http" or _is_local_host(o.hostname or ""):
         return None
-    if status is not None and 300 <= status < 400 and (location or "").lower().startswith("https://"):
-        return False
-    return True
+    if status is None:
+        return None
+    if 300 <= status < 400:
+        # -> https = the origin upgrades (TLS enforced, clean); -> http = redirects but stays cleartext (fires)
+        return not (location or "").lower().startswith("https://")
+    if 200 <= status < 300:
+        return True                          # serves cleartext content over http with no upgrade -> no TLS
+    return None   # 401/403/404/429/5xx: a WAF / auth / rate-limit / error / not-found MASKED the real TLS
+    #               behavior (e.g. netlify http->https 301 seen as a 403) -> can't assess -> N/A, not a false fire
 
 
 def no_tls_origin(ctx, probe) -> bool | None:
@@ -2882,12 +2956,37 @@ def vulnerable_dependency(ctx, probe) -> bool | None:
 _SOURCEMAP_URL = re.compile(r"//[#@]\s*sourceMappingURL=(\S+)")
 
 
+# A .map that reconstructs only VENDORED source (React, Next's polyfills, axios) is not a disclosure: that code
+# is already public on npm and carries none of the app's business logic or secrets. In the v18 corpus 114 of 164
+# fires (69%) were exactly this -- 104 the identical Next.js chunk `a6dad97d9634a72d.js.map` (one source, a
+# node_modules polyfill) and 10 the base44 platform `badge.js` widget (one app file, `src/badge/badge.ts`). The
+# finding must key on the app's OWN source, so exclude vendored paths and require >= 2 app-authored code files.
+_VENDOR_SOURCE = ("node_modules/", "/webpack/runtime/", "webpack://webpack/", "/dist/build/polyfills/")
+_SOURCE_CODE_EXT = (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue", ".svelte", ".coffee")
+_MIN_APP_SOURCES = 2   # the badge widget exposes exactly 1 app file; the smallest real leak in v18 exposed 3
+
+
+def _app_source_files(sources) -> list[str]:
+    """The app-authored CODE files in a sourcemap's `sources`: not under node_modules / a bundler runtime /
+    a framework polyfill, and an actual source extension (a .png/.css asset is not a business-logic leak)."""
+    out = []
+    for s in sources or []:
+        if not isinstance(s, str):
+            continue
+        low = s.lower()
+        if any(v in low for v in _VENDOR_SOURCE):
+            continue
+        if low.rsplit("?", 1)[0].endswith(_SOURCE_CODE_EXT):
+            out.append(s)
+    return out
+
+
 def source_map_exposed(ctx, probe) -> bool | None:
     """SPA-native info-disclosure: a production bundle ships its .map, so anyone can reconstruct the ORIGINAL
     source — business logic, hidden endpoints, and (the real risk) hardcoded secrets a minified scan misses.
     For each same-origin .js bundle, fetch the //# sourceMappingURL target (or the conventional <bundle>.map);
-    fire only on a REAL sourcemap (JSON with sources/sourcesContent), never a soft-404 shell (innocence check).
-    N/A when there are no .js bundles to check."""
+    fire only on a REAL sourcemap (JSON with sources/sourcesContent) that reconstructs the APP's OWN source, never
+    a soft-404 shell or a purely-vendored map (React/Next/a platform widget). N/A when there are no .js bundles."""
     js = [r for r in (["/"] + ctx.profile.routes) if r.split("?")[0].endswith(".js")]
     if not js:
         return None
@@ -2908,10 +3007,15 @@ def source_map_exposed(ctx, probe) -> bool | None:
                 sm = r.json()
             except ValueError:
                 continue
-            if isinstance(sm, dict) and sm.get("version") and ("sources" in sm or "sourcesContent" in sm):
-                ctx.evidence.update(bundle=path, source_map=mp, sources=len(sm.get("sources") or []),
-                                    reconstructable=bool(sm.get("sourcesContent")))
-                return True
+            if not (isinstance(sm, dict) and sm.get("version") and ("sources" in sm or "sourcesContent" in sm)):
+                continue
+            app = _app_source_files(sm.get("sources"))
+            if len(app) < _MIN_APP_SOURCES:
+                continue                      # vendored-only (React/Next) or a platform widget -> not app source
+            ctx.evidence.update(bundle=path, source_map=mp, sources=len(sm.get("sources") or []),
+                                app_sources=len(app), app_source_sample=app[:6],
+                                reconstructable=bool(sm.get("sourcesContent")))
+            return True
     return False
 
 
@@ -3169,6 +3273,68 @@ def _record_collections(resp):
     return [(k, rows) for k, rows in out if rows]
 
 
+_ANON_BULK_VALUE_SAMPLE = 25   # rows to sample for value-type + variance checks (JSON collections are homogeneous)
+
+# A curated listing of PUBLIC entities (places / orgs / resources) returns bulk records with an address, a phone
+# or an org email, and that is not a personal-data leak: those contacts are meant to be published. The tell is a
+# place/listing column (a Google Places id, a scrape `dataSource`, opening `hours`, a `category`) AND the ABSENCE
+# of any per-user ownership column. If a row is owned by a user (uid / created_by / candidate / patient /
+# submitted_by ...), it is user data whatever else it carries, so an ownership column VETOES the directory verdict.
+_DIRECTORY_MARKERS = {"googleplaceid", "googlemapsurl", "mapsurl", "placeid", "datasource", "website", "hours",
+                      "openinghours", "category", "categories", "rating", "googlerating", "verified",
+                      "departments", "services", "eligibility", "amenities", "cuisine"}
+_OWNERSHIP_MARKERS = {"uid", "userid", "owner", "ownerid", "createdby", "createdbyid", "account", "accountid",
+                      "customer", "customerid", "candidate", "candidateid", "patient", "patientid", "submittedby",
+                      "submittedbyuid", "submittedbyid", "author", "authorid", "member", "memberid"}
+
+
+def _norm_col(c: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", c.lower())
+
+
+def _is_public_directory(cols: list[str]) -> bool:
+    """True when the collection reads as a published listing of public entities, not a dump of user records: a
+    directory-marker column is present and NO per-user ownership column is (ownership vetoes -> it is user data)."""
+    norm = {_norm_col(c) for c in cols}
+    if norm & _OWNERSHIP_MARKERS:
+        return False
+    return bool(norm & _DIRECTORY_MARKERS)
+
+
+def _values_match_sensitive_type(col: str, vals: list) -> bool:
+    """The column NAME matched `_SENSITIVE_COLUMN`; confirm at least one VALUE is actually of that type. A column
+    merely NAMED like PII is not a leak: `tokens_total` holds LLM token COUNTS (ints), `phones` holds ARPAbet
+    phonemes (['Y','AE1']), `phone_bedtime_habit` holds a survey enum. Value-level is provable; name-level is a
+    guess -- and the whole probe bills 40 points, so it must key on the evidence, not the label."""
+    c = col.lower()
+    scalars = [v for v in vals if isinstance(v, (str, int, float)) and not isinstance(v, bool)]
+    if not scalars:
+        return False        # values are lists / dicts / bools / null -> not a scalar identifier (phones=['Y','AE1'])
+    strs = [str(v) for v in scalars]
+    if "email" in c or "mail" in c:
+        return any("@" in s and "." in s.split("@")[-1] for s in strs)
+    if re.search(r"ssn|social", c):
+        return any(sum(ch.isdigit() for ch in s) == 9 for s in strs)
+    if "credit" in c or "card" in c:
+        return any(13 <= sum(ch.isdigit() for ch in s) <= 19 for s in strs)
+    if "phone" in c:
+        def _phoneish(s: str) -> bool:
+            digits = sum(ch.isdigit() for ch in s)
+            body = re.sub(r"[\s()+.-]", "", s)          # a real number is mostly digits after formatting chars
+            return 7 <= digits <= 15 and digits >= len(body) - 1
+        return any(_phoneish(s) for s in strs)
+    if "token" in c or "secret" in c or "key" in c or "stripe" in c:
+        # an opaque credential (a JWT, an sk_live_..., a UUID), not a counter: a mixed-alnum string >= 12 chars,
+        # never a plain integer -- this is what separates `access_token` from `tokens_total`
+        return any(isinstance(v, str) and len(v) >= 12 and any(ch.isdigit() for ch in v)
+                   and any(ch.isalpha() for ch in v) for v in scalars)
+    if "dob" in c or "birth" in c:
+        return any(sum(ch.isdigit() for ch in s) >= 4 and any(sep in s for sep in "-/.") for s in strs)
+    # name / address / password: type-validation is weak (any string looks valid), so accept a non-empty string
+    # here and let `_is_public_directory` handle the public-address / public-org-contact case.
+    return any(isinstance(v, str) and v.strip() for v in scalars)
+
+
 def anon_bulk_data_exposed(ctx, probe) -> bool | None:
     """An ANONYMOUS request returning bulk records with PII / financial / credential columns.
 
@@ -3202,8 +3368,20 @@ def anon_bulk_data_exposed(ctx, probe) -> bool | None:
             for key, rows in collections:
                 if len(rows) < _ANON_BULK_MIN_RECORDS:
                     continue
-                cols = sorted({c for row in rows[:5] for c in row})
-                hits = [c for c in cols if _SENSITIVE_COLUMN.search(c)]
+                sample = rows[:_ANON_BULK_VALUE_SAMPLE]
+                cols = sorted({c for row in sample for c in row})
+                if _is_public_directory(cols):
+                    continue      # a published listing of public places/orgs, not a dump of personal records
+                hits = []
+                for c in cols:
+                    if not _SENSITIVE_COLUMN.search(c):
+                        continue
+                    vals = [row[c] for row in sample if row.get(c) not in (None, "")]
+                    if not _values_match_sensitive_type(c, vals):
+                        continue  # named like PII, but the values are not (tokens_total=ints, phones=phonemes)
+                    if len({str(v).strip().lower() for v in vals}) < 2:
+                        continue  # one value shared across every row = a config / org contact, not per-user data
+                    hits.append(c)
                 if not hits:
                     continue      # bulk but not sensitive: a catalog, an index, a public profile list
                 ctx.evidence.update(anon_readable=True, endpoint=path, collection=key or "(top level)",
@@ -4177,26 +4355,6 @@ def _served(ctx, path: str) -> bool:
         return False
 
 
-def slow_first_paint(ctx, probe) -> bool:
-    """Browser oracle: render and read First Contentful Paint; slop if it exceeds the gate — the
-    user-facing 'slow app' signal (client render delay, distinct from server TTFB). Browser-gated.
-    Measures the declared page if served, else the homepage (real apps don't serve the reference path)."""
-    target = _home_path(ctx, probe)
-    if not _served(ctx, target):
-        target = _landing(ctx)
-    url = ctx.base_url.rstrip("/") + target
-    # median of N renders, not one sample: FCP is wall-clock timing (JIT warmup, CPU/network jitter),
-    # so a single sample near the gate flips between runs -> non-deterministic score. The isinstance
-    # filter also drops any non-numeric value a hostile page could inject (would raise TypeError).
-    _sa = _shell_ok(ctx)
-    samples = [browser.first_contentful_paint(url, headers=ctx.headers, shell_await=_sa) for _ in range(3)]
-    vals = [s for s in samples if isinstance(s, (int, float))]
-    if not vals:
-        return False
-    fcp = statistics.median(vals)
-    threshold = probe.probe.get("threshold_ms", 1000)
-    ctx.evidence.update(fcp_ms=round(fcp), threshold_ms=threshold)
-    return fcp > threshold
 
 
 def _shell_ok(ctx) -> bool:
@@ -4207,28 +4365,6 @@ def _shell_ok(ctx) -> bool:
     return getattr(getattr(ctx, "profile", None), "render_state", None) not in ("error", "stuck")
 
 
-def slow_core_web_vitals(ctx, probe) -> bool:
-    """Browser oracle: Core Web Vitals (LCP / CLS / total blocking time) sampled over N device-throttled
-    renders and scored off the PLAYER-FAVORABLE EDGE (best-of-N) against Google's POOR thresholds (set
-    beyond the normal variance band) -- so the app has to be poor even on its BEST run to fire, and
-    measurement variance can only ever help the player. Browser-gated."""
-    target = _home_path(ctx, probe)
-    if not _served(ctx, target):
-        target = _landing(ctx)
-    url = ctx.base_url.rstrip("/") + target
-    samples = browser.web_vitals(url, headers=ctx.headers, samples=probe.probe.get("samples", 3),
-                                 shell_await=_shell_ok(ctx))
-    if not samples:
-        return False
-    best_lcp = min(s["lcp_ms"] for s in samples)   # lower is better -> take the player's best run
-    best_cls = min(s["cls"] for s in samples)
-    best_tbt = min(s["tbt_ms"] for s in samples)
-    bad = {"LCP": best_lcp > probe.probe.get("lcp_ms", 4000),   # Google "poor": LCP>4s / CLS>0.25 / TBT>600ms
-           "CLS": best_cls > probe.probe.get("cls", 0.25),
-           "TBT": best_tbt > probe.probe.get("tbt_ms", 600)}
-    ctx.evidence.update(best_lcp_ms=best_lcp, best_cls=best_cls, best_tbt_ms=best_tbt,
-                        samples=len(samples), failed=[k for k, v in bad.items() if v])
-    return any(bad.values())
 
 
 _CONSOLE_INTACT_SCALE = 0.4   # an uncaught error that DIDN'T visibly break the render is a real defect but not
@@ -4676,168 +4812,8 @@ def load_resilience(ctx, probe) -> bool:
     return med > 0.1
 
 
-# Performance rubric (see perf.py): measure objective primitives on the homepage and grade against the
-# tiered, published thresholds. `tier` = "profile" (tight, standardized-sandbox) or "ceiling" (absolute,
-# environment-robust); the two are separate catalog probes sharing a variant_group -> the worse tier
-# fires once. The homepage is the representative always-present target (real apps have no /heavy).
-# Subresources a browser AUTO-LOADS: src on media/script tags + href on <link> (stylesheet/preload).
-# Deliberately NOT <a href> — those are user navigations, not page assets, and blindly GETting them can
-# fire a destructive link (e.g. DVWA's <a href="logout.php"> would log the grader's session out mid-run,
-# de-authenticating every probe after it). Also the correct definition for page-weight / request-count.
-_ASSET_REF = re.compile(
-    r"""<(?:(?:img|script|iframe|embed|audio|video|source|track)\b[^>]*\bsrc|link\b[^>]*\bhref)"""
-    r"""\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
 
 
-def _page_weight(c, base_url, path="/"):
-    """(total bytes, request count) for the homepage + up to 40 same-origin CSS/JS/img/media assets."""
-    try:
-        r = c.get(path)
-    except (httpx.HTTPError, httpx.InvalidURL):
-        return 0, 0
-    total, reqs = len(r.content), 1
-    if "html" not in r.headers.get("content-type", "").lower():
-        return total, reqs                      # non-HTML homepage (JSON API) -> just the body
-    base = urllib.parse.urlparse(base_url)
-    assets = []
-    for ref in _ASSET_REF.findall(r.text):
-        ref = ref.split("#")[0].strip()
-        if not ref or ref.startswith(("data:", "javascript:", "mailto:", "tel:")):
-            continue
-        t = urllib.parse.urlparse(urllib.parse.urljoin("%s://%s%s" % (base.scheme, base.netloc, path), ref))
-        if t.netloc == base.netloc and t.path:
-            # KEEP THE QUERY. `dot.png?v=11` and `dot.png?v=12` are two round trips and two cache entries,
-            # and cache-busting query strings are precisely how bundlers version assets — so stripping the
-            # query before the dedupe below collapsed a chatty page into a tidy one. Measured on
-            # supavulnbase's perf-003 fixture: 60 statically-referenced `dot.png?v=N` links counted as ONE
-            # request against a threshold of 50, so perf-requests-001 read clean on a page built to fail it.
-            assets.append(t.path + ("?" + t.query if t.query else ""))
-    uniq = list(dict.fromkeys(assets))
-    reqs += len(uniq)                         # request count = homepage + EVERY referenced asset
-    for a in uniq[:40]:                       # fetch a bounded subset for the weight number
-        try:
-            total += len(c.get(a).content)
-        except (httpx.HTTPError, httpx.InvalidURL):
-            continue
-    return total, reqs
-
-
-def perf_ttfb(ctx, probe) -> bool:
-    """Homepage time-to-first-byte (server compute) exceeds the tier threshold — MEDIAN of 3 samples, per
-    perf.sample_ttfb, which rejects a cold-start/GC outlier. This said "p90 over samples", which is not what
-    the code does and is the opposite kind of statistic: p90 leans INTO the tail this deliberately discards."""
-    thresh = perf.TTFB_CEILING if probe.probe.get("tier") == "ceiling" else perf.TTFB_PROFILE
-    with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
-        sample = perf.sample_ttfb(c, _home_path(ctx, probe))
-    ctx.evidence.update(ttfb_s=round(sample, 3), threshold_s=thresh,
-                        tier=probe.probe.get("tier", "profile"))
-    return sample >= thresh
-
-
-def perf_page_weight(ctx, probe) -> bool:
-    """Total homepage transfer weight (HTML + critical assets) exceeds the tier threshold."""
-    thresh = perf.WEIGHT_CEILING if probe.probe.get("tier") == "ceiling" else perf.WEIGHT_PROFILE
-    with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
-        weight = _page_weight(c, ctx.base_url, _home_path(ctx, probe))[0]
-    ctx.evidence.update(weight_bytes=weight, threshold_bytes=thresh,
-                        tier=probe.probe.get("tier", "profile"))
-    return weight >= thresh
-
-
-def perf_request_count(ctx, probe) -> bool:
-    """The homepage needs more than the profile's round-trip budget to render (too chatty)."""
-    with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
-        reqs = _page_weight(c, ctx.base_url, _home_path(ctx, probe))[1]
-    ctx.evidence.update(requests=reqs, threshold=perf.REQUESTS_PROFILE)
-    return reqs > perf.REQUESTS_PROFILE
-
-
-def perf_load_time(ctx, probe) -> bool:
-    """Computed end-to-end load time on the published profile crosses the absolute abandonment ceiling
-    (~5s) -> most users leave. Deterministic: TTFB + weight/bandwidth + round-trips."""
-    target = _home_path(ctx, probe)
-    with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
-        ttfb = perf.sample_ttfb(c, target, n=3)
-        weight, reqs = _page_weight(c, ctx.base_url, target)
-    load_time = perf.computed_load_time(ttfb, weight, reqs)
-    ctx.evidence.update(load_time_s=round(load_time, 2), ttfb_s=round(ttfb, 3), weight_bytes=weight,
-                        requests=reqs, ceiling_s=perf.LOADTIME_CEILING)
-    return load_time >= perf.LOADTIME_CEILING
-
-
-# Caching — a static asset (JS/CSS/image/font) that carries no cache validators forces a full refetch
-# on every page load; a validator the server won't honor with a 304 is decorative. Static assets only:
-# HTML documents legitimately go uncached, so checking them would false-fire.
-_STATIC_EXT = (".js", ".mjs", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
-               ".webp", ".avif", ".woff", ".woff2", ".ttf", ".eot", ".otf", ".mp4", ".webm")
-_STATIC_CTYPE = ("javascript", "css", "image/", "font/", "application/font", "svg")
-
-
-def _static_assets(c, base_url, path="/"):
-    """Same-origin static-asset paths (by extension) referenced by the homepage's src/href attrs."""
-    try:
-        r = c.get(path)
-    except (httpx.HTTPError, httpx.InvalidURL):
-        return []
-    if "html" not in r.headers.get("content-type", "").lower():
-        return []                                   # a JSON/asset homepage references no page assets
-    base = urllib.parse.urlparse(base_url)
-    out = []
-    for ref in _ASSET_REF.findall(r.text):
-        ref = ref.split("#")[0].strip()
-        if not ref or ref.startswith(("data:", "javascript:", "mailto:", "tel:")):
-            continue
-        t = urllib.parse.urlparse(urllib.parse.urljoin("%s://%s%s" % (base.scheme, base.netloc, path), ref))
-        if t.netloc != base.netloc or not t.path.lower().endswith(_STATIC_EXT):
-            continue
-        out.append(t.path + ("?" + t.query if t.query else ""))
-    return list(dict.fromkeys(out))
-
-
-def caching_ineffective(ctx, probe) -> bool | None:
-    """Fetch each same-origin static asset and check it is actually cacheable: it must carry a validator
-    (ETag / Last-Modified) or explicit freshness (Cache-Control max-age / Expires), must not say
-    no-store, and any validator it advertises must yield a 304 on revalidation (else it's decorative and
-    saves nothing). Fires on the first asset that fails. N/A when the page references no static asset."""
-    budget = probe.probe.get("max_attempts", 20)
-    tested = False
-    n_assets = 0
-    with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
-        for path in _static_assets(c, ctx.base_url, _home_path(ctx, probe)):
-            if budget <= 0:
-                break
-            budget -= 1
-            try:
-                r = c.get(path)
-            except (httpx.HTTPError, httpx.InvalidURL):
-                continue
-            ctype = r.headers.get("content-type", "").lower()
-            if r.status_code != 200 or not any(t in ctype for t in _STATIC_CTYPE):
-                continue                            # 404/redirect or an SPA catch-all HTML shell -> not an asset
-            tested = True
-            n_assets += 1
-            cc = r.headers.get("cache-control", "").lower()
-            etag, lastmod = r.headers.get("etag", ""), r.headers.get("last-modified", "")
-            has_fresh = any(k in cc for k in ("max-age", "public", "immutable")) or "expires" in r.headers
-            if "no-store" in cc:
-                ctx.evidence.update(cacheable=False, asset=path, issue="no-store")
-                return True                         # actively un-cacheable -> refetched every load
-            if not (etag or lastmod or has_fresh):
-                ctx.evidence.update(cacheable=False, asset=path, issue="no-validator")
-                return True                         # no caching affordance at all
-            try:                                    # decorative validator: advertised but not honored
-                if etag and c.get(path, headers={"If-None-Match": etag}).status_code != 304:
-                    ctx.evidence.update(cacheable=False, asset=path, issue="etag-not-honored")
-                    return True
-                if not etag and lastmod and \
-                        c.get(path, headers={"If-Modified-Since": lastmod}).status_code != 304:
-                    ctx.evidence.update(cacheable=False, asset=path, issue="last-modified-not-honored")
-                    return True
-            except (httpx.HTTPError, httpx.InvalidURL):
-                continue
-    if tested:
-        ctx.evidence.update(cacheable=True, assets_checked=n_assets)
-    return False if tested else None
 
 
 _SOFT404_EXT = (".js", ".css", ".png", ".webp", ".svg", ".woff2")
@@ -4934,6 +4910,14 @@ def a11y_hard_fails(ctx, probe) -> bool | None:
     the ratio math). Each DISTINCT hard-fail contributes its severity tier to a SUM (see _a11y_penalty /
     _STATIC_A11Y_IMPACT), matching the browser axe probe's model so a multi-barrier page outscores a
     single-barrier one and the score doesn't jump when the browser is on vs off. N/A on a non-HTML page."""
+    # DEFER TO AXE when the browser ran. qa-a11y-001 (axe on the RENDERED DOM) covers the SAME flaw (shared
+    # variant_group_id) and is authoritative; this static pre-JS-HTML pass is blind to CSS-hidden and JS-labeled
+    # controls, so it over-reports control-no-accessible-name -- and because the variant group scores the MAX of
+    # its members, that inflated value OVERRODE axe's accurate lower one (+1093 pts across ~88 v18 hosts). So
+    # this is a browser-OFF FALLBACK only: when axe ran, read N/A rather than double-count / override it.
+    if ctx.profile.capabilities.get("browser"):
+        ctx.evidence["na_reason"] = "browser ran -> axe (qa-a11y-001) on the rendered DOM is authoritative"
+        return None
     with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
         try:
             r = c.get(_home_path(ctx, probe))
@@ -5013,9 +4997,15 @@ def _same_origin_links(c, ctx, probe) -> list[str] | None:
         return None
     links = []
     for href in _ANCHOR_HREF.findall(r.text):
-        href = href.split("#")[0].strip()
+        href = html.unescape(href.split("#")[0].strip())   # decode entities: `?a=1&amp;b=2` IS `?a=1&b=2` to a
+        #                                                     browser -- not unescaping fetched a literal &amp; -> 400
         if not href or href.startswith(("mailto:", "tel:", "javascript:", "data:")):
             continue
+        if "${" in href or "{{" in href:
+            continue                                   # an UNINTERPOLATED template literal leaked into the href
+            #                                            (/${s.url}, /${escapeHtml(href)}) -> a code artifact, not a link
+        if "/cdn-cgi/" in href:
+            continue                                   # Cloudflare-INJECTED (email-protection etc.) -> not the app's link
         if re.search(r"log[-_]?out|sign[-_]?out", href, re.IGNORECASE):
             continue                                   # never GET a logout link (would drop the session)
         t = urllib.parse.urlparse(urllib.parse.urljoin("%s://%s%s" % (base.scheme, base.netloc, target), href))
@@ -5036,9 +5026,12 @@ def broken_links(ctx, probe) -> bool | None:
         for path in links[:budget]:
             try:
                 st = c.get(path).status_code
-                if 400 <= st < 500:
+                # a DEAD END is not-found (404/410) or a malformed request (400/414), NOT access-control:
+                # 401/403 = the page exists but is gated (a login-required nav item / deployment protection), and
+                # 429 = rate-limited -- the link WORKS, it isn't broken. So skip the access-control/limit statuses.
+                if 400 <= st < 500 and st not in (401, 403, 429):
                     ctx.evidence.update(broken=True, link=path, status=st)
-                    return True                            # dead link: an internal href leads to a 4xx
+                    return True                            # dead link: an internal href leads to a 4xx dead end
             except (httpx.HTTPError, httpx.InvalidURL):
                 continue
     ctx.evidence.update(broken=False, links_checked=len(links[:budget]))
@@ -5189,80 +5182,13 @@ def subresource_integrity_missing(ctx, probe) -> bool | None:
 # a production asset that simply wasn't minified. Same-origin only (the app's OWN build output; a third-party
 # CDN file is the vendor's concern). Size-gated so a small hand-written script isn't charged.
 _MIN_ASSET_BYTES = 8192     # below this, minification savings are negligible and the file is often hand-authored
-_MINIFY_EXT = re.compile(r"\.(?:js|css)(?:\?|#|$)", re.I)   # (distinct from _ASSET_REF, the perf asset-ref regex)
 
 
-def _minified(text: str) -> bool:
-    """A minified asset packs code onto very long lines; hand/prettier source wraps at ~40-80 chars. True when
-    the average line length is well past any formatted source (>200) -> minified. The wide gap (minified bundles
-    run into the thousands) keeps the middle band unfired rather than guessing."""
-    return len(text) / (text.count("\n") + 1) > 200
-
-
-def _same_origin_assets(html: str, page_url: str) -> list[str]:
-    """Same-origin .css/.js the page references (<script src>, <link rel=stylesheet>). A cross-origin CDN asset
-    is excluded -- minifying the vendor's file is not the app's call."""
-    origin = urllib.parse.urlparse(page_url).netloc.lower()
-    refs = re.findall(r"<script\b[^>]*\bsrc\s*=\s*[\"']([^\"']+)[\"']", html, re.I)
-    for m in re.finditer(r"<link\b([^>]*)>", html, re.I):
-        if re.search(r"\brel\s*=\s*[\"']?stylesheet", m.group(1), re.I):
-            href = re.search(r"\bhref\s*=\s*[\"']([^\"']+)[\"']", m.group(1), re.I)
-            if href:
-                refs.append(href.group(1))
-    out = []
-    for ref in refs:
-        full = urllib.parse.urljoin(page_url, ref.strip())
-        p = urllib.parse.urlparse(full)
-        if p.netloc.lower() == origin and _MINIFY_EXT.search(p.path or ""):
-            out.append(full)
-    return list(dict.fromkeys(out))
-
-
-def unminified_assets(ctx, probe) -> bool | None:
-    """A sizeable SAME-ORIGIN .css/.js asset shipped to production UNMINIFIED -- wasted bytes + parse time on
-    every load (Lighthouse unminified-css / unminified-javascript). Same-origin only; small files are skipped
-    (savings negligible, often hand-written). N/A when the page references no sizeable same-origin script/style.
-    A DISTINCT hygiene signal from the dev-build probe: a production asset the build simply left unminified."""
-    with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
-        try:
-            r = c.get(_home_path(ctx, probe))
-        except (httpx.HTTPError, httpx.InvalidURL):
-            return None
-        if "html" not in r.headers.get("content-type", "").lower():
-            return None
-        unmin, checked = [], 0
-        for url in _same_origin_assets(r.text, str(r.url))[:probe.probe.get("max_attempts", 6)]:
-            try:
-                a = c.get(url)
-            except (httpx.HTTPError, httpx.InvalidURL):
-                continue
-            ct = a.headers.get("content-type", "").lower()
-            if not ("javascript" in ct or "css" in ct) or len(a.text) < _MIN_ASSET_BYTES:
-                continue                                 # not a real asset (html error shell) / too small to matter
-            checked += 1
-            if not _minified(a.text):
-                unmin.append(url)
-    if checked == 0:
-        return None                                      # no sizeable same-origin asset -> nothing to assess
-    ctx.evidence.update(unminified=unmin[:6], assets_checked=checked)
-    return bool(unmin)
 
 
 # v2.0 FAMILY 4 -- lazy-loading the LCP image. `loading="lazy"` on the element that DEFINES first paint makes
 # the browser defer the one image it should fetch first, delaying LCP for every visitor (~15% of sites do this;
 # Lighthouse flags it). Decorrelated from page weight -- a loading-STRATEGY mistake, not a size one.
-def lcp_image_lazy_loaded(ctx, probe) -> bool | None:
-    """The Largest Contentful Paint element is an <img> marked loading="lazy" -> the browser defers the very
-    image that defines first paint. Browser-gated. N/A when the LCP element isn't an image (nothing to
-    lazy-load) or the render fails; clean when the LCP image loads eagerly."""
-    m = browser.render_metrics(ctx.base_url.rstrip("/") + _home_path(ctx, probe), headers=ctx.headers,
-                               shell_await=_shell_ok(ctx))
-    if m is None:
-        return None
-    if not m.get("lcp_is_img"):
-        return None                                      # text/other LCP -> no LCP image to mis-load
-    ctx.evidence.update(lcp_is_img=True, lcp_loading=m.get("lcp_loading") or "eager", engine="lcp-observer")
-    return m.get("lcp_loading") == "lazy"
 
 
 # v2.0 FAMILY 4 -- excessive DOM size (Lighthouse dom-size). Too many nodes slow style/layout/interaction on
@@ -5270,69 +5196,10 @@ def lcp_image_lazy_loaded(ctx, probe) -> bool | None:
 _DOM_NODE_LIMIT = 1400     # Lighthouse's excessive-DOM threshold; only a genuinely heavy DOM fires
 
 
-def excessive_dom_size(ctx, probe) -> bool | None:
-    """The rendered page carries an excessive DOM (> Lighthouse's ~1400-node threshold): style/layout/interaction
-    cost scales with node count, independent of page weight. Browser-gated. N/A when the render fails."""
-    m = browser.render_metrics(ctx.base_url.rstrip("/") + _home_path(ctx, probe), headers=ctx.headers,
-                               shell_await=_shell_ok(ctx))
-    if m is None:
-        return None
-    n = m.get("dom_nodes") or 0
-    limit = probe.probe.get("max_nodes", _DOM_NODE_LIMIT)
-    ctx.evidence.update(dom_nodes=n, threshold=limit, engine="dom-count")
-    return n > limit
 
 
-# v2.0 FAMILY 4 -- web font without a non-blocking font-display (FOIT). A @font-face / Google Fonts load with no
-# font-display: swap|optional|fallback leaves text INVISIBLE while the font downloads, then reflows (Lighthouse
-# font-display; ~32% of font pages use a blocking value). Decorrelated: a font-LOADING strategy, not size.
-_FONT_FACE_BLOCK = re.compile(r"@font-face\b[^{]*\{([^}]*)\}", re.I | re.S)
-_FONT_HAS_SRC = re.compile(r"\bsrc\s*:", re.I)
-_GOOD_FONT_DISPLAY = re.compile(r"font-display\s*:\s*(?:swap|optional|fallback)\b", re.I)
-_GFONTS_LINK = re.compile(r"fonts\.googleapis\.com/css2?\?[^\"'<>\s)]+", re.I)
-_GFONTS_DISPLAY = re.compile(r"[?&]display=(?:swap|optional|fallback)\b", re.I)
 
 
-def font_display_missing(ctx, probe) -> bool | None:
-    """A web font loaded WITHOUT a non-blocking font-display (swap/optional/fallback) -> FOIT: text is invisible
-    while the font downloads, then reflows. Checks @font-face in the inline + same-origin CSS and Google Fonts
-    <link>s. N/A when the page loads no web font; clean when every one sets a good display. Static HTML/CSS."""
-    with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
-        try:
-            r = c.get(_home_path(ctx, probe))
-        except (httpx.HTTPError, httpx.InvalidURL):
-            return None
-        if "html" not in r.headers.get("content-type", "").lower():
-            return None
-        html = r.text
-        origin = urllib.parse.urlparse(str(r.url)).netloc.lower()
-        blobs = [html]                                   # inline <style> @font-face live here
-        for m in re.finditer(r"<link\b([^>]*)>", html, re.I):
-            if not re.search(r"\brel\s*=\s*[\"']?stylesheet", m.group(1), re.I):
-                continue
-            href = re.search(r"\bhref\s*=\s*[\"']([^\"']+)[\"']", m.group(1), re.I)
-            if href:
-                full = urllib.parse.urljoin(str(r.url), href.group(1).strip())
-                if urllib.parse.urlparse(full).netloc.lower() == origin:
-                    try:
-                        blobs.append(c.get(full).text)
-                    except (httpx.HTTPError, httpx.InvalidURL):
-                        pass
-    web_fonts, offenders = 0, []
-    for blob in blobs:
-        for fb in _FONT_FACE_BLOCK.finditer(blob):
-            if _FONT_HAS_SRC.search(fb.group(1)):
-                web_fonts += 1
-                if not _GOOD_FONT_DISPLAY.search(fb.group(1)):
-                    offenders.append("@font-face")
-    for g in _GFONTS_LINK.findall(html):                 # Google Fonts defaults to a blocking display unless set
-        web_fonts += 1
-        if not _GFONTS_DISPLAY.search(g):
-            offenders.append(g[:80])
-    if web_fonts == 0:
-        return None
-    ctx.evidence.update(foit_sources=offenders[:6], web_fonts=web_fonts)
-    return bool(offenders)
 
 
 # SEO / discoverability meta — objective presence checks on best-practice head tags. Viewport is the
@@ -5362,8 +5229,18 @@ def seo_meta_missing(ctx, probe) -> bool | None:
 # encoding (mojibake), and it's a UTF-7 XSS surface in old engines. (A "HEAD must not return a body"
 # check was dropped: a spec-compliant HTTP client discards the HEAD body, so it isn't observable without
 # raw-socket work — not worth it for this low-impact tail.)
+# A page declares its encoding via the Content-Type HEADER *or* a <meta charset>/<meta http-equiv=content-type>
+# in the document -- both are valid per the HTML spec, and the meta form is how virtually every HTML5 page does
+# it. The browser's encoding prescan only reads the first 1024 bytes, so a meta beyond that is not honored (still
+# a real ambiguity). Checking the header alone made this ~89% false: 57 of 64 v18 fires declared charset by meta.
+_META_CHARSET = re.compile(rb"<meta[^>]+charset", re.I)   # matches <meta charset=..> AND http-equiv content-type
+_CHARSET_PRESCAN = 1024                                   # the HTML spec's encoding-sniffing window, in bytes
+
+
 def http_conformance(ctx, probe) -> bool | None:
-    """Fire on an HTML response served without a declared charset. N/A on a non-HTML homepage."""
+    """Fire on an HTML response served with NO declared charset in EITHER the Content-Type header or a <meta>
+    in the document's first 1024 bytes (the browser's encoding-prescan window) -> the browser must GUESS the
+    encoding. N/A on a non-HTML homepage."""
     with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
         try:
             r = c.get(_home_path(ctx, probe))
@@ -5372,9 +5249,11 @@ def http_conformance(ctx, probe) -> bool | None:
     ctype = r.headers.get("content-type", "").lower()
     if "text/html" not in ctype:
         return None                                       # only HTML documents declare a page charset
-    has_charset = "charset=" in ctype
-    ctx.evidence.update(charset=has_charset)
-    return not has_charset
+    header_cs = "charset=" in ctype
+    meta_cs = bool(_META_CHARSET.search(r.content[:_CHARSET_PRESCAN]))
+    ctx.evidence.update(charset=header_cs or meta_cs,
+                        charset_via=("header" if header_cs else "meta" if meta_cs else None))
+    return not (header_cs or meta_cs)
 
 
 # Crash-resistance — a ROBUST app rejects malformed input with a 4xx (400/413/422); a FRAGILE one lets
@@ -5583,7 +5462,20 @@ def declared_constraint_unenforced(ctx, probe) -> bool | None:
                     r = _xss_send(c, method, form.action, bad)
                 except (httpx.HTTPError, httpx.InvalidURL):
                     continue
-                if _same_success(base, r, form.action, good, bad):   # a bare 2xx with an inline error is NOT
+                if _same_success(base, r, form.action, good, bad):
+                    # INPUT-DEPENDENCE gate (v18: this probe was ~100% FP). A static-shell SPA (action="/")
+                    # answers 200 to ANY body, and an auth-guarded form 3xx's to /login for any body -- both
+                    # read as "accepted the invalid value" though the server never processed the field. Require
+                    # the acceptance to be INPUT-DEPENDENT: an all-EMPTY submission must NOT get the same success.
+                    # If it does, the endpoint ignores the body (shell / auth-guard / catch-all) -> not this
+                    # field's enforcement -> clean. A real enforcing server rejects the empty required values.
+                    empties = {f: "" for f in form.fields}
+                    try:
+                        empty = _xss_send(c, method, form.action, empties)
+                    except (httpx.HTTPError, httpx.InvalidURL):
+                        continue
+                    if _same_success(base, empty, form.action, good, empties):
+                        continue                             # input-independent -> shell / auth-guard, not a fire
                     ctx.evidence.update(action=form.action, field=field, declared=cons.get("type"),
                                         invalid=str(invalid_val)[:40], valid_status=base.status_code,
                                         invalid_status=r.status_code)
@@ -5734,7 +5626,7 @@ def decompression_bomb(ctx, probe) -> bool | None:
             try:
                 r = c.post(path, content=bomb, headers=gz_ct)
             except httpx.TimeoutException:
-                if s_small < 500:                      # 10KB fine, 50MB HUNG -> size-driven exhaustion (provable)
+                if 200 <= s_small < 300:               # 10KB ACCEPTED, 50MB HUNG -> size-driven exhaustion (provable)
                     ctx.evidence.update(decompression_capped=False, endpoint=path, signal="timeout",
                                         control_status=s_small, expanded_mb=50,
                                         repro=_dos_repro(ctx, path, "hung decompressing 50MB (10KB control -> %d)" % s_small))
@@ -5743,11 +5635,12 @@ def decompression_bomb(ctx, probe) -> bool | None:
             except (httpx.HTTPError, httpx.InvalidURL):
                 continue
             # Fire only on PROVABLE evidence. accepted (2xx): the app took a 50MB body -> no size cap <=50MB.
-            # exhausted (5xx a 10KB control doesn't trigger): the SIZE crashed it. A 4xx is NOT scored: 413 is
-            # a proven size cap (defended); a generic 400/422 is INCONCLUSIVE (a cap OR a post-decompression
-            # content failure — indistinguishable at a safe size), and we don't fire on inconclusive evidence
-            # (precision-favoring; FN is the safe error). This retires the old 413-only rule that fired on a 400.
-            exhausted = r.status_code >= 500 and s_small < 500
+            # exhausted (5xx where a 10KB control was ACCEPTED 2xx): the SIZE crashed a live handler. The 10KB
+            # control MUST be 2xx -- if it 404s/400s, the endpoint isn't a live body handler and the 50MB 500 is
+            # infra rejecting a huge upload to a dead/wrong route, not decompression exhaustion (v18: /ingest &
+            # /api/ingest 404 controls, /api/auth/login 400). A 4xx bomb is NOT scored (413 = a proven cap;
+            # 400/422 = inconclusive). Precision-favoring; FN is the safe error.
+            exhausted = r.status_code >= 500 and 200 <= s_small < 300
             accepted = 200 <= r.status_code < 400
             if exhausted or accepted:
                 ctx.evidence.update(decompression_capped=False, endpoint=path, status=r.status_code,
@@ -5836,7 +5729,93 @@ def http_response_splitting(ctx, probe) -> bool | None:
     return False if tested else None
 
 
+# ------------------------------------------------------------------ Lighthouse-backed perf (v2.0) ----------
+# The perf axis reads Lighthouse (pinned 13.4.1, throttled, median-of-N) instead of the hand-rolled probes it
+# replaces (they ran 60-90% FP). ONE generic predicate; each perf YAML names the audit(s) + mode. The per-app
+# MEDIAN report is run once by the pipeline and cached on ctx.lighthouse. Tiering (Ian: "a 0 should be hard to
+# get") reuses Lighthouse's own score bands: green (>=0.9) = pass, orange (0.5-0.9) = HALF penalty, red (<0.5) =
+# FULL, carried via penalty_override (the same per-fire override the a11y probes use; pipeline caps at 250).
+_LH_PASS, _LH_FAIL = 0.9, 0.5
+
+
+def _lh_mult(score):
+    """Deduction multiplier for a Lighthouse score: None (green/pass) | 0.5 (orange) | 1.0 (red/fail)."""
+    if score is None or score >= _LH_PASS:
+        return None
+    return 1.0 if score < _LH_FAIL else 0.5
+
+
+def lighthouse_audit(ctx, probe) -> bool | None:
+    """Generic Lighthouse-backed perf predicate. probe.probe config:
+        audit / audits : one or more Lighthouse audit ids; the WORST drives the tier
+        mode: 'score'   -> tier on Lighthouse's own 0-1 score band (green/orange/red)
+              'numeric' -> tier on numericValue vs `needs_above` / `fail_above`
+    N/A when the pipeline captured no Lighthouse result (unreachable url / run failed) or the audit does not
+    apply to the page. Fires True with a tiered penalty_override; False (clean) when the app passes."""
+    rep = getattr(ctx, "lighthouse", None)
+    if not rep:
+        ctx.evidence["na_reason"] = "no lighthouse result (url unreachable or the run failed)"
+        return None
+    spec = probe.probe
+    ids = spec.get("audits") or ([spec["audit"]] if spec.get("audit") else [])
+    au = lighthouse.audits(rep)
+    found = [(aid, au[aid]) for aid in ids if aid in au]
+    if not found:
+        ctx.evidence["na_reason"] = "lighthouse audit(s) %s not applicable to this page" % ids
+        return None
+    base, runs = probe.penalty, rep.get("runs")
+    if spec.get("mode", "score") == "score":
+        aid, a = min(found, key=lambda x: x[1].get("score") if x[1].get("score") is not None else 1.0)
+        mult = _lh_mult(a.get("score"))
+        if mult is None:
+            return False
+        ctx.evidence.update(audit=aid, score=round(a.get("score"), 2), runs=runs, versions=rep.get("versions"), display=a.get("displayValue", ""),
+                            tier=("fail" if mult == 1.0 else "needs-improvement"), report_only=bool(spec.get("report_only")),
+                            penalty_override=0 if spec.get("report_only") else max(1, round(base * mult)))
+        return True
+    aid, a = max(found, key=lambda x: x[1].get("numericValue") or 0)   # numeric: worst = the largest value
+    num = a.get("numericValue")
+    if num is None:   # count-based audit (network-requests) carries the value as the length of details.items
+        num = len((a.get("details") or {}).get("items") or [])
+    if spec.get("fail_above") is not None and num >= spec["fail_above"]:
+        mult = 1.0
+    elif spec.get("needs_above") is not None and num >= spec["needs_above"]:
+        mult = 0.5
+    else:
+        return False
+    ctx.evidence.update(audit=aid, value=round(num), runs=runs, versions=rep.get("versions"), display=a.get("displayValue", ""),
+                        tier=("fail" if mult == 1.0 else "needs-improvement"), report_only=bool(spec.get("report_only")),
+                        penalty_override=0 if spec.get("report_only") else max(1, round(base * mult)))
+    return True
+
+
+def lighthouse_perf_score(ctx, probe) -> bool | None:
+    """The perf axis's SCORING probe: slop = round((1 - overall_perf_score) * 100 * scale) -- i.e. the app's
+    DISTANCE from a perfect Lighthouse score (a 100 -> 0 slop, an 84 -> 16, a 25 -> 75). Lighthouse already did
+    the scoring off its own calibrated weights; we just invert the headline into slop instead of re-summing the
+    per-audit tiers (which double-counted metrics the headline already weighed, and penalized apps Lighthouse
+    itself rates fast). `scale` (default 1.0) is the one dial if the axis ever needs to weigh less. The metric
+    breakdown rides along in evidence as OFF-SCORE diagnostics. N/A when there is no Lighthouse result."""
+    rep = getattr(ctx, "lighthouse", None)
+    if not rep:
+        ctx.evidence["na_reason"] = "no lighthouse result (url unreachable or the run failed)"
+        return None
+    score = lighthouse.perf_score(rep)      # 0..1, Lighthouse's own weighted headline
+    if score is None:
+        ctx.evidence["na_reason"] = "lighthouse produced no overall performance score"
+        return None
+    scale = probe.probe.get("scale", 1.0)
+    slop = round((1.0 - score) * 100 * scale)
+    ctx.evidence.update(performance=round(score * 100), runs=rep.get("runs"), versions=rep.get("versions"),
+                        metrics=lighthouse.metric_breakdown(rep),
+                        tier=("good" if score >= 0.90 else "needs-improvement" if score >= 0.50 else "poor"),
+                        penalty_override=slop)
+    return slop > 0
+
+
 PREDICATES = {
+    "lighthouse_audit": lighthouse_audit,
+    "lighthouse_perf_score": lighthouse_perf_score,
     "sqli_auth_bypass": sqli_auth_bypass,
     "api_sqli": api_sqli,
     "xss_injectable": xss_injectable,
@@ -5888,25 +5867,14 @@ PREDICATES = {
     "load_resilience": load_resilience,
     "crash_resistance": crash_resistance,
     "declared_constraint_unenforced": declared_constraint_unenforced,
-    "perf_ttfb": perf_ttfb,
-    "perf_page_weight": perf_page_weight,
-    "perf_request_count": perf_request_count,
-    "perf_load_time": perf_load_time,
-    "caching_ineffective": caching_ineffective,
     "http_soft_404": http_soft_404,
     "a11y_hard_fails": a11y_hard_fails,
     "broken_links": broken_links,
     "redirect_loop": redirect_loop,
     "mixed_content": mixed_content,
     "subresource_integrity_missing": subresource_integrity_missing,
-    "unminified_assets": unminified_assets,
-    "lcp_image_lazy_loaded": lcp_image_lazy_loaded,
-    "excessive_dom_size": excessive_dom_size,
-    "font_display_missing": font_display_missing,
     "seo_meta_missing": seo_meta_missing,
     "http_conformance": http_conformance,
-    "slow_first_paint": slow_first_paint,
-    "slow_core_web_vitals": slow_core_web_vitals,
     "console_errors_present": console_errors_present,
     "a11y_violations_present": a11y_violations_present,
     "dead_controls_present": dead_controls_present,
@@ -5919,14 +5887,12 @@ PREDICATES = {
 
 # Human-readable "why it fired" reasons for verbose / --failed output, derived from the probe's check.
 _MATCHER_REASONS = {
-    "ttfb_at_least": "slow time-to-first-byte (>{arg}s)",
     "response_contains": "reflected the probe payload unescaped",
     "response_missing_header": "missing header: {arg}",
     "response_missing_clickjacking_defense": "no clickjacking defense (X-Frame-Options / CSP frame-ancestors)",
     "response_csp_weak": "the Content-Security-Policy is present but toothless against XSS ('unsafe-inline' / wildcard script source with no nonce/hash) -> a false sense of safety",
     "response_cors_misconfigured": "reflects an arbitrary Origin with credentials (CORS)",
     "response_server_error": "returned a 5xx server error",
-    "response_uncompressed": "sizeable text served without gzip (no Content-Encoding)",
     "response_has_header": "leaks the {arg} header (stack / version disclosure)",
     "response_is_aws_credentials": "served an AWS credentials file at the webroot",
     "response_leaks_credentials": "returned password/credential material in a response body",
@@ -5937,6 +5903,8 @@ _MATCHER_REASONS = {
 }
 
 _PREDICATE_REASONS = {
+    "lighthouse_audit": "a Lighthouse performance audit is below its passing threshold",
+    "lighthouse_perf_score": "the overall Lighthouse performance score is below a perfect 100 (slop = its distance from 100)",
     "sqli_auth_bypass": "login bypassed by a SQL-injection payload",
     "api_sqli": "a parameter is SQL-injectable (error / boolean / UNION / time-based)",
     "xss_injectable": "an input reflects unescaped into HTML (XSS: script / img / svg / attribute / stored)",
@@ -5989,25 +5957,14 @@ _PREDICATE_REASONS = {
     "load_resilience": "endpoint 5xx'd under a concurrent burst",
     "crash_resistance": "malformed input caused an unhandled 5xx instead of a graceful 4xx",
     "declared_constraint_unenforced": "the server accepted a value violating the app's own declared field constraint (type=email/number/... -> client-only validation)",
-    "perf_ttfb": "slow server response (time-to-first-byte over the perf budget)",
-    "perf_page_weight": "heavy page (transfer weight over the perf budget)",
-    "perf_request_count": "too many requests to render the homepage (over the perf budget)",
-    "perf_load_time": "homepage load time crosses the ~5s user-abandonment ceiling",
-    "caching_ineffective": "static asset not cacheable (no validator / no-store / ignored revalidation) -> refetched every load",
     "http_soft_404": "a nonexistent static asset returned 2xx instead of 404 (soft-404 -> pollutes caches / crawlers / monitoring)",
     "a11y_hard_fails": "accessibility hard-fail (missing lang / alt / form-control name / page title, or text below the 3:1 contrast floor)",
     "broken_links": "an internal link leads to a 4xx dead end (broken navigation)",
     "redirect_loop": "the homepage or a route it links to redirects endlessly (ERR_TOO_MANY_REDIRECTS) -- the page never loads for any visitor",
     "mixed_content": "an https page loads a subresource over plain http:// (mixed content -> MITM-tamperable; active mixed content is browser-blocked, breaking the page)",
     "subresource_integrity_missing": "a cross-origin script/stylesheet loads without a Subresource Integrity hash -> a compromised or hijacked CDN can run arbitrary code in the app's origin (supply-chain risk)",
-    "unminified_assets": "a sizeable same-origin .css/.js is shipped to production unminified -> wasted bytes and parse time on every page load",
-    "lcp_image_lazy_loaded": "the largest-contentful-paint image is marked loading=lazy -> the browser defers the very image that defines first paint, delaying it for every visitor",
-    "excessive_dom_size": "the page renders an excessive DOM (over ~1400 nodes) -> style/layout/interaction slow on every update, independent of page weight",
-    "font_display_missing": "a web font loads without font-display: swap/optional/fallback -> text is invisible while the font downloads, then reflows (FOIT)",
     "seo_meta_missing": "missing a best-practice meta tag (viewport -> unusable on mobile, or description -> no search snippet)",
     "http_conformance": "HTML response served with no declared charset (browser must guess the encoding -> mojibake / UTF-7 XSS surface)",
-    "slow_first_paint": "First Contentful Paint exceeded the gate",
-    "slow_core_web_vitals": "Core Web Vitals poor on the best of N throttled samples (slow LCP / layout shift / main-thread blocking)",
     "login_no_rate_limit": "repeated wrong-password logins were never throttled",
     "console_errors_present": "the app's own code fails on load (an uncaught JS error, a CSP that blocks its own resource, or a React hydration mismatch)",
     "dead_controls_present": "clickable controls wired to nothing (no effect on click) — non-functional UI",

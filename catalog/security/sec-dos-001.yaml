@@ -9,4 +9,7 @@ applicability:
 probe:
   # confirm the endpoint decompresses request bodies, then send a ~50MB-expanding (safe) bomb;
   # fire unless it's rejected with 413 (a decompressed-size cap). Detects the missing defense, never OOMs.
+  # PRECISION (v18 live-audit, 3/4 FP): the 10KB size-control MUST be a live 2xx. If it 404s/400s, the endpoint
+  # isn't a live body handler and the 50MB->500 is infra rejecting a huge upload to a dead/wrong route, not
+  # decompression exhaustion (v18: /ingest & /api/ingest 404 controls, /api/auth/login 400).
   predicate: decompression_bomb

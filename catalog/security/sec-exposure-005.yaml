@@ -10,5 +10,9 @@ applicability:
 probe:
   target: routes   # scan every discovered route/endpoint (incl. spec-derived) for leaked credentials
   na_if_absent: true
+  # PRECISION (v18 live-audit): a "password":"<value>" is a leak only when the VALUE is a real credential, not a
+  # UI/i18n LABEL -- a /api/translate strings endpoint returns "password":"Password" / "Enter your password".
+  # A phrase of words ending in "password" (or a bullet placeholder) is excluded; a real value with digits/
+  # symbols still fires (edy /api/pedidos leaked "EdyDemo6717!" -> a genuine TP, kept).
 slop_if:
   - response_leaks_credentials

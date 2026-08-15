@@ -8,6 +8,9 @@ penalty: 8   # an HTML response with no declared charset: every response, but lo
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:
-  # fire when a text/html response omits ; charset= (browser guesses encoding). N/A on a non-HTML homepage
+  # Fire when a text/html response declares NO charset -- in neither the Content-Type header NOR a <meta> in the
+  # document's first 1024 bytes (the browser's encoding-prescan window) -> the browser must guess the encoding.
+  # A <meta charset> is a valid declaration and is how most HTML5 pages do it: checking the header alone was
+  # ~89% false (57 of 64 v18 fires declared charset by meta). N/A on a non-HTML homepage.
   predicate: http_conformance
   target: /

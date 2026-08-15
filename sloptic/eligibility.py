@@ -8,6 +8,10 @@ A shared predicate makes that class of bug unrepresentable.
 """
 from __future__ import annotations
 
+import urllib.parse
+
+from . import platform_id
+
 # Hosts that render the app into a client-side canvas (websocket-driven) rather than into HTML, so a black-box
 # surface probe only ever reaches the framework's uniform shell, never the student's app. Every such grade is
 # the SAME framework-shell score (v17: all 66 Streamlit apps -> surface_size 108, forms/inputs 0, an identical
@@ -36,3 +40,21 @@ def is_shell_only(rec: dict) -> bool:
     if rs is not None:
         return rs in ("error", "stuck")
     return ((rec.get("platform") or {}).get("host_platform") or "") in SHELL_ONLY_PLATFORMS
+
+
+def wrong_owner_reason(rec: dict) -> str | None:
+    """The wrong-owner CATEGORY for a graded record (a third-party/platform surface that isn't the team's own
+    engineered app -- an S3 bucket, a Jira/SharePoint/Notion/Google product, a Gamma deck, a no-code site, or a
+    Lovable EDITOR url), else None. A black-box grade of these measures the third party, not the submission, so
+    the record is excluded from the reference distribution -- like a canvas shell. Reads the classified
+    platform.host, falling back to the graded URL for legacy records that predate it."""
+    host = (rec.get("platform") or {}).get("host") or ""
+    if not host:
+        url = rec.get("repo") or rec.get("url") or rec.get("url_ingest") or rec.get("deployed") or ""
+        if isinstance(url, str) and url.startswith("http"):
+            host = urllib.parse.urlparse(url).netloc
+    return platform_id.wrong_owner_host(host)
+
+
+def is_wrong_owner(rec: dict) -> bool:
+    return wrong_owner_reason(rec) is not None

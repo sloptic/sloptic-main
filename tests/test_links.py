@@ -14,6 +14,10 @@ _MODE_LINK = {
     "redirect": '<a href="/moved">x</a>',
     "server": '<a href="/boom">x</a>',
     "external": '<a href="http://example.invalid/gone">x</a>',
+    "template": '<a href="/${s.url}">x</a>',                 # uninterpolated template literal -> not a link
+    "cdncgi": '<a href="/cdn-cgi/l/email-protection#abc">x</a>',  # Cloudflare-injected -> not the app's link
+    "entity": '<a href="/api?role=x&amp;id=y">x</a>',        # &amp; IS & to a browser -> decodes to a valid URL
+    "forbidden": '<a href="/gated">x</a>',                   # 403 access-control -> gated, not a dead end
 }
 
 
@@ -46,6 +50,11 @@ def _handler(mode):
                 return
             if p == "/boom":
                 return self._w(500, b"server error", "text/plain")
+            if p == "/api":
+                # 400 if the &amp; was NOT decoded (a literal `amp;` param leaks in); 200 on the real URL
+                return self._w(400 if "amp;" in self.path else 200, b"ok")
+            if p == "/gated":
+                return self._w(403, b"forbidden", "text/plain")
             return self._w(404, b"not found", "text/plain")   # /gone + anything unknown
     return _H
 
@@ -80,6 +89,14 @@ def test_broken_links_fires_on_dead_internal_link(server):
 @pytest.mark.parametrize("mode", ["ok", "redirect", "server", "external"])
 def test_broken_links_clean_when_not_a_4xx_dead_end(server, mode):
     # resolves / followed-redirect-resolves / 5xx (crash-resistance's job) / external -> not broken
+    assert broken_links(_ctx(server(mode)), _Probe()) is False
+
+
+@pytest.mark.parametrize("mode", ["template", "cdncgi", "entity", "forbidden"])
+def test_broken_links_ignores_artifacts_and_access_control(server, mode):
+    # v18 FP classes: an uninterpolated /${...} template literal + a Cloudflare /cdn-cgi/ injected link are not
+    # the app's links (skipped in extraction); an &amp; href decodes to a valid URL (200); a 403 is access-control
+    # (the page exists, gated), not a dead end. All -> clean. Each would fire without the fix.
     assert broken_links(_ctx(server(mode)), _Probe()) is False
 
 

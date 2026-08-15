@@ -46,7 +46,8 @@ from functools import lru_cache
 
 _HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))     # repo root on path, so the lazy `import sloptic` resolves when run as a script
-from sloptic.eligibility import is_shell_only, is_ungradeable_challenge  # noqa: E402  (needs the path insert above)
+from sloptic.eligibility import (is_shell_only, is_ungradeable_challenge,  # noqa: E402  (needs the path insert above)
+                                 is_wrong_owner, wrong_owner_reason)
 _DEFAULT_CURVE = _HERE.parent / "validation" / "benchmark-curve.json"
 _AXES = ("security", "qa", "performance")
 _PREFIX = {"sec-": "security", "qa-": "qa", "perf-": "performance"}
@@ -88,6 +89,7 @@ def _eligible(r: dict) -> bool:
         and not str(r.get("project") or "").startswith("anchor-")
         and not is_ungradeable_challenge(r)      # entry-challenge withhold -> scored 0, nothing was graded
         and not is_shell_only(r)                 # canvas-shell host (Streamlit) -> graded the framework, not the app
+        and not is_wrong_owner(r)                # S3 bucket / Jira / no-code site / editor url -> not the team's app
     )
 
 
@@ -365,6 +367,7 @@ def rank(curve: dict, score, record: dict | None = None) -> dict:
         b = reporting_bundle(record)
         out["reporting"] = b
         out["shell_only"] = is_shell_only(record)   # canvas-shell host (Streamlit): graded the framework, not the app
+        out["wrong_owner"] = wrong_owner_reason(record)   # S3/Jira/no-code/editor: not the team's app (category or None)
         out["certifiable"] = (b["status"] == "completed" and not b["untested_families"]
                               and not gates and not out["shell_only"])
     return out

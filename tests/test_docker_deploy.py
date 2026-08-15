@@ -25,12 +25,18 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _cat():
+    # exclude the Lighthouse-backed perf probes: a real Lighthouse run per grade is slow + environment-variable,
+    # which would break the docker==subprocess score equivalence this file exists to prove.
+    return [p for p in load_catalog(CATALOG) if p.probe.get("predicate") != "lighthouse_audit"]
+
+
 def _docker_score(app: str) -> int:
-    return run(DockerDeployer(str(REFS / app)), load_catalog(CATALOG)).slop_score
+    return run(DockerDeployer(str(REFS / app)), _cat()).slop_score
 
 
 def _subprocess_score(app: str) -> int:
-    return run(SubprocessDeployer(str(REFS / app / "app.py")), load_catalog(CATALOG)).slop_score
+    return run(SubprocessDeployer(str(REFS / app / "app.py")), _cat()).slop_score
 
 
 def test_docker_vulnerable_matches_subprocess():

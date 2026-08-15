@@ -271,20 +271,6 @@ def await_streamlit(page, budget_s: float = 60.0) -> str:
     return "stuck"
 
 
-def _await_if_shell(page, url: str, budget_s: float = 12.0) -> None:
-    """Post-goto hook for the MEASURING renders (perf): if this is a websocket-rendered shell host (Streamlit),
-    wait for the real app to paint so the metric reflects the app, not the framework shell. No-op otherwise
-    (cheap gate first). The server is already warm here — discovery's render woke it — so a rendered app paints
-    in a few seconds; the budget is SHORT on purpose (this runs in EVERY perf render, and web_vitals runs it
-    per sample) so a genuinely-STUCK Streamlit app can't stack 45s x N waits and blow the grade timeout — it
-    just measures the shell, which is excluded from the curve anyway (render_state was set once in discovery)."""
-    if budget_s <= 0:
-        return   # caller opted out (discovery already found this app error/stuck -> don't re-wait, just measure)
-    try:
-        if _looks_streamlit(page, url):
-            await_streamlit(page, budget_s=budget_s)
-    except Exception:
-        pass
 
 
 def render_routes(base_url: str, paths, headers=None, timeout: float = 12.0,
@@ -835,7 +821,7 @@ def inert_controls(url: str, headers=None, timeout: float = 12.0, max_controls: 
     observable effect on ANY watched channel — inert ("dead") controls. None if no browser or the render
     fails; [] if every control did something. Channels: DOM mutation / network / navigation / dialog /
     uncaught error / scroll (smooth-scroll nav) / clipboard (copy) / popup (window.open) / file-chooser
-    (upload). Observed behavior, so event-delegated handlers (invisible to a static check) still clear a
+    (upload) / download (a file link). Observed behavior, so event-delegated handlers (invisible to a static check) still clear a
     control; a control whose only effect is slower than per_wait_ms reads as live-or-skipped, never dead —
     the miss-don't-invent bias that keeps this safe to score. Already-active tabs/toggles (aria-selected/
     pressed) are not clicked (re-clicking them is a correct no-op, not a dead control)."""
@@ -851,7 +837,7 @@ def inert_controls(url: str, headers=None, timeout: float = 12.0, max_controls: 
             try:
                 page = b.new_page()
                 net, dialogs, errs = {"n": 0}, {"n": 0}, {"n": 0}
-                popups, choosers = {"n": 0}, {"n": 0}
+                popups, choosers, downloads = {"n": 0}, {"n": 0}, {"n": 0}
                 page.on("request", lambda r: net.__setitem__("n", net["n"] + 1))         # ALL network (img/beacon too)
                 page.on("dialog", lambda d: (dialogs.__setitem__("n", dialogs["n"] + 1), d.dismiss()))
                 page.on("pageerror", lambda e: errs.__setitem__("n", errs["n"] + 1))
@@ -860,6 +846,10 @@ def inert_controls(url: str, headers=None, timeout: float = 12.0, max_controls: 
                 # the DOM/network channels; watch them so those controls clear instead of reading as dead.
                 page.on("popup", lambda p: (popups.__setitem__("n", popups["n"] + 1), _quiet_close(p)))
                 page.on("filechooser", lambda fc: choosers.__setitem__("n", choosers["n"] + 1))
+                # a <a href="report.csv"> / <a download> triggers a file download, not a nav/DOM change -- a real
+                # effect off the other channels, so watch it or those controls read as dead (killthebill's
+                # 'Sample 1/2' CSV links were the qa-deadctrl-001 FP class).
+                page.on("download", lambda d: downloads.__setitem__("n", downloads["n"] + 1))
                 page.add_init_script(script=_INERT_WATCH_JS)   # re-installs the watcher on every navigation
                 _apply_auth(page, url, headers)
                 page.goto(url, timeout=timeout * 1000, wait_until="load")
@@ -880,15 +870,16 @@ def inert_controls(url: str, headers=None, timeout: float = 12.0, max_controls: 
                             loc.scroll_into_view_if_needed(timeout=1000)
                         page.evaluate("() => { if (window.__hlw) { window.__hlw.muts = 0; window.__hlw.reqs = 0;"
                                       " window.__hlw.clip = 0; window.__hlw.scroll = 0; } }")
-                        n0, d0, e0, p0, f0, url0 = (net["n"], dialogs["n"], errs["n"], popups["n"],
-                                                    choosers["n"], page.url)
+                        n0, d0, e0, p0, f0, dl0, url0 = (net["n"], dialogs["n"], errs["n"], popups["n"],
+                                                         choosers["n"], downloads["n"], page.url)
                         loc.click(timeout=1500)
                         page.wait_for_timeout(per_wait_ms)
                         w = page.evaluate("() => window.__hlw || {muts: 0, reqs: 0, clip: 0, scroll: 0}")
                         navigated = page.url != url0
                         moved = ((w.get("muts") or 0) or (w.get("reqs") or 0) or (w.get("clip") or 0)
                                  or (w.get("scroll") or 0) or (net["n"] - n0) or (dialogs["n"] - d0)
-                                 or (errs["n"] - e0) or (popups["n"] - p0) or (choosers["n"] - f0) or navigated)
+                                 or (errs["n"] - e0) or (popups["n"] - p0) or (choosers["n"] - f0)
+                                 or (downloads["n"] - dl0) or navigated)
                         if not moved:
                             dead.append(label or "(unlabeled)")
                         if navigated:   # a live control that navigated away -> restore + re-tag to continue
@@ -902,32 +893,6 @@ def inert_controls(url: str, headers=None, timeout: float = 12.0, max_controls: 
         return None
 
 
-def first_contentful_paint(url: str, headers=None, timeout: float = 12.0, shell_await: bool = True) -> float | None:
-    """Render url and return First Contentful Paint in milliseconds (the user-facing 'time to see
-    something' metric). None if no browser, render fails, or nothing ever paints."""
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        return None
-    try:
-        with sync_playwright() as pw:
-            b = _launch(pw)
-            if b is None:
-                return None
-            try:
-                page = b.new_page()
-                _apply_auth(page, url, headers)
-                page.goto(url, timeout=timeout * 1000, wait_until="load")
-                _await_if_shell(page, url, budget_s=12.0 if shell_await else 0.0)  # skip if discovery found it dead
-                page.wait_for_timeout(2500)  # allow delayed/contentful paint to occur
-                return page.evaluate(
-                    "() => { const e = performance.getEntriesByName('first-contentful-paint')[0];"
-                    " return e ? e.startTime : null; }"
-                )
-            finally:
-                b.close()
-    except Exception:
-        return None
 
 
 # Accessibility is graded with axe-core (Deque), the gold-standard WCAG engine, injected into the render.
@@ -1197,34 +1162,6 @@ _METRICS_JS = """(() => {
 })()"""
 
 
-def render_metrics(url: str, headers=None, timeout: float = 15.0, shell_await: bool = True) -> dict | None:
-    """Render url once and return {lcp_is_img, lcp_loading, dom_nodes}. None if no browser / the render fails."""
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        return None
-    try:
-        with sync_playwright() as pw:
-            b = _launch(pw)
-            if b is None:
-                return None
-            try:
-                page = b.new_page()
-                page.add_init_script(_METRICS_JS)                 # observe LCP from before the page loads
-                _apply_auth(page, url, headers)
-                page.goto(url, timeout=timeout * 1000, wait_until="load")
-                _await_if_shell(page, url, budget_s=12.0 if shell_await else 0.0)  # skip if discovery found it dead
-                try:
-                    page.wait_for_load_state("networkidle", timeout=6000)   # let the SPA settle so LCP is final
-                except Exception:
-                    page.wait_for_timeout(400)
-                return page.evaluate(
-                    "() => ({lcp_is_img: window.__hlm.lcp_is_img, lcp_loading: window.__hlm.lcp_loading, "
-                    "dom_nodes: document.getElementsByTagName('*').length})")
-            finally:
-                b.close()
-    except Exception:
-        return None
 
 
 # Core Web Vitals — LCP (largest content paint), CLS (layout shift), total blocking time (main-thread
@@ -1245,41 +1182,6 @@ _VITALS_JS = """(() => {
 _CWV_THROTTLE = {"offline": False, "latency": 150, "downloadThroughput": 200_000, "uploadThroughput": 93_750}
 
 
-def web_vitals(url: str, headers=None, timeout: float = 25.0, samples: int = 3, shell_await: bool = True) -> list | None:
-    """Sample Core Web Vitals over N throttled renders; return [{lcp_ms, cls, tbt_ms}] per run (the caller
-    scores off the player-favorable edge). None if no browser or the render fails."""
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        return None
-    try:
-        with sync_playwright() as pw:
-            b = _launch(pw)
-            if b is None:
-                return None
-            try:
-                out = []
-                for _ in range(samples):
-                    page = b.new_page()
-                    try:
-                        cdp = page.context.new_cdp_session(page)
-                        cdp.send("Network.enable")
-                        cdp.send("Network.emulateNetworkConditions", _CWV_THROTTLE)
-                        cdp.send("Emulation.setCPUThrottlingRate", {"rate": 4})
-                        page.add_init_script(script=_VITALS_JS)   # observers up before any page script
-                        _apply_auth(page, url, headers)
-                        page.goto(url, timeout=timeout * 1000, wait_until="load")
-                        _await_if_shell(page, url, budget_s=12.0 if shell_await else 0.0)  # skip if discovery found it dead
-                        page.wait_for_timeout(2000)   # let LCP finalize + late layout shifts settle (throttled)
-                        v = page.evaluate("() => window.__hlv")
-                        out.append({"lcp_ms": round(v["lcp"]), "cls": round(v["cls"], 3), "tbt_ms": round(v["tbt"])})
-                    finally:
-                        page.close()
-                return out
-            finally:
-                b.close()
-    except Exception:
-        return None
 
 
 def dom_xss_executes(base_url: str, paths, params=("q",), max_attempts: int = 24,
@@ -1354,8 +1256,13 @@ def back_button_broken(base_url: str, headers=None, timeout: float = 12.0):
                 _apply_auth(page, base_url, headers)
                 detail = {}
                 page.goto(base_url.rstrip("/") + "/", timeout=timeout * 1000, wait_until="load")
+                with contextlib.suppress(Exception):
+                    page.wait_for_load_state("networkidle", timeout=5000)  # let the SPA finish painting BEFORE we
+                page.wait_for_timeout(300)                                  # fingerprint -> a reproducible entry view
                 url_a, fa = page.url.rstrip("/"), _view_fp(page)
                 detail["entry_url"] = url_a
+                if len(fa) < 3:
+                    return "inconclusive", detail    # entry rendered ~nothing (partial/blank) -> can't judge restoration
                 host = urllib.parse.urlparse(base_url).netloc
                 link, href_used = None, None
                 with contextlib.suppress(Exception):
@@ -1386,9 +1293,21 @@ def back_button_broken(base_url: str, headers=None, timeout: float = 12.0):
                     return "inconclusive", detail                       # the click didn't change the view
                 with contextlib.suppress(Exception):
                     page.go_back(timeout=5000)
-                    page.wait_for_load_state("load", timeout=5000)
+                    page.wait_for_load_state("networkidle", timeout=5000)   # settle the restored view before comparing
                     page.wait_for_timeout(300)
                 url_c, fc = page.url.rstrip("/"), _view_fp(page)
+                # AUTH-GATED back: the app sent Back to a real login FORM (a visible password field) or to an auth
+                # URL -> the gate intercepted, so we never observe whether Back restores the prior view -> N/A, not
+                # a 'dead back button'. NB: key on the password FIELD, not "log in" TEXT -- nearly every landing
+                # page has a "Log in" nav button (toyota's marketing page, findmyseat), and matching that text
+                # over-suppressed normal pages. The replaceState-skip (Back -> about:blank) and view-stuck-on-B
+                # defects have no password field and no auth URL, so they still fire below.
+                on_login_form = False
+                with contextlib.suppress(Exception):
+                    on_login_form = bool(page.evaluate("() => !!document.querySelector('input[type=password]')"))
+                if on_login_form or _AUTH_URL.search(url_c):
+                    detail["auth_gated_on_back"] = True
+                    return "inconclusive", detail
                 content_restored = len(fc & a_only) >= len(fc & b_only)
                 detail.update(after_back_url=url_c, url_restored=(url_c == url_a), content_restored=content_restored)
                 # restored = the entry URL is back AND A's distinctive content returned (not still showing B's)
@@ -1404,12 +1323,27 @@ def _fp_sim(a: frozenset, b: frozenset) -> float:
     return len(a & b) / len(u) if u else 0.0
 
 
+# A route that renders a LOGIN/auth screen is auth-GATED (working correctly), not a broken deep link -- and when
+# the app gates everything, the nonexistent-route fallback renders that same login screen, so a gated route
+# matches it and reads as "broken". The blank-shell case (route+fallback both render the empty shell, no login)
+# is the REAL broken deep link. This separates them: 9 of 16 sampled v18 fires were auth-gated, 7 genuinely broken.
+_LOGIN_SCREEN_JS = """() => {
+  const t = (document.body ? document.body.innerText : '').toLowerCase();
+  return !!document.querySelector('input[type=password]')
+      || /\\b(sign in|log in|login|signin|sign up|forgot password|continue with)\\b/.test(t);
+}"""
+
+# a URL that IS an auth route -- back-navigating to it means the app gated the Back nav (qa-backnav-001), which
+# we cannot score as a "dead back button": we never got to observe whether Back restores the prior view.
+_AUTH_URL = re.compile(r"/(?:login|log-?in|signin|sign-?in|sign_in|auth|register|signup|sign-?up)\b", re.I)
+
+
 def deep_link_broken(base_url: str, routes, headers=None, timeout: float = 12.0, max_routes: int = 8):
     """FRESH-navigate (goto, not in-app) to a guaranteed-nonexistent route to capture the app's FALLBACK render
     (home / 404 / blank), then fresh-navigate to each discovered route; return ('broken', route) for the first
     that renders ~identically to the fallback (>= 0.92 word-set similarity -> no route-specific content, so a
-    shared/bookmarked link is dead), else ('ok', None) or ('inconclusive', None). Tests the bookmarked-link
-    path a catch-all host's 200 shell hides from an HTTP-only check."""
+    shared/bookmarked link is dead) AND is not merely an auth gate, else ('ok', None) or ('inconclusive', None).
+    Tests the bookmarked-link path a catch-all host's 200 shell hides from an HTTP-only check."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -1441,6 +1375,11 @@ def deep_link_broken(base_url: str, routes, headers=None, timeout: float = 12.0,
                         continue                            # this route rendered blank (slow load?) -> skip, conservative
                     tested += 1
                     if _fp_sim(fp_r, fp_bogus) >= 0.92:     # renders the same as a nonexistent route
+                        is_login = False
+                        with contextlib.suppress(Exception):
+                            is_login = bool(page.evaluate(_LOGIN_SCREEN_JS))
+                        if is_login:
+                            continue                         # a login/auth screen -> auth-gated, not a dead deep link
                         return ("broken", route)
                 return (("ok" if tested else "inconclusive"), None)
             finally:

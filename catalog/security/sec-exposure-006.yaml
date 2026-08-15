@@ -9,3 +9,9 @@ applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:
   predicate: source_map_exposed
+  # PRECISION: a served .map is a finding only when it reconstructs the APP's OWN source. A map whose sources are
+  # all vendored (node_modules React/Next, a bundler polyfill) exposes code already public on npm -- no business
+  # logic, no secrets. The v18 corpus fired 164, of which 114 (69%) were vendored-only: 104 the identical Next.js
+  # chunk `a6dad97d9634a72d.js.map` (one source, a polyfill) and 10 the base44 platform `badge.js` widget (one
+  # app file). The gate requires >= 2 app-authored CODE files (node_modules excluded, assets excluded); the
+  # smallest real leak in v18 exposed 3, the badge exposed 1. Re-check the threshold on the v19 distribution.

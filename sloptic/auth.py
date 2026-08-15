@@ -392,6 +392,13 @@ def _bearer_token(resp: httpx.Response) -> str | None:
     return None
 
 
+# a CREDENTIAL-rejection phrase (for an HTML login answer), deliberately NOT matching a generic server-error
+# page like nginx "400 Bad Request" / "403 Forbidden" -- those are the request/server saying no, not the app
+# rejecting credentials (geoiq /users/login served a bare nginx 400 and read as a login surface).
+_AUTH_REJECT_PHRASE = re.compile(r"invalid|incorrect|unauthor|wrong\s+(?:password|credential|email|user)|"
+                                 r"\bcredential|login\s+failed|authentication\s+failed", re.I)
+
+
 def find_json_login(client: httpx.Client, root: str = ""):
     """Probe common JSON login endpoints with a wrong-creds body; return (path, creds, response) for
     the first that behaves like a REAL login, else (None, None, None). Lets the rate-limit probe reach
@@ -431,9 +438,23 @@ def find_json_login(client: httpx.Client, root: str = ""):
         if r.status_code in (404, 405, 501):
             continue
         ct = r.headers.get("content-type", "").lower()
-        # a genuine login rejects wrong creds (400/401/403/422) or answers in JSON; a static SPA returns
-        # 200 text/html (its shell) for everything — that's not a login surface, so keep looking.
-        if r.status_code in (400, 401, 403, 422) or "json" in ct:
+        body = ""
+        try:
+            body = r.text[:5000]
+        except Exception:
+            pass
+        rejects = bool(_AUTH_REJECT_PHRASE.search(body))
+        # A login SURFACE is one that REJECTS wrong creds. Three shapes are NOT that, each a v18 json-login FP:
+        #   - a 2xx SUCCESS body (usaii /api/sessions -> 201 {"sessionId":...}): it ACCEPTED the garbage creds,
+        #     so it is not a rejection to rate-limit. A 2xx qualifies ONLY if the body itself says it rejected
+        #     them (some real logins answer 200 + {"error":"invalid credentials"}).
+        #   - a redirect (3xx): a platform auth handoff, not the app rejecting creds.
+        #   - a bare server-error page (nginx "400 Bad Request" text/html): the SERVER rejected the request
+        #     shape, not the APP rejecting credentials (geoiq /users/login).
+        if r.status_code in (400, 401, 403, 422):
+            if "json" in ct or rejects:
+                return path, creds, r
+        elif 200 <= r.status_code < 300 and rejects:
             return path, creds, r
     return None, None, None
 
@@ -598,12 +619,26 @@ _PROVIDER_SESSION = ("auth0",)
 # JS-readable (judging it would report a false hygiene failure), a refresh token is not the access session,
 # and an email/verification token is not a login. Exclusions win over hints.
 _NOT_SESSION = ("csrf", "xsrf", "antiforgery", "anti-forgery", "authenticity", "verification", "verify",
-                "refresh")
+                "refresh", "code-verifier", "code_verifier", "clerk_db_jwt", "taboola")
 # `authenticity` was missing and is a pre-existing FP vector this file's own precision test caught: Rails names
 # its CSRF token `authenticity_token`, which contains "token" and so matched as a session. is_csrf_field already
 # listed it for FORM fields (_CSRF_FIELD_HINTS) while the COOKIE check did not — the two lists had drifted. A
 # CSRF cookie is deliberately JS-readable, so judging one reports a false "missing HttpOnly" on an app doing
 # nothing wrong, which is precisely what these exclusions exist to prevent.
+#
+# The last four were the ENTIRE sec-session-001 fire set on the v18 corpus (23/23 findings, a 100%-FP probe),
+# all client-readable-BY-DESIGN vendor cookies namespaced into the auth family but NOT the app's session:
+#   `code-verifier`  Supabase/PKCE `sb-<ref>-auth-token-code-verifier` — the pre-login OAuth nonce (9 apps).
+#                    The real session is a JWT in localStorage, which sec-session-005 already judges. The SDK
+#                    MUST read the verifier from JS to complete the code exchange, so HttpOnly is impossible.
+#   `clerk_db_jwt`   Clerk's dev-instance handshake cookie `__clerk_db_jwt[_suffix]` (13 apps). Clerk's real
+#                    session is `__session` (HttpOnly, and still judged); the db-jwt is JS-read by the FAPI
+#                    client by design. Matched here only via the "jwt" hint.
+#   `taboola`        `taboola_session_id`, a third-party ad-network tracker (1 app) — session-NAMED but not an
+#                    app login at all. Matched via the "session" hint.
+# The verifier/db-jwt were selected because `session_cookie()` prefers a token-shaped value and their opaque
+# base64url bodies pass `_token_shaped`, so nothing downstream rescued the pick. Same bar as every other entry
+# here: added only after being VERIFIED on live findings, never speculatively.
 
 
 def _is_session_cookie(name: str) -> bool:

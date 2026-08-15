@@ -12,7 +12,7 @@ from dataclasses import dataclass, field, replace
 
 import httpx
 
-from . import auth, platform_id, safety, secretscan
+from . import auth, lighthouse, platform_id, safety, secretscan
 from .aggregate import compute_axis_slop, compute_slop_score, coverage_metrics
 from .deploy import Deployer
 from .discovery import discover, surface_metrics
@@ -51,6 +51,7 @@ class _Ctx:
     profile: Profile
     headers: dict | None = None
     browser_register: object = None   # optional callback: browser-driven SPA registration for the auth self-oracle
+    lighthouse: dict | None = None    # per-app median Lighthouse report (run once by run(); read by lighthouse_audit)
     evidence: dict = field(default_factory=dict)  # a predicate may record measured values here; the
     #     executor snapshots it onto the outcome and resets it before the next probe (probes run serially)
     _browser_cache: dict = field(default_factory=dict)  # per-suffix browser-registration RESULT (see register)
@@ -295,6 +296,17 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
             if profile.render_state in ("error", "stuck"):
                 return Report(slop_score=0, outcomes=[], surface=surface_metrics(profile),
                               platform=platform_id.classify_live(client, origin), trace=trace_sink or [])
+            # PERF: run Lighthouse ONCE (pinned 13.4.1, median-of-N) and cache it on ctx for the lighthouse_audit
+            # probes. Gated on the catalog carrying such a probe (skip the ~2-3min run otherwise) and on the app
+            # being real+reachable (past the entry gate + shell short-circuit above). Best-effort: on failure
+            # ctx.lighthouse stays None -> those probes read N/A, never DNF the grade. Grade the LANDING page (a
+            # sub-path deploy's real app), not the bare origin. Sets the `lighthouse` capability so the YAMLs gate.
+            if any(p.probe.get("predicate") == "lighthouse_audit" for p in catalog):
+                try:
+                    ctx.lighthouse = lighthouse.measure(origin.rstrip("/") + (profile.landing_path or "/"))
+                    profile.capabilities["lighthouse"] = True
+                except lighthouse.PSIError:
+                    pass
             # Run low-volume probes FIRST, the high-volume injection/stress tail LAST: on an adaptive-WAF host a
             # challenge then trips late (during the tail), so the recovery keeps the already-collected outcomes
             # (it scores only PRE-onset). Stable sort -> catalog order preserved within each tier; a completed
@@ -353,8 +365,12 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
             stage = "late"
         elif end_challenged:
             bot_challenge, stage = True, "late"
+        surface = surface_metrics(profile)
+        if ctx.lighthouse:   # capture the Lighthouse performance score (0-100) onto the record -- the perf axis
+            perf = lighthouse.perf_score(ctx.lighthouse)   # already grades on it; this surfaces it for the stats.
+            surface["lighthouse"] = {"performance": round(perf * 100) if perf is not None else None}
         return Report(slop_score=compute_slop_score(outcomes), outcomes=outcomes,
-                      axis_slop=compute_axis_slop(outcomes), surface=surface_metrics(profile),
+                      axis_slop=compute_axis_slop(outcomes), surface=surface,
                       coverage=coverage_metrics(outcomes), platform=plat, bot_challenge=bot_challenge,
                       challenge_stage=stage, challenge_onset=onset_probe or "", request_counts=req_counts,
                       blocked_probes=blocked_probes, incomplete_axes=incomplete_axes, trace=trace_sink or [])

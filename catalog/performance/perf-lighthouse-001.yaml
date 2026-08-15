@@ -1,0 +1,13 @@
+id: perf-lighthouse-001
+bundle: performance
+category: overall
+pool: public
+evidence_model: oracle
+penalty: 50   # NOMINAL only. The real slop = penalty_override = round((1 - lighthouse_perf_score) * 100 * scale),
+              # i.e. the app's distance from a perfect 100 (a 100 -> 0, an 84 -> 16, a 25 -> 75). Lighthouse does
+              # the scoring off its own calibrated weights; we invert the headline into slop. Median-of-3.
+applicability:
+  requires: [lighthouse]
+probe:
+  predicate: lighthouse_perf_score
+  scale: 1.0   # the one dial: 1.0 = pure 100-N; drop below 1.0 to weigh the perf axis less without touching code

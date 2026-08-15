@@ -23,3 +23,15 @@ probe:
   # (username/display_name/bio) is a declared control, so it must stay silent while sponsor_leads and
   # payout_accounts fire. Requires >= 3 records so a single /api/me is not mistaken for a dump, and skips a
   # body sec-exposure-005 already claims so one leak is never billed twice.
+  #
+  # A column NAME is only a candidate; the finding keys on the VALUE (the v18 corpus fired 13, of which 9 were
+  # false on name alone). Three gates, all grounded in real v18 shapes:
+  #   1. VALUE-TYPE match — `tokens_total` held LLM token counts (ints), `phones` held ARPAbet phonemes
+  #      (['Y','AE1']), `phone_bedtime_habit` held a survey enum. A `token`/`phone`/`email` column whose values
+  #      are not credentials / numbers / addresses is not a leak.
+  #   2. PER-ROW VARIANCE — `managerApprovalPhone` was ONE number repeated across 25 policy rows: a config
+  #      contact, not 25 people. A real dump has >= 2 distinct values.
+  #   3. PUBLIC-DIRECTORY suppression — a published listing of places/orgs (a Google Places id, a scrape
+  #      `dataSource`, opening `hours`, a `category`) is public contact info; five directories fired in v18
+  #      (venues, funeral homes, hospitals, community resources, food banks). A per-user ownership column
+  #      (uid / created_by / submitted_by / candidate / patient) VETOES the directory verdict -> it is user data.

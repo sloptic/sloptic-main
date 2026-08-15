@@ -24,16 +24,14 @@ ALL_PROBES = [
     "sec-split-001",  # HTTP response splitting (CRLF into a reflected header)
     "sec-dos-001",  # decompression-bomb: decompresses gzip request bodies with no size cap
     "sec-headers-001", "sec-headers-002", "sec-headers-004", "sec-headers-005", "sec-headers-006",  # header depth (003=HSTS https-only); 006=X-Powered-By
-    "qa-errhyg-001", "perf-ttfb-001",
+    "qa-errhyg-001",
     "sec-debug-001",  # framework debug mode on in prod (Werkzeug debugger page at /crash)
     "sec-exposure-001", "sec-exposure-002", "sec-exposure-003", "sec-exposure-004",  # .env + .git + .aws/credentials
     "sec-idor-001",  # horizontal IDOR (self-as-oracle, two accounts)
     "qa-crash-010",  # crash-resistance: malformed input (values / JSON / decode-crashing path) -> 5xx
     "qa-input-001",  # declared-constraint: /register accepts type=email="hlnotanemail" (client-only validation)
     "qa-race-001",  # race condition: concurrent creates collide on the same id
-    "perf-load-001",  # load resilience: 5xx under a concurrent burst
-    "perf-compress-001",  # no gzip on a sizeable text response
-    "perf-cache-001",  # static asset served with no cache validators -> refetched every load
+    "perf-load-001",  # load resilience: 5xx under a concurrent burst (the one perf probe NOT Lighthouse-backed)
     "qa-http-001",  # soft-404: a nonexistent static asset returns 2xx instead of 404
     "qa-a11y-002",  # static WCAG hard-fails: missing lang / alt / label / title / contrast floor
     "qa-links-001",  # broken navigation: an internal <a href> lands on a 4xx dead end
@@ -46,8 +44,15 @@ ALL_PROBES = [
 SURFACE_PROBES = ["sec-sqli-001", "sec-sqli-002", "sec-sqli-003", "sec-xss-001"]
 
 
+def _catalog():
+    # perf is Lighthouse now; the pipeline integration tests exclude the lighthouse_audit probes (a real
+    # Lighthouse run per test is slow + environment-variable, and that path is covered by test_lighthouse_audit
+    # + a live validation). perf-load-001 (the hand-rolled burst-stress probe) is not lighthouse-backed -> stays.
+    return [p for p in load_catalog(CATALOG) if p.probe.get("predicate") != "lighthouse_audit"]
+
+
 def _run(app: str):
-    return run(SubprocessDeployer(str(REFS / app / "app.py")), load_catalog(CATALOG))
+    return run(SubprocessDeployer(str(REFS / app / "app.py")), _catalog())
 
 
 def test_vulnerable_app_accrues_slop():
@@ -93,14 +98,11 @@ def test_vulnerable_app_accrues_slop():
     assert o["sec-domxss-001"] == "not_applicable"
     # qa-race-001 (self-as-oracle): N concurrent creates collide on one id -> non-atomic allocation:
     assert o["qa-race-001"] == "slop_detected"
-    # perf-load-001: /report 5xx's under a concurrent burst (unsynchronized shared state):
+    # perf-load-001: /report 5xx's under a concurrent burst (unsynchronized shared state). The one perf probe
+    # NOT Lighthouse-backed -> still tested here; the Lighthouse-backed perf probes are covered separately.
     assert o["perf-load-001"] == "slop_detected"
-    # perf-compress-001: the homepage HTML is served uncompressed (no Content-Encoding):
-    assert o["perf-compress-001"] == "slop_detected"
     # qa-crash-010: malformed input (nasty field values / JSON / decode-crashing path) -> unhandled 5xx:
     assert o["qa-crash-010"] == "slop_detected"
-    # perf-cache-001: /config.js (a static asset) ships no Cache-Control / ETag -> refetched every load:
-    assert o["perf-cache-001"] == "slop_detected"
     # qa-http-001: a nonexistent /<rand>.js falls through to a 200 index shell (soft-404), not a 404:
     assert o["qa-http-001"] == "slop_detected"
     # qa-a11y-002 (no browser): <html> has no lang, inputs are placeholder-only (no accessible name),
@@ -115,8 +117,6 @@ def test_vulnerable_app_accrues_slop():
     assert o["qa-deploy-003"] == "not_applicable"
     assert o["sec-tls-001"] == "not_applicable"
     assert o["sec-sri-001"] == "not_applicable"   # the vuln ref loads only same-origin/inline scripts -> nothing to guard
-    assert o["perf-minify-001"] == "not_applicable"   # its only same-origin asset (/config.js) is far under the 8KB gate
-    assert o["perf-font-001"] == "not_applicable"      # the vuln ref loads no web font -> nothing to check for FOIT
     # sec-mixed-001 is https-gated: over the plain-http reference there's nothing to be "mixed" -> N/A
     # (fire/clean is CI-locked against a self-signed HTTPS server in test_mixed_content):
     assert o["sec-mixed-001"] == "not_applicable"
@@ -124,15 +124,10 @@ def test_vulnerable_app_accrues_slop():
     assert o["qa-seo-001"] == "slop_detected"
     # qa-http-002: the vulnerable app serves text/html with no charset -> browser must guess encoding:
     assert o["qa-http-002"] == "slop_detected"
-    # evidence rides on outcomes (clean ones too): the load-time probe records the measured number, and
-    # api_sqli records the techniques it tried even when the app is clean -> for the display layer.
-    ltime = next(x for x in report.outcomes if x.probe_id == "perf-loadtime-001")
-    assert "load_time_s" in ltime.evidence and ltime.evidence["ceiling_s"] == 5.0
+    # evidence rides on outcomes (clean ones too): api_sqli records the techniques it tried even when the app
+    # is clean -> for the display layer.
     sqli = next(x for x in report.outcomes if x.probe_id == "sec-sqli-004")
     assert set(sqli.evidence.get("techniques_tried", [])) == {"error", "boolean"}  # scored; time=advisory, union=cut
-    # perf-cwv-001 (FCP) / perf-cwv-002 (full Core Web Vitals) are browser-only -> N/A here; browser run in test_browser:
-    assert o["perf-cwv-001"] == "not_applicable"
-    assert o["perf-cwv-002"] == "not_applicable"
     # qa-console-001 / qa-a11y-001 are browser-only too -> N/A here (fired in test_browser):
     assert o["qa-console-001"] == "not_applicable"
     assert o["qa-a11y-001"] == "not_applicable"
@@ -156,9 +151,9 @@ def test_vulnerable_app_accrues_slop():
     # (frequency x severity, see the catalog): security holds its catastrophic per-instance ceiling (40),
     # while qa/perf are priced up for their every-user frequency. On this deliberately security-riddled
     # reference, security still dominates; a realistic janky app (references/qa-janky) leans qa/perf.
-    assert report.axis_slop == {"security": 429, "qa": 186, "performance": 68}   # qa 152->186: +34 for the
-    #                                 new v2.0 Family-1 probe qa-deploy-001 (unreachable-backend), fires once
-    assert report.slop_score == 683   # 649->683: +34 qa-deploy-001. (Earlier: qa 167->152 a11y re-pricing)
+    assert report.axis_slop == {"security": 429, "qa": 186, "performance": 28}   # perf 68->28: this pipeline
+    #     test excludes the Lighthouse-backed perf probes, so performance is just perf-load-001 (the burst probe)
+    assert report.slop_score == 643   # 683->643: -40 from excluding the Lighthouse-backed perf probes here
                                       # (30/18/10/4 -> 20/12/7/3, see _A11Y_TIER). This reference renders
                                       # critical 1 + serious 2, priced 47 -> 32, and that -15 is the WHOLE
                                       # delta — security 429 and performance 68 are unmoved, which is the
@@ -204,9 +199,7 @@ def test_minimal_app_resolves_surface_probes_na():
     assert o["sec-csrf-001"] == "not_applicable"
     assert o["sec-ratelimit-001"] == "not_applicable"  # no password form -> no login to brute-force
     assert o["sec-cors-001"] == "clean"  # applies (any endpoint) but minimal doesn't reflect Origin
-    assert o["perf-compress-001"] == "clean"  # tiny homepage -> too small to need compression
     assert o["qa-crash-010"] == "clean"       # robust: malformed input -> graceful 4xx / 404
-    assert o["perf-cache-001"] == "not_applicable"  # homepage references no static asset to cache
     assert o["qa-http-001"] == "clean"        # correct: a missing asset 404s (universally testable)
     assert o["qa-a11y-002"] == "clean"        # accessible HTML: lang + title set, no img/unlabeled control
     assert o["qa-links-001"] == "not_applicable"  # no <a href> links on the homepage -> nothing to follow
@@ -217,8 +210,6 @@ def test_minimal_app_resolves_surface_probes_na():
     assert o["qa-deploy-003"] == "not_applicable"   # no OAuth flow to inspect
     assert o["sec-tls-001"] == "not_applicable"     # served on loopback (local host) -> not a public http origin
     assert o["sec-sri-001"] == "not_applicable"     # no cross-origin subresource to guard
-    assert o["perf-minify-001"] == "not_applicable"   # no sizeable same-origin asset to assess
-    assert o["perf-font-001"] == "not_applicable"      # no web font to check
     assert o["sec-redirect-001"] == "clean"   # no redirect endpoint reflects an external host
     assert o["sec-hosthdr-001"] == "clean"    # no endpoint reflects the Host header
     assert o["sec-split-001"] == "not_applicable"  # no form/param surface to inject CRLF into
@@ -231,8 +222,6 @@ def test_minimal_app_resolves_surface_probes_na():
     assert o["sec-idor-001"] == "not_applicable"      # same gate
     assert o["sec-domxss-001"] == "not_applicable"    # browser-gated
     assert o["qa-race-001"] == "not_applicable"       # no password form -> can't self-register
-    assert o["perf-cwv-001"] == "not_applicable"      # browser-gated
-    assert o["perf-cwv-002"] == "not_applicable"      # browser-gated
     assert o["qa-console-001"] == "not_applicable"    # browser-gated
     assert o["qa-a11y-001"] == "not_applicable"       # browser-gated
     assert o["qa-deadctrl-001"] == "not_applicable"   # browser-gated
@@ -243,10 +232,10 @@ def test_cached_profile_freezes_surface_and_reproduces_score(monkeypatch):
     # build 1b (per-commit surface cache): the FIRST grade mints + hands back the discovered surface; a
     # re-grade REUSES it verbatim, skipping the crawl entirely, and reproduces the EXACT score. The
     # deployment's port differs between runs, so this also exercises the base_url re-bind (paths are relative).
-    catalog = load_catalog(CATALOG)
+    catalog = _catalog()   # exclude Lighthouse perf -> fast + deterministic (no metric variance in this repro test)
     minted = []
     r1 = run(SubprocessDeployer(str(REFS / "vulnerable" / "app.py")), catalog, on_profile=minted.append)
-    assert len(minted) == 1 and r1.slop_score == 683          # cache MISS -> discovered once + handed back
+    assert len(minted) == 1 and r1.slop_score == 643          # cache MISS -> discovered once + handed back
 
     import sloptic.pipeline as pipeline_mod            # PROVE the crawl is skipped on a cache HIT:
     monkeypatch.setattr(pipeline_mod, "discover",             # discover() must never be called with a cached profile
@@ -254,7 +243,7 @@ def test_cached_profile_freezes_surface_and_reproduces_score(monkeypatch):
     seen = []
     r2 = run(SubprocessDeployer(str(REFS / "vulnerable" / "app.py")), catalog,
              cached_profile=minted[0], on_profile=seen.append)
-    assert r2.slop_score == 683 and seen == []                # HIT -> same score, no re-crawl, no re-mint
+    assert r2.slop_score == 643 and seen == []                # HIT -> same score, no re-crawl, no re-mint
     assert r2.axis_slop == r1.axis_slop                       # identical per-axis decomposition too
 
 

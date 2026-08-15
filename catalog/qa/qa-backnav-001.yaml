@@ -13,3 +13,10 @@ probe:
   # fire the browser BACK button, assert the entry view returns. Fires when the SPA router hijacked history
   # without a pushState so BACK doesn't restore the prior view. Binary (no threshold), intent-independent,
   # no create flow. Self-N/A: no in-app navigation to exercise (single-view app / no router link).
+  # PRECISION (v18 live-audit): the oracle was render-timing-noisy and confounded by auth-gating. Fixed in
+  # browser.back_button_broken: (1) settle the entry + after-back renders (networkidle) + a blank-entry guard, so
+  # a partial mid-load fingerprint no longer reads as "not restored" (arca/surplussync/nexia stopped mis-firing);
+  # (2) if BACK lands on a real login FORM (a visible password field) or an auth URL, the app GATED the nav ->
+  # N/A, not a dead back button. Keys on the password FIELD, NOT "log in" text -- almost every landing page has a
+  # "Log in" nav button, so matching that text over-suppressed normal pages. Genuine defects still fire: a
+  # replaceState skip (BACK -> about:blank) and a view left stuck on B.

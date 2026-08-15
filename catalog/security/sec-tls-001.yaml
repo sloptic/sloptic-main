@@ -12,5 +12,9 @@ applicability:
 probe:
   # fire when the graded origin is plain http on a PUBLIC host and does not redirect to https. N/A for an https
   # origin (HSTS/mixed-content cover those) or a localhost / private-IP / *.local dev/preview target.
+  # PRECISION (v18 live-audit): "no TLS" is provable only when we OBSERVE cleartext -- a 2xx over http, or a
+  # 3xx to another http URL. A blocking/error status (401/403/404/429/5xx) MASKS the real behavior (netlify's
+  # http->https 301 came back to the probe as a 403; a 429 rate-limit hid a real no-TLS origin) -> N/A, not a
+  # false fire. On a re-grade the masked host resolves correctly (403->301-https = clean; 429->200 = fires).
   predicate: no_tls_origin
   target: /

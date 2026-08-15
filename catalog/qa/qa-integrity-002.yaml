@@ -12,3 +12,11 @@ probe:
   # the read-by-id round-trip is N/A even when writes silently fail. Create an object with a unique marker,
   # then GET the COLLECTION (the create path's sibling) and confirm the marker is present. Fires when the
   # create reports 2xx but the object is absent from its own list. N/A when there's no JSON create+collection.
+  #
+  # PRECISION: the read-back must be an actual resource COLLECTION and the endpoint an actual CREATE, or a
+  # stateless POST reads as data loss. v18 fired 4, of which 3 were false. Two gates:
+  #   1. The collection body must contain a RECORD ARRAY (top-level, or an envelope {"items":[...]}). A stateless
+  #      RPC's sibling is a status/config OBJECT ({"encounterId":""}, {"hasApiKey":false}) -- nothing is
+  #      persisted there, so "unchanged after a 2xx" is not data loss (encounter + recommendation fired this way).
+  #   2. An auth endpoint is excluded (a password field or an auth-verb path): its "collection" is not a public
+  #      data list, so "the record is absent from a list" is meaningless (fahimni's /backend/auth.php).

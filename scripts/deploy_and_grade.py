@@ -254,6 +254,33 @@ def _record_plan_meta(result: dict, plan: dict) -> None:
         result[k] = plan.get(k)
 
 
+_VERDICT_RANK = {"not_applicable": 0, "clean": 1}   # a probe that JUDGED (clean) outranks one that couldn't (n/a)
+# evidence keys worth keeping on an unfired verdict: bulky repro/response bodies live on FIRES, so a clean/n-a
+# entry keeps only its light audit signal (status, what it measured, WHY it was n/a). Bounds the size blow-up.
+_VERDICT_EV_KEYS = ("na_reason", "status", "records", "sources", "app_sources", "sensitive_columns",
+                    "checked", "tried", "collection", "endpoint", "fails")
+
+
+def _verdicts(outcomes: list) -> list[dict]:
+    """Every APPLIED-but-UNFIRED probe verdict, collapsed to one entry per probe -- the dark-recall audit set.
+    A `clean` is the probe asserting "no defect here" (a candidate false-NEGATIVE to sample against ground
+    truth); a `not_applicable` carries its na_reason (the COVERAGE map -- where a probe structurally could not
+    see, e.g. the 177 login apps whose auth capture failed). Fires are already in `findings`, so a probe that
+    fired anywhere is excluded here. Fan-out collapses to the strongest applied state (clean > not_applicable)."""
+    fired = {o.probe_id for o in outcomes if o.outcome == "slop_detected"}
+    best: dict[str, dict] = {}
+    for o in outcomes:
+        if o.outcome == "slop_detected" or o.probe_id in fired:
+            continue
+        cur = best.get(o.probe_id)
+        if cur is None or _VERDICT_RANK[o.outcome] > _VERDICT_RANK[cur["outcome"]]:
+            ev = {k: o.evidence[k] for k in _VERDICT_EV_KEYS if k in o.evidence}
+            best[o.probe_id] = {"probe_id": o.probe_id, "bundle": o.bundle, "category": o.category,
+                                "outcome": o.outcome, "na_reason": o.evidence.get("na_reason", ""),
+                                "evidence": ev}
+    return sorted(best.values(), key=lambda v: (v["bundle"], v["probe_id"]))
+
+
 def gather_context(repo: pathlib.Path) -> str:
     tree = subprocess.run(["bash", "-c",
                            f"cd {repo} && (git ls-files 2>/dev/null || find . -type f) "
@@ -1397,7 +1424,8 @@ def main():
                       platform=report.platform, bot_challenge=report.bot_challenge,
                       challenge_stage=report.challenge_stage, challenge_onset=report.challenge_onset,
                       request_counts=report.request_counts, blocked_probes=report.blocked_probes,
-                      incomplete_axes=report.incomplete_axes, findings=findings)
+                      incomplete_axes=report.incomplete_axes, findings=findings,
+                      verdicts=_verdicts(report.outcomes))   # applied-but-unfired probes -> dark-recall audit set
         if report.trace:   # --trace only: per-probe request log (payloads/endpoints), viewable via stats.py --audit
             result["trace"] = report.trace
         if args.recon:

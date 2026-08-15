@@ -60,11 +60,16 @@ def _make_app(mode):   # durable | lossy | atomic | racy
                 if mode != "lossy":                          # durable/atomic/racy store; lossy drops the write
                     items.append({"id": iid, **body})
                 return self._j(201, {"id": iid})
+            if path == "/api/recommendation":               # a stateless RPC: 2xx, computes, persists nothing
+                return self._j(200, {"score": 0.7})
             return self._j(404, {})
 
         def do_GET(self):
-            if urlparse(self.path).path == "/api/items":
+            path = urlparse(self.path).path
+            if path == "/api/items":
                 return self._j(200, {"items": items})
+            if path == "/api/recommendation":               # sibling is a status/config OBJECT, not a collection
+                return self._j(200, {"hasApiKey": False})
             return self._j(404, {})
     return H
 
@@ -107,6 +112,22 @@ def test_integrity_clean_when_durable():
 
 def test_integrity_na_without_create_endpoint():
     assert _run(data_integrity_list_roundtrip, "durable", endpoints=[]) is None
+
+
+def test_integrity_na_on_a_stateless_rpc_not_a_collection():
+    # the v18 FP class (3 of 4 fires: encounter/recommendation/config): POST is 2xx but its sibling GET is a
+    # status/config OBJECT, not a resource list -> nothing was ever persisted there -> N/A, not silent data loss.
+    rpc = [Endpoint(path="/api/recommendation", method="post", raw_path="/api/recommendation",
+                    body_fields=["task"])]
+    assert _run(data_integrity_list_roundtrip, "durable", endpoints=rpc) is None
+
+
+def test_integrity_na_on_an_auth_endpoint():
+    # fahimni's /backend/auth.php fired here: a login POST has body fields but its 'collection' is not a public
+    # data list. A password field (or an auth-verb path) excludes it from the create set -> N/A.
+    auth = [Endpoint(path="/api/login", method="post", raw_path="/api/login",
+                     body_fields=["username", "password"])]
+    assert _run(data_integrity_list_roundtrip, "durable", endpoints=auth) is None
 
 
 def test_race_fires_on_duplicate_ids_under_concurrency():

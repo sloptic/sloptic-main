@@ -28,7 +28,7 @@ _SUFFIX_PLATFORM = {
     "github.io": "github-pages", "herokuapp.com": "heroku", "run.app": "google-cloud-run", "deno.dev": "deno",
     "replit.app": "replit", "repl.co": "replit", "surge.sh": "surge", "glitch.me": "glitch",
     "koyeb.app": "koyeb", "adaptable.app": "adaptable", "streamlit.app": "streamlit", "cyclic.app": "cyclic",
-    "lovable.app": "lovable", "lovableproject.com": "lovable", "bolt.host": "bolt",
+    "lovable.app": "lovable", "lovableproject.com": "lovable", "bolt.host": "bolt", "base44.app": "base44",
 }
 # suffixes that are ALSO an AI builder's own hosting (host and builder are the same origin)
 _BUILDER_SUFFIX = {"lovable.app": "lovable", "lovableproject.com": "lovable", "bolt.host": "bolt"}
@@ -101,8 +101,9 @@ def classify(base_url: str, headers: dict | None, html: str | None) -> dict:
     suf_plat = _platform_by_suffix(host)
     if suf_plat:
         signals.append("suffix:" + suf_plat)
-        if not hp:
-            hp = suf_plat            # no leaking header (custom domain masked, or a plain static host) -> suffix
+        if not hp or suf_plat == "base44":   # base44 apps run ON render and leak x-render-origin-server, but a
+            hp = suf_plat                     # *.base44.app host IS a base44 platform app -> the suffix is
+            #                                   authoritative over the leaked backend header (else it reads render)
 
     # --- builder (from served markup; a builder can sit on any host) ---
     builder = _builder_by_suffix(host)
@@ -133,8 +134,48 @@ def classify(base_url: str, headers: dict | None, html: str | None) -> dict:
 # PaaS that runs the team's container (railway / render / fly / heroku / replit) is NOT here: there the app
 # owns its own rate-limiting + capacity, so those probes stay live.
 _EDGE_MANAGED_HOSTS = frozenset({"vercel", "netlify", "cloudflare-pages", "cloudflare-workers", "firebase",
-                                 "github-pages", "amplify"})
+                                 "github-pages", "amplify", "base44"})   # base44 = a BaaS platform (like firebase):
+#                        it OWNS auth + scaling, so its /api/auth/login rate-limiting is the vendor's, not the team's
 _EDGE_CDNS = frozenset({"cloudflare", "fastly", "cloudfront"})
+
+
+# WRONG-OWNER hosts: a graded URL that is NOT the team's own engineered web app, so a black-box grade measures
+# the third party / platform, not the submission (the v18 audit's cross-cutting wrong-owner root cause). Two
+# tiers. TIER 1 -- a third-party product / raw storage / a slide deck / an EDITOR url: never a team's app.
+# TIER 2 -- a no-code SITE/app builder whose surface (headers/auth/perf/rate-limit) is the PLATFORM's config,
+# not the team's engineering (same reason edge_managed / SHELL_ONLY exclude). Deliberately NOT here (first-party):
+# tiiny.site (the team uploads their OWN built dist), and AI-code-GENERATORS that emit owned code -- base44.app,
+# a DEPLOYED lovable.app, bolt -- plus every real code host (vercel/netlify/render/railway/fly/github-pages/...).
+_WRONG_OWNER_SUFFIX = {
+    # TIER 1: third-party products / raw storage / presentations / designs
+    "atlassian.net": "atlassian", "sharepoint.com": "sharepoint",
+    "notion.site": "notion", "notion.so": "notion",
+    "withgoogle.com": "google-product", "docs.google.com": "google-product",
+    "sites.google.com": "google-product", "drive.google.com": "google-product",
+    "gamma.app": "presentation", "gamma.site": "presentation", "canva.site": "design-tool",
+    # TIER 2: no-code site/app builders (the surface is the platform's, not the team's)
+    "softr.app": "no-code-site", "wixsite.com": "no-code-site", "wix.com": "no-code-site",
+    "wix-vibe.com": "no-code-site", "wix-vibe-site.com": "no-code-site",
+    "framer.app": "no-code-site", "framer.website": "no-code-site", "framer.media": "no-code-site",
+    "carrd.co": "no-code-site", "glide.page": "no-code-site", "glideapp.io": "no-code-site",
+    "bubbleapps.io": "no-code-site", "retool.app": "no-code-site",
+}
+
+
+def wrong_owner_host(host: str) -> str | None:
+    """The wrong-owner CATEGORY of a host (a third-party/platform surface that isn't the team's engineered app),
+    else None. Pure over the host, so it classifies both live grades and stored records."""
+    h = (host or "").split("/")[0].split(":")[0].lower().rstrip(".")
+    if not h:
+        return None
+    if h.startswith("id-preview--") and h.endswith("lovable.app"):
+        return "editor-preview"          # the Lovable EDITOR, not the deployed app (the real deploy is elsewhere)
+    if h == "s3.amazonaws.com" or ".s3." in h or (h.startswith("s3-") and h.endswith(".amazonaws.com")):
+        return "s3-bucket"               # raw object storage (NOT elasticbeanstalk/EC2 -- those run the team's app)
+    for suf, cat in _WRONG_OWNER_SUFFIX.items():
+        if h == suf or h.endswith("." + suf):
+            return cat
+    return None
 
 
 def edge_managed(plat: dict) -> bool:

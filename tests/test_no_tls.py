@@ -30,6 +30,13 @@ def test_decision_http_upgrading_to_https_is_clean():
     assert _no_tls_decision("http://example.com", 301, "https://example.com/") is False
 
 
+def test_decision_blocked_or_errored_status_is_na():
+    # a WAF 403 / rate-limit 429 / server error 5xx / not-found masks the real TLS behavior (netlify's
+    # http->https 301 came back as a 403 to the probe) -> can't assess -> N/A, not a false "no TLS" fire
+    for st in (401, 403, 404, 429, 500, 503):
+        assert _no_tls_decision("http://example.com", st, "") is None, st
+
+
 def test_decision_https_origin_is_na():
     assert _no_tls_decision("https://example.com", 200, "") is None
 

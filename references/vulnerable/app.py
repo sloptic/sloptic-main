@@ -186,8 +186,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path == "/register":
             length = int(self.headers.get("Content-Length", "0"))
             form = urllib.parse.parse_qs(self.rfile.read(length).decode())
-            user = form.get("username", ["anon"])[0] or "anon"
+            user = form.get("username", [""])[0]
+            if not user:
+                return self._send(400, "username required")  # the field IS required -> an empty body is rejected
             _SESSIONS[user] = user  # vulnerable: session token == username (guessable)
+            # ...but the declared type=email is NEVER validated: an invalid email is accepted (client-only
+            # validation) -> qa-input-001 fires. Rejecting the empty body is what makes it an INPUT-DEPENDENT
+            # enforcement gap, not the shell/auth-guard pattern the probe now (correctly) suppresses.
             return self._send(200, "account created", cookie="session=" + user)
         if self.path == "/notes":  # create a note owned by the current session's user
             length = int(self.headers.get("Content-Length", "0"))

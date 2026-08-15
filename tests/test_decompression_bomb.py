@@ -36,6 +36,11 @@ def _handler(mode):
                     raw = gzip.decompress(raw)           # uncapped -> a bomb expands unchecked
                     if mode == "crash5xx" and len(raw) > 1_000_000:
                         return self._end(500)            # decompressed the whole 50MB, then choked on the SIZE
+                    if mode == "midsize400":             # the 10KB control is REJECTED (not a live 2xx handler);
+                        if len(raw) > 1_000_000:         # the 50MB bomb 500s -> old code fired, but the control
+                            return self._end(500)        # not being 2xx means the 500 isn't provably size-driven
+                        if len(raw) > 5000:              # on a live endpoint (v18: /ingest 404/400 controls)
+                            return self._end(400)
             try:
                 json.loads(raw)
                 self._end(200)
@@ -90,3 +95,10 @@ def test_dos_fires_on_size_driven_5xx(server):
     # provable exhaustion: the 50MB body 500s the app while a 10KB control (same shape) returns 200 -> the
     # SIZE crashed it, not a broken gzip handler.
     assert decompression_bomb(_ctx(server("crash5xx")), _Probe()) is True
+
+
+def test_dos_clean_when_control_is_not_live_2xx(server):
+    # the 50MB body 500s, but the 10KB control returns 400 (the endpoint isn't a live 2xx body handler) -> the
+    # 500 is infra rejecting a huge upload to a dead/wrong route, not decompression exhaustion. v18 FP: /ingest
+    # & /api/ingest with 404 controls, /api/auth/login with a 400 control. Control must be 2xx to score.
+    assert decompression_bomb(_ctx(server("midsize400")), _Probe()) is not True

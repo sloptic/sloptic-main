@@ -1,14 +1,17 @@
 id: perf-weight-001
 bundle: performance
 category: page-weight
-variant_group_id: perf-weight
 pool: public
-evidence_model: provable
-penalty: 12   # standardized-profile page weight (>2MB) -> heavy load for every visitor.
-              # Grouped w/ perf-weight-002 (the worse tier fires once).
+evidence_model: oracle
+penalty: 22   # PROVISIONAL (re-priced on v19). Heavy page (transfer bytes). Lighthouse total-byte-weight.
+              # needs=2MB half, fail=4MB full -- tiering collapses the old profile+ceiling probes into one.
 applicability:
-  requires: [at_least_one_http_endpoint_exists]
+  requires: [lighthouse]
 probe:
-  predicate: perf_page_weight
-  tier: profile
-  target: /
+  predicate: lighthouse_audit
+  report_only: true   # OFF-SCORE: fires as a per-metric diagnostic finding at 0 penalty;
+                      # the perf axis is scored once on the overall headline (perf-lighthouse-001).
+  audit: total-byte-weight
+  mode: numeric
+  needs_above: 2000000
+  fail_above: 4000000
