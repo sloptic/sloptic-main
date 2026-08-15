@@ -279,6 +279,10 @@ def _build_cmd(j, args, ckpt):
             cmd += ["--platform-host", h]
     else:
         cmd += ["--attempts", str(args.attempts), "--build-timeout", str(args.build_timeout), "--checkpoint", str(ckpt)]
+        if args.max_repo_mb:                                     # repo-only throughput knobs (no-op for --url)
+            cmd += ["--max-repo-mb", str(args.max_repo_mb)]
+        if args.retry_timeouts:
+            cmd += ["--retry-timeouts"]
     if not args.browser:
         cmd += ["--no-browser"]
     if args.audit_coverage:
@@ -474,6 +478,12 @@ def main():
     ap.add_argument("--attempts", type=int, default=3, help="deploy attempts per repo")
     ap.add_argument("--build-timeout", type=int, default=480, dest="build_timeout",
                     help="per-repo docker build timeout in seconds (default 480; lower = more throughput)")
+    ap.add_argument("--max-repo-mb", type=int, default=0, dest="max_repo_mb",
+                    help="forward to deploy_and_grade: skip repos larger than this MB (committed node_modules/"
+                         "datasets/weights), pre-clone via GitHub API. 0 = off; ~300 is a good throughput knob.")
+    ap.add_argument("--retry-timeouts", action="store_true", dest="retry_timeouts",
+                    help="forward to deploy_and_grade: retry a BUILD TIMEOUT (default: give up, it's a "
+                         "'too heavy' verdict, not a fixable error).")
     ap.add_argument("--grade-timeout", type=int, default=480, dest="grade_timeout",
                     help="grading's OWN wall-clock budget in seconds (default 480), externally enforced — "
                          "independent of deploy time so a slow 3-attempt deploy can't leave grading no room")
@@ -572,6 +582,9 @@ def main():
     # concurrency, which is otherwise unrecoverable from the results and was uncheckable when it mattered.
     os.environ.setdefault("HL_RUN_ID", provenance.run_id())
     os.environ["HL_CONCURRENCY"] = str(conc)
+    if conc > 1:   # serialize the CPU-timing-sensitive Lighthouse trace across the concurrent (URL-phase) grade
+        os.environ.setdefault("SLOPTIC_LIGHTHOUSE_LOCK",   # processes -- one Chrome trace host-wide at a time
+                              os.path.abspath(args.results) + ".lhlock")
     if conc > 1:
         note = f" · url {conc}-wide" + (f", {len(repo_jobs)} repo serial" if repo_jobs else "")
         print(f"   concurrency: {conc}{note}", flush=True)

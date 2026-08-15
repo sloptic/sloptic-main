@@ -7,10 +7,17 @@ so multiple vulnerable endpoints cost more than one but less than linearly.
 """
 from __future__ import annotations
 
+import contextlib
+import os
 import time
 from dataclasses import dataclass, field, replace
 
 import httpx
+
+try:
+    import fcntl
+except ImportError:   # non-POSIX (Windows) -> the cross-process Lighthouse lock degrades to a no-op
+    fcntl = None
 
 from . import auth, lighthouse, platform_id, safety, secretscan
 from .aggregate import compute_axis_slop, compute_slop_score, coverage_metrics
@@ -80,6 +87,35 @@ class _Ctx:
 
 def _applicable(probe: Probe, profile: Profile) -> bool:
     return all(profile.capabilities.get(req, False) for req in probe.applicability.requires)
+
+
+def _needs_lighthouse(catalog: list[Probe]) -> bool:
+    """Should the pipeline spend the ~2-3min Lighthouse run for this catalog? Iff some probe DECLARES it needs
+    the `lighthouse` capability. Keyed on the declared requirement (not a predicate name) so scoring can't go
+    dark when predicates change: perf-lighthouse-001 (predicate lighthouse_perf_score) and the report_only
+    lighthouse_audit diagnostics all declare `requires: [lighthouse]`, so any one of them triggers the run."""
+    return any("lighthouse" in p.applicability.requires for p in catalog)
+
+
+@contextlib.contextmanager
+def _lighthouse_lock():
+    """Serialize the Lighthouse perf trace across concurrent grade PROCESSES. run_batch shells one
+    deploy_and_grade per repo, so a thread lock wouldn't help -- this is a cross-process file lock. When
+    SLOPTIC_LIGHTHOUSE_LOCK names a path, flock it EXCLUSIVE around measure() so only ONE Chrome trace runs
+    host-wide at a time: two concurrent traces on a shared CPU wreck each other's LCP/TBT (and median-of-3
+    can't rescue three contended runs). Unset -> no lock, no cost, the right thing for serial runs. NOTE this
+    covers Lighthouse-vs-Lighthouse only, not a docker build running alongside a trace; --concurrency 1 stays
+    the pristine-timing choice on a CPU-bound box."""
+    path = os.environ.get("SLOPTIC_LIGHTHOUSE_LOCK")
+    if not path or fcntl is None:
+        yield
+        return
+    with open(path, "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)   # blocks until the other grade's trace finishes
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
 
 
 def _fetch_path(probe: Probe, client: httpx.Client, path: str) -> httpx.Response:
@@ -297,14 +333,19 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
             if profile.render_state in ("error", "stuck"):
                 return Report(slop_score=0, outcomes=[], surface=surface_metrics(profile),
                               platform=platform_id.classify_live(client, origin), trace=trace_sink or [])
-            # PERF: run Lighthouse ONCE (pinned 13.4.1, median-of-N) and cache it on ctx for the lighthouse_audit
-            # probes. Gated on the catalog carrying such a probe (skip the ~2-3min run otherwise) and on the app
-            # being real+reachable (past the entry gate + shell short-circuit above). Best-effort: on failure
+            # PERF: run Lighthouse ONCE (pinned 13.4.1, median-of-N) and cache it on ctx for the Lighthouse-backed
+            # probes. Gated on the catalog carrying a probe that DECLARES `requires: [lighthouse]` (skip the ~2-3min
+            # run otherwise) and on the app being real+reachable (past the entry gate + shell short-circuit above).
+            # Keying on the declared capability, NOT a predicate name, so it stays correct as predicates are added:
+            # the SCORING probe perf-lighthouse-001 uses `lighthouse_perf_score`, which a `== "lighthouse_audit"`
+            # check silently missed (perf axis would go dark if the report_only lighthouse_audit probes were ever
+            # dropped, and a `--probe perf-lighthouse-001` subset never triggered the run). Best-effort: on failure
             # ctx.lighthouse stays None -> those probes read N/A, never DNF the grade. Grade the LANDING page (a
             # sub-path deploy's real app), not the bare origin. Sets the `lighthouse` capability so the YAMLs gate.
-            if any(p.probe.get("predicate") == "lighthouse_audit" for p in catalog):
+            if _needs_lighthouse(catalog):
                 try:
-                    ctx.lighthouse = lighthouse.measure(origin.rstrip("/") + (profile.landing_path or "/"))
+                    with _lighthouse_lock():   # host-wide: one Chrome perf trace at a time under --concurrency
+                        ctx.lighthouse = lighthouse.measure(origin.rstrip("/") + (profile.landing_path or "/"))
                     profile.capabilities["lighthouse"] = True
                 except lighthouse.PSIError:
                     pass

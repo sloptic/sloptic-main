@@ -9,7 +9,8 @@ import pathlib
 
 from sloptic.catalog import load_catalog
 from sloptic.deploy import SubprocessDeployer
-from sloptic.pipeline import run
+from sloptic.pipeline import run, _needs_lighthouse
+from sloptic.schema import Applicability, Probe
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 CATALOG = ROOT / "catalog"
@@ -265,6 +266,33 @@ def test_progress_callback_fires_per_probe():
     starts = sum(1 for _, is_start in events if is_start)   # outcomes is None -> a start event
     dones = sum(1 for _, is_start in events if not is_start)
     assert starts == n and dones == n  # one start + one done per probe, none skipped
+
+
+def test_lighthouse_lock_noops_without_env_and_serializes_with(tmp_path, monkeypatch):
+    # the cross-process semaphore around the Lighthouse trace: no env var -> a plain no-op (serial runs pay
+    # nothing); env set -> flock the file EXCLUSIVE for the trace's duration, released after so it's re-acquirable.
+    from sloptic.pipeline import _lighthouse_lock
+    monkeypatch.delenv("SLOPTIC_LIGHTHOUSE_LOCK", raising=False)
+    with _lighthouse_lock():                       # unset -> no-op, must not raise or block
+        pass
+    lock = tmp_path / "lh.lock"
+    monkeypatch.setenv("SLOPTIC_LIGHTHOUSE_LOCK", str(lock))
+    with _lighthouse_lock():                        # acquires the exclusive lock
+        assert lock.exists()
+    with _lighthouse_lock():                        # released above -> re-acquirable in-process (no deadlock)
+        pass
+
+
+def test_needs_lighthouse_keys_on_the_declared_capability_not_the_predicate_name():
+    # the Lighthouse-run gate must trigger for the SCORING probe (predicate lighthouse_perf_score), not only
+    # the report_only lighthouse_audit diagnostics -- else a --probe perf-lighthouse-001 subset, or dropping
+    # the diagnostics, would silently take the whole perf axis dark.
+    def probe(pred, requires):
+        return Probe(id="t", bundle="performance", category="overall", penalty=1,
+                     probe={"predicate": pred}, applicability=Applicability(requires=requires))
+    assert _needs_lighthouse([probe("lighthouse_perf_score", ["lighthouse"])])   # the scoring probe ALONE
+    assert _needs_lighthouse([probe("lighthouse_audit", ["lighthouse"])])        # a report_only diagnostic
+    assert not _needs_lighthouse([probe("broken_links", [])])                    # no lighthouse-dependent probe
 
 
 def test_a_predicate_can_override_its_penalty_absolutely(monkeypatch):
