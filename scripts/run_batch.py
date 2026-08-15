@@ -279,9 +279,9 @@ def _build_cmd(j, args, ckpt):
             cmd += ["--platform-host", h]
     else:
         cmd += ["--attempts", str(args.attempts), "--build-timeout", str(args.build_timeout), "--checkpoint", str(ckpt)]
-        if args.max_repo_mb:                                     # repo-only throughput knobs (no-op for --url)
+        if getattr(args, "max_repo_mb", 0):                     # repo-only throughput knobs (no-op for --url)
             cmd += ["--max-repo-mb", str(args.max_repo_mb)]
-        if args.retry_timeouts:
+        if getattr(args, "retry_timeouts", False):
             cmd += ["--retry-timeouts"]
     if not args.browser:
         cmd += ["--no-browser"]
