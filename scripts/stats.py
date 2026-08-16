@@ -172,10 +172,12 @@ def _is_graded(r):
 
 
 def _slop_stats(xs):
-    """median / mean / (population) stdev of a score list -- None where the sample is too small to define one
-    (stdev needs >=2). pstdev matches section (b)'s overall spread."""
-    return {"median": round(statistics.median(xs), 1) if xs else None,
+    """min / median / mean / max / (population) stdev of a score list -- None where the sample is too small to
+    define one (stdev needs >=2). pstdev matches section (b)'s overall spread."""
+    return {"min": min(xs) if xs else None,
+            "median": round(statistics.median(xs), 1) if xs else None,
             "mean": round(statistics.mean(xs), 1) if xs else None,
+            "max": max(xs) if xs else None,
             "stdev": round(statistics.pstdev(xs), 1) if len(xs) >= 2 else None}
 
 
@@ -228,9 +230,11 @@ def by_hackathon(recs):
         s, w = _slop_stats(d["graded"]), _slop_stats(d["win_scores"])
         rows.append({"hackathon": h, "subs": d["subs"], "graded": len(d["graded"]),
                      "deploy_pct": round(100 * d["deployed"] / d["repo"]) if d["repo"] else None,
-                     "median_slop": s["median"], "mean_slop": s["mean"], "stdev_slop": s["stdev"],
+                     "min_slop": s["min"], "median_slop": s["median"], "mean_slop": s["mean"],
+                     "max_slop": s["max"], "stdev_slop": s["stdev"],
                      "winners": d["winners"], "winner_graded": len(d["win_scores"]),
-                     "winner_median": w["median"], "winner_mean": w["mean"], "winner_stdev": w["stdev"]})
+                     "winner_min": w["min"], "winner_median": w["median"], "winner_mean": w["mean"],
+                     "winner_max": w["max"], "winner_stdev": w["stdev"]})
     rows.sort(key=lambda x: -x["subs"])
     return rows
 
@@ -504,13 +508,15 @@ def main():
     def _f(v):   # a stat cell: em-dash when undefined (too small a sample), else one decimal
         return "—" if v is None else f"{v:.1f}"
     print(f"\n(a2) BY HACKATHON  ({len(hk_rows)} hackathons — source attribution)   [slop = whole cohort · w.* = winners only]")
-    print(f"     {'hackathon':<32}{'subs':>5}{'grd':>5}{'med':>7}{'mean':>7}{'sd':>6}"
-          f"{'win':>5}{'w.grd':>6}{'w.med':>7}{'w.mean':>8}{'w.sd':>6}")
+    print(f"     {'hackathon':<28}{'subs':>5}{'grd':>4}{'min':>6}{'med':>6}{'mean':>6}{'max':>6}{'sd':>5}"
+          f"{'win':>5}{'w.grd':>6}{'w.min':>6}{'w.med':>6}{'w.mean':>7}{'w.max':>6}{'w.sd':>5}")
     for row in hk_rows:
-        print(f"     {row['hackathon'][:32]:<32}{row['subs']:>5}{row['graded']:>5}"
-              f"{_f(row['median_slop']):>7}{_f(row['mean_slop']):>7}{_f(row['stdev_slop']):>6}"
-              f"{row['winners']:>5}{row['winner_graded']:>6}{_f(row['winner_median']):>7}"
-              f"{_f(row['winner_mean']):>8}{_f(row['winner_stdev']):>6}")
+        print(f"     {row['hackathon'][:28]:<28}{row['subs']:>5}{row['graded']:>4}"
+              f"{_f(row['min_slop']):>6}{_f(row['median_slop']):>6}{_f(row['mean_slop']):>6}"
+              f"{_f(row['max_slop']):>6}{_f(row['stdev_slop']):>5}"
+              f"{row['winners']:>5}{row['winner_graded']:>6}{_f(row['winner_min']):>6}"
+              f"{_f(row['winner_median']):>6}{_f(row['winner_mean']):>7}{_f(row['winner_max']):>6}"
+              f"{_f(row['winner_stdev']):>5}")
     if hk_ranked:   # which hackathons produced the sloppiest / cleanest apps (min 10 graded, so it's not noise)
         top = sorted(hk_ranked, key=lambda x: -x["median_slop"])[:3]
         bot = sorted(hk_ranked, key=lambda x: x["median_slop"])[:3]

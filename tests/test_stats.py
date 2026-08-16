@@ -74,12 +74,15 @@ def test_by_hackathon_computes_slop_and_winner_stats():
     t = rows[0]
     assert t["subs"] == 4 and t["graded"] == 3 and t["deploy_pct"] == 75               # 3 of 4 repo apps deployed
     assert t["median_slop"] == 50 and t["mean_slop"] == 50.0 and t["stdev_slop"] == 8.2  # pstdev(40,50,60)
+    assert t["min_slop"] == 40 and t["max_slop"] == 60                                  # pool range (40,50,60)
     assert t["winners"] == 3 and t["winner_graded"] == 2                                # 3 flagged, 2 graded
     assert t["winner_median"] == 50 and t["winner_mean"] == 50.0                        # over the graded winners 40,60
     assert t["winner_stdev"] == 10.0                                                    # pstdev(40,60)
+    assert t["winner_min"] == 40 and t["winner_max"] == 60                              # winner range (40,60)
     la = rows[1]
     assert la["deploy_pct"] is None and la["graded"] == 1                               # URL cohort -> deploy N/A
     assert la["median_slop"] == 20 and la["stdev_slop"] is None                         # n=1 -> stdev undefined
+    assert la["min_slop"] == 20 and la["max_slop"] == 20                                # n=1 -> min==max==the value
     assert la["winners"] == 0 and la["winner_median"] is None and la["winner_stdev"] is None
 
 
