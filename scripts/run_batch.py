@@ -583,11 +583,12 @@ def main():
     os.environ.setdefault("HL_RUN_ID", provenance.run_id())
     os.environ["HL_CONCURRENCY"] = str(conc)
     if conc > 1:   # serialize the CPU-timing-sensitive Lighthouse trace across the concurrent (URL-phase) grade
-        os.environ.setdefault("SLOPTIC_LIGHTHOUSE_LOCK",   # processes -- one Chrome trace host-wide at a time
+        os.environ.setdefault("SLOPTIC_LIGHTHOUSE_LOCK",   # processes -- N trace lanes host-wide (SLOTS)
                               os.path.abspath(args.results) + ".lhlock")
-    if conc > 1:
+        slots = os.environ.get("SLOPTIC_LIGHTHOUSE_SLOTS", "1")   # display the actual Lighthouse throttle so a
+        runs = os.environ.get("SLOPTIC_LIGHTHOUSE_RUNS", "3")     # long run's perf-timing config is on the record
         note = f" · url {conc}-wide" + (f", {len(repo_jobs)} repo serial" if repo_jobs else "")
-        print(f"   concurrency: {conc}{note}", flush=True)
+        print(f"   concurrency: {conc}{note} · lighthouse: {slots} lanes, median-{runs}", flush=True)
     prog = _Progress(len(repo_jobs) + len(url_jobs))   # drives the ETA in BOTH --tldr and the full-dump footer
     cap = args.tldr        # --tldr captures (suppresses) each child's dump; we print one line from its record
     try:
