@@ -190,6 +190,7 @@ def lighthouse_scores(recs):
         if isinstance(lh, dict) and lh.get("performance") is not None:
             xs.append(lh["performance"])
     q = statistics.quantiles(xs, n=4) if len(xs) >= 2 else None   # [Q1, Q2, Q3]; needs >=2 points
+    green = sum(1 for x in xs if x >= 90)   # >=90 is Lighthouse's green line = the 90-N floor => ZERO perf slop
     return {"performance": {"n": len(xs),
                             "min": min(xs) if xs else None,
                             "q1": round(q[0]) if q else None,
@@ -197,7 +198,9 @@ def lighthouse_scores(recs):
                             "q3": round(q[2]) if q else None,
                             "max": max(xs) if xs else None,
                             "mean": round(statistics.mean(xs), 1) if xs else None,
-                            "stdev": round(statistics.pstdev(xs), 1) if len(xs) >= 2 else None}}
+                            "stdev": round(statistics.pstdev(xs), 1) if len(xs) >= 2 else None,
+                            "green_n": green,
+                            "pct_green": round(100 * green / len(xs), 1) if xs else None}}
 
 
 def by_hackathon(recs):
@@ -441,6 +444,9 @@ def main():
             "probe_fire_frequency": {pid: n for pid, n in freq},
             "by_hackathon": hk_rows,
             "lighthouse_scores": lighthouse_scores(graded),
+            "lighthouse_by_winner": {
+                "winners": lighthouse_scores([r for r in graded if r.get("winner") is True])["performance"],
+                "non_winners": lighthouse_scores([r for r in graded if r.get("winner") is False])["performance"]},
             "winners": {"n": len(win_scores), "avg": round(statistics.mean(win_scores), 1) if win_scores else None},
             "non_winners": {"n": len(non_scores), "avg": round(statistics.mean(non_scores), 1) if non_scores else None},
             "anomalies": {"zeros": [r["repo"] for r in zeros], "thin": [r["repo"] for r in thin],
@@ -534,6 +540,12 @@ def main():
         print(f"\n(b2) LIGHTHOUSE PERFORMANCE (0-100)   higher is better")
         print(f"     5-number:  min {s['min']}  ·  Q1 {s['q1']}  ·  median {s['median']}  ·  Q3 {s['q3']}  ·  max {s['max']}")
         print(f"     mean {s['mean']}  ·  stdev {s['stdev']}  (n {s['n']})")
+        print(f"     green (>=90 -> ZERO perf slop): {s['green_n']}/{s['n']} ({s['pct_green']}%)")
+        win = lighthouse_scores([r for r in graded if r.get("winner") is True])["performance"]
+        non = lighthouse_scores([r for r in graded if r.get("winner") is False])["performance"]
+        if win["n"] and non["n"]:
+            print(f"     winners     (n {win['n']:>4}):  median {win['median']:>3}  mean {win['mean']:>5}  green {win['pct_green']}%")
+            print(f"     non-winners (n {non['n']:>4}):  median {non['median']:>3}  mean {non['mean']:>5}  green {non['pct_green']}%")
 
     # (c)
     print(f"\n(c) PER-PROBE FIRE-FREQUENCY  (# of the {len(graded)} graded apps each probe fired on)")

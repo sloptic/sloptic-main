@@ -97,5 +97,6 @@ def test_lighthouse_scores_summarize_performance_and_empty_otherwise():
     recs = [_lh(90), _lh(60), _lh(None), _rec()]   # last two lack a perf score / any lighthouse block
     s = lighthouse_scores(recs)["performance"]
     assert s["n"] == 2 and s["median"] == 75 and s["min"] == 60 and s["max"] == 90   # median(60,90)
+    assert s["green_n"] == 1 and s["pct_green"] == 50.0   # only the 90 is >=90 (green -> zero perf slop)
     # a pre-Lighthouse corpus (no scores) -> n=0, all None -> the (b2) section self-skips
     assert lighthouse_scores([_rec(), _rec()])["performance"]["n"] == 0
