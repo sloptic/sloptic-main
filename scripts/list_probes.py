@@ -32,17 +32,29 @@ def _check(p) -> str:
     return "slop_if:" + ",".join(matchers) if matchers else "(declarative)"
 
 
+# Predicates whose REAL penalty is computed at grade time (via evidence["penalty_override"]), so the catalog
+# nominal is misleading. Keyed on predicate -> human formula; the PEN cell shows "*" and a footnote gives the
+# formula. (report_only probes are handled separately -> a flat 0.)
+_COMPUTED_PENALTY = {
+    "lighthouse_perf_score": "max(0, 90 - N), N = Lighthouse perf score (0-100)",
+    "a11y_violations_present": "sum of per-rule axe severities (can exceed the nominal)",
+    "a11y_hard_fails": "sum of per-rule severities of the static a11y hard-fails",
+}
+
+
 def _rows(catalog):
     for p in sorted(catalog, key=lambda x: (x.bundle, x.category, x.id)):
         # report_only probes FIRE as diagnostics but are forced to penalty 0 (they contribute nothing to the
         # score -- e.g. the per-audit Lighthouse probes, since perf is scored once on the overall headline).
         # Show their EFFECTIVE penalty (0) + an [off-score] marker so the table isn't read as if they still score.
         report_only = bool(p.probe.get("report_only"))
+        pen_note = "" if report_only else _COMPUTED_PENALTY.get(p.probe.get("predicate"), "")
         yield {
             "id": p.id,
             "bundle": p.bundle,
             "category": p.category,
-            "penalty": 0 if report_only else p.penalty,
+            "penalty": 0 if report_only else p.penalty,   # nominal; see penalty_note for computed-at-grade-time
+            "penalty_note": pen_note,
             "pool": p.pool,
             "evidence_model": p.evidence_model,
             "variant_group": p.variant_group_id or "",
@@ -94,7 +106,8 @@ def main() -> None:
         return
     if args.verbose:   # human: a report-card block per probe instead of the table
         for r in data:
-            print(f"\n{r['id']}  [{r['bundle']}/{r['category']}]  penalty {r['penalty']}"
+            print(f"\n{r['id']}  [{r['bundle']}/{r['category']}]  penalty "
+                  + (f"* ({r['penalty_note']})" if r.get("penalty_note") else str(r["penalty"]))
                   + (f"  ·  {r['variant_group']}" if r["variant_group"] else ""))
             print(f"  EXPECTED:    {r['card_expected']}")
             print(f"  INDICATES:   {r['card_indicates']}")
@@ -105,8 +118,18 @@ def main() -> None:
     header = "  ".join(h.ljust(w) for _, h, w in _COLS)
     print(header)
     print("-" * len(header))
+    notes = {}
     for r in data:
-        print("  ".join(str(r[k])[:w].ljust(w) for k, _, w in _COLS))
+        if r.get("penalty_note"):
+            notes[r["check"]] = r["penalty_note"]
+        cells = []
+        for k, _, w in _COLS:
+            v = "*" if (k == "penalty" and r.get("penalty_note")) else str(r[k])   # computed at grade time
+            cells.append(v[:w].ljust(w))
+        print("  ".join(cells))
+    print("-" * len(header))
+    for pred, note in sorted(notes.items()):
+        print(f"  * {pred}: real penalty = {note}")
 
     print("-" * len(header))
     raw = sum(p.penalty for p in catalog)
