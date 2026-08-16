@@ -34,17 +34,21 @@ def _check(p) -> str:
 
 def _rows(catalog):
     for p in sorted(catalog, key=lambda x: (x.bundle, x.category, x.id)):
+        # report_only probes FIRE as diagnostics but are forced to penalty 0 (they contribute nothing to the
+        # score -- e.g. the per-audit Lighthouse probes, since perf is scored once on the overall headline).
+        # Show their EFFECTIVE penalty (0) + an [off-score] marker so the table isn't read as if they still score.
+        report_only = bool(p.probe.get("report_only"))
         yield {
             "id": p.id,
             "bundle": p.bundle,
             "category": p.category,
-            "penalty": p.penalty,
+            "penalty": 0 if report_only else p.penalty,
             "pool": p.pool,
             "evidence_model": p.evidence_model,
             "variant_group": p.variant_group_id or "",
             "requires": ";".join(p.applicability.requires),
             "check": _check(p),
-            "why": describe(p),
+            "why": ("[off-score] " + describe(p)) if report_only else describe(p),
         }
 
 
@@ -53,7 +57,8 @@ def _worst_case(probes) -> int:
     (fires once at max) and per-category diminishing-returns (0.6**i) dampers are applied exactly as in
     a live grade. The realistic ceiling for a maximally-bad app, vs the naive raw penalty sum."""
     fired = [Outcome(probe_id=p.id, bundle=p.bundle, category=p.category, outcome="slop_detected",
-                     penalty=p.penalty, variant_group_id=p.variant_group_id) for p in probes]
+                     penalty=(0 if p.probe.get("report_only") else p.penalty),   # off-score probes add nothing
+                     variant_group_id=p.variant_group_id) for p in probes]
     return compute_slop_score(fired)
 
 
