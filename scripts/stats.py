@@ -55,11 +55,23 @@ def _source(r):
     return r.get("source") or ("url" if r.get("url_ingest") else "repo")
 
 
+def _scored(f):
+    """A finding that CONTRIBUTES to the score. report_only / off-score diagnostics (the per-audit Lighthouse
+    probes) must stay out of the concentration + fire-frequency views or they read as if they scored. Key on
+    the explicit `report_only` flag FIRST (robust to pre-leak-fix corpora where these leaked at penalty 1, not
+    0), then fall back to penalty>0 for any other zero-cost fire."""
+    if (f.get("evidence") or {}).get("report_only"):
+        return False
+    return f.get("penalty", 0) > 0
+
+
 def cat_subtotals(rec):
-    """Per-category DAMPED subtotal for one app, rebuilt from its findings — faithful to the live scorer
-    (variant-group collapse + within-category decay)."""
+    """Per-category DAMPED subtotal for one app, rebuilt from its SCORED findings — faithful to the live scorer
+    (variant-group collapse + within-category decay). Off-score diagnostics (penalty 0) are excluded."""
     by_cat = defaultdict(list)
     for f in rec.get("findings", []):
+        if not _scored(f):   # off-score diagnostics add 0 to the damper anyway; drop them so a category that is
+            continue         # ALL diagnostics (the report_only Lighthouse audits) doesn't show as a 0-value row
         # findings are deduped-with-count (one row per probe+reason); expand so the fan-out fired
         # instances are all present for the variant-group / decay dampers to reproduce the live score.
         for _ in range(f.get("count", 1)):
@@ -168,19 +180,24 @@ def _slop_stats(xs):
 
 
 def lighthouse_scores(recs):
-    """The Lighthouse performance score (0-100) across records that carry it -> {'performance': {n, median, mean,
-    min, max}} (values None when none do). This is the score the perf axis already grades on, surfaced for the
-    report. (Accessibility is NOT here on purpose: a11y is scored by the qa-a11y axe probes, not Lighthouse.)
-    Records graded before the Lighthouse cutover have no score, so the caller skips the section when n=0."""
+    """The Lighthouse performance score (0-100) across records that carry it -> {'performance': {n, min, q1,
+    median, q3, max (the 5-number summary), mean, stdev}} (values None when none do). This is the score the perf
+    axis already grades on, surfaced for the report. (Accessibility is NOT here on purpose: a11y is scored by the
+    qa-a11y axe probes, not Lighthouse.) Pre-Lighthouse-cutover records have no score, so the caller skips at n=0."""
     xs = []
     for r in recs:
         lh = (r.get("observed_surface") or {}).get("lighthouse")
         if isinstance(lh, dict) and lh.get("performance") is not None:
             xs.append(lh["performance"])
+    q = statistics.quantiles(xs, n=4) if len(xs) >= 2 else None   # [Q1, Q2, Q3]; needs >=2 points
     return {"performance": {"n": len(xs),
+                            "min": min(xs) if xs else None,
+                            "q1": round(q[0]) if q else None,
                             "median": round(statistics.median(xs)) if xs else None,
+                            "q3": round(q[2]) if q else None,
+                            "max": max(xs) if xs else None,
                             "mean": round(statistics.mean(xs), 1) if xs else None,
-                            "min": min(xs) if xs else None, "max": max(xs) if xs else None}}
+                            "stdev": round(statistics.pstdev(xs), 1) if len(xs) >= 2 else None}}
 
 
 def by_hackathon(recs):
@@ -288,6 +305,8 @@ def main():
     probe_meta = {}                      # probe_id -> (bundle, category)
     for r in graded:
         for f in r.get("findings", []):
+            if not _scored(f):   # off-score diagnostics (report_only) don't belong in the fire-frequency
+                continue
             probe_apps[f["probe_id"]].add(r["repo"])
             probe_meta[f["probe_id"]] = (f["bundle"], f["category"])
     freq = sorted(((pid, len(apps)) for pid, apps in probe_apps.items()), key=lambda x: -x[1])
@@ -512,8 +531,9 @@ def main():
     # pre-Lighthouse-cutover corpus, so the section self-skips. (a11y is scored by qa-a11y, not shown here.)
     s = lighthouse_scores(graded)["performance"]
     if s["n"]:
-        print(f"\n(b2) LIGHTHOUSE PERFORMANCE (0-100)")
-        print(f"     median {s['median']}  mean {s['mean']}  min {s['min']}  max {s['max']}  (n {s['n']})")
+        print(f"\n(b2) LIGHTHOUSE PERFORMANCE (0-100)   higher is better")
+        print(f"     5-number:  min {s['min']}  ·  Q1 {s['q1']}  ·  median {s['median']}  ·  Q3 {s['q3']}  ·  max {s['max']}")
+        print(f"     mean {s['mean']}  ·  stdev {s['stdev']}  (n {s['n']})")
 
     # (c)
     print(f"\n(c) PER-PROBE FIRE-FREQUENCY  (# of the {len(graded)} graded apps each probe fired on)")
