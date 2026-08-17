@@ -18,3 +18,8 @@ probe:
                          # it would suppress 28+ genuinely-dead CTAs (Login/Try now/GO PRO/...). The one FP class,
                          # download-link anchors, is closed in the observer's download channel (browser.py), not
                          # by raising this threshold.
+tp_definition: |
+  TP: a control that presents an action does NOTHING when activated -- the UI lies about what it can do.
+  NOT (confounders/FP): the control DOES act via a channel the probe cannot observe -- canvas/WebGL draw,
+  input.value= form-fill, new-tab/popup, clipboard, an already-active re-click, or an effect completing after
+  the observation window. Probe-blind != dead.

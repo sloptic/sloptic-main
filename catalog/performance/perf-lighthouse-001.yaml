@@ -13,3 +13,9 @@ probe:
   green_floor: 0.90   # Lighthouse's green cutoff: score >= this -> no perf slop (a clean, achievable, meaningful 0);
                       # flooring at green (not 100) also refuses to score the 90-100 measurement jitter
   scale: 1.0          # weigh the whole perf axis: 1.0 = full; drop below 1.0 to soften it without touching code
+tp_definition: |
+  TP: the app is genuinely slow/unoptimized for a real visitor -- Lighthouse's weighted score (median-of-3,
+  throttled) sits below green, reflecting real render/main-thread cost the team could reduce.
+  NOT (confounders/FP): a COLD-START / dormant-restart first load (free-tier spin-up) measured as if steady-
+  state -- median-of-3 tames a single cold run, but a still-spinning app reads falsely slow; or grader-side
+  CPU contention under --concurrency (serialize the trace via SLOTS).

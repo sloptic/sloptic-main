@@ -11,3 +11,9 @@ probe:
   # request a guaranteed-nonexistent typed static asset (/hlnope<rand>.js/.css/.png); a 2xx = soft-404.
   # typed-asset path keeps it SPA-safe (the standard /route->200 index rewrite is intended, not flagged)
   predicate: http_soft_404
+tp_definition: |
+  TP: a missing resource the APP ITSELF references returns a 2xx success shell, silently masking a REAL broken
+  asset (operative harm: a co-occurring load/parse failure).
+  NOT (confounders/FP): a RANDOM nonexistent asset returns the shell under the platform-recommended SPA
+  fallback (Netlify/Firebase/Vercel) with no app-referenced asset broken and no materialized harm (a
+  defensible config, not a defect); or builder-host routing the team does not control (bolt/figma/v0/base44).

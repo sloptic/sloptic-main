@@ -15,3 +15,9 @@ probe:
   # modulepreload> ships without an integrity= hash. same-origin resources need no SRI. N/A when none exist.
   predicate: subresource_integrity_missing
   target: /
+tp_definition: |
+  TP: a THIRD-PARTY, app-uncontrolled, code-executing subresource that SRI COULD protect is loaded without
+  integrity (a compromised CDN could inject undetectably).
+  NOT (confounders/FP): SRI is inapplicable so there is no better way (fonts.googleapis.com serves per-UA CSS,
+  a hash breaks it); first-party / app-controlled (registrable-domain match via the PSL); a non-executing
+  resource (preloaded image).

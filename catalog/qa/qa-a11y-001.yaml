@@ -21,3 +21,10 @@ probe:
   target: /
   threshold: 0   # fire on any axe-core WCAG 2 A/AA violation (~100 gold-standard rules: alt/label/lang/
                  # contrast/ARIA/structure); axe's deterministic `violations` set, so intent-independent
+tp_definition: |
+  TP: an axe barrier that genuinely EXCLUDES a user, where the fix is strictly better with no tradeoff --
+  missing alt / form label / accessible name / lang, or insufficient contrast.
+  NOT (confounders/FP): the barrier is not real for a user (scrollable-region-focusable where content IS
+  reachable); a violation misattributed to a THIRD-PARTY embedded widget, not the app's own markup.
+  NOTE: meta-viewport (user-scalable=no) IS a real barrier = a TP; it is over-PRICED as critical (a
+  re-pricing question), not a FP.

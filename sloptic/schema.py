@@ -20,6 +20,11 @@ class Probe(BaseModel):
     pool: str = "public"  # public | hidden
     evidence_model: str = "provable"  # provable | oracle (detection hint only)
     penalty: int  # slop added when the probe fires; deduction-only, so always positive
+    # What genuinely counts as a TRUE POSITIVE + the confounders to rule out (a FP is a fire that FAILS this).
+    # Recorded so an audit measures fires against a STATED def, not memory/vibes; doc-only, never affects scoring.
+    # Especially load-bearing for confounder-prone probes (timing/load/cold-start/presence-vs-use), where the
+    # defect and its mimic look identical; binary injection probes barely need it.
+    tp_definition: str = ""
     applicability: Applicability = Field(default_factory=Applicability)
     # Either {"predicate": name} for oracle probes, or {"method", "target"} for declarative ones.
     probe: dict[str, Any] = Field(default_factory=dict)

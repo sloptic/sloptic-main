@@ -11,3 +11,9 @@ applicability:
 probe:
   predicate: login_no_rate_limit
   attempts: 10   # wrong-password logins to fire; slop if none is throttled (429/423)
+tp_definition: |
+  TP: a REAL credential-checking login endpoint accepts unlimited wrong-password attempts (no throttle) ->
+  brute-forceable.
+  NOT (confounders/FP): no real login was found / the detected 'login' is not a credential gate (a 2xx
+  success or a non-rejecting form); or throttling was masked by the grader's OWN concurrency (a load
+  confounder -- trustworthy only graded in isolation).

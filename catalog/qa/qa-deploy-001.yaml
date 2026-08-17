@@ -11,3 +11,9 @@ applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:
   predicate: unreachable_backend_reference
+tp_definition: |
+  TP: the deployed app actually attempts, for a real visitor, a request to a backend no visitor can reach
+  (localhost / private IP) and the data layer fails -- an operative broken deploy.
+  NOT (confounders/FP): the address is PRESENT in the bundle but never requested in prod -- a dead
+  `env || localhost` fallback (the prod env override wins at runtime), a CORS/OAuth-origin allowlist entry, a
+  comment, or a corpus-shared template constant (e.g. localhost:9999). Presence != use.
