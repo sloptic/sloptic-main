@@ -71,6 +71,10 @@ def test_wrong_owner_host_flags_third_party_and_editor_surfaces():
         "zula85294.softr.app": "no-code-site",
         "my-site.wix-vibe.com": "no-code-site",
         "id-preview--abc123.lovable.app": "editor-preview",  # the Lovable EDITOR, not the deploy
+        "app.uizard.io": "design-tool",                      # v20: a Uizard DESIGN, not a deployed app
+        "www.tella.tv": "video-demo",                        # v20: a Tella demo VIDEO
+        "onedrive.live.com": "file-share",                   # v20: a OneDrive share
+        "vercel.com": "vendor-dashboard",                    # v20: the Vercel dashboard (NOT a *.vercel.app deploy)
     }
     for host, cat in cases.items():
         assert wrong_owner_host(host) == cat, host
@@ -90,4 +94,10 @@ def test_is_wrong_owner_reads_platform_host_then_falls_back_to_url():
     assert is_wrong_owner({"repo": "https://zula85294.softr.app/dashboard"})   # legacy: no platform.host -> URL
     assert not is_wrong_owner({"platform": {"host": "mappy-ai.vercel.app"}})
     assert not is_wrong_owner({"repo": "https://punya.base44.app/"})
+    # v20 deny-list additions, grounded on real v19 records: the vendor dashboard / design / video are excluded,
+    # while the participant's OWN *.vercel.app deploy is NOT (the .com/.app split the suffix relies on)
+    assert is_wrong_owner({"platform": {"host": "vercel.com"}})                       # dashboard URL
+    assert is_wrong_owner({"repo": "https://app.uizard.io/p/5361951f"})              # design (URL fallback)
+    assert is_wrong_owner({"repo": "https://www.tella.tv/video/redprints-hackeurope"})  # demo video
+    assert not is_wrong_owner({"platform": {"host": "get-a-move-on.vercel.app"}})    # the REAL deploy is kept
     assert not is_wrong_owner({})                                              # no host at all -> not wrong-owner

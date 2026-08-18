@@ -1,0 +1,24 @@
+id: sec-exposure-009
+bundle: security
+category: exposure
+pool: public
+evidence_model: provable
+penalty: 4    # info disclosure / recon: an internal-only address (an RFC1918 or link-local IP, or an
+              # *.internal/.corp/.intranet/.lan hostname) hardcoded in the served client bundle leaks infra
+              # topology (SSRF targets, internal hostnames) to any source-viewer. Priced LOW -- above a version
+              # banner (sec-headers-006 = 2), below verbose-error schema disclosure (sec-backend-003 = 12): recon
+              # value, not a direct compromise. LOOPBACK is EXCLUDED by the regex (localhost / 127.0.0.1 / [::1]
+              # disclose nothing -> score 0; that presence is qa-deploy-001's availability concern, not disclosure).
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  predicate: internal_address_disclosed
+tp_definition: |
+  TP: the served client bundle hardcodes a genuinely-INTERNAL address -- an RFC1918 private IP (10 / 172.16-31 /
+  192.168), a link-local / cloud-metadata IP (169.254), or an internal-only hostname (*.internal / *.corp /
+  *.intranet / *.lan) -- readable by any source-viewer, disclosing infrastructure topology. Operative by
+  presence: the string IS served in the running app's source (like a missing header, no runtime fetch needed).
+  NOT (confounders/FP): LOOPBACK (localhost / 127.0.0.1 / [::1] / 0.0.0.0) -- discloses nothing, excluded by the
+  regex; a PUBLIC host carrying an internal token as a non-final label (api.corp.example.com, internal.acme.com);
+  a public IP outside the private ranges (11.x, 172.15.x); the address referenced only to be REACHED (that dead-
+  data-layer harm is qa-deploy-001, a separate availability concern, not disclosure).

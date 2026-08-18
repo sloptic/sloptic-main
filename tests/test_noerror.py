@@ -80,3 +80,20 @@ def test_predicate_na_without_a_create_form():
     ctx.evidence = {}
     ctx.register = lambda suffix="": None
     assert no_error_state(ctx, type("P", (), {"probe": {}})()) is None
+
+
+def test_silent_fire_records_which_form_and_what_happened(monkeypatch):
+    # add-evidence: a 'silent' fire now records the tested form's action + a plain-language description,
+    # so the finding carries its own proof instead of a bare verdict
+    from sloptic import probes
+    from sloptic.schema import Form
+    monkeypatch.setattr(browser, "silent_failure_on_action", lambda *a, **k: "silent")
+    ctx = type("C", (), {})()
+    ctx.profile = Profile(base_url="http://x", forms=[Form(action="/api/items", method="post", fields=["title"])])
+    ctx.base_url = "http://x"
+    ctx.headers = None
+    ctx.evidence = {}
+    ctx.register = lambda suffix="": None
+    assert probes.no_error_state(ctx, type("P", (), {"probe": {}})()) is True
+    assert ctx.evidence["action"] == "/api/items"
+    assert "silent data loss" in ctx.evidence["matched"]

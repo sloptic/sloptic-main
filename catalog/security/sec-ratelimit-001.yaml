@@ -15,5 +15,7 @@ tp_definition: |
   TP: a REAL credential-checking login endpoint accepts unlimited wrong-password attempts (no throttle) ->
   brute-forceable.
   NOT (confounders/FP): no real login was found / the detected 'login' is not a credential gate (a 2xx
-  success or a non-rejecting form); or throttling was masked by the grader's OWN concurrency (a load
-  confounder -- trustworthy only graded in isolation).
+  success or a non-rejecting form); a GET-method 'login form' (creds-in-query / SPA onSubmit stub, not the
+  POST credential endpoint -> JSON fallback); a transport redirect (http->https / host canonicalization to
+  the SAME path) mistaken for an auth rejection; or throttling masked by the grader's OWN concurrency (a
+  load confounder -- trustworthy only graded in isolation).

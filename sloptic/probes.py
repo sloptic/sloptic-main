@@ -26,7 +26,7 @@ import httpx
 from . import auth, baas, browser, depscan, lighthouse, oob, secretscan
 from .net import make_client, request_counts
 from .schema import Endpoint
-from .discovery import _CATCHALL_PROBE, _body_sig
+from .discovery import _CATCHALL_PROBE, _body_sig, _registrable_domain
 
 
 # --- innocence check: never fire a phantom finding on a catch-all / soft-404 SHELL ------------------------
@@ -117,7 +117,12 @@ def _policy_applies(resp) -> bool:
 # header is no real exposure. Suppression only ever REMOVES a penalty (upside-only), so a conservative
 # known-suffix list is safe; a custom domain is never suppressed.
 _HSTS_PRELOADED_SUFFIXES = (
-    ".vercel.app", ".netlify.app", ".onrender.com", ".pages.dev", ".web.app", ".firebaseapp.com",
+    # Google's HSTS-preloaded TLDs (whole TLD, includeSubDomains): every *.app / *.dev / *.page has HTTPS
+    # browser-enforced, so a missing per-app HSTS header is no real exposure. Subsumes vercel/netlify/web.app +
+    # pages.dev, and catches run.app / railway.app / workers.dev / base44.app -- the S1 audit's ~40% preloaded-TLD FP.
+    ".app", ".dev", ".page",
+    # specific HSTS-preloaded platform domains NOT under a preloaded TLD
+    ".onrender.com", ".firebaseapp.com", ".github.io",
 )
 
 
@@ -1151,7 +1156,8 @@ def no_error_state(ctx, probe) -> bool | None:
     The forced failure makes the OUTCOME definitively failed, so a silent-retry-that-succeeds can't confuse it;
     ANY indication (message / red field / toast) counts as handled — we grade that an apology exists, not its
     quality. N/A without a browser or a create form whose submit fires a mutating request."""
-    if auth.create_form(ctx.profile.forms) is None:
+    form = auth.create_form(ctx.profile.forms)
+    if form is None:
         ctx.evidence["na_reason"] = "no create/save form to submit-and-fail"
         return None
     hdrs = dict(ctx.headers or {})   # authenticate the page if we hold a session (the form is usually gated)
@@ -1168,8 +1174,10 @@ def no_error_state(ctx, probe) -> bool | None:
     finally:
         if account is not None:
             account.client.close()
-    ctx.evidence.update(verdict=verdict)
+    ctx.evidence.update(verdict=verdict, action=form.action)
     if verdict == "silent":
+        ctx.evidence["matched"] = ("forced the submit of %s to fail; the app showed no error/failure "
+                                   "indication (silent data loss)" % form.action)
         return True   # the action's request failed and the app showed the user nothing -> silent data loss
     if verdict == "handled":
         return False
@@ -2751,7 +2759,7 @@ _SUPABASE_COMMON = ("users", "profiles", "accounts", "posts", "orders", "message
 _SENSITIVE_TABLE = re.compile(r"user|account|profile|payment|order|customer|subscription|transaction|"
                               r"credential|session|contact|booking|member|billing|invoice|message", re.I)
 _SENSITIVE_COLUMN = re.compile(r"email|password|passwd|phone|token|api_?key|secret|stripe|address|ssn|"
-                               r"credit|dob|birth|first_?name|last_?name|full_?name|access_?token", re.I)
+                               r"credit_?card|dob|birth|first_?name|last_?name|full_?name|access_?token", re.I)
 
 
 def _client_bundle(ctx, cap: int = 2_000_000) -> str:
@@ -2801,21 +2809,83 @@ _PRIVATE_HOST = re.compile(
 _UNSET_ENV_HOST = re.compile(r"""https?://(?:undefined|null)(?::\d+)?(?=[/"'\s)]|$)""", re.I)
 
 
+def _operative_private_hosts(matched_urls, opaque_hosts) -> list:
+    """Which matched private/unset backend URLs the app ACTUALLY requested at runtime -- their host was observed
+    in the opaque-host tier (an off-origin host discovery couldn't attribute, where a localhost/private fetch
+    lands, see discovery._classify_hosts). Compared by hostname (port-agnostic): a bundle localhost:9999 the app
+    fetched on :3000 is still "the data layer hit a dead private host at runtime". A match => OPERATIVE (dead in
+    prod for real visitors). No match => the address is PRESENT in the bundle but never requested (a dead
+    `env || localhost` fallback the prod override wins, a CORS/OAuth allowlist entry, a corpus-shared template
+    constant like localhost:9999) => presence != use => UNPROVEN, off-score. (opaque_hosts is capped at 10
+    upstream, so a genuine fetch beyond the 10th unattributable host reads here as presence-only -- conservative:
+    it can under-count operative fires, never invent one. A mixed-content-blocked http://localhost fetch from an
+    https page may also not reach net_sink; capturing page.on('requestfailed') would recover those -- a recall
+    follow-up, not a correctness gap: unobserved => off-score, never a false score.)"""
+    def _host(s):
+        return (urllib.parse.urlparse(s if "://" in s else "//" + s).hostname or "").lower()
+    observed = {_host(h) for h in opaque_hosts}
+    return [u for u in matched_urls if _host(u) in observed]
+
+
 def unreachable_backend_reference(ctx, probe) -> bool | None:
     """DEPLOY-TIME "works on my machine": the shipped client bundle points its backend at a host no visitor can
     reach -- localhost / 127.0.0.1 / 0.0.0.0 / a private RFC1918 IP (the developer's own machine), or
-    `https://undefined` / `https://null` (an unset NEXT_PUBLIC_/VITE_ build-time env var stringified into the
-    URL). The front page still renders, so the app's data layer being dead for everyone but the developer is
-    invisible to a "does it load" check. Reads the app's OWN served bundle (ethical). N/A when there is no bundle."""
+    `https://undefined` / `https://null` (an unset NEXT_PUBLIC_/VITE_ build-time env var stringified into the URL).
+    SCORES only when the app is OBSERVED to actually request that host at runtime (its host shows up in the opaque
+    tier) -- an OPERATIVE dead data layer, invisible to a "does it load" check. A match that is merely PRESENT in
+    the bundle but never requested (a dead `env || localhost` fallback, a CORS/OAuth allowlist entry, a corpus-
+    shared template constant like localhost:9999) is UNPROVEN: recorded as an OFF-SCORE diagnostic (report_only),
+    never scored -- presence != use. Reads the app's OWN served bundle (ethical). N/A when there is no bundle."""
     blob = _client_bundle(ctx)
     if not blob.strip():
         return None
     private = sorted({m.group(0) for m in _PRIVATE_HOST.finditer(blob)})
     unset = sorted({m.group(0) for m in _UNSET_ENV_HOST.finditer(blob)})
-    if private or unset:
-        ctx.evidence.update(private_backends=private[:5], unset_env_backends=unset[:5], source="client-bundle")
+    if not (private or unset):
+        ctx.evidence.update(private_backends=[], unset_env_backends=[], scanned_bytes=len(blob))
+        return False
+    opaque = (ctx.profile.host_tiers or {}).get("opaque_hosts", [])
+    operative = _operative_private_hosts(private + unset, opaque)
+    if operative:
+        ctx.evidence.update(private_backends=private[:5], unset_env_backends=unset[:5],
+                            operative_backends=operative[:5], observed=True, source="client-bundle")
+        return True                                     # OPERATIVE -> the yaml penalty (34) applies
+    ctx.evidence.update(private_backends=private[:5], unset_env_backends=unset[:5], observed=False,
+                        report_only=True, penalty_override=0, source="client-bundle")
+    return True                                          # presence-only -> off-score diagnostic (UNPROVEN)
+
+
+# v2.0 -- INTERNAL-ADDRESS disclosure. A served bundle that hardcodes a genuinely-INTERNAL address (an RFC1918
+# private IP, a link-local / cloud-metadata IP, or an internal-only hostname) leaks infrastructure topology to
+# every source-viewer -- recon value (SSRF targets, internal hostnames for lateral movement). LOOPBACK is
+# deliberately EXCLUDED: localhost / 127.0.0.1 / [::1] / 0.0.0.0 disclose nothing (everyone has one), so this
+# scores them at ZERO -- that presence is qa-deploy-001's availability concern, not a disclosure. URL-form + a
+# host lookahead (same rigor as _PRIVATE_HOST): the internal TLD must be the FINAL host label, so a PUBLIC host
+# carrying the token as a middle label (api.corp.example.com) does NOT match, and a bare "10.0.0.1" in unrelated
+# numeric data (no scheme) does NOT match.
+_INTERNAL_ADDR = re.compile(
+    r"""https?://(?:"""
+    r"""10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}|"""
+    r"""169\.254(?:\.\d{1,3}){2}|"""
+    r"""[a-z0-9-]+\.(?:internal|corp|intranet|lan))"""
+    r"""(?::\d+)?(?=[/"'\s)]|$)""", re.I)
+
+
+def internal_address_disclosed(ctx, probe) -> bool | None:
+    """INFO DISCLOSURE: the served client bundle hardcodes a genuinely-INTERNAL address -- an RFC1918 private IP
+    (10 / 172.16-31 / 192.168), a link-local / cloud-metadata IP (169.254), or an internal-only hostname
+    (*.internal / *.corp / *.intranet / *.lan). Readable by any source-viewer, it leaks infra topology (recon:
+    SSRF targets, internal hostnames). LOOPBACK (localhost / 127.0.0.1 / [::1] / 0.0.0.0) is EXCLUDED -- it
+    discloses nothing, so localhost scores zero here (that presence is qa-deploy-001's availability concern, not
+    a disclosure). Reads the app's OWN served bundle (ethical). N/A when there is no bundle."""
+    blob = _client_bundle(ctx)
+    if not blob.strip():
+        return None
+    addrs = sorted({m.group(0) for m in _INTERNAL_ADDR.finditer(blob)})
+    if addrs:
+        ctx.evidence.update(internal_addresses=addrs[:5], source="client-bundle")
         return True
-    ctx.evidence.update(private_backends=[], unset_env_backends=[], scanned_bytes=len(blob))
+    ctx.evidence.update(internal_addresses=[], scanned_bytes=len(blob))
     return False
 
 
@@ -3585,6 +3655,32 @@ def _firebase_readable(client, json_url: str):
     return None
 
 
+def _rtdb_sensitive_names(data) -> list[str]:
+    """Sensitive node/field names in a world-readable RTDB tree. RTDB `.read:true` exposes the WHOLE tree
+    with no per-path rules, so the leak is a top-level node named like a private table (users/payments/...)
+    OR a nested field named like PII/secret (email/token/...); a public-by-design tree (config, or a
+    leaderboard of name+score) is not. Scans every top-level node and ONE sampled leaf per node -- RTDB
+    nodes are homogeneous, so a sample suffices -- and is bounded by a node budget regardless of row count.
+    This brings the RTDB path to parity with the Supabase read path's column-sensitivity gate."""
+    names: list[str] = []
+    budget = [400]
+
+    def _walk(node, level):
+        if budget[0] <= 0 or level > 2 or not isinstance(node, dict):
+            return
+        for i, (k, v) in enumerate(node.items()):
+            if budget[0] <= 0:
+                return
+            budget[0] -= 1
+            if isinstance(k, str) and (_SENSITIVE_COLUMN.search(k) or (level == 0 and _SENSITIVE_TABLE.search(k))):
+                names.append(k)
+            if level == 0 or i == 0:      # all top-level nodes; then one homogeneous sample per node
+                _walk(v, level + 1)
+
+    _walk(data, 0)
+    return names
+
+
 def _firestore_collections(blob: str, observed: list[str] | None = None) -> list[str]:
     """Collections to test for public readability, strongest signal first: OBSERVED at runtime (survives
     minification/dynamic queries), then the app's own code (`collection(db, 'name')`), then a small
@@ -3612,9 +3708,16 @@ def _firestore_readable(client, base: str, project: str, api_key: str, collectio
             except (ValueError, AttributeError):
                 continue
             if isinstance(docs, list) and docs:   # real documents to the public key -> world-readable rules
-                fields = sorted((docs[0].get("fields") or {}).keys())[:8]
-                return {"collection": coll, "documents": len(docs), "fields": fields,
-                        "repro": _repro_from_resp(r, matched="%d document(s) readable" % len(docs))}
+                fields = sorted((docs[0].get("fields") or {}).keys())
+                sensitive = _sensitive_columns(fields)
+                if not sensitive:
+                    continue                       # public-by-design collection (no PII/secret field): NOT a leak,
+                                                   # the same column-sensitivity gate the Supabase read path applies
+                return {"collection": coll, "documents": len(docs), "fields": fields[:8],
+                        "sensitive_fields": sensitive[:6],
+                        "repro": _repro_from_resp(
+                            r, matched="%d document(s) readable to anon, carrying %s"
+                                       % (len(docs), ", ".join(sensitive[:3])))}
     return None if reached else "unreachable"
 
 
@@ -3654,10 +3757,15 @@ def exposed_backend_readable(ctx, probe) -> bool | None:
             url = "https://" + fm.group(1) + "/.json"
             data = _firebase_readable(ext, url)
             if isinstance(data, (dict, list)) and data:
-                ctx.evidence.update(backend="firebase-rtdb", host=fm.group(1),
-                                    sample_keys=sorted(data)[:8] if isinstance(data, dict) else len(data),
-                                    repro=_repro("GET", url, status=200, matched="RTDB readable to anon"))
-                return True
+                sensitive = _rtdb_sensitive_names(data)
+                if sensitive:                       # gate on sensitive node/field names (Supabase-path parity)
+                    ctx.evidence.update(backend="firebase-rtdb", host=fm.group(1),
+                                        sample_keys=sorted(data)[:8] if isinstance(data, dict) else len(data),
+                                        sensitive_fields=sensitive[:6],
+                                        repro=_repro("GET", url, status=200,
+                                                     matched="RTDB readable to anon, carrying %s"
+                                                             % ", ".join(sensitive[:3])))
+                    return True
             reached = reached or data != "unreachable"
         if fs_used:
             proj, key = proj_m.group(1), key_m.group(0)
@@ -3665,7 +3773,8 @@ def exposed_backend_readable(ctx, probe) -> bool | None:
                                       _firestore_collections(blob, _observed_tables(ctx)))
             if isinstance(hit, dict):
                 ctx.evidence.update(backend="firestore", project=proj, collection=hit["collection"],
-                                    documents_readable=hit["documents"], fields=hit["fields"], repro=hit["repro"])
+                                    documents_readable=hit["documents"], fields=hit["fields"],
+                                    sensitive_fields=hit.get("sensitive_fields"), repro=hit["repro"])
                 return True
             reached = reached or hit != "unreachable"
     ctx.evidence.update(checked=True, reachable=reached, world_readable=False)
@@ -3760,9 +3869,31 @@ def _supabase_candidate_tables(client, base: str, hdr: dict, tables) -> list:
     return disclosed + [t for t in tables if t not in disclosed]
 
 
+def _foreign_rows(rows: list, own_ids: set) -> list:
+    """The subset of `rows` NOT owned by the FRESH test user -- a genuine CROSS-USER read. A row is the fresh
+    user's OWN when an owner column (owner_id/user_id/created_by/... via _OWNER_ID_FIELD, or `id`/`uid`) holds
+    their JWT `sub`, or an email column holds their signup email. A CORRECTLY per-user-scoped table (RLS
+    `using(auth.uid() = user_id)`, plus the near-universal Supabase handle_new_user() trigger that seeds the
+    fresh user's OWN profile row) therefore returns ONLY own rows here -> [] -> NO leak; only a row belonging to
+    SOMEONE ELSE proves the 'any authenticated user reads everything' bypass. Fail-closed: with no identifiable
+    own-id we cannot prove any row is cross-user -> [] (don't fire). A real Supabase access_token always carries
+    sub+email, so this only guards a malformed token."""
+    if not own_ids:
+        return []
+    def _owns(k: str) -> bool:
+        return bool(_OWNER_ID_FIELD.match(k)) or k.lower() in ("id", "uid") or "email" in k.lower()
+    return [r for r in rows if isinstance(r, dict)
+            and not any(str(v) in own_ids for k, v in r.items() if isinstance(v, (str, int)) and _owns(k))]
+
+
 def _supabase_authed_only(client, base, anon_key, user_jwt, tables):
-    """A table a FRESH authenticated user reads but ANON cannot -> a broken `authenticated` RLS policy (any
-    logged-in user reads all rows). Differential + sensitivity gated; read-only. {table,...} / 'unreachable' / None."""
+    """A table where a FRESH authenticated user reads rows OWNED BY SOMEONE ELSE while ANON cannot -> a broken
+    `authenticated`-tier RLS policy (any logged-in user reads all rows, the IDOR equivalent on a BaaS SPA). The
+    fresh user's OWN rows (the handle_new_user() profile row, anything keyed on its sub/email) are EXCLUDED, so a
+    correctly per-user-scoped table -- which returns only the fresh user's own row -- does NOT fire. Differential
+    + own-row filter + sensitivity gated; read-only. {table,...} / 'unreachable' / None."""
+    claims = auth._jwt_claims(user_jwt) or {}
+    own_ids = {str(claims[k]) for k in ("sub", "email") if claims.get(k)}
     tables = _supabase_candidate_tables(client, base, {"apikey": anon_key,
                                                        "Authorization": "Bearer " + anon_key}, tables)
     def read(table, jwt, lim):
@@ -3782,10 +3913,13 @@ def _supabase_authed_only(client, base, anon_key, user_jwt, tables):
             continue
         reached = True
         if not anon_rows and authed_rows:   # anon denied/empty, a fresh authed user sees rows
-            columns = sorted(authed_rows[0]) if isinstance(authed_rows[0], dict) else []
-            if _sensitive_leak(table, columns):
-                return {"table": table, "rows": len(authed_rows), "columns": columns[:8],
-                        "repro": _repro_from_resp(authed_resp, matched="%d row(s) readable by ANY authed user" % len(authed_rows))}
+            foreign = _foreign_rows(authed_rows, own_ids)   # drop the fresh user's OWN rows -> only cross-user left
+            if foreign:
+                columns = sorted(foreign[0]) if isinstance(foreign[0], dict) else []
+                if _sensitive_leak(table, columns):
+                    return {"table": table, "rows": len(foreign), "columns": columns[:8],
+                            "repro": _repro_from_resp(authed_resp,
+                                     matched="%d cross-user row(s) readable by ANY authed user (own rows excluded)" % len(foreign))}
     return None if reached else "unreachable"
 
 
@@ -3962,7 +4096,23 @@ def _looks_like_auth_reject(resp) -> bool:
     if sc in (400, 401, 403, 422):
         return True
     if sc in (301, 302, 303, 307, 308):
-        return any(h in resp.headers.get("location", "").lower() for h in _CSRF_REJECT_HINTS)
+        loc = resp.headers.get("location", "")
+        if not loc:
+            return False
+        # A redirect that only upgrades the scheme (http->https) or canonicalizes the host (www/apex) while
+        # keeping the SAME path is a transport redirect, not a credential rejection: every wrong-password
+        # attempt gets the identical 3xx, so counting it would phantom-fire "never throttled" on an endpoint
+        # that never processed the login. (A same-origin redirect back to /login IS still counted -- that is
+        # the flash-error re-render pattern, a real rejection.)
+        try:
+            req = resp.request.url
+            tgt = req.join(loc)
+            if (tgt.path.rstrip("/") == req.path.rstrip("/")
+                    and (tgt.scheme != req.scheme or tgt.host != req.host)):
+                return False
+        except Exception:
+            pass
+        return any(h in loc.lower() for h in _CSRF_REJECT_HINTS)
     if "json" in resp.headers.get("content-type", "").lower():
         return True
     try:
@@ -3978,8 +4128,11 @@ def login_no_rate_limit(ctx, probe) -> bool | None:
     can't collide with other probes that hit /login (e.g. sqli_auth_bypass). N/A when no login form, or
     when the endpoint never returns an auth-shaped rejection (no real server auth to rate-limit)."""
     form = auth.login_form(ctx.profile.forms)
-    if form is None:
-        return _login_rate_limit_json(ctx, probe)  # no HTML login form -> try a JSON login endpoint
+    if form is None or (form.method or "post").lower() == "get":
+        # No HTML login form, OR a GET-method one: a GET 'login form' carries creds in the query string and
+        # is not the credential-processing POST endpoint this probe models (on an SPA it is an onSubmit stub
+        # whose real login is a JSON fetch). Either way, try a JSON login endpoint instead of GET-fetching.
+        return _login_rate_limit_json(ctx, probe)
     data = {}
     for name in form.fields:
         low = name.lower()
@@ -4820,12 +4973,15 @@ _SOFT404_EXT = (".js", ".css", ".png", ".webp", ".svg", ".woff2")
 
 
 def http_soft_404(ctx, probe) -> bool:
-    """A missing STATIC ASSET must return a 4xx (normally 404), never 2xx. A 2xx for a guaranteed-
-    nonexistent typed asset is a soft-404: a misconfigured catch-all (often an SPA serving index.html
-    for everything) that makes caches, crawlers and monitors treat a nonexistent URL as real content.
-    Using a *typed asset* path keeps this SPA-safe — the standard `/route -> 200 index` rewrite is
-    intended, but no correct server (SPA or not) serves a nonexistent .js/.css/.png as success.
-    Redirects are NOT followed: a 3xx to a login is an auth gate, not a soft-404."""
+    """A missing STATIC ASSET returns a 2xx shell instead of a 4xx: a catch-all (usually an SPA serving
+    index.html for everything) so caches, crawlers and monitors treat a nonexistent URL as real content.
+    Using a *typed asset* path keeps this SPA-safe (the `/route -> 200 index` rewrite is intended, not flagged).
+    Redirects are NOT followed: a 3xx to a login is an auth gate, not a soft-404.
+
+    OFF-SCORE (report_only) by default: the tested path is RANDOM, so it fires on the platform-recommended SPA
+    fallback (its own tp_definition's named non-defect), not an observed operative harm; and the real broken-asset
+    case -- an APP-REFERENCED bundle chunk served the shell instead of JS -- is scored by qa-chunk-001
+    (dead_bundle_chunk). Kept as a visible diagnostic. report_only -> penalty_override 0."""
     token = "hlnope" + secrets.token_hex(5)          # a unique random name that cannot be a real file
     with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=False) as c:
         for ext in _SOFT404_EXT:
@@ -4846,7 +5002,9 @@ def http_soft_404(ctx, probe) -> bool:
                 if sig and _body_sig(r.text) != sig:
                     continue                         # HTML, but not the root shell the host serves everywhere
                 ctx.evidence.update(soft_404=True, ext=ext, status=r.status_code)
-                return True                          # nonexistent asset served as the shell -> soft-404
+                if probe.probe.get("report_only"):
+                    ctx.evidence.update(report_only=True, penalty_override=0)   # off-score diagnostic
+                return True                          # a catch-all shell for a missing asset -> soft-404
     ctx.evidence.update(soft_404=False, exts_tested=len(_SOFT404_EXT))
     return False
 
@@ -5125,30 +5283,72 @@ def mixed_content(ctx, probe) -> bool | None:
     return True if insecure else False
 
 
-# v2.0 FAMILY 4 -- Subresource Integrity (SRI, a W3C recommendation). A CROSS-ORIGIN <script src> / stylesheet
-# loaded without an `integrity=` hash is an unguarded supply-chain risk: if that CDN is compromised or the
-# domain is hijacked, arbitrary code runs in the app's origin with full access to its DOM, cookies, and tokens.
-# Same-origin resources need no SRI (you already control them). Static: parsed from the served HTML.
+# v2.0 FAMILY 4 -- Subresource Integrity (SRI, a W3C recommendation). A CROSS-ORIGIN, code-executing <script src>
+# / stylesheet loaded without an `integrity=` hash is an unguarded supply-chain risk: if that CDN is compromised
+# or the domain is hijacked, arbitrary code runs in the app's origin with full access to its DOM, cookies, and
+# tokens. Same-origin resources need no SRI (you already control them). Static: parsed from the served HTML.
+#
+# SRI is INAPPLICABLE to these subresource hosts, so flagging them is a false positive by DOMINANCE (not
+# prevalence): font-CSS endpoints serve DIFFERENT bytes per User-Agent (the @font-face `src` varies), so a
+# pinned integrity hash MISMATCHES for some browsers and BLOCKS the stylesheet -- the "fix" breaks the site; and
+# tag/loader endpoints (GTM / Google Identity / gapi) publish no stable hash and bootstrap further scripts SRI on
+# the loader cannot cover. Loading these WITHOUT SRI is the correct practice.
+_SRI_INAPPLICABLE_HOSTS = {
+    "fonts.googleapis.com", "api.fontshare.com", "use.typekit.net", "fonts.bunny.net", "use.fontawesome.com",
+    "www.googletagmanager.com", "accounts.google.com", "apis.google.com",
+}
+# Zero-dev-control BUILDER-INJECTED asset hosts: the platform (Lovable / Framer / Wix / Softr / Gamma / Supabase)
+# wrote the <script>/<link>, so the participant cannot add integrity= to a tag they did not author -> wrong
+# owner, an ATTRIBUTABLE false positive. Suffix-matched, so a subdomain is covered too.
+_SRI_PLATFORM_ASSET_HOSTS = {
+    "gpteng.co", "framerusercontent.com", "parastorage.com", "softr-files.com",
+    "gammahosted.com", "frontend-assets.supabase.com",
+}
+
+
+def _sri_excluded_host(host: str) -> bool:
+    """A cross-origin subresource host that is NOT a scorable SRI gap: one SRI cannot protect (per-UA font CSS /
+    a tag loader -- a hash breaks it), or a builder-injected asset host the participant does not own."""
+    if host in _SRI_INAPPLICABLE_HOSTS:
+        return True
+    return any(host == s or host.endswith("." + s) for s in _SRI_PLATFORM_ASSET_HOSTS)
+
+
 def _sri_scan(html: str, page_url: str) -> tuple[list[str], int]:
-    """(cross-origin script/stylesheet URLs that ship WITHOUT integrity=, count of ALL cross-origin such
-    resources). The second value separates 'no third-party resources -> N/A' from 'all of them are protected
-    -> clean'. Only <script src> and <link rel=stylesheet|preload|modulepreload> -- the resource kinds SRI
-    covers; <img>/<iframe> are out of scope (SRI does not apply)."""
-    origin = urllib.parse.urlparse(page_url).netloc.lower()
+    """(cross-origin subresource URLs that ship WITHOUT integrity=, count of ALL SRI-APPLICABLE cross-origin such
+    resources). The second value separates 'no third-party resource to protect -> N/A' from 'all protected ->
+    clean'. Counts only CODE-EXECUTING cross-origin kinds -- <script src>, <link rel=stylesheet|modulepreload>,
+    and <link rel=preload as=script|style> (a preloaded image/font/fetch does not execute) -- treats a sibling
+    subdomain of the SAME registrable domain as first-party (PSL-aware), and excludes hosts SRI cannot protect or
+    that the participant does not own (see _sri_excluded_host). <img>/<iframe> are out of scope."""
+    origin_site = _registrable_domain(urllib.parse.urlparse(page_url).netloc.split(":")[0].lower())
     gaps: list[str] = []
     total = 0
     tags = [(m.group(1), "src") for m in re.finditer(r"<script\b([^>]*)>", html, re.I)]
     for m in re.finditer(r"<link\b([^>]*)>", html, re.I):
-        rel = re.search(r"\brel\s*=\s*[\"']?([^\"'>\s]+)", m.group(1), re.I)
-        if rel and rel.group(1).lower() in ("stylesheet", "preload", "modulepreload"):
-            tags.append((m.group(1), "href"))
+        attrs = m.group(1)
+        rel = re.search(r"\brel\s*=\s*[\"']?([^\"'>\s]+)", attrs, re.I)
+        if not rel:
+            continue
+        kind = rel.group(1).lower()
+        if kind in ("stylesheet", "modulepreload"):
+            tags.append((attrs, "href"))                 # a stylesheet applies / a module preload executes
+        elif kind == "preload":
+            as_ = re.search(r"\bas\s*=\s*[\"']?([^\"'>\s]+)", attrs, re.I)
+            if as_ and as_.group(1).lower() in ("script", "style"):
+                tags.append((attrs, "href"))             # a preloaded script/style executes; image/font/fetch does not
     for attrs, urlattr in tags:
         ref = re.search(r"\b" + urlattr + r"\s*=\s*[\"']([^\"']+)[\"']", attrs, re.I)
         if not ref:
             continue
         p = urllib.parse.urlparse(urllib.parse.urljoin(page_url, ref.group(1).strip()))
-        if p.scheme not in ("http", "https") or not p.netloc or p.netloc.lower() == origin:
-            continue                                     # relative / same-origin -> no SRI needed
+        if p.scheme not in ("http", "https") or not p.netloc:
+            continue                                     # relative / non-http
+        host = p.netloc.split(":")[0].lower()
+        if _registrable_domain(host) == origin_site:
+            continue                                     # first-party (same registrable domain, incl. a sibling subdomain)
+        if _sri_excluded_host(host):
+            continue                                     # SRI-inapplicable host / builder-injected asset -> not a gap
         total += 1
         if not re.search(r"\bintegrity\s*=\s*[\"']", attrs, re.I):
             gaps.append(p.geturl())
@@ -5278,6 +5478,14 @@ _CRASH_JSON = (
     b'{"x": "\\ud834"}',                   # lone-surrogate escape
 )
 _CRASH_PATHS = ("/%ff%fe", "/%c0%ae%c0%ae", "/%00", "/%e0%80%80")
+# Real-server PaaS: these hosts run the PARTICIPANT's own container/function, so a catch-all there is THEIR
+# router and a decode 500 is their crash (not a static-builder edge). The decode branch is allowed to fire on a
+# catch-all host for these -- recovers the v19 railway/modal false cleans -- without re-admitting static-builder
+# (lovable/retool/netlify-static) catch-all edges.
+_REAL_SERVER_HOSTS = (".up.railway.app", ".modal.run", ".onrender.com", ".fly.dev", ".run.app")
+# Managed-BaaS PLATFORM API namespace (base44's /api/apps/<hexid>/...): a 5xx on malformed input there is the
+# VENDOR's SDK, not the participant's own endpoint -> wrong owner, skip (the v20 blind-audit malformed-JSON FP).
+_VENDOR_PLATFORM_NS = re.compile(r"/api/apps/[0-9a-f]{16,}/", re.I)
 
 
 def _induce_error_responses(ctx, budget=20):
@@ -5342,11 +5550,17 @@ def leaks_error_detail(ctx, probe) -> bool | None:
     inspected = False
     for r in _induce_error_responses(ctx):
         inspected = True
-        if _TRACE.search(r.text):
-            ctx.evidence.update(status=r.status_code, leak="stack-trace")
+        m = _TRACE.search(r.text)
+        if m:
+            ctx.evidence.update(status=r.status_code, leak="stack-trace",
+                                matched=r.text[m.start():m.start() + 200].strip(),
+                                repro=_repro_from_resp(r, matched="stack trace leaked in the error response"))
             return True
-        if _SQL_ERROR.search(r.text):
-            ctx.evidence.update(status=r.status_code, leak="db-error")
+        m = _SQL_ERROR.search(r.text)
+        if m:
+            ctx.evidence.update(status=r.status_code, leak="db-error",
+                                matched=r.text[m.start():m.start() + 200].strip(),
+                                repro=_repro_from_resp(r, matched="database error leaked in the error response"))
             return True
     ctx.evidence.update(inspected=inspected, leak=None)
     return False if inspected else None
@@ -5495,6 +5709,8 @@ def crash_resistance(ctx, probe) -> bool | None:
                   if e.method.lower() == "get" and e.query_params])
     with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=False) as c:
         for action, method, fields in targets:            # 1. malformed field values
+            if _VENDOR_PLATFORM_NS.search(action):
+                continue                                   # managed-BaaS platform API -> the vendor's handler, not the app's
             try:
                 base = _xss_send(c, method, action, {fn: "1" for fn in fields})
             except (httpx.HTTPError, httpx.InvalidURL):
@@ -5525,6 +5741,8 @@ def crash_resistance(ctx, probe) -> bool | None:
             [f.action for f in ctx.profile.forms if (f.method or "").lower() == "post"]
             + [e.path for e in ctx.profile.endpoints if e.method.lower() == "post"]))
         for path in posts:
+            if _VENDOR_PLATFORM_NS.search(path):
+                continue                                   # managed-BaaS platform API -> the vendor's handler, not the app's
             try:                                           # baseline: a WELL-FORMED empty JSON body
                 base = c.post(path, json={})
             except (httpx.HTTPError, httpx.InvalidURL):
@@ -5548,16 +5766,23 @@ def crash_resistance(ctx, probe) -> bool | None:
                         return True
                 except (httpx.HTTPError, httpx.InvalidURL):
                     continue
-        for p in _CRASH_PATHS:                             # 3. decode-crashing paths (naive router -> 500)
-            tested = True
-            try:
-                cr = c.get(p)
-                if cr.status_code >= 500 and c.get(p).status_code >= 500:
-                    ctx.evidence.update(crashed=True, via="decode-path", target=p, status=cr.status_code,
-                                        repro=_repro_from_resp(cr, matched="unhandled %d on a decode-crashing path, reproduced" % cr.status_code))
-                    return True
-            except (httpx.HTTPError, httpx.InvalidURL):
-                continue
+        # 3. decode-crashing paths: a naive SERVER ROUTER 500s trying to %-decode a malformed path. Run on an
+        # HONEST host (real 404s, a real router) OR a real-server PaaS whose catch-all IS the participant's own
+        # router (railway/modal/...) -- but NOT a static-SPA / builder catch-all, where a 5xx here is the platform
+        # EDGE choking on the URL, not the app's router. And require a 500 specifically: a 502/503/504 is the
+        # proxy/CDN rejecting the malformed URL, not the app's own unhandled exception.
+        _crash_host = urllib.parse.urlparse(ctx.base_url).netloc.split(":")[0].lower()
+        if _catch_all_sig(ctx) is None or _crash_host.endswith(_REAL_SERVER_HOSTS):
+            for p in _CRASH_PATHS:
+                tested = True
+                try:
+                    cr = c.get(p)
+                    if cr.status_code == 500 and c.get(p).status_code == 500:
+                        ctx.evidence.update(crashed=True, via="decode-path", target=p, status=cr.status_code,
+                                            repro=_repro_from_resp(cr, matched="unhandled 500 on a decode-crashing path, reproduced"))
+                        return True
+                except (httpx.HTTPError, httpx.InvalidURL):
+                    continue
     if tested:
         ctx.evidence.update(crashed=False)
     return False if tested else None
@@ -5854,6 +6079,7 @@ PREDICATES = {
     "authenticated_backend_readable": authenticated_backend_readable,
     "bundle_leaks_secret": bundle_leaks_secret,
     "unreachable_backend_reference": unreachable_backend_reference,
+    "internal_address_disclosed": internal_address_disclosed,
     "oauth_redirect_localhost": oauth_redirect_localhost,
     "no_tls_origin": no_tls_origin,
     "vulnerable_dependency": vulnerable_dependency,
@@ -5945,6 +6171,7 @@ _PREDICATE_REASONS = {
     "authenticated_backend_readable": "any logged-in user reads every other user's data -> broken authenticated-tier RLS/Rules (the IDOR equivalent on a BaaS app; missing per-user row filtering)",
     "bundle_leaks_secret": "a hardcoded SECRET key (Stripe sk_ / OpenAI / AWS secret / GitHub PAT / private key) is shipped in the client JS bundle -> account/DB takeover (public anon/publishable keys are not flagged)",
     "unreachable_backend_reference": "the shipped client bundle calls a backend no visitor can reach (localhost / a private IP / an unset env var) -> the app renders but its data layer is dead in production",
+    "internal_address_disclosed": "the client bundle hardcodes an internal-only address (a private/link-local IP or an *.internal/.corp hostname) -> leaks infrastructure topology to any source-viewer (recon); loopback/localhost is not flagged",
     "oauth_redirect_localhost": "the OAuth sign-in sets redirect_uri to localhost / a private IP / an unset env var -> after authenticating, the provider bounces the user to a host that doesn't exist in production, so login is dead for every visitor",
     "no_tls_origin": "the public origin is served over plain http:// with no upgrade to https -> every visitor's credentials and session cookies cross the network in the clear",
     "vulnerable_dependency": "the app ships a client library with a KNOWN CVE (retire.js-style: jQuery / AngularJS / Bootstrap / Axios / Moment / Handlebars / DOMPurify) -> supply-chain risk the team chose; upgrade per the finding",

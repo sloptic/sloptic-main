@@ -1,7 +1,10 @@
 id: sec-backend-003
 bundle: security
 category: backend-exposure
-variant_group_id: backend-schema-disclosure   # the root and a verbose error are the same disclosure
+variant_group_id: backend-anon-exposure   # subsumed by sec-backend-001 when the data is ALSO readable (the
+                                          # schema leak is redundant once the rows are exposed, and both come
+                                          # from the same anon-access misconfig); scores alone (12) only when
+                                          # the schema discloses but RLS still protects the data
 pool: public
 evidence_model: provable
 penalty: 12   # information disclosure, not access: the schema itself is not the data. Priced below the

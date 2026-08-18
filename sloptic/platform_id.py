@@ -153,6 +153,11 @@ _WRONG_OWNER_SUFFIX = {
     "withgoogle.com": "google-product", "docs.google.com": "google-product",
     "sites.google.com": "google-product", "drive.google.com": "google-product",
     "gamma.app": "presentation", "gamma.site": "presentation", "canva.site": "design-tool",
+    "uizard.io": "design-tool",          # a Uizard DESIGN (app.uizard.io/p/...), not a deployed app
+    "tella.tv": "video-demo",            # a Tella demo VIDEO (www.tella.tv/video/...), not the app
+    "onedrive.live.com": "file-share",   # a OneDrive file/folder share
+    "vercel.com": "vendor-dashboard",    # the Vercel DASHBOARD (vercel.com/<team>/<proj>); *.vercel.app deploys
+    #                                      are NOT caught (they end .vercel.app, not .vercel.com)
     # TIER 2: no-code site/app builders (the surface is the platform's, not the team's)
     "softr.app": "no-code-site", "wixsite.com": "no-code-site", "wix.com": "no-code-site",
     "wix-vibe.com": "no-code-site", "wix-vibe-site.com": "no-code-site",

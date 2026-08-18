@@ -17,6 +17,17 @@ def test_variant_group_fires_once():
     assert compute_slop_score(outs) == 40
 
 
+def test_backend_schema_disclosure_subsumed_by_data_leak():
+    # sec-backend-001 (data readable, 40) and sec-backend-003 (schema disclosed, 12) share a variant group:
+    # both firing on the same anon-access misconfig scores once at the max (40), never 40+12
+    both = [_o("sec-backend-001", "backend-exposure", 40, group="backend-anon-exposure"),
+            _o("sec-backend-003", "backend-exposure", 12, group="backend-anon-exposure")]
+    assert compute_slop_score(both) == 40
+    # a schema disclosure ALONE (RLS still protects the data) keeps its standalone penalty
+    alone = [_o("sec-backend-003", "backend-exposure", 12, group="backend-anon-exposure")]
+    assert compute_slop_score(alone) == 12
+
+
 def test_diminishing_returns_within_category():
     # 10 + 10*0.6 + 10*0.36 = 19.6 -> 20
     outs = [_o("a", "crash", 10), _o("b", "crash", 10), _o("c", "crash", 10)]

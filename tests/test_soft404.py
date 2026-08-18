@@ -100,3 +100,20 @@ def test_soft_404_fires_when_html_body_matches_root_shell(server):
     url = server("soft404")
     with make_client(url, None) as client:
         assert http_soft_404(_ctx(url, client), _Probe()) is True
+
+
+def test_soft_404_report_only_fire_is_off_score(server):
+    # demoted: it still fires (a visible diagnostic) but report_only -> penalty_override 0, so it does not score.
+    # the random-asset shell is the SPA default (its tp_definition's non-defect); the app-referenced-asset case
+    # is owned by qa-chunk-001.
+    ctx = _ctx(server("soft404"))
+    probe = type("P", (), {"probe": {"report_only": True}})()
+    assert http_soft_404(ctx, probe) is True
+    assert ctx.evidence["report_only"] is True and ctx.evidence["penalty_override"] == 0
+
+
+def test_soft_404_without_report_only_sets_no_penalty_override(server):
+    # a plain fire (report_only absent) carries no penalty_override -> the pipeline uses the yaml penalty
+    ctx = _ctx(server("soft404"))
+    assert http_soft_404(ctx, _Probe()) is True
+    assert "penalty_override" not in ctx.evidence

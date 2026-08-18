@@ -1,7 +1,7 @@
 """qa-deploy-001 (v2.0 Family 1, unreachable-backend) precision. The URL patterns fire on a dev / private-IP /
 unset-env backend URL shipped to the client, and must NOT fire on a server bind address, a hostname dev-check
 string, a real host that merely contains the token, a normal backend, or a relative same-origin call."""
-from sloptic.probes import _PRIVATE_HOST, _UNSET_ENV_HOST
+from sloptic.probes import _PRIVATE_HOST, _UNSET_ENV_HOST, _operative_private_hosts
 
 
 def _hit(text):
@@ -35,3 +35,24 @@ def test_clean_on_hosts_that_merely_contain_the_tokens():
               'API="https://api.myapp.com/v2"',             # a normal real backend
               'fetch("/api/items")'):                       # a relative same-origin call
         assert not _hit(s), s
+
+
+# --- the operative gate: score only a bundle-matched private host the app ACTUALLY requested at runtime ---
+
+def test_operative_gate_scores_only_observed_runtime_hosts():
+    # matched in the bundle AND observed hitting that private host at runtime (opaque tier) -> OPERATIVE
+    assert _operative_private_hosts(["http://localhost:9999"], ["localhost:9999"]) == ["http://localhost:9999"]
+    # port-agnostic: bundle references :9999, the app actually fetched :3000 -> same dead private host
+    assert _operative_private_hosts(["http://localhost:9999"], ["localhost:3000"]) == ["http://localhost:9999"]
+    # a private IP observed at runtime, alongside an unrelated opaque vendor host
+    assert _operative_private_hosts(["http://10.0.0.5:8000"], ["10.0.0.5:8000", "api.vendor.com"]) == ["http://10.0.0.5:8000"]
+    # IPv6 loopback, port-agnostic
+    assert _operative_private_hosts(["http://[::1]:9999"], ["[::1]:8080"]) == ["http://[::1]:9999"]
+
+
+def test_operative_gate_treats_unobserved_presence_as_off_score():
+    # present in the bundle but never requested at runtime (dead fallback / template constant) -> nothing operative
+    assert _operative_private_hosts(["http://localhost:9999"], []) == []
+    assert _operative_private_hosts(["http://localhost:9999"], ["api.realbackend.com", "cdn.vendor.net"]) == []
+    # the localhost:9999 template-constant case: the app has a REAL working backend, localhost never fired
+    assert _operative_private_hosts(["http://localhost:9999"], ["some-real-api.onrender.com"]) == []

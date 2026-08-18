@@ -31,11 +31,11 @@ def test_same_origin_and_relative_scripts_need_no_sri():
     assert total == 0 and gaps == []
 
 
-def test_cross_origin_stylesheet_and_preload_are_in_scope():
-    html = ('<link rel="stylesheet" href="https://fonts.googleapis.com/css?x">'
+def test_cross_origin_stylesheet_and_modulepreload_are_in_scope():
+    html = ('<link rel="stylesheet" href="https://cdn.other.io/theme.css">'
             '<link rel="modulepreload" href="https://cdn.other.io/m.js">')
     gaps, total = _sri_scan(html, _ORIGIN)
-    assert total == 2 and set(gaps) == {"https://fonts.googleapis.com/css?x", "https://cdn.other.io/m.js"}
+    assert total == 2 and set(gaps) == {"https://cdn.other.io/theme.css", "https://cdn.other.io/m.js"}
 
 
 def test_protocol_relative_cross_origin_is_in_scope():
@@ -47,6 +47,44 @@ def test_images_and_canonical_link_are_out_of_scope():
     html = '<img src="https://cdn.other.io/pic.png"><link rel="canonical" href="https://other.io/x">'
     gaps, total = _sri_scan(html, _ORIGIN)
     assert total == 0 and gaps == []
+
+
+def test_sri_inapplicable_font_css_and_tag_loaders_are_excluded_by_dominance():
+    # Google Fonts serves per-UA CSS -> a pinned hash BREAKS it, so requiring SRI is not the better practice (FP)
+    gaps, total = _sri_scan('<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter">', _ORIGIN)
+    assert total == 0 and gaps == []                 # not counted -> nothing SRI-applicable to protect
+    # a tag/loader endpoint publishes no stable hash and bootstraps further scripts -> likewise excluded
+    g2, t2 = _sri_scan('<script src="https://www.googletagmanager.com/gtag/js?id=X"></script>', _ORIGIN)
+    assert t2 == 0 and g2 == []
+
+
+def test_builder_injected_asset_hosts_are_wrong_owner_and_excluded():
+    # the platform wrote these tags; the participant can't add integrity= to a tag they didn't author -> FP
+    for src in ("https://cdn.gpteng.co/gptengineer.js",
+                "https://framerusercontent.com/x.js",
+                "https://static.parastorage.com/services/y.js"):
+        gaps, total = _sri_scan(f'<script src="{src}"></script>', _ORIGIN)
+        assert total == 0 and gaps == [], src
+
+
+def test_first_party_sibling_subdomain_needs_no_sri():
+    # same registrable domain (clerk.app.example.com ~ app.example.com) -> app-controlled, not a third-party CDN
+    gaps, total = _sri_scan('<script src="https://clerk.app.example.com/npm/clerk.js"></script>', _ORIGIN)
+    assert total == 0 and gaps == []
+
+
+def test_different_multitenant_subdomain_is_still_third_party():
+    # foo.vercel.app != bar.vercel.app (multi-tenant suffix, PSL-aware) -> another tenant IS cross-origin
+    gaps, total = _sri_scan('<script src="https://other.vercel.app/x.js"></script>', "https://myapp.vercel.app/")
+    assert total == 1 and gaps == ["https://other.vercel.app/x.js"]
+
+
+def test_non_executing_preload_dropped_but_script_preload_kept():
+    html = ('<link rel="preload" as="font" href="https://cdn.other.io/f.woff2">'
+            '<link rel="preload" as="image" href="https://cdn.other.io/pic.png">'
+            '<link rel="preload" as="script" href="https://cdn.other.io/late.js">')
+    gaps, total = _sri_scan(html, _ORIGIN)
+    assert total == 1 and gaps == ["https://cdn.other.io/late.js"]
 
 
 # ---- the probe end to end ---------------------------------------------------------------------------

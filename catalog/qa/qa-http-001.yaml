@@ -3,14 +3,20 @@ bundle: qa
 category: http-correctness
 pool: public
 evidence_model: provable
-penalty: 12   # soft-404: caches, crawlers and monitors treat phantom content as real ->
-              # recurring, moderate severity (corrupts SEO + observability).
+penalty: 12   # NOMINAL only -- this probe is now report_only (OFF-SCORE, penalty 0). It fires on a RANDOM
+              # nonexistent asset returning the SPA catch-all shell = the platform-recommended default (its own
+              # tp_definition's non-defect), not an operative defect; and the real broken-asset harm (an APP-
+              # REFERENCED bundle chunk served the shell instead of JS) is already scored by qa-chunk-001
+              # (dead_bundle_chunk). Kept as a visible diagnostic; re-score only against a server-side corpus,
+              # where a soft-404 is a genuine misconfig rather than the SPA norm.
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:
-  # request a guaranteed-nonexistent typed static asset (/hlnope<rand>.js/.css/.png); a 2xx = soft-404.
-  # typed-asset path keeps it SPA-safe (the standard /route->200 index rewrite is intended, not flagged)
+  # request a guaranteed-nonexistent typed static asset (/hlnope<rand>.js/.css/.png); a 2xx HTML shell = soft-404.
+  # OFF-SCORE: the random-asset shell is the SPA default, and the app-referenced-asset case is owned by
+  # qa-chunk-001 -> report_only makes the fire penalty 0.
   predicate: http_soft_404
+  report_only: true
 tp_definition: |
   TP: a missing resource the APP ITSELF references returns a 2xx success shell, silently masking a REAL broken
   asset (operative harm: a co-occurring load/parse failure).

@@ -35,14 +35,15 @@ def test_header_policy_matchers_ignore_server_errors():
 
 
 def test_hsts_suppressed_on_preloaded_platform_subdomains():
-    # sec-headers-003: a missing HSTS header on an ephemeral platform subdomain whose HSTS-preloaded apex
-    # already browser-enforces HTTPS for all subdomains is no real exposure -> suppress (upside-only). On a
-    # custom domain it's a genuine omission and still fires.
-    assert response_missing_header(_resp_host(200, "foo.vercel.app"), "strict-transport-security") is False
-    assert response_missing_header(_resp_host(200, "my-app.netlify.app"), "strict-transport-security") is False
-    assert response_missing_header(_resp_host(200, "svc.onrender.com"), "strict-transport-security") is False
-    assert response_missing_header(_resp_host(200, "app.example.com"), "strict-transport-security") is True
-    assert response_missing_header(_resp_host(200, "notvercel.app"), "strict-transport-security") is True  # no dot sep
+    # sec-headers-003: a missing HSTS header where HTTPS is ALREADY browser-enforced is no real exposure ->
+    # suppress (upside-only). That covers Google's HSTS-preloaded TLDs (every *.app / *.dev / *.page, incl.
+    # run.app / railway.app / workers.dev / a bare *.app site) plus specific preloaded platform domains. A
+    # custom domain (.com/.io/...) is a genuine omission and still fires.
+    for host in ("foo.vercel.app", "my-app.netlify.app", "svc.onrender.com", "bychen.workers.dev",
+                 "svc-x.up.railway.app", "notvercel.app", "myproj.web.app", "user.github.io", "brand.page"):
+        assert response_missing_header(_resp_host(200, host), "strict-transport-security") is False, host
+    for host in ("app.example.com", "secure.mybank.io", "shop.co"):
+        assert response_missing_header(_resp_host(200, host), "strict-transport-security") is True, host
     # scoped to HSTS only: OTHER header probes still fire on a platform subdomain
     assert response_missing_header(_resp_host(200, "foo.vercel.app"), "x-content-type-options") is True
 

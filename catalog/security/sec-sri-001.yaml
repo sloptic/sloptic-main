@@ -11,8 +11,10 @@ penalty: 12   # PROVISIONAL (v2.0 Family 4 -- re-price from the corpus footrule 
 applicability:
   requires: [at_least_one_http_endpoint_exists]   # further self-gated by the predicate: N/A with no cross-origin subresource
 probe:
-  # parse the served homepage HTML; fire when a cross-origin <script src> or <link rel=stylesheet|preload|
-  # modulepreload> ships without an integrity= hash. same-origin resources need no SRI. N/A when none exist.
+  # parse the served homepage HTML; fire when a cross-origin CODE-EXECUTING subresource (script / stylesheet /
+  # modulepreload / preload as=script|style) ships without an integrity= hash. First-party is by registrable
+  # domain (PSL); excludes hosts SRI can't protect (per-UA font CSS, tag loaders) + builder-injected assets.
+  # N/A when no SRI-applicable cross-origin subresource exists.
   predicate: subresource_integrity_missing
   target: /
 tp_definition: |

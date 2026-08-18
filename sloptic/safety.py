@@ -36,7 +36,7 @@ PASSIVE_PROBES = frozenset({
     # bundle, normal responses, a served source map). No payload, no mutation, no FETCHING of hidden files.
     "sec-headers-001", "sec-headers-002", "sec-headers-003", "sec-headers-004", "sec-headers-005",
     "sec-headers-006", "sec-csp-001", "sec-cors-001", "sec-mixed-001", "sec-deps-001", "sec-secrets-001",
-    "sec-secrets-002", "sec-exposure-005", "sec-exposure-006",
+    "sec-secrets-002", "sec-exposure-005", "sec-exposure-006", "sec-exposure-009",
     "sec-tls-001",   # observes the origin's scheme + whether it upgrades to https (a plain GET, no payload)
     "sec-sri-001",   # parses the served homepage HTML for cross-origin subresources without integrity (a GET)
 })

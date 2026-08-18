@@ -7,6 +7,9 @@ penalty: 34   # PROVISIONAL (v2.0 Family 1 -- re-price from the corpus footrule 
               # app's data layer is dead for every real visitor (localhost / private-IP / unset-env backend URL
               # shipped to prod). A shipped-broken deployment: more severe than diffuse hygiene, but the page
               # still renders so it is not a crash. Gate-shaped (rare, decisive), not middle-band.
+              # SCORED only when the private host is OBSERVED requested at runtime (an operative dead data layer);
+              # a bundle-present-but-never-requested match (dead env||localhost fallback / template constant) is an
+              # OFF-SCORE diagnostic at 0 (report_only), NOT scored -- see unreachable_backend_reference.
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:
