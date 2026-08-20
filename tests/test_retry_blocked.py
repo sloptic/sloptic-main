@@ -9,7 +9,8 @@ from collections import Counter
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
-from retry_blocked import _fold_and_summary, _load_jobs, _status, _to_outcome, merge  # noqa: E402
+from retry_blocked import (  # noqa: E402
+    _IP_BLOCK_SAMPLE, _fold_and_summary, _load_jobs, _looks_like_ip_block, _status, _to_outcome, merge)
 
 from sloptic.aggregate import compute_slop_score  # noqa: E402
 
@@ -127,6 +128,27 @@ def test_dnf_retry_recovers_nothing():
     assert m["incomplete_axes"] == ["security"]                     # still incomplete
     assert m["retry"]["recovered"] == []                           # nothing recovered
     assert m["slop_score"] == main["slop_score"]
+
+
+def test_ip_block_breaker_trips_on_all_entry_challenged_no_recovery():
+    # every app re-challenged at entry ('none' + bot_challenge) and nothing recovered => IP-level flag, abort
+    assert _looks_like_ip_block([("none", True)] * _IP_BLOCK_SAMPLE) is True
+
+
+def test_ip_block_breaker_holds_fire_on_any_recovery_or_small_sample():
+    # a single recovery means it is per-app challenging (retry_blocked's normal case), never an IP flag
+    assert _looks_like_ip_block([("none", True)] * _IP_BLOCK_SAMPLE + [("full", False)]) is False
+    assert _looks_like_ip_block([("none", True)] * _IP_BLOCK_SAMPLE + [("partial", True)]) is False
+    # below the sample threshold it waits for more evidence
+    assert _looks_like_ip_block([("none", True)] * (_IP_BLOCK_SAMPLE - 1)) is False
+
+
+def test_ip_block_breaker_ignores_dnf_and_non_challenge_blocks():
+    # dead-URL streaks and blocks WITHOUT a bot-challenge are not a WAF verdict, so they never trip the breaker
+    assert _looks_like_ip_block([("dnf", False)] * 20) is False
+    assert _looks_like_ip_block([("none", False)] * 20) is False
+    # dnf entries are neutral: real entry-challenges still trip even when interleaved with dead URLs
+    assert _looks_like_ip_block([("dnf", False), ("none", True)] * _IP_BLOCK_SAMPLE) is True
 
 
 def test_load_jobs_dedups_by_url_and_skips_unblocked():
