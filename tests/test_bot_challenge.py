@@ -58,6 +58,11 @@ def test_challenge_onset_also_catches_vercel_mitigated_header():
     net._watch_challenge(_R(429, "", {"x-vercel-mitigated": "challenge"}))
     assert net.challenge_onset() == "sec-xss-001"
     net.start_trace(False)
+    # a per-path `deny` (a WAF rule blocking /.aws/credentials) must NOT trip the onset -- the app stays reachable
+    net.set_trace_probe("sec-exposure-004")
+    net._watch_challenge(_R(403, "blocked", {"x-vercel-mitigated": "deny", "content-type": "text/plain"}))
+    assert net.challenge_onset() is None
+    net.start_trace(False)
 
 
 def test_request_counts_tally_per_probe():
@@ -108,6 +113,10 @@ def test_detects_vercel_mitigation_header():
     assert is_bot_challenge(_Resp({"x-vercel-mitigated": "challenge"}, "")) is True
     assert is_bot_challenge(_Resp({"x-vercel-challenge-token": "abc",
                                    "content-type": "application/json"}, "{}")) is True
+    # a per-PATH `deny` (a WAF rule blocking /.aws/credentials etc.) is NOT an app-wide interstitial: the app is
+    # still gradeable, so it must NOT read as a challenge (regression -- it was halting the grade at the first
+    # sensitive-path probe once Vercel added the deny rule).
+    assert is_bot_challenge(_Resp({"x-vercel-mitigated": "deny", "content-type": "text/plain"}, "blocked")) is False
 
 
 def test_detects_known_interstitial_markers():

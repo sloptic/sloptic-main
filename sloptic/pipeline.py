@@ -62,6 +62,9 @@ class _Ctx:
     evidence: dict = field(default_factory=dict)  # a predicate may record measured values here; the
     #     executor snapshots it onto the outcome and resets it before the next probe (probes run serially)
     _browser_cache: dict = field(default_factory=dict)  # per-suffix browser-registration RESULT (see register)
+    email: object = None   # EmailReceiver | None -- the email-verification probes poll it; typed `object` so the
+    #     hot pipeline path never imports email_verify
+    _email_cache: dict = field(default_factory=dict)  # the one shared EmailVerifyResult (run once per app)
 
     def register(self, suffix: str = ""):
         """Self-register (self-as-oracle) for the authed-surface probes, with the browser fallback threaded in:
@@ -303,7 +306,7 @@ def _blocked(probes: list[Probe]) -> tuple[list[str], list[str]]:
 def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_progress=None,
         source_dir=None, seed_features=None, cached_profile=None, on_profile=None, perceive=None,
         browser_register=None, recon: bool = False, auth_crawl: bool = False, trace: bool = False,
-        login_creds=None) -> Report:
+        login_creds=None, email_receiver=None) -> Report:
     """on_progress(done, total, probe, outcomes): called twice per probe — before it runs with
     outcomes=None (so a caller can show what's currently testing), and after with its outcomes.
 
@@ -344,7 +347,7 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
         trace_sink = start_trace(trace)   # always reset (clears any stale sink); None when trace off. BEFORE
         #                                   make_client so the shared declarative client is hooked too.
         with make_client(origin, headers, timeout=15.0, follow_redirects=True) as client:
-            ctx = _Ctx(origin, client, profile, headers, browser_register=browser_register)
+            ctx = _Ctx(origin, client, profile, headers, browser_register=browser_register, email=email_receiver)
             # ENTRY GATE: if the target answers with a bot-challenge / WAF interstitial / sleeping-app page,
             # grading it draws false findings from its HTML AND hides the real surface (false cleans). Withhold
             # the grade instead of scoring the interstitial. The record is flagged bot_challenge -> excluded

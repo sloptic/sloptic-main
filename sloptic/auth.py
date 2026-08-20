@@ -81,7 +81,7 @@ def _password_form(forms: list[Form]) -> Form | None:
     return next((f for f in pw if any(h in f.action.lower() for h in _REGISTER_HINTS)), pw[0])
 
 
-def _fill(form: Form, username: str, password: str) -> dict[str, str]:
+def _fill(form: Form, username: str, password: str, email: str | None = None) -> dict[str, str]:
     data = {}
     for name in form.fields:
         low = name.lower()
@@ -90,7 +90,7 @@ def _fill(form: Form, username: str, password: str) -> dict[str, str]:
         if "pass" in low or "pwd" in low or "retype" in low or "repeat" in low:
             data[name] = password
         elif "email" in low or "mail" in low:
-            data[name] = username + "@example.com"
+            data[name] = email or (username + "@example.com")   # email-verification probes inject a real address we own
         else:
             data[name] = username
     return data
@@ -331,20 +331,22 @@ def register_account(base_url: str, profile: Profile, suffix: str = "", browser_
     return acct
 
 
-def _register_httpx(base_url: str, profile: Profile, suffix: str = "") -> Account | None:
+def _register_httpx(base_url: str, profile: Profile, suffix: str = "", email: str | None = None) -> Account | None:
     """Register via the discovered HTML form (POST its action) or a JSON API. Returns None on a transport error;
-    an Account even when no session cookie came back (the caller checks _has_session; the probes then read N/A)."""
+    an Account even when no session cookie came back (the caller checks _has_session; the probes then read N/A).
+    `email`, when set, fills the email field(s) instead of a dummy @example.com -- the email-verification probes
+    register with a real address they control so the confirmation mail is actually receivable."""
     form = _password_form(profile.forms)
     if form is None:
         # no HTML form -> JSON-API registration + login, preferring endpoints named in the spec
-        return _register_json(base_url, suffix, profile)
+        return _register_json(base_url, suffix, profile, email)
     # per-call random username: a real app with a unique-username constraint rejects a FIXED name on
     # re-grade (run 2+), silently nulling the authed session and flipping the auth probes to clean.
     # The score depends on the cookie's flags, not the username value, so this stays deterministic.
     username = "hl_" + secrets.token_hex(5) + suffix
     password = "Hl-Probe-Passw0rd!"
     client = httpx.Client(base_url=base_url, timeout=15.0, follow_redirects=True)
-    data = _fill(form, username, password)
+    data = _fill(form, username, password, email)
     try:
         # GET the form's page first: sets the CSRF cookie and lets us read the token out of the HTML,
         # so a CSRF-protected registration (Gitea, Django, Rails, ...) is accepted instead of rejected.
@@ -507,12 +509,13 @@ def _auth_shaped(r: httpx.Response) -> bool:
     return "json" in ct or bool(r.headers.get_list("set-cookie")) or _bearer_token(r) is not None
 
 
-def _register_json(base_url: str, suffix: str, profile=None) -> Account | None:
+def _register_json(base_url: str, suffix: str, profile=None, email: str | None = None) -> Account | None:
     """Self-register via a JSON API (no HTML form): try register endpoints (spec-named first), then
-    log in for an authed session — a bearer token (default Authorization header) or a session cookie."""
+    log in for an authed session — a bearer token (default Authorization header) or a session cookie.
+    `email`, when set, overrides the dummy address (email-verification probes register a real one they own)."""
     username = "hl_" + secrets.token_hex(5) + suffix
     password = "Hl-Probe-Passw0rd!"
-    email = username + "@example.com"
+    email = email or (username + "@example.com")
     # order: named in a spec -> inferred from an observed auth namespace -> the generic conventions
     register_paths = list(dict.fromkeys(_spec_auth_paths(profile, _REGISTER_KW)
                                         + _sibling_auth_paths(profile, _REGISTER_KW)

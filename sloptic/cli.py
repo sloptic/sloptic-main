@@ -318,6 +318,14 @@ def main() -> None:
                     help="auth header sent on EVERY request, e.g. --header 'Cookie: session=...' or "
                          "'Authorization: Bearer ...' — probes the authenticated surface as that user "
                          "(repeatable; note: state-changing probes then act AS that user)")
+    ap.add_argument("--email-domain", metavar="DOMAIN",
+                    help="domain of a throwaway inbox WE own for the email-verification probes (e.g. "
+                         "anachron.dev); registration addresses are hl-<tag>@DOMAIN")
+    ap.add_argument("--email-endpoint", metavar="URL",
+                    help="HTTP endpoint returning received mail as JSON (the Cloudflare Email Worker's /mail); "
+                         "without --email-domain + --email-endpoint the email-verification probes read N/A")
+    ap.add_argument("--email-token", metavar="TOKEN", default="",
+                    help="Bearer token for --email-endpoint (the Worker's MAIL_TOKEN secret)")
     ap.add_argument("--harden", action="store_true",
                     help="production sandbox for --submission: read-only rootfs + egress-blocked network")
     ap.add_argument("--network", metavar="NET", default="sloptic-net",
@@ -395,20 +403,30 @@ def main() -> None:
     _print_report(report, source, args)
 
 
+def _build_email_receiver(args):
+    """The email-verification probes' inbox: an HttpReceiver over the configured Worker endpoint, or None (the
+    probes then read N/A). Needs BOTH --email-domain (the address suffix) and --email-endpoint (the poll URL)."""
+    if not (getattr(args, "email_endpoint", None) and getattr(args, "email_domain", None)):
+        return None
+    from .email_verify import HttpReceiver
+    return HttpReceiver(domain=args.email_domain, endpoint=args.email_endpoint, token=args.email_token or "")
+
+
 def _grade(args, source, catalog, render, auth_headers, progress):
     """Deploy the source (subprocess / remote URL / sandboxed submission) and run the battery, returning the
     Report. Deploy/build/health failure -> _fail (SystemExit). Factored out so main() can short-circuit to the
     run cache before this ever executes."""
+    email_receiver = _build_email_receiver(args)   # email-verification probes' inbox (None -> they read N/A)
     # Trusted reference app: subprocess, no Docker.
     if args.app:
         return run(SubprocessDeployer(args.app), catalog, render=render, headers=auth_headers,
-                   on_progress=progress, source_dir=args.source)
+                   on_progress=progress, source_dir=args.source, email_receiver=email_receiver)
 
     # Already-running URL: dogfooding, no Docker, no teardown of the target.
     if args.target:
         try:
             return run(RemoteDeployer(args.target), catalog, render=render, headers=auth_headers,
-                       on_progress=progress, source_dir=args.source)
+                       on_progress=progress, source_dir=args.source, email_receiver=email_receiver)
         except _DEPLOY_FAILURES as e:
             _fail(args, "unreachable", str(e)[:500])
 
@@ -424,7 +442,8 @@ def _grade(args, source, catalog, render, auth_headers, progress):
             network=args.network if args.harden else None,
         )
         return run(deployer, catalog, render=render, headers=auth_headers, on_progress=progress,
-                   source_dir=args.source or str(sub.context_dir))  # scan the submission's own source
+                   source_dir=args.source or str(sub.context_dir),  # scan the submission's own source
+                   email_receiver=email_receiver)
     except _DEPLOY_FAILURES as e:
         _fail(args, "DNF", str(e)[:500])
     finally:

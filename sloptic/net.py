@@ -41,7 +41,8 @@ def _watch_challenge(response) -> None:
     if _challenge_onset.get() is not None:
         return
     h = response.headers
-    if "cf-mitigated" in h or "x-vercel-mitigated" in h or "x-vercel-challenge-token" in h:
+    # a Vercel `deny` is a per-request path block, not an app-wide challenge (see is_bot_challenge) -> never onset
+    if "cf-mitigated" in h or "x-vercel-challenge-token" in h or h.get("x-vercel-mitigated") == "challenge":
         _challenge_onset.set(_trace_probe.get() or "?")
     elif response.status_code in _CHALLENGE_STATUS:
         # BODY-CONFIRM it's a challenge, not a plain auth-403: a challenge/block page carries the markers, an
@@ -222,7 +223,10 @@ def is_bot_challenge(resp) -> bool:
     so it runs BEFORE the content-type gate: a Vercel challenge can be a 429 whose body is not HTML."""
     try:
         h = resp.headers
-        if "cf-mitigated" in h or "x-vercel-mitigated" in h or "x-vercel-challenge-token" in h:
+        # A Vercel `deny` is a per-REQUEST block of a specific path (a WAF rule denying /.aws/credentials, /.env,
+        # ...), NOT an app-wide interstitial -- the app stays fully reachable, so it must never withhold the
+        # grade or trip the challenge onset. Only a `challenge` (or its token) is a grade-halting interstitial.
+        if "cf-mitigated" in h or "x-vercel-challenge-token" in h or h.get("x-vercel-mitigated") == "challenge":
             return True
         ctype = resp.headers.get("content-type", "").lower()
         if "html" not in ctype and "text" not in ctype:

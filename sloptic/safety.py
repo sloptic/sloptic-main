@@ -48,6 +48,7 @@ ACTIVE_PROBES = frozenset({
     # qa -- fault induction, state mutation, hammering, clicking (may submit)
     "qa-crash-010", "qa-errhyg-001", "qa-input-001", "qa-integrity-001", "qa-integrity-002",
     "qa-race-001", "qa-race-002", "qa-noerror-001", "qa-staleui-001", "qa-deadctrl-001",
+    "qa-email-001", "qa-email-002",   # register with a controlled address + follow the verification link (mutate)
     # security -- injection, mutation, auth/multi-account, fault, hammer, data pull
     "sec-cmdi-001", "sec-sqli-001", "sec-sqli-002", "sec-sqli-003", "sec-sqli-004", "sec-sqli-005",
     "sec-xss-001", "sec-xss-002", "sec-domxss-001", "sec-ssti-001", "sec-lfi-001", "sec-xxe-001",
