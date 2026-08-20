@@ -10,3 +10,4 @@ applicability:
   requires: [has_auth_entrypoint]
 probe:
   predicate: bola_managed_backend
+severity_ref: access-control   # shared block in catalog/_severity_classes.yaml (bola_managed_backend sets cross_user_read)

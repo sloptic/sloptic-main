@@ -7,6 +7,7 @@ evidence_model: provable
 penalty: 35   # same tier as a served .env (sec-exposure-001): terraform state, a SQL dump, docker registry
               # auth, an npm token or a private key all hand an anonymous visitor real credentials or the
               # whole database. Provable by construction — the finding IS the file's own content.
+severity_ref: disclosed-secret
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:

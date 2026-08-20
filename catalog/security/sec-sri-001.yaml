@@ -8,6 +8,7 @@ penalty: 12   # PROVISIONAL (v2.0 Family 4 -- re-price from the corpus footrule 
               # recommendation, not our judgment. CONDITIONALLY prevalent (only apps loading cross-origin
               # script/style), so it may be a low-variance tax among applicable apps -> rank_variance decides
               # whether it stays scored and at what price. Anchored: a cross-origin script with/without integrity.
+severity: {cvss: "n/a", vrt: "P5", range: [10, 10], default: 10, tier: chore-floor}   # missing SRI on cross-origin subresource = defense-in-depth; REPRICED 12->10
 applicability:
   requires: [at_least_one_http_endpoint_exists]   # further self-gated by the predicate: N/A with no cross-origin subresource
 probe:

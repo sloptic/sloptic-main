@@ -5,6 +5,7 @@ pool: public
 evidence_model: provable
 penalty: 15   # a served .map reconstructs the ORIGINAL source (business logic, hidden endpoints, and secrets
               # a minified scan misses) — info disclosure, priced below a live secret / served .env
+severity: {cvss: "n/a", vrt: "P4", range: [15, 15], default: 15}   # sourcemap: source disclosure, low P4
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:

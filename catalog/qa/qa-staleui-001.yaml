@@ -5,6 +5,7 @@ pool: public
 evidence_model: provable
 penalty: 20   # the write IS durable (recoverable by refresh), so below silent-data-loss (34) — but a
               # significant trust defect: the UI shows nothing, so the user believes their save was LOST.
+severity: {iso_25010: "interaction-capability", nielsen: "3", range: [38, 38], default: 38}   # UI doesn't reflect a create -> it lies about state
 applicability:
   requires: [browser]   # must render + submit + reload to observe reflection; N/A without --browser
 probe:

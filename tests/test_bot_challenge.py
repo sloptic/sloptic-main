@@ -50,6 +50,16 @@ def test_challenge_onset_also_catches_cf_mitigated_header():
     net.start_trace(False)
 
 
+def test_challenge_onset_also_catches_vercel_mitigated_header():
+    # Vercel Attack Challenge Mode signals via x-vercel-mitigated (429), often with a non-HTML body -> the
+    # header alone must mark onset, no body read needed (same as cf-mitigated).
+    net.start_trace(False)
+    net.set_trace_probe("sec-xss-001")
+    net._watch_challenge(_R(429, "", {"x-vercel-mitigated": "challenge"}))
+    assert net.challenge_onset() == "sec-xss-001"
+    net.start_trace(False)
+
+
 def test_request_counts_tally_per_probe():
     net.start_trace(False)
     net.set_trace_probe("sec-cmdi-001")
@@ -60,6 +70,28 @@ def test_request_counts_tally_per_probe():
     assert net.request_counts() == {"sec-cmdi-001": 3, "sec-headers-001": 1}
 
 
+def test_make_client_presents_a_real_browser_user_agent_by_default():
+    # a `python-httpx` UA is exactly what WAF/bot mitigations challenge; the client must look like a real Chrome.
+    with net.make_client("http://x.test") as c:
+        ua = c.headers.get("user-agent", "")
+        assert "Chrome/" in ua and "python-httpx" not in ua
+        assert c.headers.get("accept-language")
+
+
+def test_make_client_lets_a_caller_user_agent_override():
+    with net.make_client("http://x.test", headers={"user-agent": "custom/1"}) as c:
+        assert c.headers.get("user-agent") == "custom/1"   # explicit --header wins, case-insensitively, no dup
+
+
+def test_default_user_agent_env_override(monkeypatch):
+    monkeypatch.setenv("SLOPTIC_USER_AGENT", "Mozilla/5.0 pinned-test")
+    net._UA_CACHE = None
+    try:
+        assert net.default_user_agent() == "Mozilla/5.0 pinned-test"
+    finally:
+        net._UA_CACHE = None   # don't leak the pinned value into other tests (it is process-cached)
+
+
 class _Resp:
     def __init__(self, headers, text=""):
         self.headers = headers
@@ -68,6 +100,14 @@ class _Resp:
 
 def test_detects_cloudflare_mitigation_header():
     assert is_bot_challenge(_Resp({"cf-mitigated": "challenge", "content-type": "text/html"}, "x")) is True
+
+
+def test_detects_vercel_mitigation_header():
+    # Vercel Attack Challenge Mode: x-vercel-mitigated / x-vercel-challenge-token (429/403), body often NOT html,
+    # so the header must win BEFORE the content-type gate (which would otherwise skip a JSON/empty challenge body).
+    assert is_bot_challenge(_Resp({"x-vercel-mitigated": "challenge"}, "")) is True
+    assert is_bot_challenge(_Resp({"x-vercel-challenge-token": "abc",
+                                   "content-type": "application/json"}, "{}")) is True
 
 
 def test_detects_known_interstitial_markers():

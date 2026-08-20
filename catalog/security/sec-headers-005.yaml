@@ -4,6 +4,7 @@ category: security-headers
 pool: public
 evidence_model: provable
 penalty: 2
+severity: {cvss: "n/a", vrt: "P5", range: [2, 2], default: 2, tier: chore-floor}   # Referrer-Policy
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:

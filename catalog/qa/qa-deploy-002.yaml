@@ -7,6 +7,7 @@ penalty: 30   # PROVISIONAL (v2.0 Family 1 -- re-price from the corpus footrule 
               # a redirect loop makes the route unreachable for EVERY visitor (the browser aborts with
               # ERR_TOO_MANY_REDIRECTS), so it is more severe than a single dead href (qa-links-001, 12) and
               # near the dead-backend gate (qa-deploy-001, 34). Gate-shaped (rare, decisive), not middle-band.
+severity: {iso_25010: "reliability", nielsen: "4", range: [50, 80], default: 50, escalators: [{evidence: root_loop, point: 80, vrt_variant: "the app ROOT loops -> whole app unreachable (a subpage-only loop = 50)"}]}
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:

@@ -5,6 +5,7 @@ pool: public
 evidence_model: oracle
 penalty: 28   # 5xx under a modest concurrent burst -> every user during a traffic spike
               # hits the failure. High-frequency outage under exactly the load that matters.
+severity: {iso_25010: "reliability", nielsen: "3", range: [50, 60], default: 50, escalators: [{evidence: observed_5xx, point: 60, vrt_variant: "a confirmed 5xx under load = a hard fault, not just dropped connections"}]}
 applicability:
   requires: [at_least_one_http_endpoint_exists, not_edge_managed]   # v2.0: N/A on managed-edge hosts (vercel/netlify/cloudflare/...) -- the platform owns rate-limiting/scaling, not the team
 probe:

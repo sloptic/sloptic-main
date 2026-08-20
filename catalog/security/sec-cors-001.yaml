@@ -4,6 +4,7 @@ category: cors
 pool: public
 evidence_model: provable
 penalty: 25
+severity: {cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:L/I:N/A:N", cvss_score: 6.1, vrt: "n/a", range: [45, 45], default: 45}   # CVSS-only (no VRT); REPRICED 25->45
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:

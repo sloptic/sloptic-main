@@ -5,6 +5,7 @@ pool: public
 evidence_model: oracle
 penalty: 22   # an uncaught JS error on load breaks interactivity for every visitor ->
               # high-frequency functional failure of a client-rendered app.
+severity: {iso_25010: "reliability", nielsen: "1->3", range: [18, 40], default: 18, escalators: [{evidence: error_overlay, point: 40, vrt_variant: "a VISIBLE error overlay/crash screen, not just invisible console noise"}]}
 applicability:
   requires: [browser]   # needs a rendered page; N/A without --browser
 probe:

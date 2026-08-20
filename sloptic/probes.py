@@ -857,7 +857,7 @@ def xss_injectable(ctx, probe) -> bool | None:
                 try:
                     sent = _xss_send(c, "post", action, {fn: inject for fn in fields})
                     if _reflects(c.get(action), detect):
-                        ctx.evidence.update(injectable=True, kind="stored", via="reflection",
+                        ctx.evidence.update(injectable=True, kind="stored", stored=True, via="reflection",
                                             target=action, payload=inject,
                                             repro=_repro_from_resp(sent, matched="payload persists; GET %s reflects it" % action))
                         return True  # persisted across a fresh request -> stored XSS
@@ -874,7 +874,7 @@ def xss_injectable(ctx, probe) -> bool | None:
             if browser.dom_xss_executes(ctx.base_url, [action], params=tuple(gfields),
                                         payloads=browser._XSS_EXEC_PAYLOADS, headers=ctx.headers):
                 exurl = ctx.base_url.rstrip("/") + action + "?" + urllib.parse.urlencode({gfields[0]: browser._XSS_PAYLOAD})
-                ctx.evidence.update(injectable=True, kind="reflected", via="execution",
+                ctx.evidence.update(injectable=True, kind="reflected", execution_confirmed=True, via="execution",
                                     target=action, fields=gfields,   # executed in a real DOM -> provable XSS
                                     repro=_repro("GET", exurl, matched="payload executed in a headless browser"))
                 return True
@@ -922,7 +922,7 @@ def stored_xss_api(ctx, probe) -> bool | None:
                   if not r.startswith("/_next/") and not r.split("?")[0].endswith((".js", ".css", ".png",
                                                                                     ".svg", ".ico", ".woff2"))][:20] or ["/"]
         if browser.stored_xss_executes(ctx.base_url, routes, headers=hdrs or None):
-            ctx.evidence.update(stored_xss=True, endpoints=[e.path for e in creates][:5])
+            ctx.evidence.update(stored_xss=True, stored=True, execution_confirmed=True, endpoints=[e.path for e in creates][:5])
             return True   # a stored API value executed unescaped in the DOM -> stored XSS
         ctx.evidence.update(stored_xss=False, creates_tested=len(creates))
         return False
@@ -1302,7 +1302,7 @@ def command_injection(ctx, probe) -> bool | None:
                         data = {fn: (sep % htmpl.format(s=salt) if fn == field else _XSS_FILLER) for fn in fields}
                         try:
                             if any(w in _xss_send(c, method, action, data).text for w in wanted):
-                                ctx.evidence.update(injectable=True, via="in-band hash",
+                                ctx.evidence.update(injectable=True, execution_confirmed=True, via="in-band hash",
                                                     target=action, field=field)
                                 return True  # a shell hashed the salt to its exact digest -> real injection
                         except (httpx.HTTPError, httpx.InvalidURL):
@@ -1388,7 +1388,7 @@ def ssti_injectable(ctx, probe) -> bool | None:
                     data = {fn: (p if fn == field else _XSS_FILLER) for fn in fields}
                     try:
                         if any(w in _xss_send(c, method, action, data).text for w in wanted):
-                            ctx.evidence.update(injectable=True, via="hash oracle", engine=engine,
+                            ctx.evidence.update(injectable=True, execution_confirmed=True, via="hash oracle", engine=engine,
                                                 target=action, field=field)
                             return True  # the engine hashed the salt to its exact digest -> real injection
                     except (httpx.HTTPError, httpx.InvalidURL):
@@ -1471,12 +1471,12 @@ def ssrf(ctx, probe) -> bool | None:
         fired = any(collab.received(t) for t in tokens)
         url_params = sorted({f for _, _, uf, _ in targets for f in uf})
         if fired:
-            ctx.evidence.update(callback_received=True, via="oast", url_params=url_params,
+            ctx.evidence.update(callback_received=True, via="oast", internal_reached=True, url_params=url_params,
                                 probes_sent=len(tokens))
             return True
         inband = _ssrf_inband(ctx, targets)
         if inband is not None:
-            ctx.evidence.update(callback_received=False, via="in-band", url_params=url_params, **inband)
+            ctx.evidence.update(callback_received=False, via="in-band", internal_reached=True, url_params=url_params, **inband)
             return True
         ctx.evidence.update(callback_received=False, url_params=url_params, probes_sent=len(tokens))
         return False
@@ -1535,7 +1535,7 @@ def xxe(ctx, probe) -> bool | None:
                     except (httpx.HTTPError, httpx.InvalidURL):
                         continue
                     if _LFI_SIG.search(r.text):
-                        ctx.evidence.update(via="in-band file read", target=action)
+                        ctx.evidence.update(via="in-band file read", sensitive_fields=True, target=action)   # read a system file
                         return True  # the parser resolved file:///etc/passwd and reflected it -> XXE
     # OOB: a callback to our one-time URL proves the server fetched it (definitive, but dark on egress-blocked hosts).
     hosts = oob.callback_hosts()
@@ -1555,7 +1555,7 @@ def xxe(ctx, probe) -> bool | None:
                             continue
         _await_callback(collab, tokens, probe)
         fired = any(collab.received(t) for t in tokens)
-        ctx.evidence.update(callback_received=fired, via=("oob callback" if fired else None),
+        ctx.evidence.update(callback_received=fired, internal_reached=fired, via=("oob callback" if fired else None),
                             post_endpoints=len(posts), probes_sent=len(tokens))
         return True if fired else False
     finally:
@@ -1648,7 +1648,7 @@ def path_traversal(ctx, probe) -> bool | None:
                                     continue   # file signature does not reproduce -> nondeterministic (#1)
                             except (httpx.HTTPError, httpx.InvalidURL):
                                 pass       # control probe unreachable -> fall through and fire on direct evidence
-                            ctx.evidence.update(found=True, target=action, field=field, canary_clean=True)
+                            ctx.evidence.update(found=True, sensitive_fields=True, target=action, field=field, canary_clean=True)
                             return True  # returned the contents of a system file -> traversal/LFI
                     except (httpx.HTTPError, httpx.InvalidURL):
                         continue
@@ -1753,7 +1753,7 @@ def file_upload(ctx, probe) -> bool | None:
                     try:
                         got = c.get(url)
                         if want in got.text:
-                            ctx.evidence.update(rce=True, form=f.action, filename=filename,
+                            ctx.evidence.update(rce=True, execution_confirmed=True, form=f.action, filename=filename,
                                                 repro=_repro_from_resp(got, matched="uploaded script executed server-side (salt digest returned)"))
                             return True  # the uploaded webshell hashed the salt server-side -> RCE via upload
                     except (httpx.HTTPError, httpx.InvalidURL):
@@ -1834,7 +1834,7 @@ def upload_stored_xss(ctx, probe) -> bool | None:
                     except (httpx.HTTPError, httpx.InvalidURL):
                         continue
                     if _served_executable_inline(got):
-                        ctx.evidence.update(stored_xss=True, form=f.action, filename=filename,
+                        ctx.evidence.update(stored_xss=True, stored=True, execution_confirmed=True, form=f.action, filename=filename,
                                             served_as=got.headers.get("content-type", ""),
                                             repro=_repro_from_resp(got, matched="served %s inline (not attachment)"
                                                                    % got.headers.get("content-type", "")))
@@ -2051,7 +2051,8 @@ def api_bola(ctx, probe) -> bool | None:
                 except (httpx.HTTPError, httpx.InvalidURL):
                     continue
                 if b_read.status_code == 200 and secret_value in b_read.text:
-                    ctx.evidence.update(cross_read=True, endpoint=read_path)
+                    # v2 severity: the crossed object carried the canary in a SENSITIVE field (pair-selected)
+                    ctx.evidence.update(cross_read=True, cross_user_read=True, sensitive_fields=True, endpoint=read_path)
                     return True  # B read A's object AND saw A's planted secret -> broken object auth
         ctx.evidence.update(cross_read=False, pairs_tested=len(pairs))
         return False if tested else None
@@ -2158,7 +2159,8 @@ def api_bola_collection(ctx, probe) -> bool | None:
                 shared = ({_obj_id(o) for o in oa} & {_obj_id(o) for o in ob}) - {None}
                 # not owner-scoped: each unrelated account sees >=2 owners AND they share a real object
                 if len(owners_a) >= 2 and len(owners_b) >= 2 and shared:
-                    ctx.evidence.update(bola_collection=True, endpoint=path,
+                    # v2 severity: an auth-gated collection leaking >=2 owners = bulk cross-user read
+                    ctx.evidence.update(bola_collection=True, cross_user_read=True, bulk_read=True, endpoint=path,
                                         distinct_owners=len(owners_a), shared_objects=len(shared),
                                         repro=_repro_from_resp(rb, matched="%d distinct owners / %d shared objects visible to a 2nd account"
                                                                % (len(owners_a), len(shared))))
@@ -2209,7 +2211,8 @@ def idor_user_record(ctx, probe) -> bool | None:
                 except (httpx.HTTPError, httpx.InvalidURL):
                     continue
                 if as_b.status_code == 200 and canary in as_b.text:
-                    ctx.evidence.update(cross_read=True, endpoint=path)
+                    # v2 severity: a user/account record is PII by nature -> sensitive_fields
+                    ctx.evidence.update(cross_read=True, cross_user_read=True, sensitive_fields=True, endpoint=path)
                     return True                    # B read A's own account record -> horizontal IDOR
         ctx.evidence.update(cross_read=False, reads_tested=len(reads))
         return False if tested else None
@@ -2287,7 +2290,8 @@ def bola_managed_backend(ctx, probe) -> bool | None:
                 except (httpx.HTTPError, httpx.InvalidURL):
                     continue
                 if as_b.status_code == 200 and canary in as_b.text:
-                    ctx.evidence.update(cross_read=True, endpoint=url.split("?")[0])
+                    # v2 severity: cross-user read PROVEN; leave sensitive_fields unset (row content not classified)
+                    ctx.evidence.update(cross_read=True, cross_user_read=True, endpoint=url.split("?")[0])
                     return True   # B read A's private backend record -> broken per-user RLS
         ctx.evidence.update(cross_read=False, reads_tested=len(reads))
         return False if tested else None
@@ -2683,7 +2687,7 @@ def debug_mode_enabled(ctx, probe) -> bool | None:
     for r in _induce_error_responses(ctx):
         inspected = True
         if _DEBUG_FINGERPRINT.search(r.text):
-            ctx.evidence.update(status=r.status_code, debug_ui=True,
+            ctx.evidence.update(status=r.status_code, debug_ui=True, execution_confirmed="werkzeug" in r.text.lower(),
                                 repro=_repro_from_resp(r, matched="framework debug UI fingerprint"))
             return True
     # Werkzeug/Flask debug ships an interactive debugger reachable WITHOUT an error: it serves its own JS
@@ -2695,7 +2699,7 @@ def debug_mode_enabled(ctx, probe) -> bool | None:
         inspected = True
         if (r.status_code == 200 and "javascript" in r.headers.get("content-type", "").lower()
                 and "werkzeug" in r.text.lower()):
-            ctx.evidence.update(endpoint="/?__debugger__=yes", debug_ui=True, framework="werkzeug")
+            ctx.evidence.update(endpoint="/?__debugger__=yes", debug_ui=True, framework="werkzeug", execution_confirmed=True)
             return True
     except (httpx.HTTPError, httpx.InvalidURL):
         pass
@@ -2792,7 +2796,7 @@ def bundle_leaks_secret(ctx, probe) -> bool | None:
         return None
     kinds = secretscan.scan_blob(blob)
     if kinds:
-        ctx.evidence.update(secret_kinds=kinds, source="client-bundle")
+        ctx.evidence.update(secret_kinds=kinds, high_privilege=True, source="client-bundle")   # server keys = takeover
         return True
     ctx.evidence.update(secret_kinds=[], scanned_bytes=len(blob))
     return False
@@ -2849,7 +2853,7 @@ def unreachable_backend_reference(ctx, probe) -> bool | None:
     if operative:
         ctx.evidence.update(private_backends=private[:5], unset_env_backends=unset[:5],
                             operative_backends=operative[:5], observed=True, source="client-bundle")
-        return True                                     # OPERATIVE -> the yaml penalty (34) applies
+        return True                                     # OPERATIVE -> severity escalator `observed` -> 85
     ctx.evidence.update(private_backends=private[:5], unset_env_backends=unset[:5], observed=False,
                         report_only=True, penalty_override=0, source="client-bundle")
     return True                                          # presence-only -> off-score diagnostic (UNPROVEN)
@@ -3017,7 +3021,8 @@ def vulnerable_dependency(ctx, probe) -> bool | None:
         return None
     vulns = depscan.scan_deps(blob)
     if vulns:
-        ctx.evidence.update(vulnerable_deps=vulns, count=len(vulns))
+        worst = max(v["cvss"] for v in vulns)   # OWASP A03: the finding IS a CVE -> score its own NVD CVSS x 10
+        ctx.evidence.update(vulnerable_deps=vulns, count=len(vulns), penalty_override=round(worst * 10))
         return True
     ctx.evidence.update(vulnerable_deps=[], scanned_bytes=len(blob))
     return False
@@ -3220,7 +3225,7 @@ def exposed_sensitive_file(ctx, probe) -> bool | None:
                 continue          # a discovered path another probe already bills -> theirs, not ours
             with contextlib.suppress(Exception):
                 if check(r):
-                    ctx.evidence.update(exposed=True, path=path, status=r.status_code,
+                    ctx.evidence.update(exposed=True, high_privilege=True, path=path, status=r.status_code,
                                         bytes=len(r.content or b""),
                                         repro=_repro("GET", str(r.url), status=r.status_code,
                                                      matched=f"served {path}"))
@@ -3454,7 +3459,7 @@ def anon_bulk_data_exposed(ctx, probe) -> bool | None:
                     hits.append(c)
                 if not hits:
                     continue      # bulk but not sensitive: a catalog, an index, a public profile list
-                ctx.evidence.update(anon_readable=True, endpoint=path, collection=key or "(top level)",
+                ctx.evidence.update(anon_readable=True, sensitive_fields=True, bulk_read=True, endpoint=path, collection=key or "(top level)",
                                     records=len(rows), sensitive_columns=hits[:6], columns=cols[:10],
                                     repro=_repro_from_resp(
                                         r, matched="%d records with %s readable to an anonymous request"
@@ -3744,13 +3749,13 @@ def exposed_backend_readable(ctx, probe) -> bool | None:
             w = _supabase_anon_writable(ext, base, keys, tables)
             if isinstance(w, dict):
                 ctx.evidence.update(backend="supabase", host=base, table=w["table"], anon_writable=True,
-                                    sqlstate=w["sqlstate"], repro=w["repro"])
+                                    write_confirmed=True, sqlstate=w["sqlstate"], repro=w["repro"])
                 return True
             hit = _supabase_readable(ext, base, keys, tables)
             if isinstance(hit, dict):
                 ctx.evidence.update(backend="supabase", host=base, table=hit["table"],
                                     rows_readable=hit["rows"], columns=hit["columns"],
-                                    sensitive_columns=hit.get("sensitive_columns"), repro=hit["repro"])
+                                    bulk_read=True, sensitive_columns=hit.get("sensitive_columns"), repro=hit["repro"])
                 return True
             reached = reached or hit != "unreachable"
         if fm:
@@ -3759,7 +3764,7 @@ def exposed_backend_readable(ctx, probe) -> bool | None:
             if isinstance(data, (dict, list)) and data:
                 sensitive = _rtdb_sensitive_names(data)
                 if sensitive:                       # gate on sensitive node/field names (Supabase-path parity)
-                    ctx.evidence.update(backend="firebase-rtdb", host=fm.group(1),
+                    ctx.evidence.update(backend="firebase-rtdb", bulk_read=True, host=fm.group(1),
                                         sample_keys=sorted(data)[:8] if isinstance(data, dict) else len(data),
                                         sensitive_fields=sensitive[:6],
                                         repro=_repro("GET", url, status=200,
@@ -3772,7 +3777,7 @@ def exposed_backend_readable(ctx, probe) -> bool | None:
             hit = _firestore_readable(ext, "https://firestore.googleapis.com", proj, key,
                                       _firestore_collections(blob, _observed_tables(ctx)))
             if isinstance(hit, dict):
-                ctx.evidence.update(backend="firestore", project=proj, collection=hit["collection"],
+                ctx.evidence.update(backend="firestore", bulk_read=True, project=proj, collection=hit["collection"],
                                     documents_readable=hit["documents"], fields=hit["fields"],
                                     sensitive_fields=hit.get("sensitive_fields"), repro=hit["repro"])
                 return True
@@ -3945,7 +3950,7 @@ def authenticated_backend_readable(ctx, probe) -> bool | None:
                                              key_m.group(0), token,
                                              _firestore_collections(blob, _observed_tables(ctx)))
                 if isinstance(hit, dict):
-                    ctx.evidence.update(backend="firestore", tier="authenticated", project=proj_m.group(1),
+                    ctx.evidence.update(backend="firestore", tier="authenticated", cross_user_read=True, bulk_read=True, project=proj_m.group(1),
                                         collection=hit["collection"], documents_readable=hit["documents"],
                                         fields=hit["fields"], repro=hit["repro"])
                     return True
@@ -3960,7 +3965,7 @@ def authenticated_backend_readable(ctx, probe) -> bool | None:
                     hit = _supabase_authed_only(ext, base, anon_key, jwt,
                                                 _supabase_tables(blob, _observed_tables(ctx)))
                     if isinstance(hit, dict):
-                        ctx.evidence.update(backend="supabase", tier="authenticated", host=base,
+                        ctx.evidence.update(backend="supabase", tier="authenticated", cross_user_read=True, bulk_read=True, host=base,
                                             table=hit["table"], rows_readable=hit["rows"],
                                             columns=hit["columns"], repro=hit["repro"])
                         return True
@@ -4495,7 +4500,7 @@ def dom_xss(ctx, probe) -> bool:
     it runs in the DOM, catching reflected-that-executes and DOM-sink XSS a source check misses.
     Gated on the `browser` capability, so it's N/A unless the run enabled rendering."""
     executed = browser.dom_xss_executes(ctx.base_url, ctx.profile.routes, headers=ctx.headers)
-    ctx.evidence.update(executed=bool(executed), routes_rendered=len(ctx.profile.routes))
+    ctx.evidence.update(executed=bool(executed), execution_confirmed=bool(executed), routes_rendered=len(ctx.profile.routes))
     return executed
 
 
@@ -4699,6 +4704,10 @@ def a11y_violations_present(ctx, probe) -> bool:
     return len(scored) > probe.probe.get("threshold", 0)
 
 
+_PRIMARY_CTA = ("submit", "save", "buy", "checkout", "pay", "order", "create", "sign up", "signup",
+                "log in", "login", "send", "confirm", "add to cart", "place order", "subscribe", "register")
+
+
 def dead_controls_present(ctx, probe) -> bool:
     """Browser oracle: clickable controls wired to nothing — clicking moves no channel (DOM / network /
     navigation / dialog / error). The AI-shell-app tell, the interactive analogue of a broken link.
@@ -4709,7 +4718,8 @@ def dead_controls_present(ctx, probe) -> bool:
     dead = browser.inert_controls(url, headers=ctx.headers, max_controls=probe.probe.get("max_controls", 10))
     if dead is None:
         return False   # no browser / render failed -> inconclusive, not a false "clean"
-    ctx.evidence.update(dead_controls=len(dead), labels=dead[:8])
+    ctx.evidence.update(dead_controls=len(dead), labels=dead[:8],
+                        primary_cta=any(any(k in (l or "").lower() for k in _PRIMARY_CTA) for l in dead))
     return len(dead) > probe.probe.get("threshold", 0)
 
 
@@ -4744,7 +4754,8 @@ def open_redirect(ctx, probe) -> bool:
                 continue
             if resp.is_redirect and urllib.parse.urlparse(
                     resp.headers.get("location", "")).hostname == _REDIRECT_PROBE_HOST:
-                ctx.evidence.update(vulnerable=True, endpoint=path,
+                ctx.evidence.update(vulnerable=True, endpoint=path, external_host=True,
+                                    auth_flow=any(k in path.lower() for k in ("oauth", "authorize", "sso", "login")),
                                     repro=_repro_from_resp(resp, matched="Location: " + resp.headers.get("location", "")))
                 return True
     ctx.evidence.update(vulnerable=False, endpoints_tested=len(seen))
@@ -4782,7 +4793,7 @@ def idor_horizontal(ctx, probe) -> bool | None:
         with httpx.Client(base_url=ctx.base_url, timeout=10.0, cookies=b_cookies, headers=b_auth) as bc:
             leaked = bc.get(resource)
         cross = leaked.status_code == 200 and marker in leaked.text
-        ctx.evidence.update(cross_read=cross, resource=resource)
+        ctx.evidence.update(cross_read=cross, cross_user_read=cross, resource=resource)   # v2 severity flag
         return cross
     except (httpx.HTTPError, httpx.InvalidURL):
         return None
@@ -4950,18 +4961,19 @@ def load_resilience(ctx, probe) -> bool:
         # always-present endpoint. NEVER fan across all routes: concurrent bursts at every endpoint
         # of a live target is a DoS.
         target = _landing(ctx)
-    ratios = []
+    ratios, saw_5xx = [], False
     for _ in range(3):  # median of N bursts, not one: a target near the 10% gate flips between runs
         statuses = _concurrent_get(ctx.base_url, target, headers=ctx.headers)
         if statuses:
             # None = connection refused/dropped/timeout — a HARDER fall-over than a 500, counted over
             # the whole burst so an app that crashes the connection can't read cleaner than one that 500s.
+            saw_5xx = saw_5xx or any(s is not None and s >= 500 for s in statuses)   # a hard fault, not just a drop
             failures = sum(1 for s in statuses if s is None or s >= 500)
             ratios.append(failures / len(statuses))
     if not ratios:
         return False
     med = statistics.median(ratios)
-    ctx.evidence.update(fail_ratio=round(med, 3), threshold=0.1, target=target)
+    ctx.evidence.update(fail_ratio=round(med, 3), threshold=0.1, observed_5xx=saw_5xx, target=target)
     return med > 0.1
 
 
@@ -5213,7 +5225,8 @@ def redirect_loop(ctx, probe) -> bool | None:
     budget = probe.probe.get("max_attempts", 40)
     base = urllib.parse.urlparse(ctx.base_url)
     with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=False) as c:
-        starts = [_home_path(ctx, probe)]
+        home = _home_path(ctx, probe)
+        starts = [home]
         links = _same_origin_links(c, ctx, probe)
         if links is None and not starts:
             return None
@@ -5226,7 +5239,7 @@ def redirect_loop(ctx, probe) -> bool | None:
                 if urllib.parse.urlparse(url).netloc not in ("", base.netloc):
                     break                                  # left our origin -> resolves elsewhere, not our loop
                 if url in seen:                            # revisited a URL we already fetched -> cycle
-                    ctx.evidence.update(loop=True, entry=start, hops=len(seen),
+                    ctx.evidence.update(loop=True, entry=start, root_loop=(start == home), hops=len(seen),
                                         reason="redirect cycle", cycle_to=urllib.parse.urlparse(url).path)
                     return True
                 seen.add(url)
@@ -5239,7 +5252,7 @@ def redirect_loop(ctx, probe) -> bool | None:
                     break                                  # resolved to a final (non-redirect) response
                 url = urllib.parse.urljoin(url, r.headers["location"])
             else:
-                ctx.evidence.update(loop=True, entry=start, hops=cap + 1,
+                ctx.evidence.update(loop=True, entry=start, root_loop=(start == home), hops=cap + 1,
                                     reason="exceeded the browser redirect cap (ERR_TOO_MANY_REDIRECTS)")
                 return True                                # never resolved within the cap -> unbounded chain
     ctx.evidence.update(loop=False, routes_checked=len(dict.fromkeys(starts)))
@@ -5558,7 +5571,7 @@ def leaks_error_detail(ctx, probe) -> bool | None:
             return True
         m = _SQL_ERROR.search(r.text)
         if m:
-            ctx.evidence.update(status=r.status_code, leak="db-error",
+            ctx.evidence.update(status=r.status_code, leak="db-error", db_error=True,
                                 matched=r.text[m.start():m.start() + 200].strip(),
                                 repro=_repro_from_resp(r, matched="database error leaked in the error response"))
             return True

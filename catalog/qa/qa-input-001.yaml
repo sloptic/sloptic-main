@@ -7,6 +7,7 @@ penalty: 16   # the server accepts a value that violates the app's OWN declared 
               # type=email/number/url/date) -> client-only validation: garbage bypasses the browser straight
               # into the datastore. ISO/IEC 25010 User Error Protection. Moderate — a data-integrity /
               # robustness gap, priced with the other qa robustness probes (crash 32 > this > errhyg 14).
+severity: {iso_25010: "functional-suitability", nielsen: "2", range: [30, 30], default: 30}   # client-only validation, bypassable
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:

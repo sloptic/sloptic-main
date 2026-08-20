@@ -6,7 +6,7 @@ import pathlib
 
 import yaml
 
-from .schema import Probe
+from .schema import Probe, Severity
 
 
 class ProbeSelectionError(ValueError):
@@ -25,11 +25,49 @@ def default_catalog_dir() -> pathlib.Path:
     return packaged if packaged.is_dir() else _PKG.parent / "catalog"
 
 
+def _load_severity_registry(root: pathlib.Path) -> dict[str, Severity]:
+    """Shared severity definitions referenced by a probe's `severity_ref` (DRY: one authority-anchored block
+    per vulnerability class, not copied into every probe of that class). Lives in catalog/_severity_classes.yaml
+    as {class_name: severity-block}. Empty when the file is absent (probes then use inline severity / nominal)."""
+    root = pathlib.Path(root)
+    reg = root / "_severity_classes.yaml"
+    if not reg.is_file():
+        # load_catalog may be called from an ANCESTOR of the catalog dir (scripts/benchmark._catalog_index
+        # passes the repo root and relies on rglob to find the probe YAMLs deep). Find the registry the same way,
+        # or every severity_ref silently fails to resolve against an empty registry.
+        reg = next(root.rglob("_severity_classes.yaml"), None)
+    if reg is None or not reg.is_file():
+        return {}
+    raw = yaml.safe_load(reg.read_text()) or {}
+    return {name: Severity(**block) for name, block in raw.items()}
+
+
+def _apply_severity_ref(probe: Probe, registry: dict[str, Severity]) -> None:
+    """Resolve a probe's `severity_ref` into its `severity` from the shared registry. A probe sets AT MOST one
+    of severity / severity_ref; an unknown ref is a catalog bug (fail loud), not a silent fall-through."""
+    if not probe.severity_ref:
+        return
+    if probe.severity is not None:
+        raise ValueError(f"{probe.id}: set either 'severity' or 'severity_ref', not both")
+    if probe.severity_ref not in registry:
+        raise ValueError(f"{probe.id}: severity_ref '{probe.severity_ref}' not in catalog/_severity_classes.yaml")
+    probe.severity = registry[probe.severity_ref]
+
+
 def load_catalog(root: str | pathlib.Path) -> list[Probe]:
+    root = pathlib.Path(root)
+    registry = _load_severity_registry(root)
     probes: list[Probe] = []
-    for path in sorted(pathlib.Path(root).rglob("*.yaml")):
+    for path in sorted(root.rglob("*.yaml")):
+        if path.name.startswith("_"):
+            continue   # shared/config catalog data (e.g. _severity_classes.yaml), not a probe
         data = yaml.safe_load(path.read_text())
-        probes.append(Probe(**data))
+        probe = Probe(**data)
+        _apply_severity_ref(probe, registry)
+        if probe.severity is not None:
+            probe.penalty = probe.severity.default   # keep the nominal in sync with the authority -> no drift,
+                                                     # no stale value; the severity block is the single source
+        probes.append(probe)
     return probes
 
 

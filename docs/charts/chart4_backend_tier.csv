@@ -1,0 +1,6 @@
+tier,apps,pct_of_traffic_bearing,n_traffic_bearing
+Same-origin frontend,682,64.2,1063
+Third-party vendor,272,25.6,1063
+Opaque (unattributable),203,19.1,1063
+Own backend (injectable),176,16.6,1063
+Managed backend (BaaS),154,14.5,1063

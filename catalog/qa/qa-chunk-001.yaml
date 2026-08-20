@@ -6,6 +6,7 @@ evidence_model: provable
 penalty: 30   # a HARD FAIL, not a UX nit — the app's own HTML points at a bundle it cannot load, so it
               # literally cannot render. Priced high (near the qa-integrity data-loss tier), per the
               # frequency(moderate) x severity(total failure) rule.
+severity: {iso_25010: "reliability", nielsen: "3", range: [45, 45], default: 45}   # served bundle chunk 404s -> a feature can't load
 probe:
   predicate: dead_bundle_chunk
   # Parse <script src> from the served '/', request each SAME-ORIGIN script, and fire on any that 404s OR

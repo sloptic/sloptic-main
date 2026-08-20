@@ -7,6 +7,7 @@ penalty: 35   # XSS is the #1 serious vuln in AI-generated code and a real explo
               # exploit tier outranks the worst QA/perf annoyances per-instance (slow load-time 34, crash 32):
               # exploit > slow > crash. This fixes the ordering by lifting the exploit, NOT by clawing back the
               # deliberate QA/perf aggregate weight. Sits below the catastrophic ceiling (40: SQLi/RCE/IDOR).
+severity_ref: xss   # reflected (heuristic 40 / executed 61) or stored (85); the predicate sets kind + execution
 applicability:
   requires: [any_endpoint_accepts_text_input]
 probe:

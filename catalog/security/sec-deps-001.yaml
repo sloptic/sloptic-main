@@ -7,6 +7,9 @@ penalty: 18   # a client dependency with a KNOWN CVE (retire.js-style) shipped t
               # prototype-pollution / ReDoS the team could have avoided with `npm audit`. Supply-chain
               # responsibility (the team CHOSE it, 24h is enough for due diligence); moderate — exploitation
               # needs the vulnerable path actually used, and it's client-side, so priced below active XSS (35).
+# NO severity block: OWASP A03 is the one probe where the finding IS a CVE, so the predicate computes
+# penalty_override = the worst matched component's NVD CVSS x 10 (depscan._DEP_VULNS carries per-CVE CVSS).
+# Exempt from the anti-vibe severity gate for this reason (test_scoring_v2._EXEMPT).
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:

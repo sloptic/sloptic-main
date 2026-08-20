@@ -29,7 +29,7 @@ from .net import challenge_onset, is_bot_challenge, make_client, request_counts,
 # most outcomes saw the real app). Below it, too much of the grade is contaminated -> withhold like an entry challenge.
 _MIN_VALID_FRACTION = 0.6
 from .probes import MATCHERS, PREDICATES, _repro_from_resp, describe
-from .schema import Form, Outcome, Probe, Profile, Report
+from .schema import Form, Outcome, Probe, Profile, Report, Severity
 
 
 def _source_secret_outcome(source_dir) -> Outcome:
@@ -196,6 +196,16 @@ _PENALTY_CAP = 250   # runaway guard on penalty_override — above any real per-
                      # ~100 rules max), so it only ever catches a bug, never clips a legitimate multi-barrier fire
 
 
+def _severity_penalty(sev: Severity, ev: dict) -> int:
+    """Authority-anchored point (SCORING_V2_SPEC.md): start at `default` (abstention = range low), lift to the
+    single HIGHEST escalator rung whose evidence flag the predicate set, clamp to [lo, hi]. Rungs never sum.
+    Default low, evidence lifts. The range's own `hi` caps it (always <= the 100 anchor), so _PENALTY_CAP is moot."""
+    lo, hi = sev.range
+    matched = [e.point for e in sev.escalators if ev.get(e.evidence)]
+    point = max(sev.default, *matched) if matched else sev.default
+    return int(min(hi, max(lo, point)))
+
+
 def _run_probe(probe: Probe, ctx: _Ctx, client: httpx.Client, profile: Profile) -> list[Outcome]:
     """Resolve one probe to its outcome(s): applicability gate, then an oracle predicate or a
     declarative fan-out across discovered targets. One Outcome per (probe x target)."""
@@ -232,9 +242,13 @@ def _run_probe(probe: Probe, ctx: _Ctx, client: httpx.Client, profile: Profile) 
             return [_outcome(probe, "not_applicable", 0, target, evidence=ev)]
         pen = probe.penalty
         override = ev.get("penalty_override")   # a predicate MAY set an ABSOLUTE penalty that can EXCEED the
-        if slop and isinstance(override, (int, float)) and override >= 0:   # nominal ceiling (the a11y per-rule
-            floor = 0 if ev.get("report_only") else 1                       # report_only fires are OFF-SCORE (a
-            pen = max(floor, min(round(override), _PENALTY_CAP))            # visible diagnostic at 0); else >=1, guarded
+        if slop:                                                           # nominal ceiling (the a11y per-rule sum).
+            if ev.get("report_only"):                                      # Precedence: report_only (off-score, 0) >
+                pen = 0                                                    # v2 severity block (range+evidence ladder)
+            elif probe.severity is not None:                              # > raw penalty_override (a11y/perf code
+                pen = _severity_penalty(probe.severity, ev)                # compute) > nominal probe.penalty.
+            elif isinstance(override, (int, float)) and override >= 0:
+                pen = max(1, min(round(override), _PENALTY_CAP))
         return [_outcome(probe, "slop_detected" if slop else "clean", pen if slop else 0,
                          target, reason=describe(probe) if slop else "", evidence=ev)]
     na_if_absent = probe.probe.get("na_if_absent", False)

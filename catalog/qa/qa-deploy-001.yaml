@@ -10,6 +10,7 @@ penalty: 34   # PROVISIONAL (v2.0 Family 1 -- re-price from the corpus footrule 
               # SCORED only when the private host is OBSERVED requested at runtime (an operative dead data layer);
               # a bundle-present-but-never-requested match (dead env||localhost fallback / template constant) is an
               # OFF-SCORE diagnostic at 0 (report_only), NOT scored -- see unreachable_backend_reference.
+severity: {iso_25010: "reliability", nielsen: "4", range: [0, 85], default: 0, escalators: [{evidence: observed, point: 85, vrt_variant: "backend host observed in live runtime traffic = dead data layer for real visitors"}]}   # presence-only stays report_only 0
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:

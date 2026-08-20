@@ -4,6 +4,7 @@ category: security-headers
 pool: public
 evidence_model: provable
 penalty: 3
+severity: {cvss: "n/a", vrt: "P5", range: [3, 3], default: 3, tier: chore-floor}   # nosniff; defense-in-depth
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:

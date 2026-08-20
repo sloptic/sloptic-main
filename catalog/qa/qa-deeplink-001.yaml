@@ -5,6 +5,7 @@ pool: public
 evidence_model: provable
 penalty: 15   # every shared/bookmarked link is dead — the app works from home but not from a deep link.
               # Moderate UX-functional severity (above a dead back button, below a total non-render).
+severity: {iso_25010: "interaction-capability", nielsen: "2", range: [28, 28], default: 28}   # direct load of a real route renders only the shell
 applicability:
   requires: [browser]   # must render to see whether the client paints the route; N/A without --browser
 probe:

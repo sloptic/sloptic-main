@@ -4,6 +4,7 @@ category: file-upload
 pool: public
 evidence_model: provable
 penalty: 40   # a webshell that executes server-side is remote code execution
+severity_ref: file-upload-rce
 applicability:
   requires: [any_endpoint_accepts_text_input]
 probe:

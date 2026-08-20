@@ -5,6 +5,7 @@ variant_group_id: credential-exposure   # "this app returns credentials" = one f
 pool: public
 evidence_model: provable
 penalty: 35   # returning password material to a client is top-tier excessive-data-exposure (OWASP API3)
+severity_ref: disclosed-secret
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:

@@ -7,6 +7,7 @@ penalty: 25   # PROVISIONAL (v2.0 Family 1 -- re-price from the corpus footrule 
               # public origin served over plain http:// sends every visitor's credentials + session cookies in
               # cleartext (network attacker reads/replays them). Complements HSTS (sec-headers-003, https-only)
               # and mixed-content (sec-mixed-001, https-only), which both miss a no-TLS origin. Gate-shaped.
+severity: {cvss: "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N", cvss_score: 5.9, vrt: "P4", range: [30, 30], default: 30}   # app served over cleartext http (CWE-319); REPRICED 25->30
 applicability:
   requires: [at_least_one_http_endpoint_exists]   # further self-gated by the predicate to public http origins
 probe:

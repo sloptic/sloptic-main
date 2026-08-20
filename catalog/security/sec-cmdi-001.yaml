@@ -4,6 +4,7 @@ category: command-injection
 pool: public
 evidence_model: provable
 penalty: 40   # OS command injection -> remote code execution, top-tier severity
+severity_ref: command-injection
 applicability:
   requires: [any_endpoint_accepts_text_input]
 probe:

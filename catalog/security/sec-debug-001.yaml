@@ -4,6 +4,7 @@ category: debug-mode
 pool: public
 evidence_model: oracle
 penalty: 20   # debug UI in prod leaks source/settings/env; a Werkzeug console is an RCE surface
+severity_ref: debug-mode
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:

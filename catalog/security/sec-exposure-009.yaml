@@ -9,6 +9,7 @@ penalty: 4    # info disclosure / recon: an internal-only address (an RFC1918 or
               # banner (sec-headers-006 = 2), below verbose-error schema disclosure (sec-backend-003 = 12): recon
               # value, not a direct compromise. LOOPBACK is EXCLUDED by the regex (localhost / 127.0.0.1 / [::1]
               # disclose nothing -> score 0; that presence is qa-deploy-001's availability concern, not disclosure).
+severity: {cvss: "n/a", vrt: "P5", range: [4, 4], default: 4, tier: chore-floor}   # internal-host recon
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:

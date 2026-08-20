@@ -3,8 +3,11 @@ and routes a static crawl misses (SPAs), and (later) so DOM/stored XSS and Core 
 measured. Optional: every entry point degrades to None when no browser is available, so the rest of
 the runner is unaffected.
 
-Browser-agnostic: tries Playwright's pinned bundled Chromium first (reproducible), then any system
-browser (chromium / chrome / msedge channels), so it works wherever one is available.
+Browser-agnostic: drives the REAL system Chrome/Edge first (a legitimate branded-browser fingerprint),
+then Chromium channels, and Playwright's bundled Chromium only as a last resort. The ORDER matters for
+reach, not merely availability: bundled headless Chromium presents a HeadlessChrome UA + automation tells
+that WAF/bot mitigations (Vercel's default DDoS challenge) escalate on, which reputation-flagged a grading
+IP across every Vercel host; the real installed Chrome the dev box and laptop drive never tripped it.
 """
 from __future__ import annotations
 
@@ -38,10 +41,14 @@ def browser_available() -> bool:
     return browser_preflight()[0]
 
 
-# Pinned bundled Chromium first (reproducible), then any system browser. Bundled Chromium for
-# Ubuntu 26.04 needs Playwright >= 1.61 (microsoft/playwright#40117); until that releases (latest is
-# 1.60) the bundled launch fails here and a system Chrome/Edge channel is used instead.
-_LAUNCH_ORDER = ({}, {"channel": "chromium"}, {"channel": "chrome"}, {"channel": "msedge"})
+# Real branded Chrome/Edge FIRST, bundled Chromium LAST. Not for availability (any of these renders the
+# page) but for LEGITIMACY: bundled headless Chromium transmits a HeadlessChrome UA + automation tells that
+# trip WAF/bot challenges and got a grading IP reputation-flagged across every Vercel host, while the real
+# installed Chrome the dev box/laptop drive never did (proven: same IP, same corpus, many runs, no flag --
+# the only variable was that the Dell had bundled Chromium installed and used it first). Reproducibility (a
+# pinned bundled build) is the lesser concern and the per-commit surface cache already absorbs cross-box
+# render variance. Bundled Chromium stays as the final fallback so a box with no system browser still runs.
+_LAUNCH_ORDER = ({"channel": "chrome"}, {"channel": "msedge"}, {"channel": "chromium"}, {})
 
 
 _LAST_LAUNCH_ERROR = ""

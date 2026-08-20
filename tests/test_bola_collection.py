@@ -132,5 +132,5 @@ def test_catalog_wires_sec_idor_005_to_a_registered_predicate():
     probe = next((p for p in cat if p.id == "sec-idor-005"), None)
     assert probe is not None, "sec-idor-005 missing from the catalog"
     assert probe.probe.get("predicate") in PREDICATES
-    assert probe.penalty == 40
+    assert probe.penalty == 30   # nominal synced to the access-control severity default (was a flat 40)
     assert probe.applicability.requires == ["has_auth_entrypoint"]

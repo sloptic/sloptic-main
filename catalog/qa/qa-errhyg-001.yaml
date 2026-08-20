@@ -5,6 +5,7 @@ pool: public
 evidence_model: oracle
 penalty: 14   # a leaked stack trace fires only on error paths (lower frequency) and is a
               # moderate info-leak -> priced modestly, below the every-user qa failures.
+severity: {iso_25010: "maintainability", nielsen: "2", range: [25, 35], default: 25, escalators: [{evidence: db_error, point: 35, vrt_variant: "a leaked DB error discloses schema/query, not just code paths"}]}
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:

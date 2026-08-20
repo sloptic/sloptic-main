@@ -4,6 +4,7 @@ category: dos-resistance
 pool: public
 evidence_model: provable
 penalty: 12   # decompresses gzip request bodies with no size cap -> a zip bomb exhausts memory (DoS)
+severity: {cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H", cvss_score: 7.5, vrt: "P4", range: [15, 15], default: 15}   # DoS via decompression bomb (missing size-cap); REPRICED 12->15
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:

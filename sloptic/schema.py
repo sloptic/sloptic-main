@@ -5,11 +5,48 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class Applicability(BaseModel):
     requires: list[str] = Field(default_factory=list)
+
+
+class Escalator(BaseModel):
+    """One rung of a probe's evidence ladder (SCORING_V2_SPEC.md): if `evidence` (a ctx.evidence flag the
+    predicate sets when it OBSERVES that impact) is truthy, the penalty may lift to `point`, clamped to the
+    Severity range. Rungs never sum: the resolver takes the single highest matched rung."""
+    evidence: str            # the ctx.evidence key that must be truthy to reach this rung
+    point: int               # penalty if this is the highest matched rung
+    vrt_variant: str = ""    # provenance: the VRT variant / CVSS change that justifies this rung
+
+
+class Severity(BaseModel):
+    """Authority-anchored penalty (SCORING_V2_SPEC.md). The RANGE is set by named authorities (CVSS x
+    Bugcrowd VRT); the POINT is set by the probe's own evidence. `default` (= range low, abstention) charges
+    the floor; each matched `escalators` rung lifts toward the high end. When a Probe carries this, the
+    resolver in pipeline._run_probe computes the penalty from it instead of the nominal `penalty:` int."""
+    cvss: str = ""                    # canonical CVSS vector, or "n/a" for a non-scorable chore
+    cvss_score: float | None = None
+    vrt: str = ""                     # Bugcrowd VRT baseline, e.g. "P1" or "P4->P1"
+    iso_25010: str = ""               # QA/perf: the ISO/IEC 25010:2023 quality characteristic (reliability / ...)
+    nielsen: str = ""                 # QA/perf: Nielsen usability-severity band 0-4 (frequency x impact x persistence)
+    range: tuple[int, int]            # [lo, hi] penalty bounds, as fractions of the 100 anchor
+    default: int                      # penalty with no escalating evidence (should equal range low)
+    tier: str = ""                    # "chore-floor" marks a Tier-4 diligence floor
+    escalators: list[Escalator] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _range_consistent(self):
+        lo, hi = self.range
+        if lo > hi:
+            raise ValueError(f"severity range low>high: {self.range}")
+        if not lo <= self.default <= hi:
+            raise ValueError(f"severity default {self.default} outside range {self.range}")
+        for e in self.escalators:
+            if not lo <= e.point <= hi:
+                raise ValueError(f"escalator '{e.evidence}' point {e.point} outside range {self.range}")
+        return self
 
 
 class Probe(BaseModel):
@@ -19,7 +56,8 @@ class Probe(BaseModel):
     variant_group_id: str | None = None  # probes sharing one fire once (same logical flaw)
     pool: str = "public"  # public | hidden
     evidence_model: str = "provable"  # provable | oracle (detection hint only)
-    penalty: int  # slop added when the probe fires; deduction-only, so always positive
+    penalty: int = 0  # nominal fallback. A probe with a severity block has this SYNCED to severity.default at
+                      # load (load_catalog), so it never drifts; a migrated probe need not set it at all.
     # What genuinely counts as a TRUE POSITIVE + the confounders to rule out (a FP is a fire that FAILS this).
     # Recorded so an audit measures fires against a STATED def, not memory/vibes; doc-only, never affects scoring.
     # Especially load-bearing for confounder-prone probes (timing/load/cold-start/presence-vs-use), where the
@@ -30,6 +68,12 @@ class Probe(BaseModel):
     probe: dict[str, Any] = Field(default_factory=dict)
     # Declarative conditions; ALL must match for slop. Each is a matcher name or {name: arg}.
     slop_if: list[Any] = Field(default_factory=list)
+    # v2 authority-anchored penalty (range + evidence ladder; SCORING_V2_SPEC.md). When set, _run_probe
+    # resolves the penalty from it and `penalty` above is only the nominal fallback. None -> legacy behavior.
+    severity: Severity | None = None
+    # DRY alternative: reference a shared class block by name (catalog/_severity_classes.yaml); load_catalog
+    # resolves it INTO `severity`. Set at most one of severity / severity_ref (the loader enforces this).
+    severity_ref: str | None = None
 
 
 @dataclass

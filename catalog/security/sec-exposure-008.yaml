@@ -8,6 +8,7 @@ penalty: 40   # same tier as broken access control, because that is what it is: 
               # bulk records with PII / financial identifiers. This class is squarely the runner's:
               # "an anonymous request that returns sensitive or bulk data is a flaw regardless of
               # intent" — and access control is ~36% of real vibe-coded-app vulnerabilities.
+severity_ref: anon-data-exposure
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:

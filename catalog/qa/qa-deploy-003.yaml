@@ -7,6 +7,7 @@ penalty: 24   # PROVISIONAL (v2.0 Family 1 -- re-price from the corpus footrule 
               # sign-in flow is dead for every visitor (the OAuth provider redirects them to a host that does
               # not exist in prod), so a core feature is unusable. Between a dead href (12) and a dead backend
               # (34): scoped to auth, not the whole data layer. Gate-shaped (rare, decisive), not middle-band.
+severity: {iso_25010: "reliability", nielsen: "3", range: [55, 55], default: 55}   # OAuth redirect_uri -> localhost: login flow dead in prod
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:

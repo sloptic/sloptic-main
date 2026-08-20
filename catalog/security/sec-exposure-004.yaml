@@ -4,6 +4,7 @@ category: exposure
 pool: public
 evidence_model: provable
 penalty: 35
+severity: {cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N", cvss_score: 7.5, vrt: "P1", range: [90, 90], default: 90}   # served .aws/credentials = cloud takeover; REPRICED 35->90
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:

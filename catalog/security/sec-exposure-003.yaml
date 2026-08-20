@@ -5,6 +5,7 @@ variant_group_id: exposed-git
 pool: public
 evidence_model: provable
 penalty: 30
+severity: {cvss: "n/a", vrt: "P2", range: [55, 55], default: 55}   # served .git = source + commit-history disclosure; REPRICED 30->55
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:

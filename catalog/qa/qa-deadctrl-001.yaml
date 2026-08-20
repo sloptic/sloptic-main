@@ -7,6 +7,7 @@ penalty: 12   # a control wired to nothing is low-severity but every-user (the A
               # advertises an action it doesn't deliver. Priced BELOW a broken link (24) — dead controls
               # span a wide severity range (a dead primary CTA vs a decorative toggle) and we can't tell
               # which; ONE finding regardless of count (the evidence carries the labels).
+severity: {iso_25010: "functional-suitability", nielsen: "2->3", range: [30, 50], default: 30, escalators: [{evidence: primary_cta, point: 50, vrt_variant: "a dead PRIMARY CTA (submit/save/buy/checkout) blocks the core workflow"}]}
 applicability:
   requires: [browser]   # must render + click to observe effect; N/A without --browser
 probe:

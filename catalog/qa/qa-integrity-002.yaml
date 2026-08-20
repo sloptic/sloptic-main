@@ -6,6 +6,7 @@ pool: public
 evidence_model: oracle
 penalty: 34   # silent data loss on save -> terminal for user trust. Same tier as qa-integrity-001;
               # the variant group means only one of the two counts (its max), never both.
+severity_ref: data-integrity
 probe:
   predicate: data_integrity_list_roundtrip
   # The SPA-shape counterpart to qa-integrity-001: many apps have UUID keys and NO GET /items/{id} route, so

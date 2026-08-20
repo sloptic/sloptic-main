@@ -116,11 +116,11 @@ def test_a_curve_is_provisional_until_declared_final_and_says_so():
 
 def test_slop_potential_reconstructs_via_the_real_damping_and_never_undercuts_the_score():
     idx = _catalog_index()
-    # two applicable probes in DIFFERENT categories (headers-002 pen 8, ratelimit-001 pen 15); only one fired.
-    # worst case = both fire = 8 + 15 = 23, damped identically to the real score (no cross-category decay).
+    # two applicable probes in DIFFERENT categories (headers-002 pen 8, ratelimit-001 pen 30 post-v2-reprice);
+    # only one fired. worst case = both fire = 8 + 30 = 38, damped identically (no cross-category decay).
     rec = {"slop_score": 8, "coverage": {"applied": ["sec-headers-002", "sec-ratelimit-001"]},
            "findings": [{"probe_id": "sec-headers-002", "category": "security-headers"}]}
-    assert _slop_potential(rec, idx) == 23
+    assert _slop_potential(rec, idx) == 38
     assert _slop_potential(rec, idx) >= rec["slop_score"]        # the invariant: worst case never below actual
     # a native field emitted at grade time wins over reconstruction
     assert _slop_potential({"slop_potential": 42, "coverage": {"applied": []}}, idx) == 42

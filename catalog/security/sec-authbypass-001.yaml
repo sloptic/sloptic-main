@@ -6,6 +6,7 @@ evidence_model: provable
 penalty: 40   # a full auth-gate bypass — a protected route reachable with NO credentials (OWASP A01). The
               # security ceiling: as severe as BOLA (sec-idor-002), often worse (it skips the gate entirely,
               # not just one object), so it sits at the max — restraint must stay competitive.
+severity: {cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N", cvss_score: 9.1, vrt: "P1", range: [88, 98], default: 90}   # full auth-gate bypass = terminal (OWASP A01); REPRICED 40->90
 applicability:
   # broad gate (the app has surface); the predicate self-decides — N/A unless it's Next.js AND a gated route
   # exists to test the x-middleware-subrequest bypass against.

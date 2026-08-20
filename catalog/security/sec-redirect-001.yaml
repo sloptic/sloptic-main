@@ -4,6 +4,7 @@ category: open-redirect
 pool: public
 evidence_model: oracle
 penalty: 20
+severity: {cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:N/A:N", cvss_score: 6.1, vrt: "P4", range: [25, 55], default: 25, escalators: [{evidence: external_host, point: 40, vrt_variant: "redirect to an attacker-controlled host"}, {evidence: auth_flow, point: 55, vrt_variant: "open redirect in an auth/oauth flow = token theft"}]}   # REPRICED 20->25 base
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:

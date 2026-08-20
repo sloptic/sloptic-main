@@ -4,6 +4,7 @@ category: session-management
 pool: public
 evidence_model: oracle
 penalty: 25   # predictable session IDs -> session hijacking by guessing the next token
+severity: {cvss: "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N", cvss_score: 5.9, vrt: "P3", range: [45, 45], default: 45}   # weak session id = hijacking; REPRICED 25->45
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:

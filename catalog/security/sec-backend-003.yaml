@@ -10,6 +10,7 @@ evidence_model: provable
 penalty: 12   # information disclosure, not access: the schema itself is not the data. Priced below the
               # RLS probes (40) deliberately — knowing the table and column names accelerates an attack
               # without being one, and over-pricing it would drown the finding that actually matters.
+severity: {cvss: "n/a", vrt: "P5", range: [12, 12], default: 12, tier: chore-floor}   # schema disclosure = info leak; subsumed by backend-001 (variant group) when data also readable
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:

@@ -4,6 +4,7 @@ category: csrf
 pool: public
 evidence_model: oracle
 penalty: 25   # no CSRF defense (no token, no SameSite) — near-universal in vibe-coded apps
+severity: {cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:L/I:L/A:N", cvss_score: 6.5, vrt: "P2", range: [45, 45], default: 45}   # REPRICED 25->45
 applicability:
   requires: [any_form_has_password]
 probe:

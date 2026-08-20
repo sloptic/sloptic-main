@@ -6,6 +6,7 @@ evidence_model: provable
 penalty: 12   # within-QA calibration (NOT a QA-vs-security retreat): a single dead internal link's own
               # freq×sev is genuinely lower than its tier-mates (a11y 26, crash 32). At 24 it ranked near
               # CSRF (25), overstating one broken link relative to real accessibility/crash failures. 24->12.
+severity: {iso_25010: "functional-suitability", nielsen: "2", range: [25, 25], default: 25}   # internal href -> 4xx dead end
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:

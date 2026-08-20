@@ -8,6 +8,10 @@ absorb Set-Cookie updates and stay logged in. Non-cookie auth (Authorization: Be
 from __future__ import annotations
 
 import contextvars
+import os
+import re
+import shutil
+import subprocess
 from urllib.parse import urlparse
 
 import httpx
@@ -36,7 +40,8 @@ def _watch_challenge(response) -> None:
         counts[p] = counts.get(p, 0) + 1
     if _challenge_onset.get() is not None:
         return
-    if "cf-mitigated" in response.headers:
+    h = response.headers
+    if "cf-mitigated" in h or "x-vercel-mitigated" in h or "x-vercel-challenge-token" in h:
         _challenge_onset.set(_trace_probe.get() or "?")
     elif response.status_code in _CHALLENGE_STATUS:
         # BODY-CONFIRM it's a challenge, not a plain auth-403: a challenge/block page carries the markers, an
@@ -115,16 +120,58 @@ def parse_cookie_header(value: str) -> dict:
     return out
 
 
+# A legitimate browser identity for the HTTP clients. Without it every request goes out as `python-httpx/<v>`,
+# which reads as an obvious bot to WAF/bot mitigations (Vercel's default DDoS challenge); at corpus volume from
+# one IP that escalates to an IP-reputation flag that then challenges EVERY request. We present the REAL Chrome
+# installed on the box (the same browser the Playwright lane drives), derived from its actual version so the UA
+# is never a stale/fake string. Env SLOPTIC_USER_AGENT overrides; a pinned recent-Chrome UA is the last resort
+# when no Chrome is found. Computed ONCE (a version shell-out per grade would be wasteful), shared by every client.
+_CHROME_BINARIES = ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "chrome")
+_UA_CACHE: str | None = None
+
+
+def _installed_chrome_major() -> str | None:
+    for name in _CHROME_BINARIES:
+        path = shutil.which(name)
+        if not path:
+            continue
+        try:
+            out = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=10).stdout
+        except Exception:
+            continue     # a browser that won't report its version is no use as a UA source; try the next
+        m = re.search(r"\b(\d+)\.\d+\.\d+", out)
+        if m:
+            return m.group(1)
+    return None
+
+
+def default_user_agent() -> str:
+    """A real-Chrome User-Agent for the grader's HTTP clients (see the note above). Cached process-wide."""
+    global _UA_CACHE
+    if _UA_CACHE is None:
+        _UA_CACHE = os.environ.get("SLOPTIC_USER_AGENT") or (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+            f"Chrome/{_installed_chrome_major() or '124'}.0.0.0 Safari/537.36")
+    return _UA_CACHE
+
+
 def make_client(base_url: str, headers: dict | None = None, **kwargs) -> httpx.Client:
-    """An httpx.Client whose Cookie header (if any) is seeded into the jar (so a rotating session is
-    followed via Set-Cookie); all other headers stay static. Extra kwargs pass through to httpx.Client."""
+    """An httpx.Client that presents a real-Chrome User-Agent (not `python-httpx`, which WAFs challenge) and
+    seeds any Cookie header into the jar (so a rotating session is followed via Set-Cookie); other caller
+    headers stay static and OVERRIDE the defaults. Extra kwargs pass through to httpx.Client."""
     cookies = None
+    static: dict = {}
     if headers:
         static = {k: v for k, v in headers.items() if k.lower() != "cookie"}
         cookie_vals = [v for k, v in headers.items() if k.lower() == "cookie"]
         if cookie_vals:
             cookies = parse_cookie_header(cookie_vals[0])
-        headers = static or None
+    # Default browser identity, but a caller-supplied header of the same name wins (case-insensitively), so an
+    # explicit --header 'User-Agent: ...' still overrides the default.
+    lower = {k.lower() for k in static}
+    ident = {k: v for k, v in {"User-Agent": default_user_agent(),
+                               "Accept-Language": "en-US,en;q=0.9"}.items() if k.lower() not in lower}
+    headers = {**ident, **static} or None
     # A black-box grader connects to whatever cert the target presents (self-signed / sandbox / expired
     # certs are normal for an app under test) -- cert validity is a separate concern, not a connection
     # blocker. Default to not verifying TLS; callers can still override via kwargs.
@@ -170,9 +217,12 @@ _CHALLENGE_MARKERS = (
 def is_bot_challenge(resp) -> bool:
     """True when `resp` is a bot-challenge / WAF interstitial / sleeping-app page, not the app itself. Callers
     should treat it as UNAVAILABLE (N/A / withhold the grade), never as content. Conservative: only fires on a
-    Cloudflare mitigation header or a specific known interstitial marker, so a real 403/error page is not one."""
+    Cloudflare/Vercel mitigation header or a specific known interstitial marker, so a real 403/error page is not
+    one. The header path is authoritative (a challenge sets x-vercel-mitigated even when its body markers drift),
+    so it runs BEFORE the content-type gate: a Vercel challenge can be a 429 whose body is not HTML."""
     try:
-        if "cf-mitigated" in resp.headers:
+        h = resp.headers
+        if "cf-mitigated" in h or "x-vercel-mitigated" in h or "x-vercel-challenge-token" in h:
             return True
         ctype = resp.headers.get("content-type", "").lower()
         if "html" not in ctype and "text" not in ctype:
