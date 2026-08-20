@@ -6057,8 +6057,8 @@ def lighthouse_perf_score(ctx, probe) -> bool | None:
 # --- email-verification probes (qa-email-001 / qa-email-002) ------------------------------------------------
 # Register with an address WE own (via ctx.email, the configured receiver), then watch whether a confirmation
 # email actually arrives and whether acting on its link establishes a session. Both probes read the ONE shared
-# flow result (register + poll mutate and block), memoized on ctx. They ship report_only until the corpus
-# admission-test validates the family.
+# flow result (register + poll mutate and block), memoized on ctx. They score (per the qa-email-001/002 severity
+# blocks); the report_only bring-up is over.
 _EMAIL_ANNOUNCED_TIMEOUT = 60.0    # total wait for a confirmation email the signup PROMISED
 _EMAIL_UNANNOUNCED_TIMEOUT = 8.0   # a short confirmatory poll for an opaque SPA that sends without announcing
 _EMAIL_RESEND_AT = 30.0            # halfway in, click the app's own 'resend' control (if any) for a second chance
@@ -6273,7 +6273,6 @@ def email_never_arrives(ctx, probe) -> bool | None:
     suitability, SCORING_V2_SPEC): no email within 60s even after a resend -> locked out (72); email only after
     the 30s checkpoint -> unreliable send (24); a working-but-no-resend-control signup -> a resilience gap (5)."""
     res = _email_verify_result(ctx)
-    ctx.evidence["report_only"] = True   # v1: off-score until the admission-test validates the family
     if not res.attempted or not res.email_gated:
         ctx.evidence["na_reason"] = res.na_reason or "signup is not email-verification-gated"
         return None
@@ -6297,7 +6296,6 @@ def email_never_arrives(ctx, probe) -> bool | None:
 def email_verification_inert(ctx, probe) -> bool | None:
     """qa-email-002: the confirmation email arrives but acting on its link establishes no session."""
     res = _email_verify_result(ctx)
-    ctx.evidence["report_only"] = True
     if not res.attempted or not res.email_gated:
         ctx.evidence["na_reason"] = res.na_reason or "signup is not email-verification-gated"
         return None

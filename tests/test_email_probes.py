@@ -1,6 +1,7 @@
 """The two email predicates (probes.email_never_arrives / email_verification_inert) map the shared
 EmailVerifyResult onto a probe verdict. The flow itself is tested in test_email_verify; here we monkeypatch it
-to canned results and check the mapping + the report_only + N/A guards, so no network or registration runs."""
+to canned results and check the mapping + the N/A guards, so no network or registration runs. The family now
+SCORES (per the qa-email-001/002 severity blocks), so no probe stamps report_only."""
 import types
 
 import httpx
@@ -24,7 +25,7 @@ def test_na_without_a_receiver():
     c = _ctx(email=None)
     assert probes.email_never_arrives(c, None) is None
     assert "no email receiver" in c.evidence["na_reason"]
-    assert c.evidence["report_only"] is True     # always off-score in v1
+    assert "report_only" not in c.evidence       # the family scores now (bring-up over)
 
 
 def test_na_with_a_provided_session():
@@ -43,7 +44,7 @@ def test_email_001_ladder_no_email_60s_locks_out_top_rung(monkeypatch):
     _canned(monkeypatch, EmailVerifyResult(attempted=True, email_gated=True, email_arrived=False, detail="no mail"))
     c = _ctx(email=RX)
     assert probes.email_never_arrives(c, None) is True
-    assert c.evidence["no_email_60s"] is True and c.evidence["report_only"] is True
+    assert c.evidence["no_email_60s"] is True and "report_only" not in c.evidence
     assert probes.email_verification_inert(_ctx(email=RX), None) is None   # 002 N/A: no link ever arrived
 
 

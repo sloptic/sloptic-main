@@ -318,6 +318,20 @@ def main():
             probe_meta[f["probe_id"]] = (f["bundle"], f["category"])
     freq = sorted(((pid, len(apps)) for pid, apps in probe_apps.items()), key=lambda x: -x[1])
 
+    # ---- email-verification family breakdown (now scoring): the qa-email-001 ladder + qa-email-002 inert.
+    # Read off the FIRED findings' evidence (email_gated apps that CLEANED leave no finding), so this sizes the
+    # lock-outs, not the whole email-gated subset. Self-suppresses when the family never fired. ----
+    def _email_fires(pid):
+        return [(r, f) for r in graded for f in r.get("findings", []) if f["probe_id"] == pid and _scored(f)]
+
+    def _ev_count(fires, key):
+        return sum(1 for _, f in fires if (f.get("evidence") or {}).get(key))
+    email_001, email_002 = _email_fires("qa-email-001"), _email_fires("qa-email-002")
+    email_break = {"unreliable_flow_apps": len(email_001), "inert_link_apps": len(email_002),
+                   "no_email_60s": _ev_count(email_001, "no_email_60s"),
+                   "email_late_30s": _ev_count(email_001, "email_late_30s"),
+                   "no_resend_button": _ev_count(email_001, "no_resend_button")}
+
     # ---- (d) winners vs non-winners ----
     def split(pred):
         return [r for r in recs if r.get("winner") is True and pred(r)], \
@@ -446,6 +460,7 @@ def main():
                               "tripped_by_probe": dict(onset_by_probe.most_common())},
             "category_concentration": {k: round(v, 1) for k, v in sorted(cat_total.items(), key=lambda x: -x[1])},
             "probe_fire_frequency": {pid: n for pid, n in freq},
+            "email_verification": email_break,
             "by_hackathon": hk_rows,
             "lighthouse_scores": lighthouse_scores(graded),
             "lighthouse_by_winner": {
@@ -789,6 +804,21 @@ def main():
         print("(i6) REQUEST VOLUME per probe (median across apps · worst single app) — the high-fan-out probes")
         for pid, med, mx, n in req_rank[:12]:
             print(f"    {pid:<22} median {med:>5.0f}   worst {mx:>5}   (n={n} apps)")
+        print()
+
+    # (i7) EMAIL-VERIFICATION (qa-email, now scoring) — of the email-gated signups, which locked a user out. The
+    # qa-email-001 ladder (no mail in 60s = locked out · only after the 30s checkpoint = unreliable · no resend
+    # control = resilience gap) + qa-email-002's inert link. Counts are over FIRED findings, so an email-gated app
+    # whose flow WORKED leaves no row here (it cleaned). Self-suppresses on a corpus where the family never fired.
+    if email_001 or email_002:
+        print(f"(i7) EMAIL-VERIFICATION (qa-email, scoring) — {len(email_001)} app(s) with an unreliable "
+              f"confirmation flow (qa-email-001) · {len(email_002)} with an inert verification link (qa-email-002)")
+        print(f"    qa-email-001 ladder:  {email_break['no_email_60s']} no mail in 60s (locked out)  ·  "
+              f"{email_break['email_late_30s']} only after the 30s checkpoint (unreliable)  ·  "
+              f"{email_break['no_resend_button']} missing a resend control")
+        for r, f in [(r, f) for r, f in email_001 if (f.get("evidence") or {}).get("no_email_60s")][:8]:
+            print(f"      {r['repo'].rsplit('/', 1)[-1][:34]:34} no mail — {(f.get('reason') or '')[:48]}")
+        print(f"    → audit: scripts/stats.py {args.results} --audit qa-email-001")
         print()
 
 
