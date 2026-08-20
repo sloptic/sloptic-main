@@ -303,6 +303,12 @@ def _build_cmd(j, args, ckpt):
         cmd += ["--llm-reasoning"]
     for h in (args.headers or []):
         cmd += ["--header", h]
+    if getattr(args, "email_domain", None):
+        cmd += ["--email-domain", args.email_domain]
+    if getattr(args, "email_endpoint", None):
+        cmd += ["--email-endpoint", args.email_endpoint]
+    if getattr(args, "email_token", None):
+        cmd += ["--email-token", args.email_token]
     if args.model:
         cmd += ["--model", args.model]
     return cmd
@@ -469,6 +475,14 @@ def main():
                     help="forward to deploy_and_grade (repeatable): a request header sent on the whole run — the "
                          "Option-B auth fallback (--header 'Cookie: …' or --header 'Authorization: Bearer …') so "
                          "the authed-surface probes reach the logged-in surface when self-registration can't.")
+    ap.add_argument("--email-domain", metavar="DOMAIN",
+                    help="forward to deploy_and_grade: throwaway inbox domain for the email-verification probes "
+                         "(e.g. anachron.dev); without --email-domain + --email-endpoint they read N/A")
+    ap.add_argument("--email-endpoint", metavar="URL",
+                    help="forward to deploy_and_grade: HTTP endpoint returning received mail as JSON (the "
+                         "Cloudflare Email Worker's /mail)")
+    ap.add_argument("--email-token", metavar="TOKEN", default="",
+                    help="forward to deploy_and_grade: Bearer token for --email-endpoint (the Worker's MAIL_TOKEN)")
     ap.add_argument("--llm-reasoning", dest="llm_reasoning", action="store_true", default=False,
                     help="forward to deploy_and_grade: opt the perceive+audit passes back INTO LLM thinking/CoT. "
                          "Default is OFF (no-think) — the A/B showed it holds quality while cutting the audit LLM "
