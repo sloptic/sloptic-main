@@ -28,7 +28,7 @@ from .net import challenge_onset, is_bot_challenge, make_client, request_counts,
 # A late-challenge grade is kept only if at least this fraction of the catalog ran BEFORE the WAF tripped (so
 # most outcomes saw the real app). Below it, too much of the grade is contaminated -> withhold like an entry challenge.
 _MIN_VALID_FRACTION = 0.6
-from .probes import MATCHERS, PREDICATES, _repro_from_resp, describe
+from .probes import MATCHERS, PREDICATES, _email_account, _repro_from_resp, describe
 from .schema import Form, Outcome, Probe, Profile, Report, Severity
 
 
@@ -84,8 +84,17 @@ class _Ctx:
                 if _s not in store:
                     store[_s] = _real(base_url)   # ONE browser registration per identity, reused across probes
                 return store[_s]
+        # EMAIL-VERIFICATION lane (built only when a receiver is configured): on an email-gated signup, complete
+        # the verification and reuse THAT authenticated session, so the authed-surface probes run as the verified
+        # user. Excluded for the two-account IDOR suffixes (_a/_b): the single email identity cannot supply two
+        # distinct users, and handing the same one to both would fabricate a cross-user read. The flow runs at
+        # most once per app (memoized on ctx), rebuilt into a fresh client per call so per-probe close stays safe.
+        email_cb = None
+        if self.email is not None and suffix not in ("_a", "_b") and not auth._provided_session(self.headers):
+            def email_cb(session_less_acct, _self=self):
+                return _email_account(_self, session_less_acct)
         return auth.register_account(self.base_url, self.profile, suffix=suffix,
-                                     browser_register=cached, headers=self.headers)
+                                     browser_register=cached, headers=self.headers, email_verify=email_cb)
 
 
 def _applicable(probe: Probe, profile: Profile) -> bool:

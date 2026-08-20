@@ -276,13 +276,19 @@ def _login_forms_at(base_url: str, client: httpx.Client) -> list:
 
 
 def register_account(base_url: str, profile: Profile, suffix: str = "", browser_register=None,
-                     headers=None) -> Account | None:
+                     headers=None, email_verify=None) -> Account | None:
     """Create a fresh account (self-as-oracle) for the authed-surface probes. httpx registration first (HTML
     form POST, else JSON-API); if that establishes NO session — the SPA case, where the form's action is a
     placeholder and the real registration is a JS fetch — and a `browser_register` callback is supplied, drive
     the BROWSER to register (its own JS makes the real request) and use the session cookie/token it establishes.
-    Returns None when nothing establishes a session (email-verify / CAPTCHA / SSO / third-party auth) -> caller
-    reads N/A. If the caller supplied a session via --header (Option B), that is used directly (single identity)."""
+    Returns None when nothing establishes a session (CAPTCHA / SSO / third-party auth) -> caller reads N/A. If
+    the caller supplied a session via --header (Option B), that is used directly (single identity).
+
+    `email_verify`, when supplied (built by ctx.register from the configured email receiver), is the EMAIL-GATED
+    lane: given the session-less httpx account, complete the emailed verification and return a fresh
+    session-carrying Account, or None. It runs BEFORE the browser launch — completing a real email confirmation
+    is cheaper than a browser register and yields the identity the app actually intends, so the authed-surface
+    probes see the logged-in surface (the reason the receiver exists)."""
     LAST_BROWSER_DIAG.clear()
     if _provided_session(headers):
         return _account_from_headers(base_url, headers)
@@ -299,6 +305,15 @@ def register_account(base_url: str, profile: Profile, suffix: str = "", browser_
     if _has_session(acct):
         _carry_secure_cookies_over_http(base_url, acct.client)
         return acct
+    # EMAIL-VERIFICATION lane, before the (expensive) browser launch. The callback owns the receiver + the
+    # shared, memoized flow and its own email-gated gate; it returns a session-carrying Account only when the
+    # signup was email-gated AND completing the verification logged us in (else None -> fall through).
+    if email_verify is not None:
+        verified = email_verify(acct)
+        if verified is not None:
+            if acct is not None and verified is not acct:
+                acct.client.close()
+            return verified
     # Two remaining lanes, and their ORDER costs a finding either way round.
     #
     # BROWSER first when a callback is available: it registers the way the app's own JS does, so it observes the

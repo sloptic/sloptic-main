@@ -6143,27 +6143,62 @@ def _follow_verification(acct, msg, base, profile, email):
             last = client.get(link)
         except (httpx.HTTPError, httpx.InvalidURL):
             continue
+    # the link may auto-log us in (Set-Cookie on the response / a session cookie in the jar). When it carries a
+    # session cookie, PROMOTE that response to the account's register_response, so the cookie-flag probes judge
+    # the REAL session cookie's flags when the authed-surface probes reuse this account.
+    if last is not None and auth.session_cookie(last) is not None:
+        acct.register_response = last
     session = (auth._has_session(acct)                                       # the link itself auto-logged us in
-               or (last is not None and auth.session_cookie(last) is not None)
                or any(auth._is_session_cookie(c.name) for c in client.cookies.jar))
     if not session:   # 'verify then log in': the link verified the account; a login should now succeed. Try by
-        #               both identifiers (some apps key login on email, some on username).
-        session = any(bool(auth.login_with_credentials(base, ident, acct.password, profile))
-                      for ident in (email, acct.username))
+        #               both identifiers (some apps key login on email, some on username), and CARRY the returned
+        #               session onto this account's client so the authed-surface probes reuse it authenticated.
+        for ident in (email, acct.username):
+            hdrs = auth.login_with_credentials(base, ident, acct.password, profile)
+            if hdrs:
+                client.headers.update(hdrs)   # Cookie and/or Authorization: Bearer -> now the logged-in user
+                session = True
+                break
     return email_verify.Verification(acted=True, session=bool(session))
+
+
+def _snapshot_session(acct) -> dict:
+    """Capture a verified account's live session as REPLAYABLE material, so ctx.register can rebuild a FRESH,
+    independently-closeable client for each authed-surface probe (a probe closing its account must never
+    invalidate the next -- the same contract the browser-cached lane keeps). Session is read as the client would
+    SEND it (an explicit Cookie header, else the jar's session cookies) plus any Bearer/apikey; register_response
+    carries Set-Cookie for the cookie-flag probes when the link auto-logged us in."""
+    hdrs: dict = {}
+    cookie = acct.client.headers.get("Cookie")
+    if not cookie:
+        jar = ([(c.name, c.value) for c in acct.client.cookies.jar if auth._is_session_cookie(c.name)]
+               or [(c.name, c.value) for c in acct.client.cookies.jar])
+        if jar:
+            cookie = "; ".join("%s=%s" % (n, v) for n, v in jar)
+    if cookie:
+        hdrs["Cookie"] = cookie
+    for h in ("Authorization", "apikey"):
+        if acct.client.headers.get(h):
+            hdrs[h] = acct.client.headers[h]
+    return {"headers": hdrs, "username": acct.username, "password": acct.password,
+            "response": acct.register_response, "storage_exposed": acct.storage_exposed}
 
 
 def _run_email_flow(ctx):
     """Build the register/follow/resend callbacks the pure flow needs from ctx, and run it. Registration uses
-    the httpx/JSON lanes with OUR address (never the browser/BaaS fallbacks, which register their own creds)."""
+    the httpx/JSON lanes with OUR address (never the browser/BaaS fallbacks, which register their own creds).
+    When the verification logs us in, capture that account's session on ctx (once) so the authed-surface probes
+    reuse it via ctx.register -- the whole reason the receiver exists."""
     tag = secrets.token_hex(6)
     base = ctx.base_url
     address = ctx.email.address(tag)
+    live: dict = {}   # captures the account the flow authenticates, for authed-surface reuse
 
     def register(address):
         acct = auth._register_httpx(base, ctx.profile, "_e" + tag[:4], email=address)
         if acct is None:
             return email_verify.RegistrationOutcome(submitted=False)
+        live["acct"] = acct
         return email_verify.RegistrationOutcome(
             submitted=True, has_session=auth._has_session(acct),
             announces_email=email_verify.announces_pending_email(_resp_text(acct.register_response)),
@@ -6179,12 +6214,18 @@ def _run_email_flow(ctx):
             return False
 
     try:
-        return email_verify.verify_email_flow(
+        result = email_verify.verify_email_flow(
             ctx.email, tag, register, follow, resend=resend,
             announced_timeout=_EMAIL_ANNOUNCED_TIMEOUT, unannounced_timeout=_EMAIL_UNANNOUNCED_TIMEOUT,
             resend_at=_EMAIL_RESEND_AT)
     except Exception:
         return email_verify.EmailVerifyResult(attempted=False, na_reason="email-verification flow errored")
+    acct = live.get("acct")
+    if result.session_after_verify and acct is not None:
+        ctx._email_cache["account_session"] = _snapshot_session(acct)   # rebuilt per call; original closed below
+        with contextlib.suppress(Exception):
+            acct.client.close()
+    return result
 
 
 def _email_verify_result(ctx):
@@ -6200,6 +6241,31 @@ def _email_verify_result(ctx):
         else:
             cache["result"] = _run_email_flow(ctx)
     return cache["result"]
+
+
+def _email_account(ctx, session_less_acct=None):
+    """Register-lane hook (called by ctx.register): when a signup is email-verification-gated, complete the
+    emailed verification and hand back a FRESH authenticated Account, so the authed-surface probes run as the
+    verified user. Returns None when no receiver is configured, the app is not email-gated, or verification set
+    no session -> the caller falls through to the browser/BaaS lanes.
+
+    Cost control: the shared flow runs at most once per app (memoized). If it has NOT run yet, only pay for it
+    when this signup's response ANNOUNCES a pending email -- a session-less SPA/SSO app must not be taxed with a
+    60s email poll before its browser launch. If it already ran and captured a session, reuse it regardless of
+    how we got here."""
+    cache = ctx._email_cache
+    if "result" not in cache:
+        if session_less_acct is None or not email_verify.announces_pending_email(
+                _resp_text(session_less_acct.register_response)):
+            return None                                  # not (yet known to be) email-gated -> let browser try
+        _email_verify_result(ctx)                        # run the one shared flow (captures the session, if any)
+    sess = cache.get("account_session")
+    if not sess:
+        return None                                      # verification established no reusable session
+    client = httpx.Client(base_url=ctx.base_url, timeout=15.0, follow_redirects=True)
+    client.headers.update(sess["headers"])
+    return auth.Account(username=sess["username"], password=sess["password"], client=client,
+                        register_response=sess["response"], storage_exposed=sess["storage_exposed"])
 
 
 def email_never_arrives(ctx, probe) -> bool | None:

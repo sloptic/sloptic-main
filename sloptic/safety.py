@@ -82,11 +82,18 @@ def is_passive(probe_id: str) -> bool:
     return probe_id in PASSIVE_PROBES
 
 
-# The upload probes are the most WAF-antagonizing (a burst of webshell / active-file multipart uploads is
-# maximally attack-shaped) AND fire ~never, so they run DEAD LAST — after every injection probe (xss/xxe/ssti/
-# sqli/cmdi) has completed — so a WAF trip on the upload burst blocks only themselves (and they're recovered by
-# the post-run retry). The v18 sample confirmed upload was the top re-challenge onset.
-RUN_LAST_PROBES = frozenset({"sec-upload-001", "sec-upload-002"})
+# Probes that ANTAGONIZE a per-app WAF and fire ~never, so they run DEAD LAST — after every injection probe —
+# and a WAF trip on THEM blocks only this trailing group (recovered by the post-run retry), not the high-value
+# session/idor/injection/qa/perf probes that already ran. The upload burst (webshell multipart) is maximally
+# attack-shaped (v18: top re-challenge onset). The exposure FETCHERS guess sensitive-file paths in a burst
+# (sec-exposure-007 sends ~22 guesses) and sec-hosthdr-001 forges Host headers -- v19 + v21 showed these are
+# the per-app-challenge onset on edge hosts (Vercel), which was blocking the whole tail; moving them here keeps
+# the rest of the grade. The served-file GATES (exposure-001/002/003) stay early: they are high-value and
+# low-request, so they complete before any trip.
+RUN_LAST_PROBES = frozenset({
+    "sec-upload-001", "sec-upload-002",
+    "sec-exposure-004", "sec-exposure-007", "sec-exposure-008", "sec-hosthdr-001",
+})
 
 
 def order_weight(probe_id: str) -> int:
