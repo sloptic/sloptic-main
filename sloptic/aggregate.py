@@ -15,10 +15,42 @@ double-count.
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import replace
 
 from .schema import Outcome
 
 CATEGORY_DECAY = 0.6
+
+# CORROBORATION ESCALATION. A defense-in-depth "tax" finding is cheap on its own — the risk it guards is
+# theoretical until something actually exploits it. It ESCALATES when a vuln it would have contained fires in the
+# SAME grade: the control's absence is then OPERATIVE, not presumed (the v19-audit operative-vs-presence
+# principle, applied to the tax probes). Cross-probe, so it can't live in a per-probe severity block (probes run
+# in an order and can't see each other's verdicts) — it's applied here at aggregation over the full fired set.
+# Keyed: tax probe id -> (escalated penalty, {corroborator CATEGORIES}). The escalated value stays BELOW the
+# corroborating vuln's own penalty (the vuln carries the primary weight; the missing containment is secondary).
+_XSS_CATEGORIES = frozenset({"xss", "dom-xss"})
+_CORROBORATION: dict[str, tuple[int, frozenset]] = {
+    "sec-headers-002": (24, _XSS_CATEGORIES),   # MISSING CSP is THE XSS backstop (its own catalog note: "needs
+    #                                             another vuln to bite") -> operative when XSS actually fires
+    "sec-csp-001":     (24, _XSS_CATEGORIES),   # a toothless (present-but-weak) CSP + a real XSS = same failure
+    "sec-session-001": (28, _XSS_CATEGORIES),   # a non-HttpOnly session cookie + XSS = stealable for real
+    "sec-session-005": (28, _XSS_CATEGORIES),   # a session JWT in localStorage + XSS = exfiltratable for real
+}
+
+
+def _escalate_corroborated(fired: list[Outcome]) -> list[Outcome]:
+    """Re-price a defense-in-depth finding UP when a vuln it would have contained also fired (operative, not
+    presumed). Returns a NEW list; only ever raises a penalty (never lowers), so it can't reduce discrimination —
+    it just moves the operative cases out of the flat-tax clump toward the tail. Unmatched outcomes pass through."""
+    present = {o.category for o in fired}
+    out = []
+    for o in fired:
+        esc = _CORROBORATION.get(o.probe_id)
+        if esc is not None and (esc[1] & present) and o.penalty < esc[0]:
+            out.append(replace(o, penalty=esc[0]))
+        else:
+            out.append(o)
+    return out
 
 
 def _damped_total(counted: list[Outcome], decay: float) -> float:
@@ -47,7 +79,7 @@ def _damped_total(counted: list[Outcome], decay: float) -> float:
 
 
 def compute_slop_score(outcomes: list[Outcome], decay: float = CATEGORY_DECAY) -> int:
-    fired = [o for o in outcomes if o.outcome == "slop_detected"]
+    fired = _escalate_corroborated([o for o in outcomes if o.outcome == "slop_detected"])
     return round(_damped_total(fired, decay))
 
 
@@ -55,7 +87,7 @@ def compute_axis_slop(outcomes: list[Outcome], decay: float = CATEGORY_DECAY) ->
     """The damped slop subtotal per bundle (security / qa / performance) — unbounded, lower = better, in
     the SAME units as slop_score. A pure decomposition, not a reweighting: every category belongs to one
     bundle, so the subtotals sum to slop_score. No caps, no axis multipliers, no 0-100 normalization."""
-    fired = [o for o in outcomes if o.outcome == "slop_detected"]
+    fired = _escalate_corroborated([o for o in outcomes if o.outcome == "slop_detected"])   # same as slop_score
     by_bundle: dict[str, list[Outcome]] = defaultdict(list)
     for o in fired:
         by_bundle[o.bundle].append(o)

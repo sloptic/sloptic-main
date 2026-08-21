@@ -424,3 +424,36 @@ def test_register_account_falls_through_to_browser_when_email_lane_returns_none(
     out = auth.register_account("http://app.test", prof, browser_register=browser,
                                 email_verify=lambda acct: None)            # email lane declines
     assert launched == [1] and auth._has_session(out)                     # browser lane ran and won
+
+
+# --- eager email prime: send at grade start, poll late (the overlap-the-wait optimization) ------------------
+
+def test_prime_email_registers_once_without_polling_and_the_flow_reuses_it(monkeypatch):
+    calls = {"register": 0}
+
+    def fake_httpx(base, profile, suffix, email=None):
+        calls["register"] += 1
+        acct = _acct(lambda r: httpx.Response(200))
+        acct.register_response = _reg_response("Check your email to confirm your account.")
+        return acct
+    monkeypatch.setattr(probes.auth, "_register_httpx", fake_httpx)
+    monkeypatch.setattr(probes, "_baas_gateway", lambda ctx: None)
+    monkeypatch.setattr(probes, "_firebase_config", lambda ctx: None)
+    monkeypatch.setattr(probes.auth, "login_with_credentials", lambda *a, **k: {})
+    ctx = _spa_ctx(None)
+    ctx._email_cache["tag"] = "tp"
+    ctx._email_cache["address"] = ctx.email.address("tp")
+
+    probes._prime_email(ctx)                       # SEND at "grade start"
+    assert calls["register"] == 1 and "_reg" in ctx._email_cache    # registered once, cached; no poll here
+
+    ctx.email.inject("tp", EmailMessage.parse("hl-tp@app.test", "Confirm", "http://app.test/verify?t=1"))
+    res = probes._email_verify_result(ctx)         # LATER poll -> must reuse the primed registration
+    assert calls["register"] == 1                  # NOT re-sent
+    assert res.email_gated and res.email_arrived    # the poll found the already-delivered mail
+
+
+def test_prime_email_is_a_noop_without_a_receiver():
+    ctx = pipeline._Ctx(base_url="http://app.test", client=None, profile=None, email=None)
+    probes._prime_email(ctx)                        # no receiver -> no send, no raise
+    assert "_reg" not in ctx._email_cache

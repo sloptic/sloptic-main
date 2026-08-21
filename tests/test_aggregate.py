@@ -98,3 +98,39 @@ def test_coverage_empty_outcomes():
     c = coverage_metrics([])
     assert c["probes_total"] == 0 and c["pct_applicable"] == 0 and c["na_kinds"] == []
     assert c["na_reasons"] == {}
+
+
+# --- corroboration escalation: a tax finding escalates when a vuln it would have contained also fires ---------
+
+def test_csp_escalates_when_xss_fires():
+    # a toothless CSP (5) is cheap alone; with a real XSS (35) it escalates to 24 -> total 35 + 24 = 59
+    tax_only = [_o("sec-csp-001", "security-headers", 5)]
+    assert compute_slop_score(tax_only) == 5
+    with_xss = [_o("sec-csp-001", "security-headers", 5), _o("sec-xss-001", "xss", 35)]
+    assert compute_slop_score(with_xss) == 35 + 24
+
+
+def test_session_flags_escalate_on_xss_and_decay_together():
+    # no-HttpOnly (15) + JWT-in-localStorage (15) both escalate to 28 under XSS; same 'session' category so the
+    # second decays: 28 + 28*0.6 = 44.8; plus the XSS (35) -> round(35 + 44.8) = 80
+    outs = [_o("sec-session-001", "session", 15), _o("sec-session-005", "session", 15),
+            _o("sec-xss-001", "xss", 35)]
+    assert compute_slop_score(outs) == round(35 + 28 + 28 * 0.6)
+
+
+def test_no_escalation_without_the_corroborating_vuln():
+    # missing HttpOnly with NO xss stays at its base 15 (the risk is still only theoretical)
+    assert compute_slop_score([_o("sec-session-001", "session", 15)]) == 15
+
+
+def test_domxss_also_corroborates_csp():
+    with_dom = [_o("sec-csp-001", "security-headers", 5), _o("sec-domxss-001", "dom-xss", 30)]
+    assert compute_slop_score(with_dom) == 30 + 24
+
+
+def test_escalation_reflected_in_axis_decomposition_and_still_sums():
+    outs = [_o("sec-csp-001", "security-headers", 5), _o("sec-xss-001", "xss", 35),
+            _o("perf-x", "loadtime", 20, bundle="performance")]
+    axis = compute_axis_slop(outs)
+    assert axis["security"] == 35 + 24 and axis["performance"] == 20
+    assert sum(axis.values()) == compute_slop_score(outs)   # decomposition still sums to the total

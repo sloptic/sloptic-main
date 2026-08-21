@@ -28,7 +28,7 @@ from .net import challenge_onset, is_bot_challenge, make_client, request_counts,
 # A late-challenge grade is kept only if at least this fraction of the catalog ran BEFORE the WAF tripped (so
 # most outcomes saw the real app). Below it, too much of the grade is contaminated -> withhold like an entry challenge.
 _MIN_VALID_FRACTION = 0.6
-from .probes import MATCHERS, PREDICATES, _email_account, _repro_from_resp, describe
+from .probes import MATCHERS, PREDICATES, _email_account, _prime_email, _repro_from_resp, describe
 from .schema import Form, Outcome, Probe, Profile, Report, Severity
 
 
@@ -404,6 +404,13 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
             if profile.render_state in ("error", "stuck"):
                 return Report(slop_score=0, outcomes=[], surface=surface_metrics(profile),
                               platform=platform_id.classify_live(client, origin), trace=trace_sink or [])
+            # EAGER EMAIL PRIME: fire the email registration NOW -- before the ~2-3min Lighthouse run and the probe
+            # loop -- so a confirmation mail is delivered by the time a qa-email / register-lane probe polls for it.
+            # The up-to-60s wait then OVERLAPS the rest of the grade instead of blocking it (the poll finds the mail
+            # already there). No-op without a receiver / auth entrypoint; the send is memoized so the later poll
+            # reuses it, and it's best-effort (never raises into the grade).
+            if email_receiver is not None and profile.capabilities.get("has_auth_entrypoint"):
+                _prime_email(ctx)
             # PERF: run Lighthouse ONCE (pinned 13.4.1, median-of-N) and cache it on ctx for the Lighthouse-backed
             # probes. Gated on the catalog carrying a probe that DECLARES `requires: [lighthouse]` (skip the ~2-3min
             # run otherwise) and on the app being real+reachable (past the entry gate + shell short-circuit above).

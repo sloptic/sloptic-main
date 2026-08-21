@@ -193,3 +193,37 @@ def test_blocked_helper_maps_probes_to_their_axes():
     assert set(ids) == {"sec-cmdi-001", "sec-ssti-001", "qa-crash-010"}
     assert set(axes) == {"security", "qa"}   # the bundles those blocked probes belong to
     assert _blocked([]) == ([], [])          # a fully-completed grade blocks nothing
+
+
+def test_request_capped_stops_a_probe_at_the_actual_request_ceiling():
+    # the injection fan-out cap: once request_counts (which tallies every redirect HOP) reaches max_requests,
+    # the predicate flips True and the probe's loop breaks -> a redirecting app can't amplify into a runaway burst.
+    import types
+
+    from sloptic import probes
+    net.start_trace(False)
+    net.set_trace_probe("sec-ssti-001")
+    probe = types.SimpleNamespace(id="sec-ssti-001", probe={"max_requests": 3})
+    capped = probes._request_capped(probe)
+    assert capped() is False
+    for _ in range(3):
+        net._watch_challenge(_R(200, "ok"))     # tally 3 actual requests (as redirect hops would)
+    assert capped() is True
+    # a mock probe with no id (or no trace) is never capped -> unit tests exercise full detection logic
+    assert probes._request_capped(types.SimpleNamespace(id="", probe={}))() is False
+    net.start_trace(False)
+
+
+def test_redirects_to_auth_detects_login_gated_targets():
+    import httpx
+
+    from sloptic import probes
+    req = httpx.Request("GET", "http://a/x")
+    assert probes._redirects_to_auth(httpx.Response(302, headers={"location": "/login?next=/x"}, request=req)) is True
+    assert probes._redirects_to_auth(httpx.Response(302, headers={"location": "/home"}, request=req)) is False   # not auth
+    assert probes._redirects_to_auth(httpx.Response(200, request=req)) is False                                  # no redirect
+
+    def handler(r):
+        return httpx.Response(302, headers={"location": "/signin"}) if r.url.path == "/x" else httpx.Response(200)
+    with httpx.Client(base_url="http://a", transport=httpx.MockTransport(handler), follow_redirects=True) as c:
+        assert probes._redirects_to_auth(c.get("/x")) is True   # followed chain landing on /signin

@@ -669,6 +669,8 @@ def api_sqli(ctx, probe) -> bool | None:
     if not targets:
         return None
     budget = probe.probe.get("max_attempts", 120)
+    capped = _request_capped(probe)   # actual-request ceiling: each slot runs error+boolean (2-4 reqs), so bound
+    #                                   the total (a real SQLi short-circuits early; the class collapses to 1 finding)
     delay = probe.probe.get("time_delay", 3)
     tested = False
     slots_tested = 0
@@ -678,11 +680,15 @@ def api_sqli(ctx, probe) -> bool | None:
     with make_client(ctx.base_url, ctx.headers, timeout=max(15.0, delay * 3 + 8),
                      follow_redirects=False) as c:
         for ep in targets:
+            if capped():
+                break
             method = ep.method.upper()
             try:
                 base = _do(c, method, _sqli_request(ep, None, _SQLI_BENIGN))
             except (httpx.HTTPError, httpx.InvalidURL):
                 continue
+            if _redirects_to_auth(base):
+                continue  # login-gated target -> not testable without a session; skip (don't fuzz the redirect)
             if _SQL_ERROR.search(base.text):
                 continue  # baseline already errors for unrelated reasons -> can't attribute injection
             if _UPSTREAM_ERROR.search(base.text):
@@ -691,7 +697,7 @@ def api_sqli(ctx, probe) -> bool | None:
                 continue  # phantom endpoint (root or per-prefix catch-all shell) -> not a real SQL sink
             eps_tested.append(ep.raw_path)
             for slot in _sqli_slots(ep):
-                if budget <= 0:
+                if budget <= 0 or capped():
                     break
                 budget -= 1
                 tested = True
@@ -709,9 +715,11 @@ def api_sqli(ctx, probe) -> bool | None:
                     continue
                 if len(deep) < _DEEP_SLOTS:
                     deep.append((method, reqfn, ep.raw_path, slot))
-            if budget <= 0:
+            if budget <= 0 or capped():
                 break
         for method, reqfn, path, slot in deep:   # blind TIME pass -> ADVISORY only, never scored
+            if capped():
+                break
             try:
                 if _tech_time(c, method, reqfn, delay):
                     ctx.evidence.setdefault("advisory", "possible blind sqli (time-based, unverified — human review)")
@@ -1205,13 +1213,56 @@ _CMD_TIME = (";sleep {d}", "$(sleep {d})", "`sleep {d}`", "&&sleep {d}", "|sleep
 # the response hook PER HOP, so a redirect-heavy origin multiplies BOTH the wire traffic and the request tally
 # (the 1626-request cmdi / 504-request ssti outliers -- both far above their payload budgets -- are hop-
 # inflated, not extra payloads). A genuine injection result is <=1-2 hops away (POST->302->GET), so cap the
-# chain: bounds the amplification and fails fast on a redirect loop (which is dinged elsewhere anyway).
-_INJECT_MAX_REDIRECTS = 4
-# cmdi TOTAL-request cap. The payload budget below counts logical attempts, but the per-target baseline/liveness
-# fan-out + redirect HOPS (each one a request the WAF sees, tallied by net.request_counts) let a redirecting app
-# reach ~874 requests (v18 sample outlier). Bound the ACTUAL request count so no app exceeds this — the v18
-# median was 80, so it only trims the outlier tail, not typical apps. (Same intent as the upload fan-out caps.)
-_CMDI_MAX_REQUESTS = 150
+# chain: bounds the amplification and fails fast on a redirect loop (which is dinged elsewhere anyway). Cut 4->2:
+# the legit case is one POST-redirect-GET; more just let a /login chain balloon the request tally.
+_INJECT_MAX_REDIRECTS = 2
+# INJECTION TOTAL-request cap (shared by cmdi/ssti/lfi). The payload budgets count logical ATTEMPTS, but the
+# per-target baseline/liveness fan-out + redirect HOPS (each one a request the WAF sees, tallied by
+# net.request_counts) let a redirecting app reach ~900 requests (v21 ssti hit 991). Bound the ACTUAL request
+# count so no app exceeds this. cmdi had this cap; ssti/lfi never got it despite the same hop inflation (their
+# budgets are attempts, not requests) -- hence the runaway tail. It's near-lossless: a real injection is found in
+# the first handful of attempts, and the score collapses all instances to ONE finding, so the deep tail only
+# buys marginal confidence in a CLEAN verdict, which saturates well below this cap.
+_INJECT_MAX_REQUESTS = 150
+_CMDI_MAX_REQUESTS = _INJECT_MAX_REQUESTS   # kept for the cmdi reference below; same value
+
+
+def _request_capped(probe, default: int = _INJECT_MAX_REQUESTS):
+    """Return a no-arg predicate that's True once THIS probe has sent `max_requests` ACTUAL requests (every
+    redirect hop counted, via net.request_counts) -- the hard stop against a redirecting app amplifying
+    attempts x hops into a WAF-tripping, timeout-blowing burst. A unit-test mock probe with no .id is never
+    capped (no request_counts entry)."""
+    pid = getattr(probe, "id", "")
+    max_req = probe.probe.get("max_requests", default)
+
+    def capped() -> bool:
+        rc = request_counts()
+        return rc is not None and rc.get(pid, 0) >= max_req
+    return capped
+
+
+# An auth route a target gets 302'd to when it's behind a session we don't hold. Injecting such a target
+# unauthenticated just bounces off the login page: every attempt is WASTED (no sink reached) and redirect-
+# amplified. So skip it -- the fix that STOPS the waste, vs the cap which only bounds it. (Authenticated
+# injection, which actually reaches the surface, is the register lane's job -- the point of email verification.)
+_AUTH_REDIRECT = re.compile(r"/(?:log-?in|sign-?in|sign-?up|register|auth(?:enticate)?|account|session|oauth)"
+                            r"(?:[/?#]|$)", re.I)
+
+
+def _redirects_to_auth(resp) -> bool:
+    """True when a target is 302'd to an auth route -- login-gated, not testable without a session, so injection
+    just fuzzes the /login redirect. Handles BOTH a direct 3xx (follow_redirects=False -> the Location is the auth
+    route) AND a followed chain (follow_redirects=True -> the final URL / any hop's Location is an auth route)."""
+    try:
+        if resp.is_redirect and _AUTH_REDIRECT.search(resp.headers.get("location", "")):
+            return True
+        if resp.history:
+            if _AUTH_REDIRECT.search(str(getattr(resp.url, "path", "") or "")):
+                return True
+            return any(_AUTH_REDIRECT.search(h.headers.get("location", "")) for h in resp.history)
+    except Exception:
+        pass
+    return False
 
 
 def _elapsed(c, method, action, data) -> float:
@@ -1283,6 +1334,8 @@ def command_injection(ctx, probe) -> bool | None:
                 base = _xss_send(c, method, action, filler)
             except (httpx.HTTPError, httpx.InvalidURL):
                 continue
+            if _redirects_to_auth(base):
+                continue  # login-gated target -> not testable without a session; skip (don't fuzz the redirect)
             if any(w in base.text for w in wanted):
                 continue  # digest already present (impossible for a random salt, but cheap) -> unattributable
             if _UPSTREAM_ERROR.search(base.text):
@@ -1373,14 +1426,22 @@ def ssti_injectable(ctx, probe) -> bool | None:
     wanted = (hashlib.sha256(salt.encode()).hexdigest(), hashlib.md5(salt.encode()).hexdigest())
     payloads = [(engine, t.replace("{S}", salt)) for engine, t in _SSTI_HASH_TMPL]
     budget = probe.probe.get("max_attempts", 160)
+    capped = _request_capped(probe)   # hard ACTUAL-request ceiling (hops incl.) -> no redirect-amplified runaway
     tested = False
     fields_seen = set()
     with make_client(ctx.base_url, ctx.headers, timeout=10.0,
                      follow_redirects=True, max_redirects=_INJECT_MAX_REDIRECTS) as c:
         for action, method, fields in targets:
+            if capped():
+                break
+            try:   # one cheap baseline: a login-gated target just fuzzes the /login redirect -> skip it
+                if _redirects_to_auth(_xss_send(c, method, action, {fn: _XSS_FILLER for fn in fields})):
+                    continue
+            except (httpx.HTTPError, httpx.InvalidURL):
+                continue
             for field in fields:
                 for engine, p in payloads:
-                    if budget <= 0:
+                    if budget <= 0 or capped():
                         break
                     budget -= 1
                     tested = True
@@ -1393,9 +1454,9 @@ def ssti_injectable(ctx, probe) -> bool | None:
                             return True  # the engine hashed the salt to its exact digest -> real injection
                     except (httpx.HTTPError, httpx.InvalidURL):
                         continue
-                if budget <= 0:
+                if budget <= 0 or capped():
                     break
-            if budget <= 0:
+            if budget <= 0 or capped():
                 break
     ctx.evidence.update(injectable=False, fields_tested=len(fields_seen), expr_shapes=len(_SSTI_HASH_TMPL))
     return False if tested else None
@@ -1608,22 +1669,27 @@ def path_traversal(ctx, probe) -> bool | None:
         return None
     targets = targets[: probe.probe.get("max_targets", 40)]   # cap the per-target baseline/liveness fan-out
     budget = probe.probe.get("max_attempts", 200)
+    capped = _request_capped(probe)   # hard ACTUAL-request ceiling (hops incl.) -> no redirect-amplified runaway
     tested = False
     fields_seen = set()
     with make_client(ctx.base_url, ctx.headers, timeout=10.0,
                      follow_redirects=True, max_redirects=_INJECT_MAX_REDIRECTS) as c:
         for action, method, fields in targets:
+            if capped():
+                break
             filler = {fn: _XSS_FILLER for fn in fields}
             try:
                 base = _xss_send(c, method, action, filler)
             except (httpx.HTTPError, httpx.InvalidURL):
                 continue
+            if _redirects_to_auth(base):
+                continue  # login-gated target -> injecting it just fuzzes the /login redirect (wasted + amplified)
             if method != "postjson" and not _endpoint_is_live(ctx, c, action, method, base):
                 continue  # catch-all / soft-404 shell -> phantom endpoint, not a real file sink; a fabricated
                 #           /etc/passwd (an LLM handed ?file=/etc/passwd can invent one) fails this gate too
             for field in fields:
                 for payload in _LFI_PAYLOADS:
-                    if budget <= 0:
+                    if budget <= 0 or capped():
                         break
                     budget -= 1
                     tested = True
@@ -1652,9 +1718,9 @@ def path_traversal(ctx, probe) -> bool | None:
                             return True  # returned the contents of a system file -> traversal/LFI
                     except (httpx.HTTPError, httpx.InvalidURL):
                         continue
-                if budget <= 0:
+                if budget <= 0 or capped():
                     break
-            if budget <= 0:
+            if budget <= 0 or capped():
                 break
     ctx.evidence.update(found=False, fields_tested=len(fields_seen), payloads=len(_LFI_PAYLOADS))
     return False if tested else None
@@ -6307,6 +6373,94 @@ def _snapshot_baas_session(session, gateway, key, creds) -> dict:
             "response": auth._synthesize_response(gateway, []), "storage_exposed": False}
 
 
+def _email_register_once(ctx, suffix=""):
+    """Register with our controlled address for one identity and TRIGGER the confirmation email -- the FAST half of
+    the flow, split out so it can run EARLY (grade start, via _prime_email) while the poll runs late. Memoized on
+    ctx (sends exactly once); populates the persisted `live` state the follow reads. Lanes in order: httpx (server
+    form/JSON) -> browser (SPA) -> BaaS (Supabase) -> Firebase. Returns the RegistrationOutcome (also cached)."""
+    cache = ctx._email_cache
+    rkey = "_reg" + suffix
+    if rkey in cache:
+        return cache[rkey]
+    tag, address = _email_ctx(ctx, suffix)
+    base = ctx.base_url
+    live = cache.setdefault("_live" + suffix, {})
+
+    def _done(outcome):
+        cache[rkey] = outcome
+        return outcome
+
+    # 1) httpx (server-rendered form / JSON API) with OUR address
+    acct = auth._register_httpx(base, ctx.profile, "_e" + tag[:4], email=address)
+    if acct is not None:
+        live["acct"] = acct
+        has_session = auth._has_session(acct)
+        announced = email_verify.announces_pending_email(_resp_text(acct.register_response))
+        if has_session or announced:
+            live["lane"] = "httpx"
+            return _done(email_verify.RegistrationOutcome(
+                submitted=True, has_session=has_session, announces_email=announced,
+                has_resend_control=_has_resend_control(acct.register_response), handle=acct))
+    # 2) SPA browser lane (browser mode only): the app's own JS signs up with our address -> an email-gated SPA
+    #    mails us. Reuses ctx's single memoized browser registration (shared with the auth self-oracle).
+    bres = None
+    if getattr(ctx, "browser_register", None) is not None:
+        try:
+            bres = ctx._browser_register_once(suffix, base)
+        except Exception:
+            bres = None
+    if isinstance(bres, dict):
+        if bres.get("email_pending"):
+            # email-gated ONLY when the post-submit page ANNOUNCES email (else it's just as often CAPTCHA / SSO /
+            # approval -> announces_email False routes it to the short unannounced poll, no 60s false lockout).
+            live["lane"] = "browser"
+            return _done(email_verify.RegistrationOutcome(
+                submitted=True, has_session=False,
+                announces_email=email_verify.announces_pending_email(bres.get("page_text") or ""), handle=None))
+        if bres.get("cookies") or bres.get("bearer"):            # the SPA logged us in at once -> not email-gated
+            live.update(lane="browser_session", browser_session=bres)
+            return _done(email_verify.RegistrationOutcome(submitted=True, has_session=True, handle=None))
+    # 3) BaaS lane (Supabase gateway): confirmation ON -> accepts the signup, withholds a session, mails a confirm link
+    gw = _baas_gateway(ctx)
+    if gw is not None:
+        gateway, key = gw
+        bsu = baas.email_signup(gateway, key, address)
+        if bsu.get("session"):
+            live.update(lane="baas_session", baas_session=bsu["session"], gateway=gateway, key=key)
+            return _done(email_verify.RegistrationOutcome(submitted=True, has_session=True, handle=None))
+        if bsu.get("pending"):
+            live.update(lane="baas", gateway=gateway, key=key,
+                        baas_creds={"_email": bsu.get("_email"), "_password": bsu.get("_password")})
+            return _done(email_verify.RegistrationOutcome(submitted=True, has_session=False, announces_email=True,
+                                                          handle=None))
+    # 3b) Firebase lane: identitytoolkit signUp returns a session AT SIGNUP (not email-gated) -> unlocks API-only
+    #     Firebase's authed surface; the browser lane already covers Firebase SPAs (localStorage idToken).
+    fb_key = _firebase_config(ctx)
+    if fb_key:
+        fsess = baas.firebase_signup(fb_key, address)
+        if fsess is not None:
+            live.update(lane="firebase_session", firebase_session=fsess)
+            return _done(email_verify.RegistrationOutcome(submitted=True, has_session=True, handle=None))
+    # 4) fall back to the httpx submission (submitted but not announced -> the flow's short confirmatory poll)
+    if acct is not None:
+        live["lane"] = "httpx"
+        return _done(email_verify.RegistrationOutcome(
+            submitted=True, has_session=auth._has_session(acct), announces_email=False,
+            has_resend_control=_has_resend_control(acct.register_response), handle=acct))
+    return _done(email_verify.RegistrationOutcome(submitted=False))
+
+
+def _prime_email(ctx, suffix=""):
+    """Fire the email registration EARLY (grade start) so the confirmation mail is delivered by the time a probe
+    polls for it -- the up-to-60s wait then OVERLAPS the rest of the grade instead of blocking. No poll here; the
+    poll+follow stays lazy (verify_email_flow, run by the qa-email probes / the register lane). No-op without a
+    receiver or with a provided --header session; the send itself is memoized, so this is safe to call once."""
+    if getattr(ctx, "email", None) is None or auth._provided_session(getattr(ctx, "headers", None)):
+        return
+    with contextlib.suppress(Exception):
+        _email_register_once(ctx, suffix)
+
+
 def _run_email_flow(ctx, suffix=""):
     """Register with OUR controlled address, decide whether the signup is email-gated, and if so whether the mail
     arrives and its link logs us in -- across THREE registration lanes so SPAs aren't blind spots:
@@ -6322,72 +6476,12 @@ def _run_email_flow(ctx, suffix=""):
     each with its own address + cache slot, so the two-account IDOR probes get distinct verified users."""
     tag, address = _email_ctx(ctx, suffix)
     base = ctx.base_url
-    live: dict = {}   # {lane, acct, browser_session} -- the authenticated identity, for authed-surface reuse
+    live = ctx._email_cache.setdefault("_live" + suffix, {})   # persisted so a PRIMED registration + the later
+    #     poll share one send: the email delivers while the rest of the grade runs, so the poll finds it there.
+    reg_outcome = _email_register_once(ctx, suffix)            # the send half (memoized; may already be primed)
 
-    def register(address):
-        # 1) httpx (server-rendered form / JSON API) with OUR address
-        acct = auth._register_httpx(base, ctx.profile, "_e" + tag[:4], email=address)
-        if acct is not None:
-            live["acct"] = acct
-            has_session = auth._has_session(acct)
-            announced = email_verify.announces_pending_email(_resp_text(acct.register_response))
-            if has_session or announced:
-                live["lane"] = "httpx"
-                return email_verify.RegistrationOutcome(
-                    submitted=True, has_session=has_session, announces_email=announced,
-                    has_resend_control=_has_resend_control(acct.register_response), handle=acct)
-        # 2) SPA browser lane (browser mode only): the app's own JS signs up with our address -> an email-gated
-        #    SPA mails us. Reuses ctx's single memoized browser registration (shared with the auth self-oracle).
-        bres = None
-        if getattr(ctx, "browser_register", None) is not None:
-            try:
-                bres = ctx._browser_register_once(suffix, base)   # THIS identity's memoized browser registration
-            except Exception:
-                bres = None
-        if isinstance(bres, dict):
-            if bres.get("email_pending"):
-                # Email-gated ONLY when the post-submit page ANNOUNCES email (check your inbox / verify link) ->
-                # poll the full window. A bare submitted-no-session is just as often CAPTCHA / SSO / admin-approval,
-                # which never mails us: leaving announces_email False routes it to the SHORT unannounced poll, so it
-                # reads N/A unless a mail actually arrives -- never a 60s wait ending in a false 72 lockout.
-                live["lane"] = "browser"
-                return email_verify.RegistrationOutcome(
-                    submitted=True, has_session=False,
-                    announces_email=email_verify.announces_pending_email(bres.get("page_text") or ""), handle=None)
-            if bres.get("cookies") or bres.get("bearer"):        # the SPA logged us in at once -> not email-gated
-                live.update(lane="browser_session", browser_session=bres)
-                return email_verify.RegistrationOutcome(submitted=True, has_session=True, handle=None)
-        # 3) BaaS lane (Supabase gateway): sign up at the app's managed auth with our address. Confirmation ON ->
-        #    the gateway accepts the signup but withholds a session pending confirmation, and mails us a Supabase
-        #    confirm link (completed in the BaaS follow). Reached only when httpx + browser produced nothing.
-        gw = _baas_gateway(ctx)
-        if gw is not None:
-            gateway, key = gw
-            bsu = baas.email_signup(gateway, key, address)
-            if bsu.get("session"):
-                live.update(lane="baas_session", baas_session=bsu["session"], gateway=gateway, key=key)
-                return email_verify.RegistrationOutcome(submitted=True, has_session=True, handle=None)
-            if bsu.get("pending"):
-                live.update(lane="baas", gateway=gateway, key=key,
-                            baas_creds={"_email": bsu.get("_email"), "_password": bsu.get("_password")})
-                return email_verify.RegistrationOutcome(submitted=True, has_session=False, announces_email=True,
-                                                        handle=None)
-        # 3b) Firebase lane: identitytoolkit signUp returns a session AT SIGNUP (Firebase does not gate signup on
-        #     e-mail verification), so this unlocks the authed surface for an API-only Firebase app. Not
-        #     email-gated -> qa-email reads N/A; the browser lane already covers Firebase SPAs (localStorage idToken).
-        fb_key = _firebase_config(ctx)
-        if fb_key:
-            fsess = baas.firebase_signup(fb_key, address)
-            if fsess is not None:
-                live.update(lane="firebase_session", firebase_session=fsess)
-                return email_verify.RegistrationOutcome(submitted=True, has_session=True, handle=None)
-        # 4) fall back to the httpx submission (submitted but not announced -> the flow's short confirmatory poll)
-        if acct is not None:
-            live["lane"] = "httpx"
-            return email_verify.RegistrationOutcome(
-                submitted=True, has_session=auth._has_session(acct), announces_email=False,
-                has_resend_control=_has_resend_control(acct.register_response), handle=acct)
-        return email_verify.RegistrationOutcome(submitted=False)
+    def register(_address):
+        return reg_outcome                                     # already registered -> never re-send
 
     def follow(reg, msg):
         lane = live.get("lane")
