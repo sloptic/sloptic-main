@@ -213,6 +213,11 @@ def main():
     ap.add_argument("--grade-timeout", type=int, default=900, help="per-app subset-grade timeout (s)")
     ap.add_argument("--browser-auth", action="store_true", help="pass through to the grader (MATCH the main run)")
     ap.add_argument("--no-browser", action="store_true", help="pass through to the grader (MATCH the main run)")
+    # email-verification flags: MATCH the main run, else a WAF-blocked authed probe on an email-gated app is
+    # retried with no receiver -> reads N/A -> the recall the email lane added is lost exactly on the retry path.
+    ap.add_argument("--email-domain", help="pass through to the grader (MATCH the main run)")
+    ap.add_argument("--email-endpoint", help="pass through to the grader (MATCH the main run)")
+    ap.add_argument("--email-token", default="", help="pass through to the grader (MATCH the main run)")
     ap.add_argument("--remerge", action="store_true",
                     help="skip grading: re-fold the EXISTING <results>.retry.jsonl into .merged.jsonl (use "
                          "after a merge-logic fix — the fold is pure, so no re-grade is needed)")
@@ -240,6 +245,12 @@ def main():
         return
 
     extra = (["--browser-auth"] if args.browser_auth else []) + (["--no-browser"] if args.no_browser else [])
+    if args.email_domain:
+        extra += ["--email-domain", args.email_domain]
+    if args.email_endpoint:
+        extra += ["--email-endpoint", args.email_endpoint]
+    if args.email_token:
+        extra += ["--email-token", args.email_token]
     tmpdir = tempfile.mkdtemp(prefix="sloptic-retry-")
     collected = {}                    # url -> retry record (None on DNF or a circuit-breaker skip)
     tally = Counter()
