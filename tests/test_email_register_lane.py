@@ -7,7 +7,7 @@ import types
 
 import httpx
 
-from sloptic import auth, pipeline, probes
+from sloptic import auth, baas, pipeline, probes
 from sloptic.auth import Account
 from sloptic.email_verify import EmailMessage, EmailVerifyResult, MockReceiver
 from sloptic.schema import Form, Profile
@@ -168,6 +168,193 @@ def test_register_account_tries_the_email_lane_before_the_browser(monkeypatch):
                                 email_verify=lambda acct: email_acct)
     assert out is email_acct                                              # the email session won
     assert launched == []                                                # ... and the browser was never launched
+
+
+def _spa_ctx(browser_register):
+    return pipeline._Ctx(base_url="http://app.test", client=None,
+                         profile=Profile(base_url="http://app.test", forms=[]),
+                         email=MockReceiver(domain="app.test"), browser_register=browser_register)
+
+
+def test_email_ctx_mints_one_shared_address():
+    ctx = _spa_ctx(lambda *a, **k: None)
+    t1, a1 = probes._email_ctx(ctx)
+    t2, a2 = probes._email_ctx(ctx)
+    assert (t1, a1) == (t2, a2) and a1 == "hl-%s@app.test" % t1     # minted once, stable
+
+
+def test_snapshot_browser_session_shape():
+    snap = probes._snapshot_browser_session(
+        {"cookies": [{"name": "sessionid", "value": "S", "httponly": True, "secure": False, "samesite": False},
+                     {"name": "other", "value": "x", "httponly": False, "secure": False, "samesite": False}],
+         "bearer": "TOK", "storage_exposed": True}, "http://app.test")
+    assert "sessionid=S" in snap["headers"]["Cookie"] and "other" not in snap["headers"]["Cookie"]
+    assert snap["headers"]["Authorization"] == "Bearer TOK" and snap["storage_exposed"] is True
+
+
+def test_spa_browser_lane_registers_with_our_address_verifies_and_snapshots(monkeypatch):
+    monkeypatch.setattr(probes.auth, "_register_httpx", lambda *a, **k: None)   # no server-rendered form (an SPA)
+    got = {}
+
+    def fake_browser_register(base_url, email=None):
+        got["email"] = email                                    # the SPA must be signed up with OUR address
+        return {"email_pending": True, "creds": {"email": email}, "cookies": []}
+    monkeypatch.setattr(probes.browser, "verify_in_browser",
+                        lambda link, base="", **k: {"cookies": [{"name": "sessionid", "value": "S",
+                                                                 "httponly": True, "secure": True,
+                                                                 "samesite": False}], "bearer": None,
+                                                    "storage_exposed": False})
+    ctx = _spa_ctx(fake_browser_register)
+    ctx._email_cache["tag"] = "t1"                               # control the tag so we can inject the mail
+    ctx._email_cache["address"] = ctx.email.address("t1")
+    ctx.email.inject("t1", EmailMessage.parse("hl-t1@app.test", "Confirm", "http://app.test/verify?token=abc"))
+
+    res = probes._email_verify_result(ctx)                     # the shared entry the probes use (caches result)
+    assert got["email"] == "hl-t1@app.test"                     # signed up with the controlled address
+    assert res.email_gated and res.email_arrived and res.acted_on_verification and res.session_after_verify
+    assert "account_session" in ctx._email_cache               # verified session captured for authed reuse
+    acct = probes._email_account(ctx)                          # ... and rebuilt into a fresh authed client
+    assert acct is not None and "sessionid=S" in acct.client.headers["Cookie"]
+    acct.client.close()
+
+
+def test_spa_browser_lane_immediate_session_is_not_email_gated(monkeypatch):
+    monkeypatch.setattr(probes.auth, "_register_httpx", lambda *a, **k: None)
+
+    def fake_browser_register(base_url, email=None):            # the SPA logs us in at once -> no email step
+        return {"cookies": [{"name": "sessionid", "value": "S", "httponly": True, "secure": True,
+                             "samesite": False}], "bearer": None, "creds": {}}
+    res = probes._run_email_flow(_spa_ctx(fake_browser_register))
+    assert res.attempted and not res.email_gated               # session immediately -> not email-verification-gated
+
+
+def test_spa_browser_lane_inert_link_fires_002(monkeypatch):
+    monkeypatch.setattr(probes.auth, "_register_httpx", lambda *a, **k: None)
+    monkeypatch.setattr(probes.browser, "verify_in_browser", lambda link, base="", **k: None)  # link grants nothing
+    ctx = _spa_ctx(lambda base_url, email=None: {"email_pending": True, "cookies": []})
+    ctx._email_cache["tag"] = "t2"
+    ctx._email_cache["address"] = ctx.email.address("t2")
+    ctx.email.inject("t2", EmailMessage.parse("hl-t2@app.test", "Confirm", "http://app.test/verify?token=x"))
+    res = probes._run_email_flow(ctx)
+    assert res.email_arrived and res.acted_on_verification and not res.session_after_verify   # inert -> qa-email-002
+
+
+# --- BaaS / Supabase lane -----------------------------------------------------------------------------------
+
+class _BaasResp:
+    def __init__(self, status, data=None, headers=None):
+        self.status_code = status
+        self._data = data
+        self.headers = headers or {}
+
+    def json(self):
+        if self._data is None:
+            raise ValueError("no json")
+        return self._data
+
+
+def test_baas_email_signup_pending_when_confirmation_required(monkeypatch):
+    monkeypatch.setattr(baas.httpx, "post", lambda *a, **k: _BaasResp(200, {"id": "u1", "email": "x@y"}))
+    out = baas.email_signup("https://ref.supabase.co", "key", "hl@anachron.dev")
+    assert out["pending"] is True and out["session"] is None    # 200 + user, no token -> confirmation pending
+
+
+def test_baas_email_signup_session_when_confirmation_off(monkeypatch):
+    monkeypatch.setattr(baas.httpx, "post", lambda *a, **k: _BaasResp(200, {"access_token": "T", "refresh_token": "R"}))
+    out = baas.email_signup("https://ref.supabase.co", "key", "hl@anachron.dev")
+    assert out["session"]["access_token"] == "T" and out["pending"] is False
+
+
+def test_baas_email_signup_neither_when_closed(monkeypatch):
+    monkeypatch.setattr(baas.httpx, "post", lambda *a, **k: _BaasResp(422, {"msg": "signups disabled"}))
+    out = baas.email_signup("https://ref.supabase.co", "key", "hl@anachron.dev")
+    assert out["session"] is None and out["pending"] is False
+
+
+def test_baas_verify_email_link_posts_the_token_hash(monkeypatch):
+    calls = {}
+
+    def fake_post(url, json=None, **k):
+        calls["url"], calls["json"] = url, json
+        return _BaasResp(200, {"access_token": "AT", "refresh_token": "RT"})
+    monkeypatch.setattr(baas.httpx, "post", fake_post)
+    s = baas.verify_email_link("https://ref.supabase.co", "key",
+                               "https://ref.supabase.co/auth/v1/verify?token_hash=HASH&type=signup")
+    assert s["access_token"] == "AT"
+    assert calls["url"].endswith("/auth/v1/verify") and calls["json"]["type"] == "signup"
+    assert calls["json"].get("token_hash") == "HASH"
+
+
+def test_baas_verify_email_link_falls_back_to_the_redirect_fragment(monkeypatch):
+    monkeypatch.setattr(baas.httpx, "post", lambda *a, **k: _BaasResp(400))   # POST verify unsupported
+    monkeypatch.setattr(baas.httpx, "get",
+                        lambda url, **k: _BaasResp(303, headers={"location":
+                                                                 "https://app.test/#access_token=FT&refresh_token=FR"}))
+    s = baas.verify_email_link("https://ref.supabase.co", "key", "https://app.test/confirm?token=X&type=signup")
+    assert s["access_token"] == "FT" and s["refresh_token"] == "FR"
+
+
+def test_baas_lane_pending_confirmation_verifies_and_snapshots(monkeypatch):
+    monkeypatch.setattr(probes.auth, "_register_httpx", lambda *a, **k: None)      # not a server-form app
+    monkeypatch.setattr(probes, "_baas_gateway", lambda ctx: ("https://ref.supabase.co", "anonkey"))
+    monkeypatch.setattr(probes.baas, "email_signup",
+                        lambda gw, key, email: {"session": None, "pending": True, "_email": email, "_password": "p"})
+    monkeypatch.setattr(probes.baas, "verify_email_link",
+                        lambda gw, key, link: {"access_token": "AT", "refresh_token": "RT"})
+    ctx = _spa_ctx(None)                                          # no browser -> the BaaS lane is reached
+    ctx._email_cache["tag"] = "t3"
+    ctx._email_cache["address"] = ctx.email.address("t3")
+    ctx.email.inject("t3", EmailMessage.parse("hl-t3@app.test", "Confirm your signup",
+                                              "https://ref.supabase.co/auth/v1/verify?token_hash=H&type=signup"))
+    res = probes._email_verify_result(ctx)
+    assert res.email_gated and res.email_arrived and res.session_after_verify
+    acct = probes._email_account(ctx)                            # authed client carries the gateway session
+    assert acct.client.headers["Authorization"] == "Bearer AT" and acct.client.headers["apikey"] == "anonkey"
+    assert "sb-ref-auth-token" in acct.client.headers.get("Cookie", "")
+    acct.client.close()
+
+
+def test_baas_lane_immediate_session_is_not_email_gated(monkeypatch):
+    monkeypatch.setattr(probes.auth, "_register_httpx", lambda *a, **k: None)
+    monkeypatch.setattr(probes, "_baas_gateway", lambda ctx: ("https://ref.supabase.co", "k"))
+    monkeypatch.setattr(probes.baas, "email_signup",
+                        lambda gw, key, email: {"session": {"access_token": "T"}, "pending": False})
+    res = probes._email_verify_result(_spa_ctx(None))
+    assert res.attempted and not res.email_gated                 # confirmation off -> logged in at once
+
+
+# --- Firebase lane ------------------------------------------------------------------------------------------
+
+def test_firebase_api_key_requires_a_firebase_marker():
+    key = "AIza" + "A" * 35
+    assert baas.firebase_api_key('{apiKey:"%s",authDomain:"x.firebaseapp.com"}' % key) == key
+    assert baas.firebase_api_key('{apiKey:"%s",mapsOnly:true}' % key) is None   # apiKey but no Firebase marker
+
+
+def test_firebase_signup_returns_the_idtoken_session(monkeypatch):
+    monkeypatch.setattr(baas.httpx, "post",
+                        lambda *a, **k: _BaasResp(200, {"idToken": "ID", "refreshToken": "R", "localId": "u1"}))
+    s = baas.firebase_signup("AIzaKEY", "hl@anachron.dev")
+    assert s["idToken"] == "ID" and s["_password"]
+
+
+def test_firebase_signup_none_on_error(monkeypatch):
+    monkeypatch.setattr(baas.httpx, "post", lambda *a, **k: _BaasResp(400, {"error": {"message": "EMAIL_EXISTS"}}))
+    assert baas.firebase_signup("AIzaKEY", "hl@anachron.dev") is None
+
+
+def test_firebase_lane_unlocks_the_authed_surface_not_email_gated(monkeypatch):
+    monkeypatch.setattr(probes.auth, "_register_httpx", lambda *a, **k: None)
+    monkeypatch.setattr(probes, "_baas_gateway", lambda ctx: None)         # not Supabase
+    monkeypatch.setattr(probes, "_firebase_config", lambda ctx: "AIzaKEY")
+    monkeypatch.setattr(probes.baas, "firebase_signup",
+                        lambda key, email: {"idToken": "IDT", "localId": "u1", "email": email, "_password": "p"})
+    ctx = _spa_ctx(None)
+    res = probes._email_verify_result(ctx)
+    assert res.attempted and not res.email_gated                          # session at signup -> not email-gated
+    acct = probes._email_account(ctx)                                     # ... but the authed surface still unlocks
+    assert acct is not None and acct.client.headers["Authorization"] == "Bearer IDT"
+    acct.client.close()
 
 
 def test_register_account_falls_through_to_browser_when_email_lane_returns_none(monkeypatch):

@@ -6184,32 +6184,221 @@ def _snapshot_session(acct) -> dict:
             "response": acct.register_response, "storage_exposed": acct.storage_exposed}
 
 
+def _email_ctx(ctx):
+    """The shared (tag, address) for this grade, minted once on ctx so EVERY registration lane (httpx, browser)
+    signs up with the same box and the flow polls it. Prefers ctx.email_address() (the real _Ctx); falls back to
+    minting locally for a duck-typed ctx that lacks it."""
+    getter = getattr(ctx, "email_address", None)
+    if callable(getter):
+        getter()                                   # populates ctx._email_cache tag+address
+        return ctx._email_cache["tag"], ctx._email_cache["address"]
+    if "tag" not in ctx._email_cache:
+        ctx._email_cache["tag"] = secrets.token_hex(6)
+        ctx._email_cache["address"] = ctx.email.address(ctx._email_cache["tag"])
+    return ctx._email_cache["tag"], ctx._email_cache["address"]
+
+
+def _snapshot_browser_session(bsession, base) -> dict:
+    """Snapshot a browser-established SPA session (post email-verification) into the SAME replayable shape as the
+    httpx lane, so ctx.register rebuilds a fresh authed client for each probe. Cookies are re-encoded as
+    Set-Cookie (auth._synthesize_response) so the cookie-flag probes still judge the real session cookie."""
+    hdrs: dict = {}
+    cookies = bsession.get("cookies") or []
+    session_cookies = [c for c in cookies if auth._is_session_cookie(c.get("name", ""))] or cookies
+    if session_cookies:
+        hdrs["Cookie"] = "; ".join("%s=%s" % (c["name"], c.get("value", "")) for c in session_cookies)
+    if bsession.get("bearer"):
+        hdrs["Authorization"] = "Bearer " + bsession["bearer"]
+    return {"headers": hdrs, "username": "hl_spa", "password": "",
+            "response": auth._synthesize_response(base, cookies),
+            "storage_exposed": bool(bsession.get("storage_exposed"))}
+
+
+def _follow_verification_browser(base, msg, live) -> "email_verify.Verification":
+    """Complete a SPA verification: open the emailed same-host link IN THE BROWSER (browser.verify_in_browser) so
+    the app's own JS reads the token and establishes the session -- an httpx GET can't run that JS. Records the
+    session on `live` for the authed-surface snapshot. acted=False for a code-only / no-link email (N/A)."""
+    links = [ln for ln in msg.links if _same_app_link(ln, base)]
+    if not links:
+        return email_verify.Verification(acted=False)
+    for link in links[:3]:
+        try:
+            bsession = browser.verify_in_browser(link, base)
+        except Exception:
+            bsession = None
+        if isinstance(bsession, dict) and (bsession.get("cookies") or bsession.get("bearer")):
+            live["browser_session"] = bsession
+            return email_verify.Verification(acted=True, session=True)
+    return email_verify.Verification(acted=True, session=False)   # clicked, still no session -> inert (qa-email-002)
+
+
+def _client_blob(ctx):
+    """The app's client JS bundle, fetched once and memoized on ctx (the BaaS + Firebase lanes both read it to
+    resolve provider config). Paid only when the email flow reaches these lanes (httpx + browser produced
+    nothing)."""
+    cache = ctx._email_cache
+    if "blob" not in cache:
+        try:
+            cache["blob"] = baas.client_blob(ctx.base_url, getattr(ctx.profile, "landing_path", "") or "") or ""
+        except Exception:
+            cache["blob"] = ""
+    return cache["blob"]
+
+
+def _baas_gateway(ctx):
+    """(gateway, anon_key) for the app's managed Supabase backend, resolved from its client bundle -- or None
+    when the app has no embedded gateway/key."""
+    try:
+        blob = _client_blob(ctx)
+        if not blob:
+            return None
+        gateway = baas.resolve_gateway(blob, ctx.base_url)
+        key = baas.anon_key(blob)
+        return (gateway, key) if gateway and key else None
+    except Exception:
+        return None
+
+
+def _firebase_config(ctx):
+    """The app's Firebase Web API key from its client bundle, or None (not a Firebase-Auth app)."""
+    try:
+        blob = _client_blob(ctx)
+        return baas.firebase_api_key(blob) if blob else None
+    except Exception:
+        return None
+
+
+def _snapshot_firebase_session(sess) -> dict:
+    """Snapshot a Firebase session (idToken at signup) into the replayable shape ctx.register rebuilds from -- a
+    Bearer idToken, which is what a Firebase app's client sends to its own backend / Firestore REST."""
+    return {"headers": {"Authorization": "Bearer " + sess["idToken"]},
+            "username": sess.get("email") or sess.get("localId") or "hl_firebase",
+            "password": sess.get("_password", ""),
+            "response": httpx.Response(200, request=httpx.Request("POST", baas._IDENTITYTOOLKIT_SIGNUP)),
+            "storage_exposed": False}
+
+
+def _follow_verification_baas(msg, live) -> "email_verify.Verification":
+    """Complete a Supabase e-mail confirmation: try each emailed link through baas.verify_email_link (the confirm
+    link's host is the GATEWAY, not the app, so _same_app_link does not apply -- the token is read from the query
+    regardless of host). Records the session on `live` for the authed-surface snapshot."""
+    gateway, key = live["gateway"], live["key"]
+    for link in msg.links[:5]:
+        try:
+            session = baas.verify_email_link(gateway, key, link)
+        except Exception:
+            session = None
+        if isinstance(session, dict) and session.get("access_token"):
+            live["baas_session"] = session
+            return email_verify.Verification(acted=True, session=True)
+    return email_verify.Verification(acted=bool(msg.links), session=False)   # link(s) but none verified -> inert
+
+
+def _snapshot_baas_session(session, gateway, key, creds) -> dict:
+    """Snapshot a Supabase session (post e-mail confirmation) into the replayable shape ctx.register rebuilds
+    from: the gateway Bearer + apikey, and the `sb-<ref>-auth-token` cookie the app reads to render authed. The
+    cookie is set by us (no Set-Cookie observed), so the cookie-flag probes read N/A here -- same as the
+    existing BaaS register lane."""
+    hdrs = {"Authorization": "Bearer " + session["access_token"], "apikey": key,
+            "Cookie": baas.cookie_name(gateway) + "=" + baas.cookie_value(session)}
+    return {"headers": hdrs,
+            "username": session.get("_email") or creds.get("_email") or "hl_baas",
+            "password": session.get("_password") or creds.get("_password") or "",
+            "response": auth._synthesize_response(gateway, []), "storage_exposed": False}
+
+
 def _run_email_flow(ctx):
-    """Build the register/follow/resend callbacks the pure flow needs from ctx, and run it. Registration uses
-    the httpx/JSON lanes with OUR address (never the browser/BaaS fallbacks, which register their own creds).
-    When the verification logs us in, capture that account's session on ctx (once) so the authed-surface probes
-    reuse it via ctx.register -- the whole reason the receiver exists."""
-    tag = secrets.token_hex(6)
+    """Register with OUR controlled address, decide whether the signup is email-gated, and if so whether the mail
+    arrives and its link logs us in -- across THREE registration lanes so SPAs aren't blind spots:
+
+      1. httpx  -- a server-rendered HTML form / JSON API (email in the body).
+      2. browser -- when browser-driven registration is on, drive the app's OWN JS signup with our address (an
+         SPA's form action is a placeholder; the real POST is a JS fetch, so httpx alone never mails us). Reuses
+         the ONE memoized browser registration ctx.register already performs, so no extra launch; the emailed
+         link is then completed in the browser too (verify_in_browser).
+
+    When a lane's verification logs us in, capture that session on ctx (once) so the authed-surface probes reuse
+    it via ctx.register -- the whole reason the receiver exists."""
+    tag, address = _email_ctx(ctx)
     base = ctx.base_url
-    address = ctx.email.address(tag)
-    live: dict = {}   # captures the account the flow authenticates, for authed-surface reuse
+    live: dict = {}   # {lane, acct, browser_session} -- the authenticated identity, for authed-surface reuse
 
     def register(address):
+        # 1) httpx (server-rendered form / JSON API) with OUR address
         acct = auth._register_httpx(base, ctx.profile, "_e" + tag[:4], email=address)
-        if acct is None:
-            return email_verify.RegistrationOutcome(submitted=False)
-        live["acct"] = acct
-        return email_verify.RegistrationOutcome(
-            submitted=True, has_session=auth._has_session(acct),
-            announces_email=email_verify.announces_pending_email(_resp_text(acct.register_response)),
-            has_resend_control=_has_resend_control(acct.register_response), handle=acct)
+        if acct is not None:
+            live["acct"] = acct
+            has_session = auth._has_session(acct)
+            announced = email_verify.announces_pending_email(_resp_text(acct.register_response))
+            if has_session or announced:
+                live["lane"] = "httpx"
+                return email_verify.RegistrationOutcome(
+                    submitted=True, has_session=has_session, announces_email=announced,
+                    has_resend_control=_has_resend_control(acct.register_response), handle=acct)
+        # 2) SPA browser lane (browser mode only): the app's own JS signs up with our address -> an email-gated
+        #    SPA mails us. Reuses ctx's single memoized browser registration (shared with the auth self-oracle).
+        bres = None
+        if getattr(ctx, "browser_register", None) is not None:
+            try:
+                bres = ctx._browser_register_once("", base)
+            except Exception:
+                bres = None
+        if isinstance(bres, dict):
+            if bres.get("email_pending"):
+                live["lane"] = "browser"                         # submitted, no session -> waiting on the email
+                return email_verify.RegistrationOutcome(submitted=True, has_session=False, announces_email=True,
+                                                        handle=None)
+            if bres.get("cookies") or bres.get("bearer"):        # the SPA logged us in at once -> not email-gated
+                live.update(lane="browser_session", browser_session=bres)
+                return email_verify.RegistrationOutcome(submitted=True, has_session=True, handle=None)
+        # 3) BaaS lane (Supabase gateway): sign up at the app's managed auth with our address. Confirmation ON ->
+        #    the gateway accepts the signup but withholds a session pending confirmation, and mails us a Supabase
+        #    confirm link (completed in the BaaS follow). Reached only when httpx + browser produced nothing.
+        gw = _baas_gateway(ctx)
+        if gw is not None:
+            gateway, key = gw
+            bsu = baas.email_signup(gateway, key, address)
+            if bsu.get("session"):
+                live.update(lane="baas_session", baas_session=bsu["session"], gateway=gateway, key=key)
+                return email_verify.RegistrationOutcome(submitted=True, has_session=True, handle=None)
+            if bsu.get("pending"):
+                live.update(lane="baas", gateway=gateway, key=key,
+                            baas_creds={"_email": bsu.get("_email"), "_password": bsu.get("_password")})
+                return email_verify.RegistrationOutcome(submitted=True, has_session=False, announces_email=True,
+                                                        handle=None)
+        # 3b) Firebase lane: identitytoolkit signUp returns a session AT SIGNUP (Firebase does not gate signup on
+        #     e-mail verification), so this unlocks the authed surface for an API-only Firebase app. Not
+        #     email-gated -> qa-email reads N/A; the browser lane already covers Firebase SPAs (localStorage idToken).
+        fb_key = _firebase_config(ctx)
+        if fb_key:
+            fsess = baas.firebase_signup(fb_key, address)
+            if fsess is not None:
+                live.update(lane="firebase_session", firebase_session=fsess)
+                return email_verify.RegistrationOutcome(submitted=True, has_session=True, handle=None)
+        # 4) fall back to the httpx submission (submitted but not announced -> the flow's short confirmatory poll)
+        if acct is not None:
+            live["lane"] = "httpx"
+            return email_verify.RegistrationOutcome(
+                submitted=True, has_session=auth._has_session(acct), announces_email=False,
+                has_resend_control=_has_resend_control(acct.register_response), handle=acct)
+        return email_verify.RegistrationOutcome(submitted=False)
 
     def follow(reg, msg):
-        return _follow_verification(reg.handle, msg, base, ctx.profile, address)
+        lane = live.get("lane")
+        if lane == "browser":
+            return _follow_verification_browser(base, msg, live)
+        if lane == "baas":
+            return _follow_verification_baas(msg, live)
+        if live.get("acct") is not None:
+            return _follow_verification(live["acct"], msg, base, ctx.profile, address)
+        return email_verify.Verification(acted=False)
 
     def resend(reg):
+        acct = live.get("acct")                                  # only the httpx lane has a resend control to hit
+        if acct is None:
+            return False
         try:
-            return _try_resend(reg.handle.client, reg.handle.register_response, address)
+            return _try_resend(acct.client, acct.register_response, address)
         except Exception:
             return False
 
@@ -6220,11 +6409,23 @@ def _run_email_flow(ctx):
             resend_at=_EMAIL_RESEND_AT)
     except Exception:
         return email_verify.EmailVerifyResult(attempted=False, na_reason="email-verification flow errored")
-    acct = live.get("acct")
-    if result.session_after_verify and acct is not None:
-        ctx._email_cache["account_session"] = _snapshot_session(acct)   # rebuilt per call; original closed below
-        with contextlib.suppress(Exception):
-            acct.client.close()
+    lane = live.get("lane")
+    if lane == "firebase_session" and live.get("firebase_session"):
+        # Firebase's session is granted at SIGNUP, not after verification, so capture it directly (the app is not
+        # email-gated -> result.session_after_verify is never set for this lane).
+        ctx._email_cache["account_session"] = _snapshot_firebase_session(live["firebase_session"])
+    elif result.session_after_verify:                           # capture the verified session for authed reuse (once)
+        if lane == "browser" and live.get("browser_session"):
+            ctx._email_cache["account_session"] = _snapshot_browser_session(live["browser_session"], base)
+        elif lane == "baas" and live.get("baas_session"):
+            ctx._email_cache["account_session"] = _snapshot_baas_session(
+                live["baas_session"], live["gateway"], live["key"], live.get("baas_creds") or {})
+        else:
+            acct = live.get("acct")
+            if acct is not None and auth._has_session(acct):
+                ctx._email_cache["account_session"] = _snapshot_session(acct)   # rebuilt per call; original closed
+                with contextlib.suppress(Exception):
+                    acct.client.close()
     return result
 
 
@@ -6255,8 +6456,13 @@ def _email_account(ctx, session_less_acct=None):
     how we got here."""
     cache = ctx._email_cache
     if "result" not in cache:
-        if session_less_acct is None or not email_verify.announces_pending_email(
-                _resp_text(session_less_acct.register_response)):
+        announced = session_less_acct is not None and email_verify.announces_pending_email(
+            _resp_text(session_less_acct.register_response))
+        # In browser mode the httpx signup is a placeholder that never announces (the real signup is a JS fetch),
+        # so an email-gated SPA would slip through the announce gate; the shared flow's browser lane is what
+        # detects it. Its browser registration is memoized (shared with ctx.register), so this adds no launch.
+        browser_spa = getattr(ctx, "browser_register", None) is not None
+        if not (announced or browser_spa):
             return None                                  # not (yet known to be) email-gated -> let browser try
         _email_verify_result(ctx)                        # run the one shared flow (captures the session, if any)
     sess = cache.get("account_session")

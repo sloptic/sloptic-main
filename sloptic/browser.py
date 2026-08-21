@@ -587,7 +587,8 @@ def _extract_storage_token(page) -> dict:
     return {}
 
 
-def register_in_browser(base_url: str, headers=None, timeout: float = 12.0, total_timeout: float = 45.0):
+def register_in_browser(base_url: str, headers=None, timeout: float = 12.0, total_timeout: float = 45.0,
+                        email: str | None = None):
     """SPA self-registration THROUGH the browser (the auth self-oracle's client-rendered path): open the signup
     form, fill throwaway creds, submit so the app's OWN JS makes the real registration request, and return the
     session cookie the server sets IN THE BROWSER — the thing an httpx form-POST can't get on an SPA (the form's
@@ -597,14 +598,20 @@ def register_in_browser(base_url: str, headers=None, timeout: float = 12.0, tota
     storage_exposed:bool} or None (no browser / no fillable signup / NEITHER a cookie nor a token — email-verify /
     CAPTCHA / SSO). Best-effort + side-effecting: creates ONE throwaway account, like the httpx register; targets a
     SIGNUP form only (a password field), never login/pay/delete (the reveal + _NO_CLICK guards). Caller (auth)
-    decides which cookie/token is the session and whether registration succeeded."""
+    decides which cookie/token is the session and whether registration succeeded.
+
+    `email`, when set, fills the signup's email field with a controlled address WE own (the email-verification
+    flow), so an email-GATED SPA mails the confirmation to us. In that mode the submitted-but-no-session outcome
+    is NOT a bare None: it returns {email_pending: True, creds, cookies, request} so the email flow can poll the
+    inbox and complete the verification link in the browser (verify_in_browser). Callers that pass no email keep
+    the exact old contract (None on no session)."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
         return None
     import secrets
     uname = "hl_" + secrets.token_hex(5)
-    creds = {"email": uname + "@example.com", "username": uname, "password": "Hl-Probe-Passw0rd!"}
+    creds = {"email": email or (uname + "@example.com"), "username": uname, "password": "Hl-Probe-Passw0rd!"}
     captured, seen_bearer, reads, out = {}, {}, [], None
     LAST_STAGE.clear()
     try:
@@ -658,6 +665,13 @@ def register_in_browser(base_url: str, headers=None, timeout: float = 12.0, tota
                                            "no token%s (e-mail confirmation / CAPTCHA / approval / SSO-only)"
                                            % (" — a registration request WAS observed" if captured else
                                               " and no registration request was even observed"))
+                    if email is not None:
+                        # EMAIL-FLOW mode: the signup submitted with OUR address but granted no session -> most
+                        # likely e-mail confirmation. Hand back the SUBMITTED state (not None) so the email flow
+                        # can poll the inbox and, if a link arrives, finish verification in the browser. Callers
+                        # in the non-email auth self-oracle path (email is None) still get the old None.
+                        return {"email_pending": True, "creds": creds, "cookies": jar,
+                                "request": captured or None, "backend_reads": reads}
                     return None
                 out = {"creds": creds, "cookies": jar, "request": captured or None,
                        "bearer": bearer, "storage_exposed": bool(stored.get("token")),
@@ -668,6 +682,62 @@ def register_in_browser(base_url: str, headers=None, timeout: float = 12.0, tota
         LAST_STAGE["stage"] = "browser registration raised %s" % type(exc).__name__
         return None
     return out
+
+
+def verify_in_browser(link: str, base_url: str = "", headers=None, timeout: float = 12.0):
+    """Complete a SPA e-mail verification: open the emailed confirmation LINK in a fresh browser so the app's OWN
+    JS reads the token out of the URL and establishes the session — an httpx GET can't run that JS, so a
+    client-rendered verify page would otherwise never log us in. Same capture path as register_in_browser:
+    returns {cookies:[{name,value,httponly,secure,samesite}], bearer:str|None, storage_exposed:bool,
+    backend_reads:[...]} when the link grants a session, else None (no browser / inert or dead link). Stateless by
+    design — the token is IN the link, so a fresh context (no prior signup session) completes it just fine."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return None
+    seen_bearer: dict = {}
+    reads: list = []
+    try:
+        with sync_playwright() as pw:
+            b = _launch(pw)
+            if b is None:
+                return None
+            try:
+                page = b.new_page()
+                _apply_auth(page, base_url or link, headers)
+
+                def _on_request(req):
+                    with contextlib.suppress(Exception):
+                        authz = req.headers.get("authorization", "")
+                        if authz[:7].lower() == "bearer " and len(authz) > 27:
+                            seen_bearer["token"] = authz[7:]
+                        apikey = req.headers.get("apikey")
+                        if req.method == "GET" and apikey and "/rest/v1/" in req.url and len(reads) < 10:
+                            if not any(r["url"] == req.url for r in reads):
+                                reads.append({"url": req.url, "apikey": apikey})
+                page.on("request", _on_request)
+                with contextlib.suppress(Exception):
+                    page.goto(link, timeout=int(timeout * 1000), wait_until="commit")
+                with contextlib.suppress(Exception):
+                    page.wait_for_load_state("networkidle", timeout=8000)
+                page.wait_for_timeout(500)
+                cookies = []
+                with contextlib.suppress(Exception):
+                    cookies = page.context.cookies()
+                jar = [{"name": c["name"], "value": c.get("value", ""),
+                        "httponly": bool(c.get("httpOnly")), "secure": bool(c.get("secure")),
+                        "samesite": (c.get("sameSite") or "").lower() in ("lax", "strict")}
+                       for c in cookies]
+                stored = _extract_storage_token(page)
+                bearer = stored.get("token") or seen_bearer.get("token")
+                if not jar and not bearer:
+                    return None   # the link established no session -> inert verification (qa-email-002's concern)
+                return {"cookies": jar, "bearer": bearer,
+                        "storage_exposed": bool(stored.get("token")), "backend_reads": reads}
+            finally:
+                b.close()
+    except Exception:
+        return None
 
 
 # ---- stale UI after a save (qa-staleui-001) ------------------------------------------------------

@@ -66,6 +66,32 @@ class _Ctx:
     #     hot pipeline path never imports email_verify
     _email_cache: dict = field(default_factory=dict)  # the one shared EmailVerifyResult (run once per app)
 
+    def email_address(self):
+        """The ONE controlled inbox address for this grade (tag minted once, cached), so every registration lane
+        signs up with the SAME address WE own and the email flow polls the right box. None when no receiver is
+        configured -> the lanes fall back to a dummy @example.com (unchanged)."""
+        if self.email is None:
+            return None
+        if "address" not in self._email_cache:
+            import secrets
+            tag = secrets.token_hex(6)
+            self._email_cache["tag"] = tag
+            self._email_cache["address"] = self.email.address(tag)
+        return self._email_cache["address"]
+
+    def _browser_register_once(self, suffix, base_url):
+        """ONE browser registration per identity (launch + fill + submit is 20-40s), memoized and SHARED between
+        the auth self-oracle (here) and the email flow, so an email-gated SPA is browser-registered exactly once.
+        Signs up with our controlled address when a receiver is configured, so the SPA mails the confirmation to
+        us; None/dummy otherwise (unchanged)."""
+        if self.browser_register is None:
+            return None
+        store = self._browser_cache
+        if suffix not in store:
+            addr = self.email_address()
+            store[suffix] = self.browser_register(base_url, email=addr) if addr else self.browser_register(base_url)
+        return store[suffix]
+
     def register(self, suffix: str = ""):
         """Self-register (self-as-oracle) for the authed-surface probes, with the browser fallback threaded in:
         a client-rendered SPA (form action = placeholder, real POST = a JS fetch) still yields a session token.
@@ -76,14 +102,10 @@ class _Ctx:
         at concurrency). The first probe for an identity pays it; the rest reuse the captured
         cookies/bearer/backend_reads. A fresh httpx client is still built PER CALL, so per-probe close semantics
         are unchanged (no shared-lifecycle risk); distinct suffixes (idor's "_a"/"_b") stay distinct identities."""
-        cached = real = self.browser_register
-        if real is not None:
-            store = self._browser_cache
-
-            def cached(base_url, _s=suffix, _real=real):
-                if _s not in store:
-                    store[_s] = _real(base_url)   # ONE browser registration per identity, reused across probes
-                return store[_s]
+        cached = None
+        if self.browser_register is not None:
+            def cached(base_url, _s=suffix):
+                return self._browser_register_once(_s, base_url)
         # EMAIL-VERIFICATION lane (built only when a receiver is configured): on an email-gated signup, complete
         # the verification and reuse THAT authenticated session, so the authed-surface probes run as the verified
         # user. Excluded for the two-account IDOR suffixes (_a/_b): the single email identity cannot supply two

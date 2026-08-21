@@ -15,7 +15,7 @@ import base64
 import json
 import re
 import secrets
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 
@@ -135,10 +135,11 @@ def cookie_value(session: dict) -> str:
     return "base64-" + base64.b64encode(raw.encode()).decode()
 
 
-def signup(gateway: str, key: str, suffix: str = "") -> dict | None:
+def signup(gateway: str, key: str, suffix: str = "", email: str | None = None) -> dict | None:
     """Register a THROWAWAY account at the gateway's GoTrue. Returns the session, or None when signup is closed
-    (email confirmation required, captcha, or anonymous sign-ups disabled) -> the caller reads N/A honestly."""
-    email = "hl-probe-%s%s@example.com" % (secrets.token_hex(5), suffix)
+    (email confirmation required, captcha, or anonymous sign-ups disabled) -> the caller reads N/A honestly.
+    `email`, when set, signs up with a controlled address WE own (the email-verification flow)."""
+    email = email or ("hl-probe-%s%s@example.com" % (secrets.token_hex(5), suffix))
     body = {"email": email, "password": "Hl-Probe-Passw0rd!"}
     try:
         r = httpx.post(gateway.rstrip("/") + "/auth/v1/signup", json=body, timeout=12.0, verify=False,
@@ -154,4 +155,113 @@ def signup(gateway: str, key: str, suffix: str = "") -> dict | None:
     if not isinstance(data, dict) or not data.get("access_token"):
         return None      # confirmation-required signups answer 200 with a user and NO token -> no session
     data["_email"], data["_password"] = email, body["password"]
+    return data
+
+
+def email_signup(gateway: str, key: str, email: str) -> dict:
+    """Sign up at the gateway with OUR controlled address (the email-verification flow). Returns
+    {"session": dict|None, "pending": bool, "_email", "_password"}: a session when e-mail confirmation is OFF
+    (logged straight in), else pending=True when the gateway ACCEPTED the signup but withholds a session pending
+    confirmation (200 with a user object, no access_token) -> the project mails us a confirm link. pending=False
+    + session=None when signup is closed / captcha'd (nothing to verify)."""
+    password = "Hl-Probe-Passw0rd!"
+    out = {"session": None, "pending": False, "_email": email, "_password": password}
+    try:
+        r = httpx.post(gateway.rstrip("/") + "/auth/v1/signup", json={"email": email, "password": password},
+                       timeout=12.0, verify=False, headers={"apikey": key, "Content-Type": "application/json"})
+    except Exception:
+        return out
+    if r.status_code not in (200, 201):
+        return out
+    try:
+        data = r.json()
+    except Exception:
+        return out
+    if isinstance(data, dict) and data.get("access_token"):
+        data["_email"], data["_password"] = email, password
+        out["session"] = data
+        return out
+    # 200 + a user object (id/email/user) but no token -> confirmation required (the app mails us)
+    out["pending"] = isinstance(data, dict) and bool(data.get("id") or data.get("user") or data.get("email"))
+    return out
+
+
+_SB_TOKEN_KEYS = ("token_hash", "token", "confirmation_token")
+
+
+def verify_email_link(gateway: str, key: str, link: str) -> dict | None:
+    """Follow a Supabase e-mail confirmation link and return the session it grants, else None (inert/dead link).
+    Two shapes are handled: (1) POST <gateway>/auth/v1/verify {type, token_hash|token} -> a JSON session (the
+    modern verify flow); (2) the link is a GET that 303-redirects with the tokens in the URL FRAGMENT -> parse
+    the Location. The token is read from the link's query under any of its known param names, so an app-hosted
+    confirm link (redirect_to on the app) works the same as a bare gateway link."""
+    q = parse_qs(urlparse(link).query)
+    token = next((q[k][0] for k in _SB_TOKEN_KEYS if q.get(k)), None)
+    typ = (q.get("type") or ["signup"])[0]
+    hdrs = {"apikey": key, "Content-Type": "application/json"}
+    if token:                                                    # (1) POST verify with the token hash -> session
+        for field in ("token_hash", "token"):
+            try:
+                r = httpx.post(gateway.rstrip("/") + "/auth/v1/verify", json={"type": typ, field: token},
+                               timeout=12.0, verify=False, headers=hdrs)
+            except Exception:
+                continue
+            if r.status_code in (200, 201):
+                try:
+                    data = r.json()
+                except Exception:
+                    data = {}
+                if isinstance(data, dict) and data.get("access_token"):
+                    return data
+    try:                                                         # (2) GET the link, parse the redirect fragment
+        r = httpx.get(link, timeout=12.0, verify=False, follow_redirects=False, headers={"apikey": key})
+    except Exception:
+        return None
+    loc = r.headers.get("location", "")
+    frag = urlparse(loc).fragment or (loc.split("#", 1)[1] if "#" in loc else "")
+    fq = parse_qs(frag)
+    if fq.get("access_token"):
+        return {"access_token": fq["access_token"][0], "refresh_token": (fq.get("refresh_token") or [""])[0]}
+    return None
+
+
+# --- Firebase Authentication (identitytoolkit) --------------------------------------------------------------
+# A DIFFERENT model from Supabase: signUp returns a session (idToken) at once -- Firebase does NOT gate signup
+# on e-mail verification (that is a separate optional post-login step). So this lane UNLOCKS the authed surface
+# for an API-only Firebase app; it is not an email-gate. Firebase SPAs are already covered by the browser lane
+# (the idToken lands in localStorage).
+_FIREBASE_KEY = re.compile(r"""apiKey["']?\s*[:=]\s*["'](AIza[0-9A-Za-z_\-]{35})["']""")
+_FIREBASE_MARKER = re.compile(r"authDomain|firebaseapp\.com|projectId|firebaseConfig|identitytoolkit", re.I)
+_IDENTITYTOOLKIT_SIGNUP = "https://identitytoolkit.googleapis.com/v1/accounts:signUp"
+
+
+def firebase_api_key(blob: str) -> str | None:
+    """The Firebase Web API key (`AIza…`) from the app's client config, or None. Requires a firebaseConfig
+    marker nearby so a lone Google Maps/other `AIza` key does NOT match -- we only sign up where the app really
+    uses Firebase Auth."""
+    m = _FIREBASE_KEY.search(blob or "")
+    if not m or not _FIREBASE_MARKER.search(blob or ""):
+        return None
+    return m.group(1)
+
+
+def firebase_signup(api_key: str, email: str) -> dict | None:
+    """Sign up at Firebase Authentication with a controlled address. Firebase returns a session (idToken) at
+    signup, so this unlocks the authed surface for an API-only Firebase app. Returns {idToken, refreshToken,
+    localId, email, _password} or None (signups disabled / not email-password / bad key)."""
+    password = "Hl-Probe-Passw0rd!"
+    try:
+        r = httpx.post(_IDENTITYTOOLKIT_SIGNUP, params={"key": api_key}, timeout=12.0, verify=False,
+                       json={"email": email, "password": password, "returnSecureToken": True})
+    except Exception:
+        return None
+    if r.status_code not in (200, 201):
+        return None
+    try:
+        data = r.json()
+    except Exception:
+        return None
+    if not isinstance(data, dict) or not data.get("idToken"):
+        return None
+    data["_password"] = password
     return data
