@@ -772,6 +772,38 @@ def _mined_api_endpoints(base_url, headers, route_list, existing, app_root: str 
     return out
 
 
+# Auth ROUTE literals in a JS bundle: a quoted client-route path (`"/login"`, React-Router / router config) OR a
+# Next.js app-router chunk segment (`/app/login/page`). The `\b`/`/` boundary keeps `/login` from matching
+# `/logins-report`. Split login-ish vs signup-ish so we can set the right trigger.
+_MINED_LOGIN_ROUTE = re.compile(r"""["'`]/(?:log-?in|sign-?in|authenticate|account|dashboard)\b"""
+                               r"""|/app/(?:login|signin|sign-in|auth|account|dashboard)/""", re.I)
+_MINED_SIGNUP_ROUTE = re.compile(r"""["'`]/(?:sign-?up|register|create-account|join)\b"""
+                                r"""|/app/(?:signup|sign-up|register)/""", re.I)
+
+
+def _mine_auth_routes(base_url, headers, js_urls, cap: int = _MINE_CHUNK_CAP) -> tuple[bool, bool]:
+    """Grep the discovered JS chunks for auth ROUTE literals — a code-split `/login` the crawl never linked to
+    and the CTA scan (_auth_triggers) never saw, so `has_auth_entrypoint` wrongly reads False and the whole auth
+    cluster goes N/A. Returns (login_seen, signup_seen). Cheap: reuses the chunk URLs the crawl already found, and
+    is only called when no auth surface turned up any other way, so the extra fetches land only where they help. A
+    false positive just makes the register lane ATTEMPT and self-gate to N/A -- never a false finding."""
+    chunks = [u for u in dict.fromkeys(js_urls) if (u or "").split("?")[0].endswith(".js")][:cap]
+    if not chunks:
+        return False, False
+    login = signup = False
+    with make_client(base_url, headers, timeout=8.0, follow_redirects=True) as c:
+        for u in chunks:
+            if login and signup:
+                break
+            try:
+                text = c.get(u).text[:400_000]
+            except (httpx.HTTPError, httpx.InvalidURL):
+                continue
+            login = login or bool(_MINED_LOGIN_ROUTE.search(text))
+            signup = signup or bool(_MINED_SIGNUP_ROUTE.search(text))
+    return login, signup
+
+
 def _endpoints_from_observed(observed, base_url) -> list:
     """Endpoints OBSERVED in the app's own same-origin xhr/fetch traffic during render+interaction — the
     ACCURATE endpoint surface (the app actually called these), which the deterministic crawl and the static
@@ -1258,6 +1290,19 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
     catch_all, endpoints, forms = _drop_phantom_surface(base_url, headers, endpoints, forms)
 
     has_pw = any(any("pass" in name.lower() for name in form.fields) for form in forms)
+    # ROUTE-MINING fallback: a code-split SPA lazy-loads /login into a chunk the crawl never links to, so both the
+    # CTA scan and the rendered crawl miss it and has_auth_entrypoint reads False -> the whole auth cluster N/As.
+    # When nothing else found auth, grep the collected JS chunks for auth ROUTE literals and set the trigger. Gated
+    # to the no-auth-yet case so the extra fetches are only spent where they can recover surface.
+    if not (has_pw or auth[0] or auth[1]) and js_urls:
+        _ml, _ms = _mine_auth_routes(base_url, headers, js_urls)
+        auth[0] |= _ml
+        auth[1] |= _ms
+    # an API AUTH ENDPOINT is an auth door too (a JSON login/signup route with no <form> and no CTA button — the
+    # modern SPA-with-backend shape). has_login/has_signup already credit it; has_auth_entrypoint historically did
+    # NOT, so those apps read has_login=True yet had every auth-gated probe N/A. Same source, so align them.
+    auth_endpoint = any(e.kind in ("auth", "signup") or _LOGIN_EP.search(e.raw_path or e.path or "")
+                        for e in endpoints)
     capabilities = {
         "at_least_one_http_endpoint_exists": any_response,
         # text-input surface = HTML form fields OR API query params / JSON body fields (so the
@@ -1282,11 +1327,12 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
         # so parity credits a CTA login (the audit's #1 has_login=false complaint), not only password forms
         "login_trigger": auth[0],
         "signup_trigger": auth[1],
-        # any auth DOOR — an inline password form OR a login/signup CTA (button/link to a separate route). The
+        # any auth DOOR — an inline password form, a login/signup CTA (button/link), OR an API auth endpoint. The
         # auth self-oracle (httpx form-POST, else the browser register) can ATTEMPT registration wherever one
         # exists; the predicate self-gates to N/A when it can't establish a session, so widening here never
-        # false-fires — it just lets the auth-probe cluster reach the CTA-login SPAs a password-form check missed.
-        "has_auth_entrypoint": has_pw or auth[0] or auth[1],
+        # false-fires — it just lets the auth-probe cluster reach the CTA-login / API-auth SPAs a password-form
+        # check missed. Kept in lockstep with has_login/has_signup (same sources), which previously disagreed.
+        "has_auth_entrypoint": has_pw or auth[0] or auth[1] or auth_endpoint,
         # NOT on a managed-edge host (vercel/netlify/cloudflare/firebase/... or any WAF-CDN-fronted origin).
         # The hosting-layer probes (rate-limit, load-burst) require this: on a managed edge those protections
         # are the VENDOR's (the app inherits them), so grading them measures the platform not the team -- and
