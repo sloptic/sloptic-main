@@ -987,14 +987,21 @@ def _drop_phantom_surface(base_url, headers, endpoints, forms):
         return False, endpoints, forms
 
 
-def _crawl_auth_headers(base_url: str, forms) -> dict:
-    """Register a THROWAWAY crawl account (httpx, the same flow the probes use) and return its session as
-    request headers a browser render can carry (a Cookie, or a Bearer Authorization) — so the crawl reaches
-    the surface an SPA hides behind login (upload, item CRUD) instead of only mapping the login page. Kept
-    SEPARATE from the probes' session_headers (they self-register fresh identities, incl. two for IDOR).
-    Returns {} when nothing establishes a session (no register API / email-verify / SSO / third-party auth)."""
+def _crawl_auth_headers(base_url: str, forms, auth=(False, False), browser_register=None) -> dict:
+    """Register a THROWAWAY crawl account and return its session as request headers a browser render can carry (a
+    Cookie, or a Bearer Authorization) — so the crawl reaches the surface an SPA hides behind login (upload, item
+    CRUD) instead of only mapping the login page. Uses the SAME lanes the probes do: httpx form/JSON, and — when
+    `browser_register` is supplied (--browser-auth) — the BROWSER lane, so a CLIENT-RENDERED SPA login (no
+    server-side form, just a 'Sign in' CTA) is registered too. That is Gap B: without the browser lane the crawl
+    could only httpx-register, so SPA authed surface never got mapped and the now-session-aware injection/upload
+    probes had nothing behind login to test. Kept SEPARATE from the probes' session_headers (they self-register
+    fresh identities, incl. two for IDOR). Returns {} when nothing establishes a session (email-verify / SSO)."""
     from .auth import _has_session, register_account   # local: auth is only exercised under --browser-auth
-    acct = register_account(base_url, Profile(base_url=base_url, forms=list(forms)))
+    # carry the crawl's CTA-trigger detection so register_account's browser lane runs even with no server-side
+    # <form> (has_auth_surface = password form OR login/signup trigger).
+    prof = Profile(base_url=base_url, forms=list(forms),
+                   capabilities={"login_trigger": bool(auth[0]), "signup_trigger": bool(auth[1])})
+    acct = register_account(base_url, prof, browser_register=browser_register)
     if not _has_session(acct):
         if acct is not None:
             acct.client.close()
@@ -1011,7 +1018,7 @@ def _crawl_auth_headers(base_url: str, forms) -> dict:
 
 
 def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: int = MAX_DEPTH,
-             headers=None, seed_features=None, perceive=None, auth_crawl=False) -> Profile:
+             headers=None, seed_features=None, perceive=None, auth_crawl=False, browser_register=None) -> Profile:
     """`perceive(rendered_doms, observed)` (optional) — PROACTIVE discovery: an injected LLM reads the rendered
     pages and returns the probeable surface the crawl missed (perceive_surface output), merged in below via
     merge_perceived. LLM-agnostic here: the callback owns the model call; a None/failing one degrades to the
@@ -1132,7 +1139,7 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
             # unauthenticated render only maps the LOGIN page — file-upload / idor / backend go N/A for want of
             # a target. Register a throwaway account and carry its session into the browser context (SEPARATE
             # from the probes' session_headers, which stay fresh so IDOR still gets two distinct identities).
-            _auth = _crawl_auth_headers(base_url, forms)
+            _auth = _crawl_auth_headers(base_url, forms, auth=tuple(auth), browser_register=browser_register)
             if _auth:
                 render_headers = {**(headers or {}), **_auth}
         render_meta: dict = {}

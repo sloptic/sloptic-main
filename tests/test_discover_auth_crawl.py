@@ -111,3 +111,22 @@ def test_mine_auth_routes_empty_without_js_chunks():
     from sloptic import discovery
     assert discovery._mine_auth_routes("http://app.test", None, []) == (False, False)
     assert discovery._mine_auth_routes("http://app.test", None, ["/style.css"]) == (False, False)
+
+
+# --- Gap B: the crawl now registers a client-rendered SPA login via the browser lane ------------------------
+
+def test_crawl_auth_headers_uses_the_browser_lane_for_a_cta_only_login():
+    from sloptic import discovery
+    # a CTA-only login (no server-side <form>) -> the browser lane must still run (has_auth_surface via the
+    # login trigger) and its session must come back as crawl headers, so the render maps the authed surface.
+    def fake_browser_register(base_url, email=None):
+        return {"cookies": [{"name": "sessionid", "value": "S", "httponly": True, "secure": False,
+                             "samesite": False}]}
+    hdrs = discovery._crawl_auth_headers("http://127.0.0.1:1", forms=[], auth=(True, False),
+                                         browser_register=fake_browser_register)
+    assert "Cookie" in hdrs and "sessionid=S" in hdrs["Cookie"]
+
+
+def test_crawl_auth_headers_empty_when_nothing_establishes_a_session():
+    from sloptic import discovery
+    assert discovery._crawl_auth_headers("http://127.0.0.1:1", forms=[], auth=(False, False)) == {}
