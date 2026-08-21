@@ -677,7 +677,7 @@ def api_sqli(ctx, probe) -> bool | None:
     eps_tested: list = []
     deep: list = []  # slots deferred to the UNION/time (blind, last-resort) pass
     techs = ["error", "boolean"]   # SCORED. time is advisory/off-score; union is cut (causal-specificity)
-    with make_client(ctx.base_url, ctx.headers, timeout=max(15.0, delay * 3 + 8),
+    with make_client(ctx.base_url, _authed_headers(ctx), timeout=max(15.0, delay * 3 + 8),
                      follow_redirects=False) as c:
         for ep in targets:
             if capped():
@@ -822,7 +822,7 @@ def xss_injectable(ctx, probe) -> bool | None:
     tested = False
     checked = 0
     get_candidates: list[tuple[str, str]] = []   # (action, field) GET reflections to confirm by execution
-    with make_client(ctx.base_url, ctx.headers, timeout=10.0, follow_redirects=True) as c:
+    with make_client(ctx.base_url, _authed_headers(ctx), timeout=10.0, follow_redirects=True) as c:
         for action, method, fields in targets:
             for field in fields:
                 if budget <= 0:
@@ -1265,6 +1265,39 @@ def _redirects_to_auth(resp) -> bool:
     return False
 
 
+def _authed_headers(ctx):
+    """The session headers the injection probes should inject WITH, so they reach the AUTHED surface instead of
+    bouncing off /login (the whole point of the register lane / email verification -- injecting anonymously is
+    blind to everything behind login). A caller-supplied --header session wins; otherwise the register-lane
+    session (self-registered / email-verified, memoized on ctx). Falls back to ctx.headers (anonymous) when no
+    session can be established -- and _redirects_to_auth then skips the login-gated targets. Merged onto
+    ctx.headers so a UA / provided header survives. Memoized on ctx (one registration shared across the injection
+    probes, not one each)."""
+    if auth._provided_session(getattr(ctx, "headers", None)):
+        return ctx.headers                                   # the caller's session is already carried
+    cache = getattr(ctx, "_email_cache", None)
+    if isinstance(cache, dict) and "_authed_headers" in cache:
+        return cache["_authed_headers"]
+    result = getattr(ctx, "headers", None)                   # anonymous fallback (the auth-redirect skip handles /login)
+    reg = getattr(ctx, "register", None)
+    if callable(reg):
+        try:
+            acct = reg()                                     # establish the register-lane session (once)
+        except Exception:
+            acct = None
+        if acct is not None:
+            try:
+                session = _snapshot_session(acct).get("headers") or {}   # Cookie / Bearer / apikey, replayable
+            finally:
+                with contextlib.suppress(Exception):
+                    acct.client.close()
+            if session:
+                result = {**(ctx.headers or {}), **session}
+    if isinstance(cache, dict):
+        cache["_authed_headers"] = result
+    return result
+
+
 def _elapsed(c, method, action, data) -> float:
     """Seconds for one request; a large sentinel on error so it can't look like a fast baseline."""
     t0 = time.perf_counter()
@@ -1324,7 +1357,7 @@ def command_injection(ctx, probe) -> bool | None:
     def _capped():   # ACTUAL requests this probe has already sent (net.request_counts tallies every hop)
         rc = request_counts()
         return rc is not None and rc.get(_pid, 0) >= max_req
-    with make_client(ctx.base_url, ctx.headers, timeout=max(15.0, delay * 3 + 8),
+    with make_client(ctx.base_url, _authed_headers(ctx), timeout=max(15.0, delay * 3 + 8),
                      follow_redirects=True, max_redirects=_INJECT_MAX_REDIRECTS) as c:
         for action, method, fields in targets:
             if budget <= 0 or _capped():
@@ -1429,7 +1462,7 @@ def ssti_injectable(ctx, probe) -> bool | None:
     capped = _request_capped(probe)   # hard ACTUAL-request ceiling (hops incl.) -> no redirect-amplified runaway
     tested = False
     fields_seen = set()
-    with make_client(ctx.base_url, ctx.headers, timeout=10.0,
+    with make_client(ctx.base_url, _authed_headers(ctx), timeout=10.0,
                      follow_redirects=True, max_redirects=_INJECT_MAX_REDIRECTS) as c:
         for action, method, fields in targets:
             if capped():
@@ -1672,7 +1705,7 @@ def path_traversal(ctx, probe) -> bool | None:
     capped = _request_capped(probe)   # hard ACTUAL-request ceiling (hops incl.) -> no redirect-amplified runaway
     tested = False
     fields_seen = set()
-    with make_client(ctx.base_url, ctx.headers, timeout=10.0,
+    with make_client(ctx.base_url, _authed_headers(ctx), timeout=10.0,
                      follow_redirects=True, max_redirects=_INJECT_MAX_REDIRECTS) as c:
         for action, method, fields in targets:
             if capped():
@@ -1799,7 +1832,7 @@ def file_upload(ctx, probe) -> bool | None:
     variants = _upload_variants(salt)
     tested = False
     sent = 0
-    with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
+    with make_client(ctx.base_url, _authed_headers(ctx), timeout=15.0, follow_redirects=True) as c:
         for f in forms:
             for filename, ctype, body in variants:
                 if sent >= _UPLOAD_BUDGET:
@@ -1878,7 +1911,7 @@ def upload_stored_xss(ctx, probe) -> bool | None:
         return None
     tested = False
     sent = 0
-    with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
+    with make_client(ctx.base_url, _authed_headers(ctx), timeout=15.0, follow_redirects=True) as c:
         for f in forms:
             for filename, ctype, body in _upload_xss_variants():
                 if sent >= _UPLOAD_BUDGET:

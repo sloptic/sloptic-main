@@ -457,3 +457,26 @@ def test_prime_email_is_a_noop_without_a_receiver():
     ctx = pipeline._Ctx(base_url="http://app.test", client=None, profile=None, email=None)
     probes._prime_email(ctx)                        # no receiver -> no send, no raise
     assert "_reg" not in ctx._email_cache
+
+
+# --- session-aware injection (3): the injection probes inject WITH the register-lane session ----------------
+
+def test_authed_headers_merges_the_register_lane_session():
+    def fake_register(suffix=""):
+        c = httpx.Client(base_url="http://a", headers={"Authorization": "Bearer T"})
+        return Account(username="u", password="p", client=c,
+                       register_response=httpx.Response(200, request=httpx.Request("POST", "http://a/s")))
+    ctx = types.SimpleNamespace(headers={"user-agent": "x"}, register=fake_register)
+    h = probes._authed_headers(ctx)
+    assert h["Authorization"] == "Bearer T" and h["user-agent"] == "x"   # session carried, UA preserved
+
+
+def test_authed_headers_falls_back_to_anonymous_without_a_session():
+    ctx = types.SimpleNamespace(headers={"user-agent": "x"}, register=lambda suffix="": None)
+    assert probes._authed_headers(ctx) == {"user-agent": "x"}            # no session -> anonymous (skip handles /login)
+
+
+def test_authed_headers_respects_a_provided_header_session_without_registering():
+    ctx = types.SimpleNamespace(headers={"Cookie": "session=abc"},
+                                register=lambda suffix="": (_ for _ in ()).throw(AssertionError("must not register")))
+    assert probes._authed_headers(ctx) == {"Cookie": "session=abc"}      # --header session wins, no self-register
