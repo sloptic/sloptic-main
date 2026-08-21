@@ -6184,18 +6184,18 @@ def _snapshot_session(acct) -> dict:
             "response": acct.register_response, "storage_exposed": acct.storage_exposed}
 
 
-def _email_ctx(ctx):
-    """The shared (tag, address) for this grade, minted once on ctx so EVERY registration lane (httpx, browser)
-    signs up with the same box and the flow polls it. Prefers ctx.email_address() (the real _Ctx); falls back to
-    minting locally for a duck-typed ctx that lacks it."""
+def _email_ctx(ctx, suffix=""):
+    """The (tag, address) for this identity (suffix), minted once on ctx so every registration lane signs up with
+    the same box and the flow polls it. Distinct suffixes get distinct addresses (the two-account IDOR case).
+    Prefers ctx.email_address(suffix) (the real _Ctx); falls back to minting locally for a duck-typed ctx."""
     getter = getattr(ctx, "email_address", None)
     if callable(getter):
-        getter()                                   # populates ctx._email_cache tag+address
-        return ctx._email_cache["tag"], ctx._email_cache["address"]
-    if "tag" not in ctx._email_cache:
-        ctx._email_cache["tag"] = secrets.token_hex(6)
-        ctx._email_cache["address"] = ctx.email.address(ctx._email_cache["tag"])
-    return ctx._email_cache["tag"], ctx._email_cache["address"]
+        getter(suffix)                             # populates ctx._email_cache tag/address for this suffix
+        return ctx._email_cache["tag" + suffix], ctx._email_cache["address" + suffix]
+    if "tag" + suffix not in ctx._email_cache:
+        ctx._email_cache["tag" + suffix] = secrets.token_hex(6)
+        ctx._email_cache["address" + suffix] = ctx.email.address(ctx._email_cache["tag" + suffix])
+    return ctx._email_cache["tag" + suffix], ctx._email_cache["address" + suffix]
 
 
 def _snapshot_browser_session(bsession, base) -> dict:
@@ -6307,7 +6307,7 @@ def _snapshot_baas_session(session, gateway, key, creds) -> dict:
             "response": auth._synthesize_response(gateway, []), "storage_exposed": False}
 
 
-def _run_email_flow(ctx):
+def _run_email_flow(ctx, suffix=""):
     """Register with OUR controlled address, decide whether the signup is email-gated, and if so whether the mail
     arrives and its link logs us in -- across THREE registration lanes so SPAs aren't blind spots:
 
@@ -6318,8 +6318,9 @@ def _run_email_flow(ctx):
          link is then completed in the browser too (verify_in_browser).
 
     When a lane's verification logs us in, capture that session on ctx (once) so the authed-surface probes reuse
-    it via ctx.register -- the whole reason the receiver exists."""
-    tag, address = _email_ctx(ctx)
+    it via ctx.register -- the whole reason the receiver exists. `suffix` selects the IDENTITY (""/"_a"/"_b"),
+    each with its own address + cache slot, so the two-account IDOR probes get distinct verified users."""
+    tag, address = _email_ctx(ctx, suffix)
     base = ctx.base_url
     live: dict = {}   # {lane, acct, browser_session} -- the authenticated identity, for authed-surface reuse
 
@@ -6340,14 +6341,19 @@ def _run_email_flow(ctx):
         bres = None
         if getattr(ctx, "browser_register", None) is not None:
             try:
-                bres = ctx._browser_register_once("", base)
+                bres = ctx._browser_register_once(suffix, base)   # THIS identity's memoized browser registration
             except Exception:
                 bres = None
         if isinstance(bres, dict):
             if bres.get("email_pending"):
-                live["lane"] = "browser"                         # submitted, no session -> waiting on the email
-                return email_verify.RegistrationOutcome(submitted=True, has_session=False, announces_email=True,
-                                                        handle=None)
+                # Email-gated ONLY when the post-submit page ANNOUNCES email (check your inbox / verify link) ->
+                # poll the full window. A bare submitted-no-session is just as often CAPTCHA / SSO / admin-approval,
+                # which never mails us: leaving announces_email False routes it to the SHORT unannounced poll, so it
+                # reads N/A unless a mail actually arrives -- never a 60s wait ending in a false 72 lockout.
+                live["lane"] = "browser"
+                return email_verify.RegistrationOutcome(
+                    submitted=True, has_session=False,
+                    announces_email=email_verify.announces_pending_email(bres.get("page_text") or ""), handle=None)
             if bres.get("cookies") or bres.get("bearer"):        # the SPA logged us in at once -> not email-gated
                 live.update(lane="browser_session", browser_session=bres)
                 return email_verify.RegistrationOutcome(submitted=True, has_session=True, handle=None)
@@ -6410,52 +6416,62 @@ def _run_email_flow(ctx):
     except Exception:
         return email_verify.EmailVerifyResult(attempted=False, na_reason="email-verification flow errored")
     lane = live.get("lane")
+    slot = "account_session" + suffix                          # per-identity snapshot slot
     if lane == "firebase_session" and live.get("firebase_session"):
         # Firebase's session is granted at SIGNUP, not after verification, so capture it directly (the app is not
         # email-gated -> result.session_after_verify is never set for this lane).
-        ctx._email_cache["account_session"] = _snapshot_firebase_session(live["firebase_session"])
+        ctx._email_cache[slot] = _snapshot_firebase_session(live["firebase_session"])
     elif result.session_after_verify:                           # capture the verified session for authed reuse (once)
         if lane == "browser" and live.get("browser_session"):
-            ctx._email_cache["account_session"] = _snapshot_browser_session(live["browser_session"], base)
+            ctx._email_cache[slot] = _snapshot_browser_session(live["browser_session"], base)
         elif lane == "baas" and live.get("baas_session"):
-            ctx._email_cache["account_session"] = _snapshot_baas_session(
+            ctx._email_cache[slot] = _snapshot_baas_session(
                 live["baas_session"], live["gateway"], live["key"], live.get("baas_creds") or {})
         else:
             acct = live.get("acct")
             if acct is not None and auth._has_session(acct):
-                ctx._email_cache["account_session"] = _snapshot_session(acct)   # rebuilt per call; original closed
+                ctx._email_cache[slot] = _snapshot_session(acct)   # rebuilt per call; original closed
                 with contextlib.suppress(Exception):
                     acct.client.close()
     return result
 
 
-def _email_verify_result(ctx):
-    """The ONE shared observation both email probes read (run once per app, memoized on ctx)."""
+def _email_verify_result(ctx, suffix=""):
+    """The email-flow observation for one identity (suffix), run once and memoized. The qa-email probes read the
+    default ("") identity; the two-account IDOR probes drive "_a"/"_b"."""
     cache = ctx._email_cache
-    if "result" not in cache:
+    key = "result" + suffix
+    if key not in cache:
         if ctx.email is None:
-            cache["result"] = email_verify.EmailVerifyResult(
+            cache[key] = email_verify.EmailVerifyResult(
                 attempted=False, na_reason="no email receiver configured (pass --email-endpoint)")
         elif auth._provided_session(ctx.headers):
-            cache["result"] = email_verify.EmailVerifyResult(
+            cache[key] = email_verify.EmailVerifyResult(
                 attempted=False, na_reason="a session was supplied (--header); the signup email flow is untestable")
         else:
-            cache["result"] = _run_email_flow(ctx)
-    return cache["result"]
+            cache[key] = _run_email_flow(ctx, suffix)
+    return cache[key]
 
 
-def _email_account(ctx, session_less_acct=None):
+def _email_account(ctx, session_less_acct=None, suffix=""):
     """Register-lane hook (called by ctx.register): when a signup is email-verification-gated, complete the
-    emailed verification and hand back a FRESH authenticated Account, so the authed-surface probes run as the
-    verified user. Returns None when no receiver is configured, the app is not email-gated, or verification set
-    no session -> the caller falls through to the browser/BaaS lanes.
+    emailed verification and hand back a FRESH authenticated Account for this IDENTITY (suffix), so the
+    authed-surface probes run as the verified user. Returns None when no receiver is configured, the app is not
+    email-gated, or verification set no session -> the caller falls through to the browser/BaaS lanes.
 
-    Cost control: the shared flow runs at most once per app (memoized). If it has NOT run yet, only pay for it
-    when this signup's response ANNOUNCES a pending email -- a session-less SPA/SSO app must not be taxed with a
-    60s email poll before its browser launch. If it already ran and captured a session, reuse it regardless of
-    how we got here."""
+    FIRST-ACCOUNT GATE (the two-account IDOR case): a SECOND identity ("_a"/"_b") is attempted only if the default
+    ("") identity already email-verified a session -- i.e. 'if we can make one, make another; if not, abandon'. So
+    a broken-email app pays the 60s poll once (for "") and then abandons IDOR instantly instead of polling twice
+    more. Cost control for the default identity: the flow runs at most once per identity (memoized); if it has NOT
+    run yet, only pay for it when this signup ANNOUNCES a pending email, or in browser mode (the SPA lane detects
+    a gate the placeholder httpx signup can't announce)."""
     cache = ctx._email_cache
-    if "result" not in cache:
+    if suffix and not cache.get("account_session"):
+        # a second identity: only worth it if the FIRST ("") verified. Ensure "" ran, then require its session.
+        _email_verify_result(ctx, "")
+        if not cache.get("account_session"):
+            return None                                  # can't make one -> don't try to make another
+    if "result" + suffix not in cache:
         announced = session_less_acct is not None and email_verify.announces_pending_email(
             _resp_text(session_less_acct.register_response))
         # In browser mode the httpx signup is a placeholder that never announces (the real signup is a JS fetch),
@@ -6464,8 +6480,8 @@ def _email_account(ctx, session_less_acct=None):
         browser_spa = getattr(ctx, "browser_register", None) is not None
         if not (announced or browser_spa):
             return None                                  # not (yet known to be) email-gated -> let browser try
-        _email_verify_result(ctx)                        # run the one shared flow (captures the session, if any)
-    sess = cache.get("account_session")
+        _email_verify_result(ctx, suffix)                # run this identity's flow (captures its session, if any)
+    sess = cache.get("account_session" + suffix)
     if not sess:
         return None                                      # verification established no reusable session
     client = httpx.Client(base_url=ctx.base_url, timeout=15.0, follow_redirects=True)

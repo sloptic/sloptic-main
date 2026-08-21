@@ -666,11 +666,15 @@ def register_in_browser(base_url: str, headers=None, timeout: float = 12.0, tota
                                            % (" — a registration request WAS observed" if captured else
                                               " and no registration request was even observed"))
                     if email is not None:
-                        # EMAIL-FLOW mode: the signup submitted with OUR address but granted no session -> most
-                        # likely e-mail confirmation. Hand back the SUBMITTED state (not None) so the email flow
-                        # can poll the inbox and, if a link arrives, finish verification in the browser. Callers
-                        # in the non-email auth self-oracle path (email is None) still get the old None.
-                        return {"email_pending": True, "creds": creds, "cookies": jar,
+                        # EMAIL-FLOW mode: the signup submitted with OUR address but granted no session -> maybe
+                        # e-mail confirmation, maybe CAPTCHA / SSO / admin-approval. Hand back the SUBMITTED state
+                        # (not None) plus the post-submit page TEXT, so the email flow can confirm the page really
+                        # announces e-mail before it treats this as email-gated (and only then poll the inbox).
+                        # Callers in the non-email auth self-oracle path (email is None) still get the old None.
+                        page_text = ""
+                        with contextlib.suppress(Exception):
+                            page_text = (page.inner_text("body") or "")[:5000]
+                        return {"email_pending": True, "creds": creds, "cookies": jar, "page_text": page_text,
                                 "request": captured or None, "backend_reads": reads}
                     return None
                 out = {"creds": creds, "cookies": jar, "request": captured or None,

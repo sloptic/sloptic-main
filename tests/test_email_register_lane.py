@@ -73,7 +73,7 @@ def test_email_account_returns_none_when_no_session_was_captured():
 
 def test_email_account_does_not_run_the_flow_for_a_non_announcing_signup(monkeypatch):
     ran = []
-    monkeypatch.setattr(probes, "_run_email_flow", lambda ctx: ran.append(1) or EmailVerifyResult(attempted=True))
+    monkeypatch.setattr(probes, "_run_email_flow", lambda ctx, suffix="": ran.append(1) or EmailVerifyResult(attempted=True))
     ctx = _ctx()
     acct = _acct(lambda r: httpx.Response(200))
     acct.register_response = _reg_response("<html>Welcome, you're in.</html>")   # no email-pending language
@@ -82,7 +82,7 @@ def test_email_account_does_not_run_the_flow_for_a_non_announcing_signup(monkeyp
 
 
 def test_email_account_runs_the_flow_for_an_announcing_signup_and_returns_the_session(monkeypatch):
-    def fake_flow(ctx):
+    def fake_flow(ctx, suffix=""):
         ctx._email_cache["account_session"] = {
             "headers": {"Cookie": "s=1"}, "username": "u", "password": "p",
             "response": _reg_response("ok"), "storage_exposed": False}
@@ -98,7 +98,7 @@ def test_email_account_runs_the_flow_for_an_announcing_signup_and_returns_the_se
 
 def test_email_account_reuses_a_session_captured_by_the_qa_probes_even_if_not_announced(monkeypatch):
     # if the shared flow already ran (via a qa-email probe) and captured a session, reuse it regardless of the gate
-    monkeypatch.setattr(probes, "_run_email_flow", lambda ctx: (_ for _ in ()).throw(AssertionError("should reuse")))
+    monkeypatch.setattr(probes, "_run_email_flow", lambda ctx, suffix="": (_ for _ in ()).throw(AssertionError("should reuse")))
     ctx = _ctx()
     ctx._email_cache["result"] = EmailVerifyResult(attempted=True, session_after_verify=True)
     ctx._email_cache["account_session"] = {"headers": {"Cookie": "s=1"}, "username": "u", "password": "p",
@@ -133,7 +133,7 @@ def test_follow_auto_login_promotes_the_flag_bearing_response():
 
 # --- ctx.register wiring -----------------------------------------------------------------------------------
 
-def test_ctx_register_wires_the_email_lane_for_single_identity_not_the_idor_pair(monkeypatch):
+def test_ctx_register_wires_the_email_lane_for_every_identity_including_the_idor_pair(monkeypatch):
     seen = {}
 
     def fake_ra(base, profile, suffix="", browser_register=None, headers=None, email_verify=None):
@@ -143,8 +143,46 @@ def test_ctx_register_wires_the_email_lane_for_single_identity_not_the_idor_pair
     ctx = pipeline._Ctx(base_url="http://app.test", client=None, profile=None, email=RX)
     for suffix in ("", "_race", "_csrf", "_a", "_b"):
         ctx.register(suffix)
-    assert seen[""] is not None and seen["_race"] is not None and seen["_csrf"] is not None
-    assert seen["_a"] is None and seen["_b"] is None                       # two distinct identities can't come from one
+    # every identity now gets the email lane -- the two-account IDOR pair (_a/_b) mints its own address per suffix
+    assert all(seen[s] is not None for s in ("", "_race", "_csrf", "_a", "_b"))
+
+
+def test_ctx_register_mints_distinct_addresses_per_identity():
+    ctx = pipeline._Ctx(base_url="http://app.test", client=None, profile=None, email=MockReceiver(domain="app.test"))
+    a, b, default = ctx.email_address("_a"), ctx.email_address("_b"), ctx.email_address("")
+    assert len({a, b, default}) == 3                       # A, B and the default are three distinct inboxes
+    assert ctx.email_address("_a") == a                    # ... and stable (minted once per identity)
+
+
+def test_second_identity_runs_its_own_flow_once_the_first_verified(monkeypatch):
+    # "_b" (an IDOR second account) mints its own session once the default ("") has email-verified.
+    ctx = _spa_ctx(None)
+    ctx._email_cache["result"] = EmailVerifyResult(attempted=True, session_after_verify=True)
+    ctx._email_cache["account_session"] = {"headers": {"Cookie": "s0=1"}, "username": "a", "password": "p",
+                                           "response": _reg_response("ok"), "storage_exposed": False}
+
+    def fake_flow_b(ctx, suffix=""):
+        assert suffix == "_b"                              # driven for the second identity
+        ctx._email_cache["account_session_b"] = {"headers": {"Cookie": "sb=1"}, "username": "b", "password": "p",
+                                                 "response": _reg_response("ok"), "storage_exposed": False}
+        return EmailVerifyResult(attempted=True, session_after_verify=True)
+    monkeypatch.setattr(probes, "_run_email_flow", fake_flow_b)
+    acct = _acct(lambda r: httpx.Response(200))
+    acct.register_response = _reg_response("Check your email to confirm.")
+    b = probes._email_account(ctx, acct, "_b")
+    assert b is not None and b.client.headers["Cookie"] == "sb=1"           # a DISTINCT session from A's s0=1
+    b.client.close()
+
+
+def test_second_identity_abandoned_when_the_first_never_verified(monkeypatch):
+    # the first-account gate: if "" could not email-verify (broken email), don't even try a second -> abandon IDOR.
+    ctx = _spa_ctx(None)
+    ctx._email_cache["result"] = EmailVerifyResult(attempted=True, email_gated=True, email_arrived=False)  # no session
+    monkeypatch.setattr(probes, "_run_email_flow",
+                        lambda ctx, suffix="": (_ for _ in ()).throw(AssertionError("must not run a second flow")))
+    acct = _acct(lambda r: httpx.Response(200))
+    acct.register_response = _reg_response("Check your email to confirm.")
+    assert probes._email_account(ctx, acct, "_b") is None                   # gated on the first -> None, no wasted poll
 
 
 def test_ctx_register_wires_no_email_lane_without_a_receiver(monkeypatch):
@@ -198,7 +236,8 @@ def test_spa_browser_lane_registers_with_our_address_verifies_and_snapshots(monk
 
     def fake_browser_register(base_url, email=None):
         got["email"] = email                                    # the SPA must be signed up with OUR address
-        return {"email_pending": True, "creds": {"email": email}, "cookies": []}
+        return {"email_pending": True, "creds": {"email": email}, "cookies": [],
+                "page_text": "Check your email to confirm your account."}   # the announce gate
     monkeypatch.setattr(probes.browser, "verify_in_browser",
                         lambda link, base="", **k: {"cookies": [{"name": "sessionid", "value": "S",
                                                                  "httponly": True, "secure": True,
@@ -218,6 +257,18 @@ def test_spa_browser_lane_registers_with_our_address_verifies_and_snapshots(monk
     acct.client.close()
 
 
+def test_spa_browser_email_pending_without_announce_is_not_a_false_lockout(monkeypatch):
+    # submitted, no session, but the post-submit page shows NO email language (CAPTCHA / SSO / approval) -> must
+    # NOT read as email-verification-gated (no 60s poll, no qa-email-001 at 72). This is the v21-sample FP fix.
+    monkeypatch.setattr(probes.auth, "_register_httpx", lambda *a, **k: None)
+    monkeypatch.setattr(probes, "_baas_gateway", lambda ctx: None)
+    monkeypatch.setattr(probes, "_firebase_config", lambda ctx: None)
+    ctx = _spa_ctx(lambda base_url, email=None: {"email_pending": True, "cookies": [],
+                                                 "page_text": "Please complete the CAPTCHA to continue."})
+    res = probes._email_verify_result(ctx)
+    assert not res.email_gated             # no announcement -> N/A; email_never_arrives then can't fire (72 lockout)
+
+
 def test_spa_browser_lane_immediate_session_is_not_email_gated(monkeypatch):
     monkeypatch.setattr(probes.auth, "_register_httpx", lambda *a, **k: None)
 
@@ -231,7 +282,8 @@ def test_spa_browser_lane_immediate_session_is_not_email_gated(monkeypatch):
 def test_spa_browser_lane_inert_link_fires_002(monkeypatch):
     monkeypatch.setattr(probes.auth, "_register_httpx", lambda *a, **k: None)
     monkeypatch.setattr(probes.browser, "verify_in_browser", lambda link, base="", **k: None)  # link grants nothing
-    ctx = _spa_ctx(lambda base_url, email=None: {"email_pending": True, "cookies": []})
+    ctx = _spa_ctx(lambda base_url, email=None: {"email_pending": True, "cookies": [],
+                                                 "page_text": "We've sent a verification link to your inbox."})
     ctx._email_cache["tag"] = "t2"
     ctx._email_cache["address"] = ctx.email.address("t2")
     ctx.email.inject("t2", EmailMessage.parse("hl-t2@app.test", "Confirm", "http://app.test/verify?token=x"))

@@ -66,29 +66,31 @@ class _Ctx:
     #     hot pipeline path never imports email_verify
     _email_cache: dict = field(default_factory=dict)  # the one shared EmailVerifyResult (run once per app)
 
-    def email_address(self):
-        """The ONE controlled inbox address for this grade (tag minted once, cached), so every registration lane
-        signs up with the SAME address WE own and the email flow polls the right box. None when no receiver is
-        configured -> the lanes fall back to a dummy @example.com (unchanged)."""
+    def email_address(self, suffix: str = ""):
+        """A controlled inbox address for this grade, minted once PER IDENTITY (suffix) and cached, so each lane
+        signs up with the address WE own for that identity and the flow polls the right box. Distinct suffixes get
+        DISTINCT addresses -- the two-account IDOR probes ("_a"/"_b") thus register two genuinely separate users.
+        None when no receiver is configured -> the lanes fall back to a dummy @example.com (unchanged)."""
         if self.email is None:
             return None
-        if "address" not in self._email_cache:
+        key = "address" + suffix
+        if key not in self._email_cache:
             import secrets
             tag = secrets.token_hex(6)
-            self._email_cache["tag"] = tag
-            self._email_cache["address"] = self.email.address(tag)
-        return self._email_cache["address"]
+            self._email_cache["tag" + suffix] = tag
+            self._email_cache[key] = self.email.address(tag)
+        return self._email_cache[key]
 
     def _browser_register_once(self, suffix, base_url):
         """ONE browser registration per identity (launch + fill + submit is 20-40s), memoized and SHARED between
         the auth self-oracle (here) and the email flow, so an email-gated SPA is browser-registered exactly once.
-        Signs up with our controlled address when a receiver is configured, so the SPA mails the confirmation to
-        us; None/dummy otherwise (unchanged)."""
+        Signs up with this identity's controlled address when a receiver is configured, so the SPA mails the
+        confirmation to us; None/dummy otherwise (unchanged)."""
         if self.browser_register is None:
             return None
         store = self._browser_cache
         if suffix not in store:
-            addr = self.email_address()
+            addr = self.email_address(suffix)
             store[suffix] = self.browser_register(base_url, email=addr) if addr else self.browser_register(base_url)
         return store[suffix]
 
@@ -107,14 +109,15 @@ class _Ctx:
             def cached(base_url, _s=suffix):
                 return self._browser_register_once(_s, base_url)
         # EMAIL-VERIFICATION lane (built only when a receiver is configured): on an email-gated signup, complete
-        # the verification and reuse THAT authenticated session, so the authed-surface probes run as the verified
-        # user. Excluded for the two-account IDOR suffixes (_a/_b): the single email identity cannot supply two
-        # distinct users, and handing the same one to both would fabricate a cross-user read. The flow runs at
-        # most once per app (memoized on ctx), rebuilt into a fresh client per call so per-probe close stays safe.
+        # the verification and reuse THAT authenticated session. Built for EVERY identity, including the two-account
+        # IDOR suffixes ("_a"/"_b"): each mints its own address and verifies independently, so an email-gated app
+        # yields two genuinely distinct verified users. A second identity is gated on the first (see _email_account),
+        # so a broken-email app abandons IDOR fast instead of polling twice more. The flow runs at most once per
+        # identity (memoized on ctx), rebuilt into a fresh client per call so per-probe close stays safe.
         email_cb = None
-        if self.email is not None and suffix not in ("_a", "_b") and not auth._provided_session(self.headers):
-            def email_cb(session_less_acct, _self=self):
-                return _email_account(_self, session_less_acct)
+        if self.email is not None and not auth._provided_session(self.headers):
+            def email_cb(session_less_acct, _self=self, _s=suffix):
+                return _email_account(_self, session_less_acct, _s)
         return auth.register_account(self.base_url, self.profile, suffix=suffix,
                                      browser_register=cached, headers=self.headers, email_verify=email_cb)
 

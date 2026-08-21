@@ -18,7 +18,7 @@ def _ctx(email=None, headers=None):
 
 
 def _canned(monkeypatch, res):
-    monkeypatch.setattr(probes, "_run_email_flow", lambda ctx: res)
+    monkeypatch.setattr(probes, "_run_email_flow", lambda ctx, suffix="": res)
 
 
 def test_na_without_a_receiver():
