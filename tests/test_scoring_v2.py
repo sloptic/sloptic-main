@@ -241,6 +241,15 @@ def test_exposure_secret_family_severity():
     assert _severity_penalty(ade, {"sensitive_fields": True, "bulk_read": True}) == 90
 
 
+def test_encoding_probe_severity_ladder():
+    from sloptic.catalog import default_catalog_dir, load_catalog
+    by_id = {p.id: p for p in load_catalog(default_catalog_dir())}
+    enc = by_id["qa-input-002"].severity                           # international/multibyte robustness
+    assert enc.range == (32, 72)
+    assert _severity_penalty(enc, {}) == 32                        # round-trip corruption
+    assert _severity_penalty(enc, {"server_error": True}) == 72    # 500s on the input -> crash rung
+
+
 def test_reset_family_severity_scores():
     from sloptic.catalog import default_catalog_dir, load_catalog
     by_id = {p.id: p for p in load_catalog(default_catalog_dir())}

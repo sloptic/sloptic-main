@@ -891,6 +891,110 @@ def xss_injectable(ctx, probe) -> bool | None:
     return False if tested else None
 
 
+# --- qa-input-002: international / multibyte input robustness ------------------------------------------------
+# Submit real-world non-ASCII text (emoji, CJK, Arabic, combining marks, full-width, astral-plane) to a writable
+# field and watch the round trip. Two failure modes a MEANINGFUL fraction of apps ship (a MySQL `utf8` 3-byte
+# column, a latin1 table, a form-charset mismatch, a naive byte-slice): the value comes back CORRUPTED (mojibake
+# / replacement char / `?` substitution) -> data silently mangled (32); or the request 500s -> the app crashes on
+# real user data (72). Intent-independent + deterministic: a UTF-8-clean stack round-trips every string untouched.
+_ENC_PROBES = [
+    ("emoji", "\U0001F468‍\U0001F469‍\U0001F467\U0001F9D1\U0001F3FD"),  # ZWJ family + skin tone: 4-byte utf8mb4
+    ("cjk", "日本語한국어中文"),          # JP/KR/CN (breaks a latin1 table)
+    ("arabic", "مرحبا"),          # RTL Arabic
+    ("fullwidth", "ＡＢＣ１２"),       # full-width double-byte forms (3-byte)
+    ("astral", "\U0001D54F\U0001F004\U0001D7D9"),          # astral-plane 4-byte (math + mahjong)
+]
+# every probe char is > U+00FF, so a surviving char never collides with the U+00C0-U+00FF mojibake signature.
+_MOJIBAKE_LEAD = tuple(chr(c) for c in range(0xC0, 0x100))  # utf-8 lead bytes (0xC2-0xF4) as latin-1
+
+
+def _encoding_corrupted(text: str, sentinel: str, expected: str):
+    """Did our non-ASCII value come back mangled? True (corrupted) / False (survived) / None (can't judge -- not
+    reflected, or ambiguous). Locates the ASCII sentinel, isolates the reflected value up to the next structural
+    delimiter, and decodes HTML entities (so `&#26085;` counts as CORRECT handling, not corruption). Fires only on
+    a POSITIVE loss marker -- a U+FFFD replacement char, a `?` substitution, or utf-8-as-latin-1 mojibake (a
+    U+00C0-U+00FF lead-byte run) where our (all > U+00FF) chars were -- never on mere absence (%-encoding, a JSON
+    \\u escape, a value the app didn't echo), which would false-positive."""
+    i = text.find(sentinel)
+    if i < 0:
+        return None                                        # value not reflected -> this probe can't judge round-trip
+    raw = text[i + len(sentinel): i + len(sentinel) + max(64, len(expected) * 8)]
+    cut = len(raw)
+    for d in ('"', "<", "\n", "\r", "'", "}", "\\"):       # the reflected value ends at the first HTML/JSON delimiter
+        j = raw.find(d)
+        if 0 <= j < cut:
+            cut = j
+    window = raw[:cut]
+    if not window:
+        return None                                        # value stripped / not echoed after the sentinel -> abstain
+    decoded = html.unescape(window)
+    if any(ch in decoded for ch in expected):
+        return False                                       # any expected char survived (raw or entity-encoded) -> clean
+    if "�" in window:
+        return True                                        # U+FFFD replacement char -> definitive loss
+    if "?" in window:
+        return True                                        # `?` where our multibyte chars were -> charset substitution
+    if any(ch in window for ch in _MOJIBAKE_LEAD):
+        return True                                        # utf-8-as-latin-1 mojibake (double-encoding)
+    return None                                            # reflected but ambiguous (stripped / %-encoded) -> abstain
+
+
+def international_input_breaks(ctx, probe) -> bool | None:
+    """qa-input-002: the app corrupts (32) or 500s (72) on international / multibyte input. Baselines each field
+    with an ASCII marker first, so a generally-broken endpoint is never blamed on encoding, and only credits the
+    500 rung when ASCII returns 2xx but the unicode payload 5xxs. Uses the register-lane session (reach fields
+    behind login). N/A when there is no writable text surface to test."""
+    targets = _injectable_targets(ctx.profile) + _json_body_targets(ctx.profile)
+    if not targets:
+        return None
+    budget = probe.probe.get("max_attempts", 60)
+    tested = False
+    corrupted_hit = None
+    with make_client(ctx.base_url, _authed_headers(ctx), timeout=10.0, follow_redirects=True) as c:
+        for action, method, fields in targets:
+            for field in fields:
+                if budget <= 0:
+                    break
+                budget -= 1
+                sentinel = "HLenc" + secrets.token_hex(3)
+                # BASELINE: an ASCII value must round-trip 2xx first, else this endpoint is broken regardless of
+                # encoding (a 500 on ascii, a dead route) -> skip; never blame encoding for a generally-broken field.
+                try:
+                    base = _xss_send(c, method, action, {fn: (sentinel if fn == field else "hl") for fn in fields})
+                except (httpx.HTTPError, httpx.InvalidURL):
+                    continue
+                if base.status_code >= 500:
+                    continue
+                tested = True
+                ascii_reflects = sentinel in base.text
+                for script, payload in _ENC_PROBES:
+                    if budget <= 0:
+                        break
+                    budget -= 1
+                    marked = sentinel + payload
+                    try:
+                        rr = _xss_send(c, method, action, {fn: (marked if fn == field else "hl") for fn in fields})
+                    except (httpx.HTTPError, httpx.InvalidURL):
+                        continue
+                    if rr.status_code >= 500:                # ASCII was fine (baseline<500) -> the unicode 500s it
+                        ctx.evidence.update(broke=True, server_error=True, kind="500", script=script,
+                                            target=action, field=field, status=rr.status_code,
+                                            repro=_repro_from_resp(rr, matched="HTTP %d on %s input" % (rr.status_code, script)))
+                        return True                          # the 72 rung: crashes on real user data
+                    if ascii_reflects and corrupted_hit is None:
+                        if _encoding_corrupted(rr.text, sentinel, payload):
+                            corrupted_hit = (action, field, script, rr)
+            if budget <= 0:
+                break
+    if corrupted_hit is not None:                            # the 32 rung: value silently mangled on round trip
+        action, field, script, rr = corrupted_hit
+        ctx.evidence.update(broke=True, corrupted=True, kind="corruption", script=script, target=action, field=field,
+                            repro=_repro_from_resp(rr, matched="%s input reflected corrupted (mojibake / ? / U+FFFD)" % script))
+        return True
+    ctx.evidence.update(broke=False)
+    return False if tested else None
+
+
 def stored_xss_api(ctx, probe) -> bool | None:
     """Stored XSS via a JSON API + client render — the SPA sink xss_injectable (reflection into an HTML
     response) and dom_xss (URL-param sink) both miss. POST an EXECUTING payload into a create endpoint's body
@@ -6792,6 +6896,7 @@ PREDICATES = {
     "email_never_arrives": email_never_arrives,
     "email_verification_inert": email_verification_inert,
     "reset_email_unreliable": reset_email_unreliable,
+    "international_input_breaks": international_input_breaks,
     "lighthouse_perf_score": lighthouse_perf_score,
     "sqli_auth_bypass": sqli_auth_bypass,
     "api_sqli": api_sqli,
@@ -6885,6 +6990,7 @@ _PREDICATE_REASONS = {
     "email_never_arrives": "signup is email-verification-gated but no confirmation email arrives -> the user is locked out",
     "email_verification_inert": "the confirmation email arrives but acting on its link establishes no session -> verification is broken",
     "reset_email_unreliable": "an account we established cannot be recovered -> the password-reset email never arrives, or its link is dead",
+    "international_input_breaks": "the app corrupts (mojibake) or 500s on international / multibyte input (emoji / CJK / Arabic / astral)",
     "lighthouse_perf_score": "the overall Lighthouse performance score is below the green line (slop = its shortfall under 90)",
     "sqli_auth_bypass": "login bypassed by a SQL-injection payload",
     "api_sqli": "a parameter is SQL-injectable (error / boolean / UNION / time-based)",

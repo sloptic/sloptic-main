@@ -1,0 +1,33 @@
+id: qa-input-002
+bundle: qa
+category: input-validation
+pool: public
+evidence_model: provable
+# The sibling of qa-input-001 (client-only constraint bypass): INTERNATIONAL / MULTIBYTE input robustness. Submit
+# real-world non-ASCII text (emoji/ZWJ, CJK, Arabic RTL, combining marks, full-width, astral-plane 4-byte) to a
+# writable field and watch the round trip. Two failure modes a meaningful fraction of apps ship (a MySQL `utf8`
+# 3-byte column, a latin1 table, a form-charset mismatch, a naive byte-slice), on a severity ladder:
+#   72  the app 500s on the input -> it crashes on real user data (a name, a message) -- a reliability failure
+#   32  the value round-trips CORRUPTED (mojibake / U+FFFD / `?` substitution) -> user data silently mangled
+# Intent-independent + deterministic: a UTF-8-clean stack round-trips every string untouched, so it never fires.
+# A generally-broken field is excluded by an ASCII baseline (must return 2xx first); corruption is called only on
+# a positive loss marker, never on mere absence (%-encoding / a non-echoing field) -> not a presence tax.
+penalty: 32
+severity:
+  iso_25010: "functional-suitability"
+  nielsen: "2"
+  range: [32, 72]
+  default: 32
+  escalators:
+    - {evidence: server_error, point: 72, vrt_variant: "the app 500s on international/multibyte input (emoji/CJK/Arabic) -- crashes on real user data"}
+applicability:
+  requires: [any_endpoint_accepts_text_input]
+probe:
+  predicate: international_input_breaks
+tp_definition: |
+  TP: a writable field that accepts an ASCII value (2xx baseline) either 500s on international/multibyte input
+  (emoji/CJK/Arabic/astral -> the 72 rung) or round-trips it CORRUPTED -- mojibake, a U+FFFD replacement char, or
+  `?` substitution where the multibyte characters were (the 32 rung). NOT (confounders): the value survives raw
+  OR HTML-entity/JSON-unicode-escaped (correct handling) -> clean; the field does not echo the value or reflects
+  it percent-encoded (cannot judge) -> N/A; the ASCII baseline itself 500s / the endpoint is dead (broken
+  regardless of encoding) -> N/A.
