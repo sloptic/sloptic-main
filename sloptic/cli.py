@@ -314,6 +314,12 @@ def main() -> None:
                          "e.g. the public web product. A passive grade is a SUBSET, not comparable to a full grade.")
     ap.add_argument("--browser", action="store_true",
                     help="render pages with a headless browser (finds SPA/client-rendered forms)")
+    ap.add_argument("--browser-auth", action="store_true", dest="browser_auth",
+                    help="authenticate the crawl AND the probes via the browser register lane (implies the "
+                         "effect of --browser for auth): self-register a throwaway account, carry its session "
+                         "into the crawl so an SPA's behind-login surface (upload/CRUD/IDOR) is mapped, and let "
+                         "the injection/upload probes reach it. No effect without --browser, or with --header "
+                         "(a supplied session is used directly).")
     ap.add_argument("--header", action="append", metavar="H", default=[],
                     help="auth header sent on EVERY request, e.g. --header 'Cookie: session=...' or "
                          "'Authorization: Bearer ...' — probes the authenticated surface as that user "
@@ -388,7 +394,7 @@ def main() -> None:
     # stored Report, so switching the OUTPUT view (--failed / --report-card / --json) doesn't re-probe the app.
     key = None if args.no_cache else runcache.cache_key(
         source, args.catalog, probes=args.probe, passive_only=args.passive_only, browser=args.browser,
-        headers=args.header, source_dir=args.source, harden=args.harden)
+        headers=args.header, source_dir=args.source, harden=args.harden, browser_auth=args.browser_auth)
     report = None
     if key and not args.refresh:
         hit = runcache.load(key)
@@ -417,16 +423,23 @@ def _grade(args, source, catalog, render, auth_headers, progress):
     Report. Deploy/build/health failure -> _fail (SystemExit). Factored out so main() can short-circuit to the
     run cache before this ever executes."""
     email_receiver = _build_email_receiver(args)   # email-verification probes' inbox (None -> they read N/A)
+    # --browser-auth: self-register a throwaway account via the browser lane and (a) carry its session into the
+    # crawl so an SPA's behind-login surface is mapped (auth_crawl), and (b) let the probes reuse it. Needs a real
+    # browser render; off when a --header session is already supplied (that is used directly).
+    browser_register = browser.register_in_browser if (args.browser_auth and args.browser) else None
+    auth_crawl = bool(args.browser_auth and args.browser and not auth_headers)
     # Trusted reference app: subprocess, no Docker.
     if args.app:
         return run(SubprocessDeployer(args.app), catalog, render=render, headers=auth_headers,
-                   on_progress=progress, source_dir=args.source, email_receiver=email_receiver)
+                   on_progress=progress, source_dir=args.source, email_receiver=email_receiver,
+                   browser_register=browser_register, auth_crawl=auth_crawl)
 
     # Already-running URL: dogfooding, no Docker, no teardown of the target.
     if args.target:
         try:
             return run(RemoteDeployer(args.target), catalog, render=render, headers=auth_headers,
-                       on_progress=progress, source_dir=args.source, email_receiver=email_receiver)
+                       on_progress=progress, source_dir=args.source, email_receiver=email_receiver,
+                       browser_register=browser_register, auth_crawl=auth_crawl)
         except _DEPLOY_FAILURES as e:
             _fail(args, "unreachable", str(e)[:500])
 
@@ -442,6 +455,7 @@ def _grade(args, source, catalog, render, auth_headers, progress):
             network=args.network if args.harden else None,
         )
         return run(deployer, catalog, render=render, headers=auth_headers, on_progress=progress,
+                   browser_register=browser_register, auth_crawl=auth_crawl,
                    source_dir=args.source or str(sub.context_dir),  # scan the submission's own source
                    email_receiver=email_receiver)
     except _DEPLOY_FAILURES as e:

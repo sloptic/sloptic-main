@@ -1,6 +1,8 @@
 """CLI output renderers — pure text builders, no server/Docker, so they run on the dev box."""
 import types
 
+import pytest
+
 from sloptic.aggregate import compute_axis_slop, compute_slop_score, coverage_metrics
 from sloptic.cli import (
     _coverage_text,
@@ -159,3 +161,43 @@ def test_grade_record_places_a_single_app_on_the_curve_and_keeps_the_gate():
     curve = benchmark.build(corpus, "t", "s")
     res = benchmark.rank(curve, rec["slop_score"], rec)
     assert "percentile" in res and res["absolute_gates"] == ["xss"]        # placed on the curve AND still gated
+
+
+def _grade_args(**over):
+    base = dict(app=None, target="http://x", submission=None, browser=False, browser_auth=False,
+                header=[], source=None, email_domain=None, email_endpoint=None, email_token="")
+    base.update(over)
+    return types.SimpleNamespace(**base)
+
+
+def _capture_run(monkeypatch):
+    from sloptic import cli
+    seen = {}
+    monkeypatch.setattr(cli, "run", lambda deployer, catalog, **kw: seen.update(kw) or "report")
+    monkeypatch.setattr(cli, "RemoteDeployer", lambda url, **k: ("dep", url))
+    return cli, seen
+
+
+def test_browser_auth_wires_register_lane_and_auth_crawl(monkeypatch):
+    cli, seen = _capture_run(monkeypatch)
+    cli._grade(_grade_args(browser=True, browser_auth=True), "http://x", [], render="R", auth_headers={}, progress=None)
+    assert seen["browser_register"] is cli.browser.register_in_browser   # the browser register lane is wired
+    assert seen["auth_crawl"] is True                                    # ... and the crawl authenticates (Gap B)
+
+
+def test_browser_auth_needs_browser_and_yields_to_a_provided_session(monkeypatch):
+    cli, seen = _capture_run(monkeypatch)
+    # --browser-auth without --browser: no render to drive the lane -> off
+    cli._grade(_grade_args(browser=False, browser_auth=True), "http://x", [], render=None, auth_headers={}, progress=None)
+    assert seen["browser_register"] is None and seen["auth_crawl"] is False
+    # a supplied --header session is used directly -> auth_crawl stays off even with --browser-auth --browser
+    seen.clear()
+    cli._grade(_grade_args(browser=True, browser_auth=True), "http://x", [], render="R",
+               auth_headers={"Cookie": "s=1"}, progress=None)
+    assert seen["auth_crawl"] is False
+
+
+def test_no_browser_auth_leaves_the_lane_off(monkeypatch):
+    cli, seen = _capture_run(monkeypatch)
+    cli._grade(_grade_args(browser=True, browser_auth=False), "http://x", [], render="R", auth_headers={}, progress=None)
+    assert seen["browser_register"] is None and seen["auth_crawl"] is False

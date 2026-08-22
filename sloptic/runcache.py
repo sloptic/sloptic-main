@@ -47,9 +47,10 @@ def _code_fingerprint(catalog_dir: str | None) -> str:
 
 
 def cache_key(source: str, catalog_dir: str | None, *, probes, passive_only, browser,
-              headers, source_dir, harden) -> str:
+              headers, source_dir, harden, browser_auth=False) -> str:
     parts = [source, catalog_dir or "", "|".join(sorted(probes or [])), str(bool(passive_only)),
              str(bool(browser)), "|".join(sorted(headers or [])), source_dir or "", str(bool(harden)),
+             str(bool(browser_auth)),   # browser-auth changes the discovered surface + the probes' session -> distinct
              _code_fingerprint(catalog_dir)]
     for p in (source, source_dir):                 # a file/dir source: an edit (mtime) invalidates the entry
         try:
