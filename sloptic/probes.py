@@ -6759,6 +6759,14 @@ def _run_email_flow(ctx, suffix=""):
                 ctx._email_cache[slot] = _snapshot_session(acct)   # rebuilt per call; original closed
                 with contextlib.suppress(Exception):
                     acct.client.close()
+    # SHARPEN the N/A: when we couldn't self-register, say WHY if discovery saw an SSO door or a captcha gate
+    # (both auth we don't drive) -> "could not submit ... [SSO: google] [CAPTCHA: recaptcha]" for the audit.
+    if not result.attempted and result.na_reason:
+        caps = getattr(getattr(ctx, "profile", None), "capabilities", {}) or {}
+        if caps.get("sso_providers"):
+            result.na_reason += " [SSO: %s]" % ",".join(caps["sso_providers"])
+        if caps.get("captcha"):
+            result.na_reason += " [CAPTCHA: %s]" % caps["captcha"]
     return result
 
 

@@ -91,6 +91,45 @@ def _auth_triggers(markup: str) -> tuple[bool, bool]:
     return bool(_LOGIN_TRIGGER.search(text)), bool(_SIGNUP_TRIGGER.search(text))
 
 
+# SSO / CAPTCHA DETECTION (off-score surface signal): WHY a self-register fails on an app that DOES have auth.
+# We never DRIVE these (no social-login automation, no captcha solving) -- we only SEE them, so an unreachable
+# session reads "SSO-only (google)" / "captcha-gated" instead of an opaque "could not submit". Matched on
+# high-precision signals only: a provider OAuth endpoint, a provider auth SDK, or a "with <provider>" CTA --
+# never a bare provider mention (a Facebook share link / Twitter icon is not SSO).
+_SSO_PROVIDERS = [
+    ("google", re.compile(r"accounts\.google\.com|googleauthprovider|/auth/(?:v1/authorize\?provider=|)google|"
+                          r"(?:sign[ -]?in|log[ -]?in|continue|sign[ -]?up) with google|accounts\.google|gsi/client", re.I)),
+    ("github", re.compile(r"github\.com/login/oauth|githubauthprovider|(?:sign[ -]?in|log[ -]?in|continue) with github|"
+                          r"/auth/(?:v1/authorize\?provider=|)github", re.I)),
+    ("apple", re.compile(r"appleid\.apple\.com|oauthprovider\(['\"]apple|(?:sign[ -]?in|continue) with apple", re.I)),
+    ("microsoft", re.compile(r"login\.microsoftonline|(?:sign[ -]?in|continue) with (?:microsoft|azure)|/auth/(?:azure|microsoft)", re.I)),
+    ("facebook", re.compile(r"facebook\.com/(?:dialog/oauth|v\d+/dialog)|facebookauthprovider|(?:sign[ -]?in|continue) with facebook", re.I)),
+    ("discord", re.compile(r"discord\.com/api/oauth2|(?:sign[ -]?in|continue) with discord", re.I)),
+    ("linkedin", re.compile(r"linkedin\.com/oauth|(?:sign[ -]?in|continue) with linkedin", re.I)),
+    ("gitlab", re.compile(r"gitlab\.com/(?:oauth|-/profile)|(?:sign[ -]?in|continue) with gitlab", re.I)),
+    ("twitter", re.compile(r"(?:sign[ -]?in|continue) with (?:twitter|x)\b|twitterauthprovider", re.I)),
+]
+# framework/BaaS OAuth with no clear provider -> "oauth"
+_SSO_GENERIC = re.compile(r"signinwithoauth|signinwithpopup|signinwithredirect|/auth/v1/authorize\?provider=|"
+                          r"next-auth|/api/auth/(?:signin|callback)|@?clerk\b|auth0\.com|useoauth|oauthprovider", re.I)
+_CAPTCHA_KINDS = [
+    ("recaptcha", re.compile(r"g-recaptcha|recaptcha/api\.js|grecaptcha|google\.com/recaptcha", re.I)),
+    ("hcaptcha", re.compile(r"h-captcha\b|hcaptcha\.com|js\.hcaptcha", re.I)),
+    ("turnstile", re.compile(r"cf-turnstile|challenges\.cloudflare\.com/turnstile|\bturnstile\b", re.I)),
+    ("arkose", re.compile(r"arkoselabs|funcaptcha", re.I)),
+]
+
+
+def _detect_sso_captcha(markup: str) -> tuple[list, str | None]:
+    """(sso_providers, captcha_kind) from a page's markup / bundle. Providers are named when identifiable, else
+    a generic 'oauth' when only a framework OAuth signature is present. captcha is the first widget kind seen."""
+    providers = [name for name, rx in _SSO_PROVIDERS if rx.search(markup)]
+    if not providers and _SSO_GENERIC.search(markup):
+        providers = ["oauth"]
+    captcha = next((name for name, rx in _CAPTCHA_KINDS if rx.search(markup)), None)
+    return providers, captcha
+
+
 # A logout/sign-out link must never be crawled or probed: following it destroys the runner's own
 # authenticated session, silently de-authing the rest of an --header'd crawl (the classic auth-crawl
 # footgun — it's why an authed DVWA crawl kept dropping to the login page mid-run).
@@ -1082,6 +1121,8 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
     js_urls: list[str] = []           # same-origin .js assets to mine for an SPA's API paths
     link_params: dict[str, set] = {}  # path -> query-param NAMES seen in links (?page=, ?id=, ...)
     auth = [False, False]             # [login_trigger, signup_trigger] seen as a button/link across the surface
+    sso_seen: set = set()             # SSO providers + CAPTCHA seen across the surface (off-score: WHY auth is
+    captcha_seen: list = [None]       # unreachable, not a defect). captcha in a list so the scan loops can set it.
 
     with make_client(base_url, headers, timeout=5.0, follow_redirects=True) as c:
         while queue and len(visited) < max_pages:
@@ -1099,6 +1140,7 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
                 continue
             html = resp.text
             _l, _s = _auth_triggers(html)   # login/signup as a button/link (a CTA a password-form check misses)
+            _pv, _cx = _detect_sso_captcha(html); sso_seen.update(_pv); captcha_seen[0] = captcha_seen[0] or _cx
             auth[0] |= _l
             auth[1] |= _s
             for form in _parse_forms(_FORM.findall(html), scope_url, path):
@@ -1213,7 +1255,8 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
                 rendered.update(render(base_url, extra, headers=render_headers,
                                        net_sink=observed_net, script_sink=observed_scripts) or {})
             for path, dom in rendered.items():
-                _l, _s = _auth_triggers(dom)   # a SPA paints 'Sign in'/'Sign up' client-side, so scan the DOM too
+                _l, _s = _auth_triggers(dom)
+                _pv, _cx = _detect_sso_captcha(dom); sso_seen.update(_pv); captcha_seen[0] = captcha_seen[0] or _cx   # a SPA paints 'Sign in'/'Sign up' client-side, so scan the DOM too
                 auth[0] |= _l
                 auth[1] |= _s
                 candidates = _parse_forms(_FORM.findall(dom), scope_url, path)
@@ -1350,6 +1393,7 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
         if mined and render is not None:
             for mpath, dom in (render(base_url, mined, headers=headers) or {}).items():
                 _l, _s = _auth_triggers(dom)
+                _pv, _cx = _detect_sso_captcha(dom); sso_seen.update(_pv); captcha_seen[0] = captcha_seen[0] or _cx
                 auth[0] |= _l
                 auth[1] |= _s
                 cands = _parse_forms(_FORM.findall(dom), scope_url, mpath)
@@ -1403,6 +1447,10 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
         # are the VENDOR's (the app inherits them), so grading them measures the platform not the team -- and
         # the burst trips the vendor's WAF. Self-hosted PaaS (railway/render/fly/...) is NOT edge-managed -> live.
         "not_edge_managed": not platform_id.edge_managed(platform_id.classify(base_url, headers, None)),
+        # SSO / CAPTCHA seen (off-score): WHY a self-register can't establish a session on an auth app -- a
+        # social-login-only door or a captcha gate, neither of which we drive. Surfaced for the population read.
+        "sso_providers": sorted(sso_seen),
+        "captcha": captcha_seen[0],
     }
     # Landing page for the universal homepage probes (target: /). When --target names a sub-path
     # (user.github.io/Project/) whose origin ROOT is a 404 — GitHub Pages with no user-site repo, a
@@ -1507,6 +1555,11 @@ def surface_metrics(profile: Profile) -> dict:
         "browser_rendered": bool(caps.get("browser")),
         "accepts_text_input": bool(caps.get("any_endpoint_accepts_text_input")),
         "has_password_form": bool(caps.get("any_form_has_password")),
+        # SSO / CAPTCHA (off-score population signal): WHY auth is unreachable on apps that have it. has_sso lets
+        # the audit split the "could not submit a signup" bucket into social-login / captcha / other.
+        "sso_providers": caps.get("sso_providers") or [],
+        "has_sso": bool(caps.get("sso_providers")),
+        "captcha": caps.get("captcha"),
         # composite "how much observable & HEALTHY APP surface we saw" — the parity denominator
         "surface_size": len(app_routes) + inputs + len(healthy_eps),
         "pointer": pointer,                          # LLM-pointer precision telemetry (off-score, build #2)
