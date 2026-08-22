@@ -6611,7 +6611,14 @@ def _email_account(ctx, session_less_acct=None, suffix=""):
     sess = cache.get("account_session" + suffix)
     if not sess:
         return None                                      # verification established no reusable session
-    client = httpx.Client(base_url=ctx.base_url, timeout=15.0, follow_redirects=True)
+    return _rebuild_account(ctx.base_url, sess)
+
+
+def _rebuild_account(base_url, sess) -> "auth.Account":
+    """Rebuild a FRESH, independently-closeable Account from a session snapshot (the register lane's, or the
+    crawl auth's seeded session). A fresh httpx client per call so a probe closing its account never invalidates
+    the next -- the same contract the browser-cached lane keeps."""
+    client = httpx.Client(base_url=base_url, timeout=15.0, follow_redirects=True)
     client.headers.update(sess["headers"])
     return auth.Account(username=sess["username"], password=sess["password"], client=client,
                         register_response=sess["response"], storage_exposed=sess["storage_exposed"])

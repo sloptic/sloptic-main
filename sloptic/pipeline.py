@@ -28,7 +28,8 @@ from .net import challenge_onset, is_bot_challenge, make_client, request_counts,
 # A late-challenge grade is kept only if at least this fraction of the catalog ran BEFORE the WAF tripped (so
 # most outcomes saw the real app). Below it, too much of the grade is contaminated -> withhold like an entry challenge.
 _MIN_VALID_FRACTION = 0.6
-from .probes import MATCHERS, PREDICATES, _email_account, _prime_email, _repro_from_resp, describe
+from .probes import (MATCHERS, PREDICATES, _email_account, _prime_email, _rebuild_account, _repro_from_resp,
+                     describe)
 from .schema import Form, Outcome, Probe, Profile, Report, Severity
 
 
@@ -104,6 +105,15 @@ class _Ctx:
         at concurrency). The first probe for an identity pays it; the rest reuse the captured
         cookies/bearer/backend_reads. A fresh httpx client is still built PER CALL, so per-probe close semantics
         are unchanged (no shared-lifecycle risk); distinct suffixes (idor's "_a"/"_b") stay distinct identities."""
+        # UNIFICATION: reuse a session already established for THIS identity -- seeded by the authenticated crawl
+        # (Gap B) or captured by the email flow -- instead of registering AGAIN. This is the primary-identity ("")
+        # de-dup: without it the crawl registers once to authenticate discovery and the probes register a SECOND
+        # time, two browser launches per auth app (the sample6 perf regression). The IDOR pair (_a/_b) still mints
+        # distinct identities. Rebuilt into a fresh client per call so per-probe close stays safe.
+        if suffix not in ("_a", "_b"):
+            seeded = self._email_cache.get("account_session")
+            if seeded and not auth._provided_session(self.headers):
+                return _rebuild_account(self.base_url, seeded)
         cached = None
         if self.browser_register is not None:
             def cached(base_url, _s=suffix):
@@ -358,6 +368,10 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
             if login_headers:
                 headers = {**(headers or {}), **login_headers}
                 auth_crawl = False   # we hold a real session -> no throwaway self-register for the crawl
+        # UNIFICATION: the authenticated crawl (Gap B) establishes a session to MAP the authed surface; capture
+        # it here so ctx.register REUSES it instead of registering a SECOND time (the sample6 two-browser-launches
+        # regression). Populated by discovery._crawl_auth_headers only on the auth_crawl path.
+        crawl_session_sink: dict = {}
         if cached_profile is not None:
             # FROZEN surface: reuse the cached crawl, re-pointing only the origin at THIS deployment's
             # ephemeral URL (routes/forms/endpoints are relative paths; base_url is the sole absolute).
@@ -365,7 +379,8 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
             profile = replace(cached_profile, base_url=handle.base_url)
         else:
             profile = discover(handle.base_url, render=render, headers=headers, seed_features=seed_features,
-                               perceive=perceive, auth_crawl=auth_crawl, browser_register=browser_register)
+                               perceive=perceive, auth_crawl=auth_crawl, browser_register=browser_register,
+                               crawl_session_sink=crawl_session_sink)
             if on_profile is not None:
                 on_profile(profile)   # cache MISS -> hand the freshly-minted canonical surface to the caller
         if recon:   # deploy -> discover(render + classify) -> STOP, skipping the probe gauntlet. Recon only needs
@@ -382,6 +397,12 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
         #                                   make_client so the shared declarative client is hooked too.
         with make_client(origin, headers, timeout=15.0, follow_redirects=True) as client:
             ctx = _Ctx(origin, client, profile, headers, browser_register=browser_register, email=email_receiver)
+            # UNIFICATION: hand the crawl's already-established session to ctx.register so the primary identity
+            # reuses it (no second registration). Only when we didn't already hold a --header/--login session
+            # (that path sets auth_crawl=False -> no crawl session anyway) and the crawl actually got one.
+            _crawl_sess = crawl_session_sink.get("session")
+            if _crawl_sess and not auth._provided_session(headers):
+                ctx._email_cache["account_session"] = _crawl_sess
             # ENTRY GATE: if the target answers with a bot-challenge / WAF interstitial / sleeping-app page,
             # grading it draws false findings from its HTML AND hides the real surface (false cleans). Withhold
             # the grade instead of scoring the interstitial. The record is flagged bot_challenge -> excluded

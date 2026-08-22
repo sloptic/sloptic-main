@@ -130,3 +130,19 @@ def test_crawl_auth_headers_uses_the_browser_lane_for_a_cta_only_login():
 def test_crawl_auth_headers_empty_when_nothing_establishes_a_session():
     from sloptic import discovery
     assert discovery._crawl_auth_headers("http://127.0.0.1:1", forms=[], auth=(False, False)) == {}
+
+
+def test_crawl_auth_headers_populates_the_session_sink_for_reuse():
+    from sloptic import discovery
+    # UNIFICATION: the crawl's established session is stashed as a replayable snapshot so the PROBES reuse it
+    # (ctx.register) instead of registering a SECOND time. The snapshot shape must match probes._snapshot_session.
+    def fake_browser_register(base_url, email=None):
+        return {"cookies": [{"name": "sessionid", "value": "S", "httponly": True, "secure": False,
+                             "samesite": False}]}
+    sink: dict = {}
+    discovery._crawl_auth_headers("http://127.0.0.1:1", forms=[], auth=(True, False),
+                                  browser_register=fake_browser_register, session_sink=sink)
+    sess = sink.get("session")
+    assert sess is not None
+    assert set(sess) == {"headers", "username", "password", "response", "storage_exposed"}
+    assert "sessionid=S" in sess["headers"].get("Cookie", "")

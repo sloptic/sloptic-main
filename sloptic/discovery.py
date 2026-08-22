@@ -987,7 +987,7 @@ def _drop_phantom_surface(base_url, headers, endpoints, forms):
         return False, endpoints, forms
 
 
-def _crawl_auth_headers(base_url: str, forms, auth=(False, False), browser_register=None) -> dict:
+def _crawl_auth_headers(base_url: str, forms, auth=(False, False), browser_register=None, session_sink=None) -> dict:
     """Register a THROWAWAY crawl account and return its session as request headers a browser render can carry (a
     Cookie, or a Bearer Authorization) — so the crawl reaches the surface an SPA hides behind login (upload, item
     CRUD) instead of only mapping the login page. Uses the SAME lanes the probes do: httpx form/JSON, and — when
@@ -1013,12 +1013,22 @@ def _crawl_auth_headers(base_url: str, forms, auth=(False, False), browser_regis
     authz = acct.client.headers.get("Authorization")
     if authz:
         out["Authorization"] = authz
+    # UNIFICATION: stash the session as a replayable snapshot so the PROBES reuse it (ctx.register seeds from this)
+    # instead of registering a SECOND time -- the two-browser-launches-per-app cost. Same shape probes._rebuild_account
+    # / _snapshot_session expect. `response` carries Set-Cookie for the cookie-flag probes.
+    if session_sink is not None:
+        session_sink["session"] = {
+            "headers": dict(out),
+            "username": acct.username, "password": acct.password,
+            "response": acct.register_response, "storage_exposed": acct.storage_exposed,
+        }
     acct.client.close()
     return out
 
 
 def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: int = MAX_DEPTH,
-             headers=None, seed_features=None, perceive=None, auth_crawl=False, browser_register=None) -> Profile:
+             headers=None, seed_features=None, perceive=None, auth_crawl=False, browser_register=None,
+             crawl_session_sink=None) -> Profile:
     """`perceive(rendered_doms, observed)` (optional) — PROACTIVE discovery: an injected LLM reads the rendered
     pages and returns the probeable surface the crawl missed (perceive_surface output), merged in below via
     merge_perceived. LLM-agnostic here: the callback owns the model call; a None/failing one degrades to the
@@ -1139,7 +1149,8 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
             # unauthenticated render only maps the LOGIN page — file-upload / idor / backend go N/A for want of
             # a target. Register a throwaway account and carry its session into the browser context (SEPARATE
             # from the probes' session_headers, which stay fresh so IDOR still gets two distinct identities).
-            _auth = _crawl_auth_headers(base_url, forms, auth=tuple(auth), browser_register=browser_register)
+            _auth = _crawl_auth_headers(base_url, forms, auth=tuple(auth), browser_register=browser_register,
+                                        session_sink=crawl_session_sink)
             if _auth:
                 render_headers = {**(headers or {}), **_auth}
         render_meta: dict = {}

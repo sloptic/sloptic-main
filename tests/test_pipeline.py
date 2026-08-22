@@ -340,3 +340,31 @@ def test_a_predicate_can_override_its_penalty_absolutely(monkeypatch):
         assert run_one(9999) == _PENALTY_CAP  # runaway-guarded
     finally:
         client.close()
+
+
+def test_register_reuses_a_seeded_crawl_session_instead_of_registering_again(monkeypatch):
+    """UNIFICATION: when the authenticated crawl already established a session (seeded into
+    ctx._email_cache['account_session']), ctx.register('') REUSES it -- no second registration. The IDOR
+    identities ('_a'/'_b') still register fresh (distinct users)."""
+    import httpx
+    from sloptic.pipeline import _Ctx
+    from sloptic import auth
+    from sloptic.schema import Profile
+    prof = Profile(base_url="http://x")
+    client = httpx.Client(base_url="http://x")
+    calls = []
+    monkeypatch.setattr(auth, "register_account",
+                        lambda *a, **k: (calls.append(k.get("suffix")), "FRESH")[1])
+    try:
+        ctx = _Ctx("http://x", client, prof, None)
+        ctx._email_cache["account_session"] = {
+            "headers": {"Cookie": "sid=seeded"}, "username": "u", "password": "p",
+            "response": auth._synthesize_response("http://x", []), "storage_exposed": False}
+        acct = ctx.register("")                      # primary identity -> reuse the seed, do NOT re-register
+        assert acct != "FRESH" and acct.username == "u"
+        assert "sid=seeded" in acct.client.headers.get("Cookie", "")
+        assert calls == []                           # register_account was never called for ""
+        assert ctx.register("_a") == "FRESH"         # IDOR identity bypasses the seed -> fresh registration
+        assert "_a" in calls
+    finally:
+        client.close()
