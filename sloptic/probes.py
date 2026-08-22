@@ -6767,9 +6767,8 @@ def _run_reset_flow(ctx, suffix=""):
 
 def reset_email_unreliable(ctx, probe) -> bool | None:
     """qa-reset-001: an account we established cannot be recovered -- the password-reset email never arrives (the
-    user is locked out of recovery), or it arrives but its link is dead. REPORT_ONLY during bring-up (off-score)
-    until the corpus admission-test validates the family."""
-    ctx.evidence["report_only"] = True
+    user is locked out of recovery), or it arrives but its link is dead. SCORES per the qa-reset-001 severity
+    block (no reset email in 60s -> 60; a dead reset link -> 24)."""
     res = _reset_result(ctx)
     if not res.attempted or not res.reset_available:
         ctx.evidence["na_reason"] = res.na_reason or "no testable password-reset flow"

@@ -241,6 +241,16 @@ def test_exposure_secret_family_severity():
     assert _severity_penalty(ade, {"sensitive_fields": True, "bulk_read": True}) == 90
 
 
+def test_reset_family_severity_scores():
+    from sloptic.catalog import default_catalog_dir, load_catalog
+    by_id = {p.id: p for p in load_catalog(default_catalog_dir())}
+    reset = by_id["qa-reset-001"].severity                          # SCORED (report_only bring-up is over)
+    assert reset is not None and reset.range == (24, 60)
+    assert _severity_penalty(reset, {"no_reset_email_60s": True}) == 60   # locked out of recovery
+    assert _severity_penalty(reset, {"reset_link_dead": True}) == 24      # broken reset page
+    assert _severity_penalty(reset, {}) == 24                            # floor
+
+
 # --- the backend / BaaS class ---
 
 def test_backend_class_severity():

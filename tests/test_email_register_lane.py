@@ -635,7 +635,7 @@ def test_reset_httpx_form_lane_fires_when_no_reset_email_arrives(monkeypatch):
     ctx._email_cache["_live"] = {"acct": acct, "lane": "httpx"}
     fired = probes.reset_email_unreliable(ctx, None)
     assert fired is True
-    assert ctx.evidence.get("no_reset_email_60s") and ctx.evidence.get("report_only") is True   # off-score bring-up
+    assert ctx.evidence.get("no_reset_email_60s") and "report_only" not in ctx.evidence   # SCORED, not off-score
     acct.client.close()
 
 

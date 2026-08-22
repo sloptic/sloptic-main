@@ -3,8 +3,7 @@ bundle: qa
 category: password-reset
 pool: public
 evidence_model: provable
-# REPORT_ONLY during bring-up (the predicate forces off-score via ctx.evidence["report_only"]) until the corpus
-# admission-test validates the family; the severity below is what it takes once promoted. The RECOVERY path a
+# SCORES per the severity block below (the report_only bring-up is over). The RECOVERY path a
 # user hits after forgetting their password is an INDEPENDENT code path (different template / mail call / route)
 # that can be broken even when signup email works. An EVIDENCE LADDER on its reliability (functional-suitability,
 # Nielsen 4 -- account recovery is a core feature; a broken one locks a forgetful user out for good):
