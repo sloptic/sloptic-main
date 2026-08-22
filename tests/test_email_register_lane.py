@@ -745,3 +745,19 @@ def test_baas_follow_completes_an_email_otp_code(monkeypatch):
     msg = EmailMessage.parse("hl@app.test", "Code", "Your login code is 481920")
     ver = probes._follow_verification_baas(msg, live)
     assert ver.acted and ver.session and live["baas_session"]["access_token"] == "AT"
+
+
+def test_reset_precondition_recognizes_a_browser_or_immediate_session(monkeypatch):
+    # broadened precondition: a session established via a non-httpx lane (no live["acct"]) still means an account
+    # with our address exists -> reset is testable (was N/A'd as "no established account" before).
+    monkeypatch.setattr(probes, "_email_register_once", lambda ctx, suffix="": None)
+    monkeypatch.setattr(probes.auth, "_trigger_reset_httpx", lambda client, base, form, addr: True)
+    monkeypatch.setattr(probes, "_baas_gateway", lambda ctx: None)
+    prof = Profile(base_url="http://app.test",
+                   forms=[Form(action="/account/forgot-password", method="post", fields=["email"])])
+    ctx = _reset_ctx(prof)
+    ctx._email_cache["_live"] = {"acct": None, "lane": "browser_session"}     # immediate session, no httpx acct
+    ctx._email_cache["account_session"] = {"headers": {"Cookie": "s=1"}, "username": "u", "password": "p",
+                                           "response": _reg_response("ok"), "storage_exposed": False}
+    assert probes.reset_email_unreliable(ctx, None) is True                   # got past the precondition -> tested
+    assert ctx.evidence.get("no_reset_email_60s")                            # no reset email arrived -> fires

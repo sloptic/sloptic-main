@@ -6908,42 +6908,56 @@ def _run_reset_flow(ctx, suffix=""):
     acct = live.get("acct")
     lane = live.get("lane", "")
     profile = getattr(ctx, "profile", None)
-    # an httpx account counts as established only if it got a session OR announced email (else the signup may have
-    # been silently rejected and no account exists); a Supabase signup lane created the user at the gateway.
+    # PRECONDITION -- an account with our address plausibly EXISTS via ANY register lane (else a reset sends
+    # nothing -> false lockout). Broadened past httpx+Supabase: an httpx session/announce, a Supabase signup, a
+    # captured session snapshot (email-verified / browser / Firebase), or an immediate-session lane all mean the
+    # signup with our address took. (Was httpx+baas only, which N/A'd the ~10%+ where the browser/Firebase/
+    # immediate lanes DID establish a session.)
     httpx_account = acct is not None and (auth._has_session(acct) or
                     email_verify.announces_pending_email(_resp_text(acct.register_response)))
-    baas_account = lane.startswith("baas")
+    account_exists = (httpx_account
+                      or lane.startswith("baas")
+                      or bool(ctx._email_cache.get("account_session" + suffix))
+                      or lane in ("browser_session", "firebase_session", "baas_session"))
     forgot = auth._forgot_form(profile.forms) if profile is not None else None
-    if not (httpx_account or baas_account):
+    if not account_exists:
         return email_verify.ResetResult(
             attempted=False, na_reason="no established account with a controlled address to request a reset for")
+    # the forgot-password endpoint takes an EMAIL, not the account's session, so a fresh client works when the
+    # session came from the browser/Firebase lane (no httpx acct); reuse the account's client when we have one.
+    own_client = acct.client if acct is not None else None
+    forgot_client = own_client or httpx.Client(base_url=base, timeout=15.0, follow_redirects=True)
     used: dict = {}
 
     def trigger(addr):
-        if httpx_account and forgot is not None and auth._trigger_reset_httpx(acct.client, base, forgot, addr):
+        if forgot is not None and auth._trigger_reset_httpx(forgot_client, base, forgot, addr):
             used["lane"] = "form"
             return True
-        if baas_account:
-            gw = _baas_gateway(ctx)
-            if gw is not None and baas.recover(gw[0], gw[1], addr):
-                used["lane"] = "baas"
-                return True
+        gw = _baas_gateway(ctx)                              # Supabase recover, gated on the gateway existing
+        if gw is not None and baas.recover(gw[0], gw[1], addr):
+            used["lane"] = "baas"
+            return True
         return False
 
     def follow(msg):
         # only the app-hosted reset link (form lane) is a GET-able page; a Supabase recover link is a gateway
         # endpoint a bare GET can't judge, so leave link_alive None there (delivery is still judged).
-        if used.get("lane") != "form" or acct is None:
+        if used.get("lane") != "form":
             return None
         for link in [ln for ln in msg.links if _same_app_link(ln, base)][:3]:
             try:
-                r = acct.client.get(link)
+                r = forgot_client.get(link)
             except (httpx.HTTPError, httpx.InvalidURL):
                 continue
             return 200 <= r.status_code < 400
         return None
 
-    return email_verify.reset_email_flow(ctx.email, tag, trigger, follow, timeout=_EMAIL_ANNOUNCED_TIMEOUT)
+    try:
+        return email_verify.reset_email_flow(ctx.email, tag, trigger, follow, timeout=_EMAIL_ANNOUNCED_TIMEOUT)
+    finally:
+        if own_client is None:                              # close the fresh client we made (never the account's)
+            with contextlib.suppress(Exception):
+                forgot_client.close()
 
 
 def reset_email_unreliable(ctx, probe) -> bool | None:
