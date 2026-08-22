@@ -556,6 +556,113 @@ def _reach_and_submit_signup(page, base_url, creds, timeout) -> bool:
     return False
 
 
+# --- LANE B: email-first signup WIZARD (step 1 = email + emailed CODE, no password; step 2 = create password) --
+# The shape register_in_browser's password-keyed path can't submit (its step 1 has no password field, e.g.
+# insightaco). Driven IN ONE SESSION so the emailed code stays valid: fill email -> trigger + wait for the code
+# field -> fetch the code from OUR inbox via a callback -> submit it -> fill a step-2 password if present. Every
+# step is best-effort + safe-degrading (any failure -> return False, the caller then reports the normal N/A).
+_EMAIL_INPUT = "input[type=email], input[name*=email i], input[id*=email i], input[placeholder*=email i]"
+_CODE_INPUT_HINT = re.compile(r"code|otp|verif|pin|token", re.I)
+_STEP_SUBMIT = re.compile(r"continue|next|verif|get.?code|send.?code|confirm|submit|sign.?up|create.?account", re.I)
+
+
+def _has_visible_password(page) -> bool:
+    with contextlib.suppress(Exception):
+        return any(p.is_visible() for p in page.query_selector_all("input[type=password]"))
+    return False
+
+
+def _click_step_button(page, timeout) -> bool:
+    """Click the step's advance button (Continue/Next/Verify/Submit), never a _NO_CLICK control (pay/delete/...)."""
+    with contextlib.suppress(Exception):
+        for b in page.query_selector_all("button, input[type=submit], [role=button]"):
+            if not b.is_visible():
+                continue
+            label = ((b.inner_text() or "") + " " + (b.get_attribute("value") or "")).strip()
+            if label and _STEP_SUBMIT.search(label) and not _NO_CLICK.search(label):
+                b.click(timeout=timeout * 1000)
+                return True
+    return False
+
+
+def _find_code_field(page):
+    """The verification-CODE input(s): a single input hinting code/otp/verif/pin, else a row of single-char
+    maxlength=1 boxes (a boxed OTP widget). None when no code field is present yet."""
+    with contextlib.suppress(Exception):
+        for inp in page.query_selector_all("input"):
+            if not inp.is_visible():
+                continue
+            hint = " ".join(filter(None, [inp.get_attribute("name"), inp.get_attribute("id"),
+                                          inp.get_attribute("placeholder"), inp.get_attribute("aria-label"),
+                                          inp.get_attribute("autocomplete")]))
+            if hint and _CODE_INPUT_HINT.search(hint):
+                return [inp]
+        boxes = [i for i in page.query_selector_all("input")
+                 if i.is_visible() and i.get_attribute("maxlength") == "1"]
+        if 3 <= len(boxes) <= 8:
+            return boxes
+    return None
+
+
+def _fill_code(fields, code) -> bool:
+    with contextlib.suppress(Exception):
+        if len(fields) == 1:
+            fields[0].fill(str(code))
+        else:                                            # a boxed OTP widget: one char per box
+            for f, ch in zip(fields, str(code)):
+                f.fill(ch)
+        return True
+    return False
+
+
+def _reach_email_first_step(page, base_url, timeout) -> bool:
+    """Park on a signup route that shows an EMAIL field with NO visible password -- the email-first step."""
+    for route in [""] + list(_SIGNUP_ROUTES):
+        with contextlib.suppress(Exception):
+            page.goto(base_url.rstrip("/") + (route or "/"), timeout=timeout * 1000, wait_until="load")
+            page.wait_for_timeout(300)
+            _reveal_hidden_controls(page)
+            if page.query_selector(_EMAIL_INPUT) and not _has_visible_password(page):
+                return True
+    return False
+
+
+def _drive_email_first(page, base_url, email, code_getter, creds, timeout) -> bool:
+    """Drive the email-first wizard on an OPEN page. True once it has advanced through the code step (the caller
+    then captures whatever session the app established); False on any dead end. `code_getter()` fetches the code
+    from our inbox IN-SESSION (so re-triggering doesn't matter -- the code we submit is the one just sent)."""
+    if not _reach_email_first_step(page, base_url, timeout):
+        return False
+    email_el = page.query_selector(_EMAIL_INPUT)
+    if email_el is None:
+        return False
+    with contextlib.suppress(Exception):
+        email_el.fill(email)
+    _click_step_button(page, timeout)                    # trigger the code send / advance to the code step
+    fields = None
+    for _ in range(20):                                  # wait up to ~6s for the code field to appear
+        fields = _find_code_field(page)
+        if fields:
+            break
+        with contextlib.suppress(Exception):
+            page.wait_for_timeout(300)
+    if not fields:
+        return False
+    code = None
+    with contextlib.suppress(Exception):
+        code = code_getter()                             # polls OUR inbox (up to ~60s) for the just-sent code
+    if not code:
+        return False
+    fields = _find_code_field(page) or fields            # re-locate: filling email may have re-rendered the DOM
+    if not _fill_code(fields, code):
+        return False
+    _click_step_button(page, timeout)                    # submit the code
+    with contextlib.suppress(Exception):
+        page.wait_for_timeout(500)
+    _fill_and_submit_signup(page, creds)                 # step 2: create a password if the wizard now asks for one
+    return True
+
+
 # A session token PERSISTED in localStorage (Supabase 'sb-<ref>-auth-token', Firebase authUser, or a bare JWT)
 # is reachable by ANY XSS on the origin — unlike an HttpOnly cookie — so its presence is the token-auth analog
 # of a session cookie missing HttpOnly (sec-session-005). The same token doubles as the Bearer for our authed
@@ -588,7 +695,7 @@ def _extract_storage_token(page) -> dict:
 
 
 def register_in_browser(base_url: str, headers=None, timeout: float = 12.0, total_timeout: float = 45.0,
-                        email: str | None = None):
+                        email: str | None = None, code_getter=None):
     """SPA self-registration THROUGH the browser (the auth self-oracle's client-rendered path): open the signup
     form, fill throwaway creds, submit so the app's OWN JS makes the real registration request, and return the
     session cookie the server sets IN THE BROWSER — the thing an httpx form-POST can't get on an SPA (the form's
@@ -604,7 +711,11 @@ def register_in_browser(base_url: str, headers=None, timeout: float = 12.0, tota
     flow), so an email-GATED SPA mails the confirmation to us. In that mode the submitted-but-no-session outcome
     is NOT a bare None: it returns {email_pending: True, creds, cookies, request} so the email flow can poll the
     inbox and complete the verification link in the browser (verify_in_browser). Callers that pass no email keep
-    the exact old contract (None on no session)."""
+    the exact old contract (None on no session).
+
+    `code_getter`, when set (with `email`), enables the LANE-B email-first WIZARD fallback: if no password-signup
+    form is reachable but an email-first step is (email + emailed CODE, password on a later step), drive it in one
+    session, calling code_getter() to fetch the code from our inbox mid-flow. None-safe: absent -> old behavior."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -640,10 +751,14 @@ def register_in_browser(base_url: str, headers=None, timeout: float = 12.0, tota
                 page.on("request", _on_request)
 
                 if not _reach_and_submit_signup(page, base_url, creds, timeout):
-                    LAST_STAGE["stage"] = ("no fillable signup reached: no visible password field on the "
-                                           "homepage (after revealing hidden controls) or at any of %d "
-                                           "conventional signup routes" % len(_SIGNUP_ROUTES))
-                    return None
+                    # LANE B fallback: no password-signup form, but maybe an EMAIL-FIRST wizard (email + emailed
+                    # code, password on a later step). Only when we have an inbox (email) AND a code fetcher.
+                    if not (email is not None and code_getter is not None
+                            and _drive_email_first(page, base_url, email, code_getter, creds, timeout)):
+                        LAST_STAGE["stage"] = ("no fillable signup reached: no visible password field on the "
+                                               "homepage (after revealing hidden controls) or at any of %d "
+                                               "conventional signup routes" % len(_SIGNUP_ROUTES))
+                        return None
                 with contextlib.suppress(Exception):                 # let the registration fetch + Set-Cookie/token land
                     page.wait_for_load_state("networkidle", timeout=8000)
                 page.wait_for_timeout(500)

@@ -8,6 +8,7 @@ so multiple vulnerable endpoints cost more than one but less than linearly.
 from __future__ import annotations
 
 import contextlib
+import inspect
 import os
 import time
 from dataclasses import dataclass, field, replace
@@ -92,8 +93,32 @@ class _Ctx:
         store = self._browser_cache
         if suffix not in store:
             addr = self.email_address(suffix)
-            store[suffix] = self.browser_register(base_url, email=addr) if addr else self.browser_register(base_url)
+            if not addr:
+                store[suffix] = self.browser_register(base_url)
+            else:
+                kwargs = {"email": addr}
+                # LANE B: hand the browser lane a CODE fetcher for the email-first wizard, but ONLY if it accepts
+                # one (the real browser.register_in_browser does; a 2-arg test stub does not -> don't break it).
+                if self.email is not None and _accepts_kwarg(self.browser_register, "code_getter"):
+                    kwargs["code_getter"] = lambda _s=suffix: self._poll_email_code(_s)
+                store[suffix] = self.browser_register(base_url, **kwargs)
         return store[suffix]
+
+    def _poll_email_code(self, suffix: str = ""):
+        """Poll our inbox for a verification CODE (the email-first browser wizard's in-session fetch): this
+        identity's tag, the flow's announced window, first code or None. Kept here (not in the browser layer) so
+        the receiver dependency stays on ctx."""
+        if self.email is None:
+            return None
+        self.email_address(suffix)                       # ensure the tag is minted
+        tag = self._email_cache.get("tag" + suffix)
+        if not tag:
+            return None
+        try:
+            msg = self.email.poll(tag, 60.0)
+        except Exception:
+            return None
+        return msg.codes[0] if (msg and msg.codes) else None
 
     def register(self, suffix: str = ""):
         """Self-register (self-as-oracle) for the authed-surface probes, with the browser fallback threaded in:
@@ -130,6 +155,16 @@ class _Ctx:
                 return _email_account(_self, session_less_acct, _s)
         return auth.register_account(self.base_url, self.profile, suffix=suffix,
                                      browser_register=cached, headers=self.headers, email_verify=email_cb)
+
+
+def _accepts_kwarg(fn, name: str) -> bool:
+    """Does `fn` accept keyword `name` (named param or **kwargs)? Guards passing code_getter to the real browser
+    lane without breaking a 2-arg test stub."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in params or any(p.kind == p.VAR_KEYWORD for p in params.values())
 
 
 def _applicable(probe: Probe, profile: Profile) -> bool:
