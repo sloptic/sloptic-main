@@ -81,6 +81,29 @@ def _password_form(forms: list[Form]) -> Form | None:
     return next((f for f in pw if any(h in f.action.lower() for h in _REGISTER_HINTS)), pw[0])
 
 
+_MAGIC_LINK_HINTS = ("login", "signin", "sign-in", "sign_in", "log-in", "auth", "magic", "otp",
+                     "passwordless", "session", "email-link", "email_link")
+
+
+def _email_only_form(forms: list[Form]) -> Form | None:
+    """A PASSWORDLESS (magic-link / email-OTP) auth form: an email field, NO password field, and an auth-hinted
+    action -- the app emails a login link instead of taking a password. Distinct from _password_form (which
+    skips it for want of a password) and from a newsletter/contact form (excluded by the auth-hint requirement,
+    so we never POST an email to a subscribe box). Prefers an explicitly magic/OTP-hinted action."""
+    _NOT_AUTH = ("subscribe", "newsletter", "contact", "waitlist", "notify", "feedback")
+    cands = [
+        f for f in forms
+        if any(("email" in n.lower() or "mail" in n.lower()) for n in f.fields)
+        and not any("pass" in n.lower() or "pwd" in n.lower() for n in f.fields)
+        and any(h in f.action.lower() for h in _MAGIC_LINK_HINTS)
+        and not any(h in f.action.lower() for h in _NOT_AUTH)   # a subscribe/contact box that happens to carry "auth"
+    ]
+    if not cands:
+        return None
+    strong = ("magic", "otp", "passwordless", "email-link", "email_link")
+    return next((f for f in cands if any(h in f.action.lower() for h in strong)), cands[0])
+
+
 def _fill(form: Form, username: str, password: str, email: str | None = None) -> dict[str, str]:
     data = {}
     for name in form.fields:
@@ -522,6 +545,35 @@ def _auth_shaped(r: httpx.Response) -> bool:
     successful registration on the first path tried (leaving a session-less account -> a silent N/A)."""
     ct = r.headers.get("content-type", "").lower()
     return "json" in ct or bool(r.headers.get_list("set-cookie")) or _bearer_token(r) is not None
+
+
+def _register_passwordless(base_url: str, profile: Profile, suffix: str = "",
+                           email: str | None = None) -> Account | None:
+    """MAGIC-LINK lane (server-rendered): POST a passwordless email-only auth form with OUR controlled address
+    so the app emails a login link. Returns an Account whose register_response the email-verification flow reads
+    (announces_pending_email -> email-gated) and whose client the existing httpx follow reuses to CLICK the
+    emailed link (_follow_verification auto-logs us in). None when there's no email-only auth form -> the caller
+    falls through to the other lanes. No password: the whole point of the lane."""
+    form = _email_only_form(profile.forms)
+    if form is None:
+        return None
+    username = "hl_" + secrets.token_hex(5) + suffix
+    client = httpx.Client(base_url=base_url, timeout=15.0, follow_redirects=True)
+    data = _fill(form, username, "", email)   # fills the email field with our address; no password field to set
+    try:
+        try:
+            token = _csrf_token(client.get(form.action).text)
+            if token:
+                for name in form.fields:
+                    if is_csrf_field(name):
+                        data[name] = token
+        except (httpx.HTTPError, httpx.InvalidURL):
+            pass
+        resp = client.request("POST", form.action, data=data)
+    except (httpx.HTTPError, httpx.InvalidURL):
+        client.close()
+        return None
+    return Account(username=username, password="", client=client, register_response=resp)
 
 
 def _register_json(base_url: str, suffix: str, profile=None, email: str | None = None) -> Account | None:

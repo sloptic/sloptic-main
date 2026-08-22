@@ -186,6 +186,24 @@ def email_signup(gateway: str, key: str, email: str) -> dict:
     return out
 
 
+def magic_link_signup(gateway: str, key: str, email: str) -> dict:
+    """MAGIC-LINK lane: request a passwordless login link from a Supabase project (POST /auth/v1/otp
+    {email, create_user}). OTP always withholds a session by design -- the project EMAILS a magic link -- so a
+    202/200 means 'pending, mail is on its way' and the existing baas follow (verify_email_link, which reads
+    type=magiclink from the link) completes it. This is the fallback for a project whose password /auth/v1/signup
+    is closed but OTP is on. Returns {"pending": bool}; pending=False when OTP is disabled / rate-limited."""
+    out = {"pending": False}
+    try:
+        r = httpx.post(gateway.rstrip("/") + "/auth/v1/otp",
+                       json={"email": email, "create_user": True},
+                       timeout=12.0, verify=False, headers={"apikey": key, "Content-Type": "application/json"})
+    except Exception:
+        return out
+    # 200/202 with no error body -> the link is being sent. A 4xx (OTP disabled, signups off) -> nothing to verify.
+    out["pending"] = r.status_code in (200, 201, 202)
+    return out
+
+
 _SB_TOKEN_KEYS = ("token_hash", "token", "confirmation_token")
 
 

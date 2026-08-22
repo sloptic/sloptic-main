@@ -480,3 +480,101 @@ def test_authed_headers_respects_a_provided_header_session_without_registering()
     ctx = types.SimpleNamespace(headers={"Cookie": "session=abc"},
                                 register=lambda suffix="": (_ for _ in ()).throw(AssertionError("must not register")))
     assert probes._authed_headers(ctx) == {"Cookie": "session=abc"}      # --header session wins, no self-register
+
+
+# --- MAGIC-LINK / passwordless lane -------------------------------------------------------------------------
+# A passwordless app has no password: enter your email, it mails a login link, clicking it logs you in. Every
+# other lane assumes a password signup, so we never triggered the link. These two submission paths do -- then
+# the EXISTING follow (httpx auto-login / baas verify_email_link) completes it.
+
+def test_email_only_form_detects_passwordless_rejects_password_and_newsletter():
+    magic = Form(action="/auth/magic-link", method="post", fields=["email"])
+    pw = Form(action="/signup", method="post", fields=["email", "password"])
+    news = Form(action="/auth/subscribe", method="post", fields=["email"])   # "auth" substring but a subscribe box
+    assert auth._email_only_form([pw, magic, news]) is magic
+    assert auth._email_only_form([pw]) is None                # has a password -> _password_form's job, not this lane
+    assert auth._email_only_form([news]) is None              # newsletter/subscribe -> excluded (never POST to it)
+
+
+def test_register_passwordless_fills_the_email_and_posts_the_form(monkeypatch):
+    posted = {}
+
+    def handler(req):
+        if req.method == "POST":
+            posted["path"], posted["body"] = req.url.path, req.content.decode()
+            return httpx.Response(200, text="Check your email for a login link.")
+        return httpx.Response(200, text="<form action='/auth/magic-link'><input name='email'></form>")   # CSRF GET
+    real_client = httpx.Client
+    monkeypatch.setattr(auth.httpx, "Client",
+                        lambda *a, **k: real_client(*a, **{**k, "transport": httpx.MockTransport(handler)}))
+    prof = Profile(base_url="http://app.test",
+                   forms=[Form(action="/auth/magic-link", method="post", fields=["email"])])
+    acct = auth._register_passwordless("http://app.test", prof, "_m", email="hl-x@app.test")
+    assert acct is not None and posted["path"] == "/auth/magic-link"
+    assert "email=" in posted["body"] and "hl-x" in posted["body"]        # our address was submitted
+    assert acct.password == ""                                            # passwordless: no password sent
+    acct.client.close()
+
+
+def test_register_passwordless_none_without_an_email_only_form():
+    prof = Profile(base_url="http://app.test",
+                   forms=[Form(action="/signup", method="post", fields=["email", "password"])])
+    assert auth._register_passwordless("http://app.test", prof, "_m", email="hl-x@app.test") is None
+
+
+def test_magic_link_httpx_lane_registers_via_email_only_form_and_the_link_logs_in(monkeypatch):
+    monkeypatch.setattr(probes.auth, "_register_httpx", lambda *a, **k: None)   # no password signup surface
+    monkeypatch.setattr(probes, "_baas_gateway", lambda ctx: None)
+    monkeypatch.setattr(probes, "_firebase_config", lambda ctx: None)
+
+    def magic_acct(base, profile, suffix="", email=None):
+        # the passwordless form accepted our address and announced a link; GETting the emailed link auto-logs in.
+        acct = _acct(lambda r: httpx.Response(200, headers={"set-cookie": "sessionid=S; HttpOnly; Path=/"}))
+        acct.register_response = _reg_response("Check your email for a login link.")
+        return acct
+    monkeypatch.setattr(probes.auth, "_register_passwordless", magic_acct)
+    ctx = _spa_ctx(None)
+    ctx._email_cache["tag"] = "tm"
+    ctx._email_cache["address"] = ctx.email.address("tm")
+    ctx.email.inject("tm", EmailMessage.parse("hl-tm@app.test", "Your login link", "http://app.test/magic?t=1"))
+    res = probes._email_verify_result(ctx)
+    assert res.email_gated and res.email_arrived and res.session_after_verify   # passwordless login worked
+    acct = probes._email_account(ctx)
+    assert acct is not None and "sessionid=S" in acct.client.headers.get("Cookie", "")
+    acct.client.close()
+
+
+def test_baas_magic_link_signup_pending_on_2xx(monkeypatch):
+    monkeypatch.setattr(baas.httpx, "post", lambda *a, **k: _BaasResp(202))    # OTP accepted -> link on its way
+    assert baas.magic_link_signup("https://ref.supabase.co", "k", "hl@anachron.dev")["pending"] is True
+
+
+def test_baas_magic_link_signup_not_pending_when_otp_disabled(monkeypatch):
+    monkeypatch.setattr(baas.httpx, "post", lambda *a, **k: _BaasResp(422, {"msg": "otp disabled"}))
+    assert baas.magic_link_signup("https://ref.supabase.co", "k", "hl@anachron.dev")["pending"] is False
+
+
+def test_magic_link_baas_otp_lane_when_password_signup_is_closed(monkeypatch):
+    monkeypatch.setattr(probes.auth, "_register_httpx", lambda *a, **k: None)
+    monkeypatch.setattr(probes, "_baas_gateway", lambda ctx: ("https://ref.supabase.co", "anonkey"))
+    monkeypatch.setattr(probes.baas, "email_signup",
+                        lambda gw, key, email: {"session": None, "pending": False})   # password signup closed
+    otp = {}
+
+    def fake_otp(gw, key, email):
+        otp["email"] = email
+        return {"pending": True}
+    monkeypatch.setattr(probes.baas, "magic_link_signup", fake_otp)
+    monkeypatch.setattr(probes.baas, "verify_email_link",
+                        lambda gw, key, link: {"access_token": "AT", "refresh_token": "RT"})
+    ctx = _spa_ctx(None)
+    ctx._email_cache["tag"] = "to"
+    ctx._email_cache["address"] = ctx.email.address("to")
+    ctx.email.inject("to", EmailMessage.parse("hl-to@app.test", "Magic link",
+                                              "https://ref.supabase.co/auth/v1/verify?token_hash=H&type=magiclink"))
+    res = probes._email_verify_result(ctx)
+    assert otp["email"] == "hl-to@app.test"                    # OTP requested with our controlled address
+    assert res.email_gated and res.email_arrived and res.session_after_verify
+    acct = probes._email_account(ctx)
+    assert acct.client.headers["Authorization"] == "Bearer AT"
+    acct.client.close()

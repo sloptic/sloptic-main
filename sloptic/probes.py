@@ -6434,6 +6434,24 @@ def _email_register_once(ctx, suffix=""):
             return _done(email_verify.RegistrationOutcome(
                 submitted=True, has_session=has_session, announces_email=announced,
                 has_resend_control=_has_resend_control(acct.register_response), handle=acct))
+    # 1b) MAGIC-LINK (server-rendered passwordless): an email-only auth form -> POST our address, the app mails a
+    #     login link, and the EXISTING httpx follow clicks it (_follow_verification auto-logs us in). Reached only
+    #     when the password httpx lane above found nothing (no email-only form -> None -> fall through).
+    macct = auth._register_passwordless(base, ctx.profile, "_m" + tag[:4], email=address)
+    if macct is not None:
+        m_session = auth._has_session(macct)
+        m_announced = email_verify.announces_pending_email(_resp_text(macct.register_response))
+        if m_session or m_announced:                         # only WIN when the POST observably did something --
+            if acct is not None:                             # else an SPA's placeholder form would shadow lane 2/3
+                with contextlib.suppress(Exception):
+                    acct.client.close()                      # the unproductive password attempt -> don't leak it
+            live["acct"] = macct
+            live["lane"] = "httpx"
+            return _done(email_verify.RegistrationOutcome(
+                submitted=True, has_session=m_session, announces_email=m_announced,
+                has_resend_control=_has_resend_control(macct.register_response), handle=macct))
+        with contextlib.suppress(Exception):
+            macct.client.close()                             # nothing observable -> let the browser/BaaS lanes try
     # 2) SPA browser lane (browser mode only): the app's own JS signs up with our address -> an email-gated SPA
     #    mails us. Reuses ctx's single memoized browser registration (shared with the auth self-oracle).
     bres = None
@@ -6464,6 +6482,14 @@ def _email_register_once(ctx, suffix=""):
         if bsu.get("pending"):
             live.update(lane="baas", gateway=gateway, key=key,
                         baas_creds={"_email": bsu.get("_email"), "_password": bsu.get("_password")})
+            return _done(email_verify.RegistrationOutcome(submitted=True, has_session=False, announces_email=True,
+                                                          handle=None))
+        # 3c) MAGIC-LINK fallback: the password /auth/v1/signup is closed but OTP is on -> request a login link
+        #     (POST /auth/v1/otp); the SAME baas follow (verify_email_link, type=magiclink) completes it.
+        mlk = baas.magic_link_signup(gateway, key, address)
+        if mlk.get("pending"):
+            live.update(lane="baas", gateway=gateway, key=key,
+                        baas_creds={"_email": address, "_password": None})
             return _done(email_verify.RegistrationOutcome(submitted=True, has_session=False, announces_email=True,
                                                           handle=None))
     # 3b) Firebase lane: identitytoolkit signUp returns a session AT SIGNUP (not email-gated) -> unlocks API-only
