@@ -3,6 +3,7 @@ it must be COMPLETED so the authed-surface probes run as the verified user (the 
 flow runs at most once per app; ctx.register rebuilds a fresh, independently-closeable client from the captured
 session on every call, and register_account tries the email lane BEFORE the (expensive) browser launch.
 """
+import json
 import types
 
 import httpx
@@ -10,7 +11,7 @@ import httpx
 from sloptic import auth, baas, pipeline, probes
 from sloptic.auth import Account
 from sloptic.email_verify import EmailMessage, EmailVerifyResult, MockReceiver
-from sloptic.schema import Form, Profile
+from sloptic.schema import Endpoint, Form, Profile
 
 RX = MockReceiver()
 
@@ -671,3 +672,76 @@ def test_reset_na_without_an_established_account(monkeypatch):
                              forms=[Form(action="/account/forgot-password", method="post", fields=["email"])]))
     ctx._email_cache["_live"] = {"acct": None, "lane": ""}     # register lane established nothing
     assert probes.reset_email_unreliable(ctx, None) is None    # no controlled account to reset -> N/A, never a fire
+
+
+# --- CODE lane (lane A): code-based email verification (6-digit codes) --------------------------------------
+
+def test_baas_verify_otp_posts_type_email_and_token(monkeypatch):
+    calls = {}
+
+    def fake_post(url, json=None, **k):
+        calls["url"], calls["json"] = url, json
+        return _BaasResp(200, {"access_token": "AT", "refresh_token": "RT"})
+    monkeypatch.setattr(baas.httpx, "post", fake_post)
+    s = baas.verify_otp("https://ref.supabase.co", "k", "hl@anachron.dev", "481920")
+    assert s["access_token"] == "AT"
+    assert calls["url"].endswith("/auth/v1/verify")
+    assert calls["json"]["email"] == "hl@anachron.dev" and calls["json"]["token"] == "481920"
+
+
+def test_baas_verify_otp_none_on_bad_code(monkeypatch):
+    monkeypatch.setattr(baas.httpx, "post", lambda *a, **k: _BaasResp(403, {"error": "invalid otp"}))
+    assert baas.verify_otp("https://ref.supabase.co", "k", "hl@a.dev", "000000") is None
+
+
+def _verify_handler(path, good_code):
+    def handler(req):
+        if req.method == "POST" and req.url.path == path:
+            body = json.loads(req.content or b"{}")
+            if good_code in (str(body.get("code")), str(body.get("otp")), str(body.get("token"))):
+                return httpx.Response(200, headers={"set-cookie": "sessionid=S; HttpOnly; Path=/"})
+        return httpx.Response(400)
+    return handler
+
+
+def test_submit_code_httpx_establishes_session_via_discovered_verify_endpoint():
+    acct = _acct(_verify_handler("/api/verify", "481920"))
+    prof = Profile(base_url="http://app.test",
+                   endpoints=[Endpoint(path="/api/verify", method="post", raw_path="/api/verify")])
+    assert probes._submit_code_httpx(acct, "http://app.test", prof, "hl@app.test", ["481920"]) is True
+    acct.client.close()
+
+
+def test_submit_code_httpx_false_without_a_verify_endpoint():
+    acct = _acct(lambda r: httpx.Response(200))
+    prof = Profile(base_url="http://app.test", endpoints=[])   # no verify-hinted endpoint -> no blind spraying
+    assert probes._submit_code_httpx(acct, "http://app.test", prof, "hl@app.test", ["481920"]) is False
+    acct.client.close()
+
+
+def test_follow_verification_completes_a_code_only_email():
+    acct = _acct(_verify_handler("/api/confirm", "481920"))
+    prof = Profile(base_url="http://app.test",
+                   endpoints=[Endpoint(path="/api/confirm", method="post", raw_path="/api/confirm")])
+    msg = EmailMessage.parse("hl@app.test", "Your code", "Your verification code is 481920")   # code, NO link
+    ver = probes._follow_verification(acct, msg, "http://app.test", prof, "hl@app.test")
+    assert ver.acted is True and ver.session is True           # code-based verification completed -> session
+    acct.client.close()
+
+
+def test_follow_verification_code_only_no_endpoint_is_na_not_a_false_fire():
+    acct = _acct(lambda r: httpx.Response(400))
+    prof = Profile(base_url="http://app.test", endpoints=[])
+    msg = EmailMessage.parse("hl@app.test", "Your code", "Your verification code is 481920")
+    ver = probes._follow_verification(acct, msg, "http://app.test", prof, "hl@app.test")
+    assert ver.acted is False                                  # a code we couldn't submit -> N/A, never a false 002
+
+
+def test_baas_follow_completes_an_email_otp_code(monkeypatch):
+    monkeypatch.setattr(probes.baas, "verify_email_link", lambda *a, **k: None)     # link path establishes nothing
+    monkeypatch.setattr(probes.baas, "verify_otp",
+                        lambda gw, key, email, code: {"access_token": "AT"} if str(code) == "481920" else None)
+    live = {"gateway": "https://ref.supabase.co", "key": "anon", "baas_creds": {"_email": "hl@app.test", "_password": None}}
+    msg = EmailMessage.parse("hl@app.test", "Code", "Your login code is 481920")
+    ver = probes._follow_verification_baas(msg, live)
+    assert ver.acted and ver.session and live["baas_session"]["access_token"] == "AT"

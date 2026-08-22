@@ -217,6 +217,29 @@ def recover(gateway: str, key: str, email: str) -> bool:
     return r.status_code in (200, 201, 202)
 
 
+def verify_otp(gateway: str, key: str, email: str, code: str) -> dict | None:
+    """Complete a Supabase EMAIL-OTP (6-digit CODE) confirmation: POST /auth/v1/verify {type, email, token: code}
+    -> a JSON session, else None. The code-based sibling of verify_email_link (which handles the LINK/token_hash).
+    Supabase labels the OTP `type=email` (magic-link/signup use `email`/`signup`), so a couple of types are tried.
+    Only ever called with an address we own and a code from our own inbox."""
+    hdrs = {"apikey": key, "Content-Type": "application/json"}
+    for typ in ("email", "signup", "magiclink"):
+        try:
+            r = httpx.post(gateway.rstrip("/") + "/auth/v1/verify",
+                           json={"type": typ, "email": email, "token": str(code)},
+                           timeout=12.0, verify=False, headers=hdrs)
+        except Exception:
+            continue
+        if r.status_code in (200, 201):
+            try:
+                data = r.json()
+            except Exception:
+                data = {}
+            if isinstance(data, dict) and data.get("access_token"):
+                return data
+    return None
+
+
 _SB_TOKEN_KEYS = ("token_hash", "token", "confirmation_token")
 
 

@@ -6361,8 +6361,6 @@ def _follow_verification(acct, msg, base, profile, email):
     email (nothing to follow) so the probe reads N/A rather than a false fire."""
     client = acct.client
     links = [ln for ln in msg.links if _same_app_link(ln, base)]
-    if not links:
-        return email_verify.Verification(acted=False)
     last = None
     for link in links[:3]:
         try:
@@ -6376,16 +6374,52 @@ def _follow_verification(acct, msg, base, profile, email):
         acct.register_response = last
     session = (auth._has_session(acct)                                       # the link itself auto-logged us in
                or any(auth._is_session_cookie(c.name) for c in client.cookies.jar))
-    if not session:   # 'verify then log in': the link verified the account; a login should now succeed. Try by
-        #               both identifiers (some apps key login on email, some on username), and CARRY the returned
-        #               session onto this account's client so the authed-surface probes reuse it authenticated.
+    if links and not session:   # 'verify then log in': the link verified the account; a login should now succeed.
+        #               Try by both identifiers (some apps key login on email, some on username), and CARRY the
+        #               returned session onto this account's client so the authed-surface probes reuse it authed.
         for ident in (email, acct.username):
             hdrs = auth.login_with_credentials(base, ident, acct.password, profile)
             if hdrs:
                 client.headers.update(hdrs)   # Cookie and/or Authorization: Bearer -> now the logged-in user
                 session = True
                 break
-    return email_verify.Verification(acted=True, session=bool(session))
+    # CODE lane (lane A): a 6-digit/alphanumeric CODE, not a link -> POST it to a DISCOVERED verify endpoint. The
+    # code-based sibling of the link path; runs when the link path established no session but a code arrived. It
+    # only ever ESTABLISHES a session (never claims failure), so a wrong endpoint/shape guess can't false-fire
+    # qa-email-002.
+    if not session and msg.codes:
+        session = _submit_code_httpx(acct, base, profile, email, msg.codes)
+    acted = bool(links) or bool(session)   # a code we couldn't complete -> not acted -> N/A, not a false fire
+    return email_verify.Verification(acted=acted, session=bool(session))
+
+
+_VERIFY_HINT = re.compile(r"verif|confirm|otp|activat|/code\b", re.I)
+
+
+def _submit_code_httpx(acct, base, profile, email, codes) -> bool:
+    """Complete a CODE-based email verification over httpx: POST an emailed code to a DISCOVERED verify endpoint
+    (path hints verify/confirm/otp/activate), across a few payload shapes, and return True iff a session is then
+    established (a Set-Cookie / token comes back). Gated to endpoints DISCOVERY found -- no blind path spraying --
+    and returns False (never a definitive failure) so a wrong-endpoint guess never fires qa-email-002. Bounded."""
+    eps = [e for e in (getattr(profile, "endpoints", None) or []) if _VERIFY_HINT.search(e.raw_path or e.path or "")]
+    if not eps:
+        return False
+    client = acct.client
+    for ep in eps[:3]:
+        path = ep.raw_path or ep.path
+        for code in codes[:2]:
+            for shape in ({"email": email, "code": str(code)}, {"email": email, "otp": str(code)},
+                          {"email": email, "token": str(code)}, {"code": str(code)}):
+                try:
+                    r = client.post(path, json=shape)
+                except (httpx.HTTPError, httpx.InvalidURL):
+                    continue
+                if r.status_code < 400:
+                    if auth.session_cookie(r) is not None:
+                        acct.register_response = r
+                    if auth._has_session(acct) or any(auth._is_session_cookie(c.name) for c in client.cookies.jar):
+                        return True
+    return False
 
 
 def _snapshot_session(acct) -> dict:
@@ -6517,6 +6551,18 @@ def _follow_verification_baas(msg, live) -> "email_verify.Verification":
         if isinstance(session, dict) and session.get("access_token"):
             live["baas_session"] = session
             return email_verify.Verification(acted=True, session=True)
+    # CODE lane (lane A): a Supabase EMAIL-OTP (6-digit code) -> /auth/v1/verify {type, email, token: code}. Runs
+    # when no link verified but a code arrived (the OTP confirmation shape). Establishes a session or abstains.
+    email = (live.get("baas_creds") or {}).get("_email")
+    if email and msg.codes:
+        for code in msg.codes[:3]:
+            try:
+                session = baas.verify_otp(gateway, key, email, code)
+            except Exception:
+                session = None
+            if isinstance(session, dict) and session.get("access_token"):
+                live["baas_session"] = session
+                return email_verify.Verification(acted=True, session=True)
     return email_verify.Verification(acted=bool(msg.links), session=False)   # link(s) but none verified -> inert
 
 
