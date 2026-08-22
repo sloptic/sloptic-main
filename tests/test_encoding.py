@@ -121,8 +121,20 @@ def test_500_on_unicode_fires_server_error(app):
     assert ctx.evidence.get("server_error") and ctx.evidence.get("kind") == "500"   # the 72 rung
 
 
-def test_non_echoing_field_is_not_a_false_positive(app):
-    assert international_input_breaks(_ctx(app, endpoints=[_ep("/noecho")]), _Probe()) is False
+def test_non_echoing_field_is_na_not_a_false_clean(app):
+    # the field accepts the value (2xx) but never echoes it -> we never SAW a round trip, so it's N/A (a "clean"
+    # would be a false negative), and the evidence records the unobservable denominator.
+    ctx = _ctx(app, endpoints=[_ep("/noecho")])
+    assert international_input_breaks(ctx, _Probe()) is None
+    assert ctx.evidence["fields_tested"] >= 1 and ctx.evidence["fields_reflecting"] == 0
+    assert "no observable international round-trip" in ctx.evidence["na_reason"]
+
+
+def test_clean_records_the_observable_denominator(app):
+    # a genuine clean carries the counts, so a corpus run can tell real handling from a vacuous non-echo
+    ctx = _ctx(app, endpoints=[_ep("/echo")])
+    assert international_input_breaks(ctx, _Probe()) is False
+    assert ctx.evidence["fields_reflecting"] >= 1 and ctx.evidence["survived"] >= 1
 
 
 def test_broken_ascii_baseline_is_na(app):

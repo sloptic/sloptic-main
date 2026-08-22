@@ -950,6 +950,11 @@ def international_input_breaks(ctx, probe) -> bool | None:
     budget = probe.probe.get("max_attempts", 60)
     tested = False
     corrupted_hit = None
+    # OBSERVABILITY instrumentation: a "clean" is only meaningful if we actually SAW a round trip. Count the
+    # observable denominator so a genuine clean (a reflecting field whose international chars survived) is
+    # distinguishable from a vacuous one (nothing reflected -> we submitted into the void). Recorded on the
+    # verdict; drives the tail-vs-recall question (SPA JSON sinks that never reflect read N/A, not false-clean).
+    fields_tested = fields_reflecting = survived = abstained = 0
     with make_client(ctx.base_url, _authed_headers(ctx), timeout=10.0, follow_redirects=True) as c:
         for action, method, fields in targets:
             for field in fields:
@@ -966,7 +971,10 @@ def international_input_breaks(ctx, probe) -> bool | None:
                 if base.status_code >= 500:
                     continue
                 tested = True
+                fields_tested += 1
                 ascii_reflects = sentinel in base.text
+                if ascii_reflects:
+                    fields_reflecting += 1                   # the value echoes -> an OBSERVABLE round trip here
                 for script, payload in _ENC_PROBES:
                     if budget <= 0:
                         break
@@ -979,20 +987,35 @@ def international_input_breaks(ctx, probe) -> bool | None:
                     if rr.status_code >= 500:                # ASCII was fine (baseline<500) -> the unicode 500s it
                         ctx.evidence.update(broke=True, server_error=True, kind="500", script=script,
                                             target=action, field=field, status=rr.status_code,
+                                            fields_tested=fields_tested, fields_reflecting=fields_reflecting,
                                             repro=_repro_from_resp(rr, matched="HTTP %d on %s input" % (rr.status_code, script)))
                         return True                          # the 72 rung: crashes on real user data
-                    if ascii_reflects and corrupted_hit is None:
-                        if _encoding_corrupted(rr.text, sentinel, payload):
+                    if ascii_reflects:
+                        verdict = _encoding_corrupted(rr.text, sentinel, payload)
+                        if verdict is True and corrupted_hit is None:
                             corrupted_hit = (action, field, script, rr)
+                        elif verdict is False:
+                            survived += 1                    # a reflecting field whose international chars came back intact
+                        elif verdict is None:
+                            abstained += 1                   # reflected but couldn't judge (%-encoded / JSON \u / stripped)
             if budget <= 0:
                 break
+    obs = dict(fields_tested=fields_tested, fields_reflecting=fields_reflecting, survived=survived, abstained=abstained)
     if corrupted_hit is not None:                            # the 32 rung: value silently mangled on round trip
         action, field, script, rr = corrupted_hit
         ctx.evidence.update(broke=True, corrupted=True, kind="corruption", script=script, target=action, field=field,
+                            **obs,
                             repro=_repro_from_resp(rr, matched="%s input reflected corrupted (mojibake / ? / U+FFFD)" % script))
         return True
-    ctx.evidence.update(broke=False)
-    return False if tested else None
+    ctx.evidence.update(broke=False, **obs)
+    if survived > 0:
+        return False                                         # observed >=1 international round trip survive -> clean
+    # tested fields, but none reflected their value (SPA JSON sink / non-echoing form) -> we never SAW a round
+    # trip, so a "clean" here would be false. Honest N/A: the recall gap a JSON create-then-read-back lane closes.
+    ctx.evidence["na_reason"] = (
+        "no observable international round-trip (%d field(s) tested, none reflected the value)" % fields_tested
+        if tested else "no writable text surface to test")
+    return None
 
 
 def stored_xss_api(ctx, probe) -> bool | None:
