@@ -204,6 +204,19 @@ def magic_link_signup(gateway: str, key: str, email: str) -> dict:
     return out
 
 
+def recover(gateway: str, key: str, email: str) -> bool:
+    """Request a Supabase password reset (POST /auth/v1/recover {email}) so the project mails a reset link to OUR
+    controlled address. Returns True when the request was accepted (2xx). Only ever call with an address we own
+    for an account we established (email_signup) -- recover is enumeration-silent, so on a non-existent account it
+    still 200s but sends nothing, which the caller must not read as broken delivery."""
+    try:
+        r = httpx.post(gateway.rstrip("/") + "/auth/v1/recover", json={"email": email},
+                       timeout=12.0, verify=False, headers={"apikey": key, "Content-Type": "application/json"})
+    except Exception:
+        return False
+    return r.status_code in (200, 201, 202)
+
+
 _SB_TOKEN_KEYS = ("token_hash", "token", "confirmation_token")
 
 

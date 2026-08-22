@@ -211,3 +211,43 @@ def test_no_resend_when_signup_is_not_announced():
 def test_receivers_are_email_receivers_and_result_is_a_dataclass():
     assert issubclass(MockReceiver, EmailReceiver) and issubclass(HttpReceiver, EmailReceiver)
     assert isinstance(_run(RegistrationOutcome(submitted=False)), EmailVerifyResult)
+
+
+# ---- the reset flow (qa-reset-001) ------------------------------------------------------------------------
+from sloptic.email_verify import ResetResult, reset_email_flow
+
+
+def test_reset_flow_na_when_no_reset_surface():
+    res = reset_email_flow(MockReceiver(), "tag", trigger=lambda addr: False, timeout=0)
+    assert res.attempted is False and "no reachable password-reset surface" in res.na_reason
+
+
+def test_reset_flow_only_ever_submits_the_owned_address():
+    rx = MockReceiver(domain="d.dev")
+    seen = {}
+
+    def trigger(addr):
+        seen["addr"] = addr
+        return True
+    reset_email_flow(rx, "tag", trigger=trigger, timeout=0)
+    assert seen["addr"] == rx.address("tag") == "hl-tag@d.dev"   # SAFETY: the flow passes only our owned mailbox
+
+
+def test_reset_flow_fires_when_no_reset_email_arrives():
+    res = reset_email_flow(MockReceiver(), "tag", trigger=lambda addr: True, timeout=0)
+    assert res.attempted and res.reset_available and res.email_arrived is False   # locked out of recovery
+    assert "no email arrived" in res.detail
+
+
+def test_reset_flow_dead_link_is_recorded():
+    rx = MockReceiver()
+    rx.inject("tag", EmailMessage.parse("hl-tag@grader.test", "Reset", "https://grader.test/reset?t=1"))
+    res = reset_email_flow(rx, "tag", trigger=lambda addr: True, follow=lambda msg: False, timeout=0)
+    assert res.email_arrived is True and res.link_alive is False and "dead" in res.detail
+
+
+def test_reset_flow_clean_when_email_arrives_with_a_live_link():
+    rx = MockReceiver()
+    rx.inject("tag", EmailMessage.parse("hl-tag@grader.test", "Reset", "https://grader.test/reset?t=1"))
+    res = reset_email_flow(rx, "tag", trigger=lambda addr: True, follow=lambda msg: True, timeout=0)
+    assert res.email_arrived is True and res.link_alive is True and isinstance(res, ResetResult)

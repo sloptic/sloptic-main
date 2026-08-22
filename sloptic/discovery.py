@@ -779,21 +779,37 @@ _MINED_LOGIN_ROUTE = re.compile(r"""["'`]/(?:log-?in|sign-?in|authenticate|accou
                                r"""|/app/(?:login|signin|sign-in|auth|account|dashboard)/""", re.I)
 _MINED_SIGNUP_ROUTE = re.compile(r"""["'`]/(?:sign-?up|register|create-account|join)\b"""
                                 r"""|/app/(?:signup|sign-up|register)/""", re.I)
+# Part 2: the FORM-bearing auth ENTRY path, CAPTURED (not just detected) so the crawl can render that exact
+# non-standard route (a code-split /auth-gateway the conventional-route render never walks). Narrower than the
+# boolean regexes above -- account/dashboard are post-login pages, not the login form, so they credit the
+# boolean but are not rendered as an entry.
+_MINED_LOGIN_PATH = re.compile(r"""["'`](/(?:[\w-]+/)*(?:log-?in|sign-?in|authenticate))\b""", re.I)
+_MINED_SIGNUP_PATH = re.compile(r"""["'`](/(?:[\w-]+/)*(?:sign-?up|register|create-account|join))\b""", re.I)
 
 
-def _mine_auth_routes(base_url, headers, js_urls, cap: int = _MINE_CHUNK_CAP) -> tuple[bool, bool]:
+def _clean_mined_path(raw: str) -> str:
+    """Normalise a mined route literal (already the capture group, no surrounding quote) to a renderable path:
+    a leading slash, no query/hash, no trailing slash."""
+    p = "/" + (raw or "").strip().strip("\"'`").lstrip("/")
+    return p.split("?")[0].split("#")[0].rstrip("/") or "/"
+
+
+def _mine_auth_routes(base_url, headers, js_urls, cap: int = _MINE_CHUNK_CAP) -> tuple[bool, bool, str | None, str | None]:
     """Grep the discovered JS chunks for auth ROUTE literals — a code-split `/login` the crawl never linked to
     and the CTA scan (_auth_triggers) never saw, so `has_auth_entrypoint` wrongly reads False and the whole auth
-    cluster goes N/A. Returns (login_seen, signup_seen). Cheap: reuses the chunk URLs the crawl already found, and
-    is only called when no auth surface turned up any other way, so the extra fetches land only where they help. A
-    false positive just makes the register lane ATTEMPT and self-gate to N/A -- never a false finding."""
+    cluster goes N/A. Returns (login_seen, signup_seen, login_path, signup_path): the booleans credit the auth
+    entrypoint (Part 1); the paths are the FORM route to RENDER so the register lane targets the real form on a
+    non-standard path (Part 2), or None. Cheap: reuses the chunk URLs the crawl already found, and is only called
+    when no auth surface turned up any other way. A false positive just makes the register lane ATTEMPT and
+    self-gate to N/A -- never a false finding."""
     chunks = [u for u in dict.fromkeys(js_urls) if (u or "").split("?")[0].endswith(".js")][:cap]
     if not chunks:
-        return False, False
+        return False, False, None, None
     login = signup = False
+    login_path = signup_path = None
     with make_client(base_url, headers, timeout=8.0, follow_redirects=True) as c:
         for u in chunks:
-            if login and signup:
+            if login and signup and login_path and signup_path:
                 break
             try:
                 text = c.get(u).text[:400_000]
@@ -801,7 +817,17 @@ def _mine_auth_routes(base_url, headers, js_urls, cap: int = _MINE_CHUNK_CAP) ->
                 continue
             login = login or bool(_MINED_LOGIN_ROUTE.search(text))
             signup = signup or bool(_MINED_SIGNUP_ROUTE.search(text))
-    return login, signup
+            if login_path is None:
+                m = _MINED_LOGIN_PATH.search(text)
+                if m:
+                    login_path = _clean_mined_path(m.group(1))
+            if signup_path is None:
+                m = _MINED_SIGNUP_PATH.search(text)
+                if m:
+                    signup_path = _clean_mined_path(m.group(1))
+    # a captured FORM path (which allows a non-standard prefix the boolean regex doesn't) also credits the
+    # entrypoint -- so /portal/login sets login even though the boolean's `"/login` anchor never matched it.
+    return login or login_path is not None, signup or signup_path is not None, login_path, signup_path
 
 
 def _endpoints_from_observed(observed, base_url) -> list:
@@ -1313,9 +1339,30 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
     # When nothing else found auth, grep the collected JS chunks for auth ROUTE literals and set the trigger. Gated
     # to the no-auth-yet case so the extra fetches are only spent where they can recover surface.
     if not (has_pw or auth[0] or auth[1]) and js_urls:
-        _ml, _ms = _mine_auth_routes(base_url, headers, js_urls)
+        _ml, _ms, _mlp, _msp = _mine_auth_routes(base_url, headers, js_urls)
         auth[0] |= _ml
         auth[1] |= _ms
+        # PART 2: render the actual mined FORM route(s) -- a non-standard code-split path (/auth-gateway) the
+        # conventional-route render (_AUTH_ROUTES) never walks -- and harvest its form, so the register lanes
+        # target the real auth surface instead of a guessed /login. Bounded (<=2), gated to the no-auth-yet case.
+        mined = [p for p in dict.fromkeys([_mlp, _msp])
+                 if p and _renderable_route(p) and p not in visited][:2]
+        if mined and render is not None:
+            for mpath, dom in (render(base_url, mined, headers=headers) or {}).items():
+                _l, _s = _auth_triggers(dom)
+                auth[0] |= _l
+                auth[1] |= _s
+                cands = _parse_forms(_FORM.findall(dom), scope_url, mpath)
+                formless = _formless_form(dom, mpath)
+                if formless is not None:
+                    cands.append(formless)
+                for form in cands:
+                    key = _form_key(form)
+                    if key not in seen_forms:
+                        seen_forms.add(key)
+                        forms.append(form)
+                        routes.setdefault(form.action, None)
+            has_pw = has_pw or any(any("pass" in n.lower() for n in f.fields) for f in forms)
     # an API AUTH ENDPOINT is an auth door too (a JSON login/signup route with no <form> and no CTA button — the
     # modern SPA-with-backend shape). has_login/has_signup already credit it; has_auth_entrypoint historically did
     # NOT, so those apps read has_login=True yet had every auth-gated probe N/A. Same source, so align them.

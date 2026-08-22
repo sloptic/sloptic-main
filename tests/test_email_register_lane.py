@@ -578,3 +578,96 @@ def test_magic_link_baas_otp_lane_when_password_signup_is_closed(monkeypatch):
     acct = probes._email_account(ctx)
     assert acct.client.headers["Authorization"] == "Bearer AT"
     acct.client.close()
+
+
+# --- PASSWORD-RESET lane (qa-reset-001) ---------------------------------------------------------------------
+
+def test_forgot_form_detects_email_only_reset_form_rejects_login_and_change():
+    forgot = Form(action="/account/forgot-password", method="post", fields=["email"])
+    login = Form(action="/login", method="post", fields=["email", "password"])   # magic/login, not reset
+    change = Form(action="/reset-password", method="post", fields=["new_password", "confirm"])  # sets a pw, email-less
+    assert auth._forgot_form([login, forgot, change]) is forgot
+    assert auth._forgot_form([login]) is None
+    assert auth._forgot_form([change]) is None                 # no email field -> not a request-a-link form
+
+
+def test_trigger_reset_httpx_posts_the_owned_address(monkeypatch):
+    posted = {}
+
+    def handler(req):
+        if req.method == "POST":
+            posted["path"], posted["body"] = req.url.path, req.content.decode()
+        return httpx.Response(200, text="If that account exists, a reset link is on its way.")
+    client = httpx.Client(base_url="http://app.test", transport=httpx.MockTransport(handler), follow_redirects=True)
+    form = Form(action="/account/forgot-password", method="post", fields=["email"])
+    ok = auth._trigger_reset_httpx(client, "http://app.test", form, "hl-r@app.test")
+    assert ok is True and posted["path"] == "/account/forgot-password" and "hl-r" in posted["body"]
+    client.close()
+
+
+def test_baas_recover_posts_the_email(monkeypatch):
+    calls = {}
+
+    def fake_post(url, json=None, **k):
+        calls["url"], calls["json"] = url, json
+        return _BaasResp(200)
+    monkeypatch.setattr(baas.httpx, "post", fake_post)
+    assert baas.recover("https://ref.supabase.co", "k", "hl@anachron.dev") is True
+    assert calls["url"].endswith("/auth/v1/recover") and calls["json"] == {"email": "hl@anachron.dev"}
+
+
+def _reset_ctx(profile):
+    ctx = pipeline._Ctx(base_url="http://app.test", client=None, profile=profile,
+                        email=MockReceiver(domain="app.test"))
+    ctx._email_cache["tag"] = "tr"
+    ctx._email_cache["address"] = ctx.email.address("tr")
+    return ctx
+
+
+def test_reset_httpx_form_lane_fires_when_no_reset_email_arrives(monkeypatch):
+    # an established account (session) + a forgot-password form + no reset email -> locked out of recovery.
+    monkeypatch.setattr(probes, "_email_register_once", lambda ctx, suffix="": None)
+    prof = Profile(base_url="http://app.test",
+                   forms=[Form(action="/account/forgot-password", method="post", fields=["email"])])
+    ctx = _reset_ctx(prof)
+    acct = _acct(lambda r: httpx.Response(200, text="reset link sent"))
+    acct.client.cookies.set("sessionid", "S")                  # -> _has_session True -> the account exists
+    ctx._email_cache["_live"] = {"acct": acct, "lane": "httpx"}
+    fired = probes.reset_email_unreliable(ctx, None)
+    assert fired is True
+    assert ctx.evidence.get("no_reset_email_60s") and ctx.evidence.get("report_only") is True   # off-score bring-up
+    acct.client.close()
+
+
+def test_reset_lane_clean_when_email_arrives_with_a_live_link(monkeypatch):
+    monkeypatch.setattr(probes, "_email_register_once", lambda ctx, suffix="": None)
+    prof = Profile(base_url="http://app.test",
+                   forms=[Form(action="/account/forgot-password", method="post", fields=["email"])])
+    ctx = _reset_ctx(prof)
+    acct = _acct(lambda r: httpx.Response(200))                 # POST reset ok; GET the link -> 200 (alive)
+    acct.client.cookies.set("sessionid", "S")
+    ctx._email_cache["_live"] = {"acct": acct, "lane": "httpx"}
+    ctx.email.inject("tr", EmailMessage.parse("hl-tr@app.test", "Reset your password",
+                                              "http://app.test/reset?token=abc"))
+    assert probes.reset_email_unreliable(ctx, None) is False    # delivered + live reset page -> recovery works
+    acct.client.close()
+
+
+def test_reset_baas_recover_lane_fires_when_no_email(monkeypatch):
+    monkeypatch.setattr(probes, "_email_register_once", lambda ctx, suffix="": None)
+    monkeypatch.setattr(probes, "_baas_gateway", lambda ctx: ("https://ref.supabase.co", "anonkey"))
+    recovered = {}
+    monkeypatch.setattr(probes.baas, "recover",
+                        lambda gw, key, email: recovered.setdefault("email", email) == email)
+    ctx = _reset_ctx(Profile(base_url="http://app.test", forms=[]))
+    ctx._email_cache["_live"] = {"lane": "baas"}               # a Supabase signup created the account
+    assert probes.reset_email_unreliable(ctx, None) is True
+    assert recovered["email"] == "hl-tr@app.test" and ctx.evidence.get("no_reset_email_60s")
+
+
+def test_reset_na_without_an_established_account(monkeypatch):
+    monkeypatch.setattr(probes, "_email_register_once", lambda ctx, suffix="": None)
+    ctx = _reset_ctx(Profile(base_url="http://app.test",
+                             forms=[Form(action="/account/forgot-password", method="post", fields=["email"])]))
+    ctx._email_cache["_live"] = {"acct": None, "lane": ""}     # register lane established nothing
+    assert probes.reset_email_unreliable(ctx, None) is None    # no controlled account to reset -> N/A, never a fire

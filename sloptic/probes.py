@@ -6692,10 +6692,107 @@ def email_verification_inert(ctx, probe) -> bool | None:
     return False       # verified + a session established -> the whole flow works
 
 
+# --- password-reset probe (qa-reset-001) --------------------------------------------------------------------
+# The RECOVERY path a user hits after forgetting their password: an independent code path (different template /
+# mail call / route) that can be broken even when signup email works. We establish an account with an address WE
+# own (the register lane), request a reset for THAT address, and watch whether the email arrives and its link is
+# alive. SAFETY: only ever the hl-<tag> mailbox we own is submitted -- never a discovered/guessed user address.
+
+def _reset_result(ctx, suffix=""):
+    """The password-reset observation for one identity (suffix), run once and memoized."""
+    cache = ctx._email_cache
+    key = "reset_result" + suffix
+    if key not in cache:
+        if getattr(ctx, "email", None) is None:
+            cache[key] = email_verify.ResetResult(
+                attempted=False, na_reason="no email receiver configured (pass --email-endpoint)")
+        elif auth._provided_session(getattr(ctx, "headers", None)):
+            cache[key] = email_verify.ResetResult(
+                attempted=False, na_reason="a session was supplied (--header); the reset flow is untestable")
+        else:
+            cache[key] = _run_reset_flow(ctx, suffix)
+    return cache[key]
+
+
+def _run_reset_flow(ctx, suffix=""):
+    """Request a password reset for an account WE established (our controlled address) and judge whether the
+    recovery path works. PRECONDITION: an account with our address must plausibly exist -- else a reset request
+    sends nothing (enumeration-silence) and 'no email' would be a false lockout. Two trigger lanes: a
+    server-rendered forgot-password form (driven with the account's own client), and Supabase /auth/v1/recover
+    when the signup lane created the account at the gateway."""
+    _email_register_once(ctx, suffix)                     # ensure an account with our address exists (memoized)
+    tag, address = _email_ctx(ctx, suffix)
+    base = ctx.base_url
+    live = ctx._email_cache.get("_live" + suffix, {})
+    acct = live.get("acct")
+    lane = live.get("lane", "")
+    profile = getattr(ctx, "profile", None)
+    # an httpx account counts as established only if it got a session OR announced email (else the signup may have
+    # been silently rejected and no account exists); a Supabase signup lane created the user at the gateway.
+    httpx_account = acct is not None and (auth._has_session(acct) or
+                    email_verify.announces_pending_email(_resp_text(acct.register_response)))
+    baas_account = lane.startswith("baas")
+    forgot = auth._forgot_form(profile.forms) if profile is not None else None
+    if not (httpx_account or baas_account):
+        return email_verify.ResetResult(
+            attempted=False, na_reason="no established account with a controlled address to request a reset for")
+    used: dict = {}
+
+    def trigger(addr):
+        if httpx_account and forgot is not None and auth._trigger_reset_httpx(acct.client, base, forgot, addr):
+            used["lane"] = "form"
+            return True
+        if baas_account:
+            gw = _baas_gateway(ctx)
+            if gw is not None and baas.recover(gw[0], gw[1], addr):
+                used["lane"] = "baas"
+                return True
+        return False
+
+    def follow(msg):
+        # only the app-hosted reset link (form lane) is a GET-able page; a Supabase recover link is a gateway
+        # endpoint a bare GET can't judge, so leave link_alive None there (delivery is still judged).
+        if used.get("lane") != "form" or acct is None:
+            return None
+        for link in [ln for ln in msg.links if _same_app_link(ln, base)][:3]:
+            try:
+                r = acct.client.get(link)
+            except (httpx.HTTPError, httpx.InvalidURL):
+                continue
+            return 200 <= r.status_code < 400
+        return None
+
+    return email_verify.reset_email_flow(ctx.email, tag, trigger, follow, timeout=_EMAIL_ANNOUNCED_TIMEOUT)
+
+
+def reset_email_unreliable(ctx, probe) -> bool | None:
+    """qa-reset-001: an account we established cannot be recovered -- the password-reset email never arrives (the
+    user is locked out of recovery), or it arrives but its link is dead. REPORT_ONLY during bring-up (off-score)
+    until the corpus admission-test validates the family."""
+    ctx.evidence["report_only"] = True
+    res = _reset_result(ctx)
+    if not res.attempted or not res.reset_available:
+        ctx.evidence["na_reason"] = res.na_reason or "no testable password-reset flow"
+        return None
+    ctx.evidence["reset_available"] = True
+    if res.message is not None:
+        ctx.evidence["subject"] = (res.message.subject or "")[:120]
+    if not res.email_arrived:
+        ctx.evidence["no_reset_email_60s"] = True         # escalator -> top rung (locked out of recovery)
+        ctx.evidence["detail"] = res.detail
+        return True
+    if res.link_alive is False:
+        ctx.evidence["reset_link_dead"] = True            # escalator -> mid rung (broken reset page)
+        ctx.evidence["detail"] = res.detail
+        return True
+    return False    # reset email arrived and (link alive, or not GET-followable) -> recovery works
+
+
 PREDICATES = {
     "lighthouse_audit": lighthouse_audit,
     "email_never_arrives": email_never_arrives,
     "email_verification_inert": email_verification_inert,
+    "reset_email_unreliable": reset_email_unreliable,
     "lighthouse_perf_score": lighthouse_perf_score,
     "sqli_auth_bypass": sqli_auth_bypass,
     "api_sqli": api_sqli,
@@ -6788,6 +6885,7 @@ _PREDICATE_REASONS = {
     "lighthouse_audit": "a Lighthouse performance audit is below its passing threshold",
     "email_never_arrives": "signup is email-verification-gated but no confirmation email arrives -> the user is locked out",
     "email_verification_inert": "the confirmation email arrives but acting on its link establishes no session -> verification is broken",
+    "reset_email_unreliable": "an account we established cannot be recovered -> the password-reset email never arrives, or its link is dead",
     "lighthouse_perf_score": "the overall Lighthouse performance score is below the green line (slop = its shortfall under 90)",
     "sqli_auth_bypass": "login bypassed by a SQL-injection payload",
     "api_sqli": "a parameter is SQL-injectable (error / boolean / UNION / time-based)",

@@ -547,6 +547,46 @@ def _auth_shaped(r: httpx.Response) -> bool:
     return "json" in ct or bool(r.headers.get_list("set-cookie")) or _bearer_token(r) is not None
 
 
+_FORGOT_HINTS = ("forgot", "reset", "recover", "password-reset", "password_reset", "lost-password",
+                 "lost_password", "recovery")
+
+
+def _forgot_form(forms: list[Form]) -> Form | None:
+    """A FORGOT-PASSWORD form: an email field, NO password field (you request a reset link, you don't set a
+    password here), and a forgot/reset/recover-hinted action. Email-only + the reset hint keeps it distinct from
+    the login form and from a magic-link form (_email_only_form's auth hints don't include forgot/reset)."""
+    cands = [
+        f for f in forms
+        if any(("email" in n.lower() or "mail" in n.lower()) for n in f.fields)
+        and not any("pass" in n.lower() or "pwd" in n.lower() for n in f.fields)
+        and any(h in f.action.lower() for h in _FORGOT_HINTS)
+    ]
+    return cands[0] if cands else None
+
+
+def _trigger_reset_httpx(client: httpx.Client, base_url: str, form: Form, email: str) -> bool:
+    """POST a forgot-password form with OUR controlled address so the app mails us a reset link. Returns True when
+    the request was submitted (2xx/3xx), False on a transport error or a 4xx/5xx that means the request did not
+    take. CSRF-handled like _register_httpx. NEVER call this with anything but an address we own."""
+    data = {}
+    for name in form.fields:
+        low = name.lower()
+        data[name] = email if ("email" in low or "mail" in low) else "hl_reset"
+    try:
+        try:
+            token = _csrf_token(client.get(form.action).text)
+            if token:
+                for name in form.fields:
+                    if is_csrf_field(name):
+                        data[name] = token
+        except (httpx.HTTPError, httpx.InvalidURL):
+            pass
+        resp = client.request("POST", form.action, data=data)
+    except (httpx.HTTPError, httpx.InvalidURL):
+        return False
+    return resp.status_code < 400
+
+
 def _register_passwordless(base_url: str, profile: Profile, suffix: str = "",
                            email: str | None = None) -> Account | None:
     """MAGIC-LINK lane (server-rendered): POST a passwordless email-only auth form with OUR controlled address

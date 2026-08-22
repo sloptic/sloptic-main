@@ -252,6 +252,57 @@ class EmailVerifyResult:
     detail: str = ""
 
 
+@dataclass
+class ResetResult:
+    """What testing the password-reset (account-recovery) flow established. Run once per app, memoized. Like the
+    signup flow but for the RECOVERY path a user hits after forgetting their password: an independent code path
+    (often a different template / mail call / route) that can be broken even when signup email works."""
+    attempted: bool                     # a password-reset was requested for an account WE own (our address)
+    reset_available: bool = False       # a forgot-password surface was found and submitted for our address
+    email_arrived: bool = False
+    link_alive: bool | None = None      # followed the reset link: True 2xx (alive) / False 4xx (dead) / None none
+    message: EmailMessage | None = None
+    na_reason: str = ""
+    detail: str = ""
+
+
+def reset_email_flow(
+    receiver: EmailReceiver,
+    tag: str,
+    trigger: Callable[[str], bool],
+    follow: Callable[[EmailMessage], bool | None] | None = None,
+    *,
+    timeout: float = 60.0,
+) -> ResetResult:
+    """Request a password reset for an account WE control and decide whether the recovery flow works. The decision
+    tree, with the false positive it is built to avoid:
+
+      * no reachable forgot-password surface, or we could not submit -> N/A, we tested nothing.
+      * a reset was requested (for OUR address, an account we established) but no email arrived within `timeout`
+        -> the recovery path is broken; a user who forgets their password is locked out for good.
+      * the reset email arrived: follow its link. Alive (2xx) -> the flow works. Dead (4xx) -> broken recovery.
+
+    SAFETY: `trigger` is only ever called with the address `receiver.address(tag)` -- an hl-<tag> mailbox WE own.
+    The caller must never submit a discovered or guessed user address to a reset endpoint. The account-exists
+    precondition (so 'no email' means broken-delivery, not 'no such account' enumeration-silence) is the caller's
+    to enforce, since only it knows whether the register lane established an account with our address."""
+    address = receiver.address(tag)
+    if not trigger(address):
+        return ResetResult(attempted=False,
+                           na_reason="no reachable password-reset surface for a controlled account")
+    msg = receiver.poll(tag, timeout)
+    if msg is None:
+        return ResetResult(attempted=True, reset_available=True, email_arrived=False,
+                           detail=f"requested a password reset for {address} but no email arrived within "
+                                  f"{timeout:.0f}s -- the account-recovery path is broken")
+    res = ResetResult(attempted=True, reset_available=True, email_arrived=True, message=msg)
+    if follow is not None:
+        res.link_alive = follow(msg)
+        if res.link_alive is False:
+            res.detail = "the password-reset email arrived but its link is dead (no working reset page)"
+    return res
+
+
 def verify_email_flow(
     receiver: EmailReceiver,
     tag: str,

@@ -1,0 +1,34 @@
+id: qa-reset-001
+bundle: qa
+category: password-reset
+pool: public
+evidence_model: provable
+# REPORT_ONLY during bring-up (the predicate forces off-score via ctx.evidence["report_only"]) until the corpus
+# admission-test validates the family; the severity below is what it takes once promoted. The RECOVERY path a
+# user hits after forgetting their password is an INDEPENDENT code path (different template / mail call / route)
+# that can be broken even when signup email works. An EVIDENCE LADDER on its reliability (functional-suitability,
+# Nielsen 4 -- account recovery is a core feature; a broken one locks a forgetful user out for good):
+#   60  no reset email within 60s for an account we established -> locked out of recovery (the catastrophe)
+#   24  the reset email arrives but its link is dead (no working reset page) -> broken recovery
+# Priced a notch below qa-email-001's 72 top rung: fewer users hit reset than hit signup, so expected harm is
+# lower, but the per-user outcome (permanent lockout) is the same class.
+severity:
+  iso_25010: "functional-suitability"
+  nielsen: "4"
+  range: [24, 60]
+  default: 24
+  escalators:
+    - {evidence: reset_link_dead, point: 24, vrt_variant: "the password-reset email arrived but its link is dead -- broken recovery"}
+    - {evidence: no_reset_email_60s, point: 60, vrt_variant: "no password-reset email within 60s for an established account -> locked out of recovery"}
+applicability:
+  requires: [has_auth_entrypoint]
+probe:
+  predicate: reset_email_unreliable
+tp_definition: |
+  TP: an account we established with an address WE own cannot be recovered -- after requesting a password reset
+  for that address, no reset email arrives within 60s (locked out of recovery), OR the reset email arrives but
+  its same-host link is dead (4xx / no working reset page). SAFETY: only ever the hl-<tag> mailbox we own is
+  submitted to a reset endpoint, never a discovered or guessed user address.
+  NOT (confounders): no account was established with our address (a reset would send nothing -- enumeration
+  silence, not broken delivery) -> N/A; no reachable forgot-password surface -> N/A; the reset email arrives with
+  an app-hosted live link -> clean; a CAPTCHA/SSO blocks the account -> N/A.
