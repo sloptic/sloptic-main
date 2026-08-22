@@ -939,11 +939,33 @@ def _encoding_corrupted(text: str, sentinel: str, expected: str):
     return None                                            # reflected but ambiguous (stripped / %-encoded) -> abstain
 
 
+def _submit_and_observe(c, method, action, fields, field, sentinel, value):
+    """Submit `value` in `field` and return (observed_text, status) -- the text where the sentinel round-trips:
+    the POST/GET response itself (an echoing endpoint), ELSE a READ-BACK GET of the endpoint (a REST create that
+    returns {id} but whose listing shows the stored value -- the SPA-sink recall lane). observed_text is None
+    when the value isn't observable anywhere; status is the submit status (for the 5xx check)."""
+    try:
+        rr = _xss_send(c, method, action, {fn: (value if fn == field else "hl") for fn in fields})
+    except (httpx.HTTPError, httpx.InvalidURL):
+        return None, None
+    if sentinel in rr.text:
+        return rr.text, rr.status_code
+    if (method or "get").lower() in ("post", "postjson", "put", "patch"):
+        try:
+            rb = c.request("GET", action.split("?")[0])          # read the value back from the endpoint/listing
+            if sentinel in rb.text:
+                return rb.text, rr.status_code
+        except (httpx.HTTPError, httpx.InvalidURL):
+            pass
+    return None, rr.status_code
+
+
 def international_input_breaks(ctx, probe) -> bool | None:
     """qa-input-002: the app corrupts (32) or 500s (72) on international / multibyte input. Baselines each field
     with an ASCII marker first, so a generally-broken endpoint is never blamed on encoding, and only credits the
-    500 rung when ASCII returns 2xx but the unicode payload 5xxs. Uses the register-lane session (reach fields
-    behind login). N/A when there is no writable text surface to test."""
+    500 rung when ASCII returns 2xx but the unicode payload 5xxs. Observes the round trip via the response echo
+    OR a READ-BACK GET (a JSON create that doesn't echo but whose listing shows the value -- the SPA sink).
+    Uses the register-lane session (reach fields behind login). N/A when there's no writable text surface."""
     targets = _injectable_targets(ctx.profile) + _json_body_targets(ctx.profile)
     if not targets:
         return None
@@ -951,9 +973,8 @@ def international_input_breaks(ctx, probe) -> bool | None:
     tested = False
     corrupted_hit = None
     # OBSERVABILITY instrumentation: a "clean" is only meaningful if we actually SAW a round trip. Count the
-    # observable denominator so a genuine clean (a reflecting field whose international chars survived) is
-    # distinguishable from a vacuous one (nothing reflected -> we submitted into the void). Recorded on the
-    # verdict; drives the tail-vs-recall question (SPA JSON sinks that never reflect read N/A, not false-clean).
+    # observable denominator (echo OR read-back) so a genuine clean (survived intact) is distinguishable from a
+    # vacuous one (nothing observable). Drives the tail-vs-recall read.
     fields_tested = fields_reflecting = survived = abstained = 0
     with make_client(ctx.base_url, _authed_headers(ctx), timeout=10.0, follow_redirects=True) as c:
         for action, method, fields in targets:
@@ -964,48 +985,43 @@ def international_input_breaks(ctx, probe) -> bool | None:
                 sentinel = "HLenc" + secrets.token_hex(3)
                 # BASELINE: an ASCII value must round-trip 2xx first, else this endpoint is broken regardless of
                 # encoding (a 500 on ascii, a dead route) -> skip; never blame encoding for a generally-broken field.
-                try:
-                    base = _xss_send(c, method, action, {fn: (sentinel if fn == field else "hl") for fn in fields})
-                except (httpx.HTTPError, httpx.InvalidURL):
-                    continue
-                if base.status_code >= 500:
+                btext, bstatus = _submit_and_observe(c, method, action, fields, field, sentinel, sentinel)
+                if bstatus is None or bstatus >= 500:
                     continue
                 tested = True
                 fields_tested += 1
-                ascii_reflects = sentinel in base.text
-                if ascii_reflects:
-                    fields_reflecting += 1                   # the value echoes -> an OBSERVABLE round trip here
+                observable = btext is not None                   # echo OR read-back showed the value
+                if observable:
+                    fields_reflecting += 1
                 for script, payload in _ENC_PROBES:
                     if budget <= 0:
                         break
                     budget -= 1
-                    marked = sentinel + payload
-                    try:
-                        rr = _xss_send(c, method, action, {fn: (marked if fn == field else "hl") for fn in fields})
-                    except (httpx.HTTPError, httpx.InvalidURL):
-                        continue
-                    if rr.status_code >= 500:                # ASCII was fine (baseline<500) -> the unicode 500s it
+                    ptext, pstatus = _submit_and_observe(c, method, action, fields, field, sentinel, sentinel + payload)
+                    if pstatus is not None and pstatus >= 500:   # ASCII was fine (baseline<500) -> the unicode 500s it
                         ctx.evidence.update(broke=True, server_error=True, kind="500", script=script,
-                                            target=action, field=field, status=rr.status_code,
+                                            target=action, field=field, status=pstatus,
                                             fields_tested=fields_tested, fields_reflecting=fields_reflecting,
-                                            repro=_repro_from_resp(rr, matched="HTTP %d on %s input" % (rr.status_code, script)))
-                        return True                          # the 72 rung: crashes on real user data
-                    if ascii_reflects:
-                        verdict = _encoding_corrupted(rr.text, sentinel, payload)
+                                            repro=_repro("POST", ctx.base_url.rstrip("/") + action,
+                                                         matched="HTTP %d on %s input" % (pstatus, script)))
+                        return True                              # the 72 rung: crashes on real user data
+                    if observable and ptext is not None:
+                        verdict = _encoding_corrupted(ptext, sentinel, payload)
                         if verdict is True and corrupted_hit is None:
-                            corrupted_hit = (action, field, script, rr)
+                            corrupted_hit = (action, field, script)
                         elif verdict is False:
-                            survived += 1                    # a reflecting field whose international chars came back intact
+                            survived += 1                        # international chars came back intact
                         elif verdict is None:
-                            abstained += 1                   # reflected but couldn't judge (%-encoded / JSON \u / stripped)
+                            abstained += 1                       # observed but couldn't judge (%-encoded / JSON \u)
             if budget <= 0:
                 break
     obs = dict(fields_tested=fields_tested, fields_reflecting=fields_reflecting, survived=survived, abstained=abstained)
     if corrupted_hit is not None:                            # the 32 rung: value silently mangled on round trip
-        action, field, script, rr = corrupted_hit
+        action, field, script = corrupted_hit
         ctx.evidence.update(broke=True, corrupted=True, kind="corruption", script=script, target=action, field=field,
                             **obs,
-                            repro=_repro_from_resp(rr, matched="%s input reflected corrupted (mojibake / ? / U+FFFD)" % script))
+                            repro=_repro("POST", ctx.base_url.rstrip("/") + action,
+                                         matched="%s input round-tripped corrupted (mojibake / ? / U+FFFD)" % script))
         return True
     ctx.evidence.update(broke=False, **obs)
     if survived > 0:

@@ -13,6 +13,8 @@ from sloptic.schema import Endpoint, Form, Profile
 
 
 class _App(http.server.BaseHTTPRequestHandler):
+    last = ""                                                    # the single latest stored value (read-back lane)
+
     def log_message(self, *a):
         pass
 
@@ -40,10 +42,25 @@ class _App(http.server.BaseHTTPRequestHandler):
             self._send("boom", code=500) if has_unicode else self._send("<p>ok</p>")
         elif path == "/noecho":                                  # 200 but never echoes the value
             self._send("<p>thanks</p>")
+        elif path in ("/api/notes", "/api/clean"):               # READ-BACK: the create's listing (single latest)
+            self._send("<p>%s</p>" % _App.last)
         elif path == "/brokenascii":                             # 500 even on the ASCII baseline
             self._send("broken", code=500)
         else:
             self._send("<p>home</p>")
+
+    def do_POST(self):
+        import json as _j
+        import urllib.parse as _u
+        path = urlparse(self.path).path
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0) or 0)).decode("utf-8", "replace")
+        try:
+            val = _j.loads(body).get("text", "")
+        except Exception:
+            val = _u.parse_qs(body).get("text", [""])[0]
+        # a REST create that returns {id} and DOES NOT echo the value -> only a read-back GET can observe it
+        _App.last = val.encode("utf-8").decode("latin-1") if path == "/api/notes" else val   # notes=mojibake, clean=intact
+        self._send('{"id":1}', ctype="application/json")
 
 
 @pytest.fixture
@@ -144,3 +161,18 @@ def test_broken_ascii_baseline_is_na(app):
 
 def test_na_without_a_text_surface(app):
     assert international_input_breaks(_ctx(app), _Probe()) is None
+
+
+# ---- read-back lane: a non-echoing JSON create whose stored value is only visible on a GET ------------------
+
+def test_readback_lane_fires_corruption_on_a_nonechoing_create(app):
+    # POST /api/notes returns {id} (no echo); GET /api/notes shows the STORED (mojibaked) value -> read-back catches it
+    ctx = _ctx(app, forms=[Form("/api/notes", "post", ["text"])])
+    assert international_input_breaks(ctx, _Probe()) is True
+    assert ctx.evidence.get("corrupted") and ctx.evidence.get("fields_reflecting") >= 1   # observed via read-back
+
+
+def test_readback_lane_clean_when_create_stores_intact(app):
+    ctx = _ctx(app, forms=[Form("/api/clean", "post", ["text"])])
+    assert international_input_breaks(ctx, _Probe()) is False
+    assert ctx.evidence.get("survived") >= 1
