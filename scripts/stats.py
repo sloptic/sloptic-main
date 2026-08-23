@@ -110,6 +110,25 @@ def _histogram(scores, bins=10, width=44):
     return out
 
 
+def _modalities(scores, top=8):
+    """The score distribution's MODES -- the exact values >1 app share, and how many -- plus the de-clump metric.
+    After the float/spectrum scoring (continuous-measurement probes emit fractional penalties), a healthy grade
+    is mostly UNIQUE with only a few structural clumps: 0 (fully clean) and small integers where only binary
+    probes fired. A big NON-zero, non-integer clump means the continuous probes failed to de-clump those apps
+    -> the thing the float work targets. Lets you SEE the spread at a glance rather than eyeball the histogram."""
+    if not scores:
+        return ["  (no scores)"]
+    c = Counter(round(s, 1) for s in scores)
+    n, uniq = len(scores), len(c)
+    top_modes = c.most_common(top)
+    clumps = [(v, k) for v, k in top_modes if k > 1]                       # (value, count) with a real tie
+    out = [f"  spread: {uniq}/{n} distinct ({100 * uniq / n:.0f}% unique)  ·  "
+           f"{n - uniq} app(s) tied  ·  biggest clump {top_modes[0][1]}×{top_modes[0][0]:g}"]
+    out.append("  top modes: " + ("  ".join(f"{k}×{v:g}" for v, k in clumps) if clumps
+                                   else "none — every score is distinct"))
+    return out
+
+
 def _curl(repro):
     """Render a repro record as a copy-pasteable curl command (Burp Repeater: 'Paste from curl'). Every
     single-quoted field is shell-escaped so a payload's own quote can't break the command."""
@@ -545,6 +564,9 @@ def main():
         print(f"      ├─ repo-deployed  {_stat_line([r['slop_score'] for r in graded if _source(r) == 'repo'])}")
         print(f"      └─ live-URL       {_stat_line([r['slop_score'] for r in graded if _source(r) == 'url'])}")
     for line in _histogram(scores):
+        print(line)
+    print(f"\n    modalities  (score clumps — float/spectrum scoring should keep this mostly unique):")
+    for line in _modalities(scores):
         print(line)
     print(f"\n    slop concentration by category (damped, summed across apps):")
     for cat, v in sorted(cat_total.items(), key=lambda x: -x[1])[:12]:

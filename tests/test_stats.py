@@ -7,7 +7,7 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
-from stats import _is_graded, by_hackathon, lighthouse_scores  # noqa: E402
+from stats import _is_graded, _modalities, by_hackathon, lighthouse_scores  # noqa: E402
 
 from sloptic.eligibility import is_ungradeable_challenge  # noqa: E402
 
@@ -103,3 +103,18 @@ def test_lighthouse_scores_summarize_performance_and_empty_otherwise():
     assert s["green_n"] == 1 and s["pct_green"] == 50.0   # only the 90 is >=90 (green -> zero perf slop)
     # a pre-Lighthouse corpus (no scores) -> n=0, all None -> the (b2) section self-skips
     assert lighthouse_scores([_rec(), _rec()])["performance"]["n"] == 0
+
+
+def test_modalities_reports_spread_and_clumps():
+    # the float/spectrum scoring de-clumps the distribution; _modalities surfaces the residual clumps + the
+    # unique fraction so you can SEE the spread. 8 scores, 5 distinct: 13.7×3, 0.0×2, and three singletons.
+    scores = [13.7, 13.7, 13.7, 0.0, 0.0, 45.6, 12.5, 88.1]
+    out = _modalities(scores)
+    assert "5/8 distinct (62% unique)" in out[0]
+    assert "3 app(s) tied" in out[0] and "biggest clump 3×13.7" in out[0]
+    assert "3×13.7" in out[1] and "2×0" in out[1]         # both real clumps listed; the three singletons omitted
+
+
+def test_modalities_none_when_every_score_is_distinct():
+    out = _modalities([12.5, 13.7, 45.6])
+    assert "100% unique" in out[0] and "none — every score is distinct" in out[1]
