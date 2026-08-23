@@ -6288,7 +6288,7 @@ def lighthouse_perf_score(ctx, probe) -> bool | None:
         return None
     scale = probe.probe.get("scale", 1.0)
     floor = probe.probe.get("green_floor", 0.90)      # Lighthouse's green cutoff: at/above it -> no perf slop
-    slop = round(max(0.0, floor - score) * 100 * scale)
+    slop = round(max(0.0, floor - score) * 100 * scale, 1)   # 1-decimal FLOAT: keep the continuous perf spread
     ctx.evidence.update(performance=round(score * 100), runs=rep.get("runs"), versions=rep.get("versions"),
                         metrics=lighthouse.metric_breakdown(rep),
                         tier=("good" if score >= 0.90 else "needs-improvement" if score >= 0.50 else "poor"),

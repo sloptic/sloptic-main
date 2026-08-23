@@ -78,20 +78,24 @@ def _damped_total(counted: list[Outcome], decay: float) -> float:
     return total
 
 
-def compute_slop_score(outcomes: list[Outcome], decay: float = CATEGORY_DECAY) -> int:
+def compute_slop_score(outcomes: list[Outcome], decay: float = CATEGORY_DECAY) -> float:
+    """The slop score, to ONE DECIMAL. Rounded to 1dp (not int) so the CONTINUOUS-measurement probes (Lighthouse
+    shortfall, contrast shortfall, broken-link / dead-control fraction) spread apps that discrete integer
+    penalties collapsed onto the same value -- finer percentile resolution where the signal is genuinely
+    continuous. Binary probes stay integer-penaltied; the decimal only carries the measurable probes' variance."""
     fired = _escalate_corroborated([o for o in outcomes if o.outcome == "slop_detected"])
-    return round(_damped_total(fired, decay))
+    return round(_damped_total(fired, decay), 1)
 
 
-def compute_axis_slop(outcomes: list[Outcome], decay: float = CATEGORY_DECAY) -> dict[str, int]:
+def compute_axis_slop(outcomes: list[Outcome], decay: float = CATEGORY_DECAY) -> dict[str, float]:
     """The damped slop subtotal per bundle (security / qa / performance) — unbounded, lower = better, in
-    the SAME units as slop_score. A pure decomposition, not a reweighting: every category belongs to one
-    bundle, so the subtotals sum to slop_score. No caps, no axis multipliers, no 0-100 normalization."""
+    the SAME units as slop_score (1 decimal). A pure decomposition, not a reweighting: every category belongs to
+    one bundle, so the subtotals sum to slop_score. No caps, no axis multipliers, no 0-100 normalization."""
     fired = _escalate_corroborated([o for o in outcomes if o.outcome == "slop_detected"])   # same as slop_score
     by_bundle: dict[str, list[Outcome]] = defaultdict(list)
     for o in fired:
         by_bundle[o.bundle].append(o)
-    return {bundle: round(_damped_total(outs, decay)) for bundle, outs in by_bundle.items()}
+    return {bundle: round(_damped_total(outs, decay), 1) for bundle, outs in by_bundle.items()}
 
 
 def coverage_metrics(outcomes: list[Outcome]) -> dict:

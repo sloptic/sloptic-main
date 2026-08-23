@@ -29,9 +29,9 @@ def test_backend_schema_disclosure_subsumed_by_data_leak():
 
 
 def test_diminishing_returns_within_category():
-    # 10 + 10*0.6 + 10*0.36 = 19.6 -> 20
+    # 10 + 10*0.6 + 10*0.36 = 19.6 (1-decimal float scoring keeps the fractional part now)
     outs = [_o("a", "crash", 10), _o("b", "crash", 10), _o("c", "crash", 10)]
-    assert compute_slop_score(outs) == 20
+    assert compute_slop_score(outs) == 19.6
 
 
 def test_distinct_categories_sum_in_full():
@@ -46,9 +46,9 @@ def test_clean_and_na_contribute_zero():
 
 
 def test_highest_penalty_anchors_a_category():
-    # within a category the worst counts full, the cheaper one decays: 40 + 8*0.6 = 44.8 -> 45
+    # within a category the worst counts full, the cheaper one decays: 40 + 8*0.6 = 44.8
     outs = [_o("a", "injection", 8), _o("b", "injection", 40)]
-    assert compute_slop_score(outs) == 45
+    assert compute_slop_score(outs) == 44.8
 
 
 def test_axis_slop_decomposes_and_sums_to_total():
@@ -112,10 +112,10 @@ def test_csp_escalates_when_xss_fires():
 
 def test_session_flags_escalate_on_xss_and_decay_together():
     # no-HttpOnly (15) + JWT-in-localStorage (15) both escalate to 28 under XSS; same 'session' category so the
-    # second decays: 28 + 28*0.6 = 44.8; plus the XSS (35) -> round(35 + 44.8) = 80
+    # second decays: 28 + 28*0.6 = 44.8; plus the XSS (35) -> 79.8 (1-decimal float scoring)
     outs = [_o("sec-session-001", "session", 15), _o("sec-session-005", "session", 15),
             _o("sec-xss-001", "xss", 35)]
-    assert compute_slop_score(outs) == round(35 + 28 + 28 * 0.6)
+    assert compute_slop_score(outs) == round(35 + 28 + 28 * 0.6, 1)
 
 
 def test_no_escalation_without_the_corroborating_vuln():

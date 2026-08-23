@@ -330,7 +330,10 @@ def _run_probe(probe: Probe, ctx: _Ctx, client: httpx.Client, profile: Profile) 
             elif probe.severity is not None:                              # > raw penalty_override (a11y/perf code
                 pen = _severity_penalty(probe.severity, ev)                # compute) > nominal probe.penalty.
             elif isinstance(override, (int, float)) and override >= 0:
-                pen = max(1, min(round(override), _PENALTY_CAP))
+                # keep 1-decimal FLOAT: the continuous-measurement probes (lighthouse/contrast/link+control
+                # fraction) set a fractional override, and rounding to int here would re-clump exactly the
+                # spread we want. Discrete probes set whole numbers, so this is a no-op for them.
+                pen = max(1.0, min(round(float(override), 1), _PENALTY_CAP))
         return [_outcome(probe, "slop_detected" if slop else "clean", pen if slop else 0,
                          target, reason=describe(probe) if slop else "", evidence=ev)]
     na_if_absent = probe.probe.get("na_if_absent", False)
