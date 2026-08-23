@@ -4813,6 +4813,21 @@ def console_errors_present(ctx, probe) -> bool:
 
 
 _A11Y_TIER = {"critical": 20, "serious": 12, "moderate": 7, "minor": 3}
+
+
+def _contrast_penalty(shortfall: float) -> float:
+    """The CONTINUOUS color-contrast penalty from the shortfall (measured/required), replacing the 4 discrete
+    bands: piecewise-linear through the WCAG-anchored tier points (0.30->20 critical, 0.50->12 serious,
+    0.75->7 moderate, 1.0->3 minor), flat 20 below 0.30 (effectively invisible). De-quantizes the largest single
+    flattening in a11y (contrast fires on ~55% of the corpus) WITHOUT moving the tier magnitudes -- a value at a
+    band boundary scores exactly what it did before, only the between-boundary values now vary."""
+    pts = ((0.30, 20.0), (0.50, 12.0), (0.75, 7.0), (1.0, 3.0))
+    if shortfall <= pts[0][0]:
+        return pts[0][1]
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+        if shortfall <= x1:
+            return round(y0 + (y1 - y0) * (shortfall - x0) / (x1 - x0), 1)
+    return pts[-1][1]
 # RE-PRICED off v11 (1,531 scored apps), because one category had become a third of the whole measurement.
 # Measured shares of total corpus penalty at the old 30/18/10/4: accessibility 34.0%, security-headers 24.4%,
 # web-vitals 10.4%. a11y fired on 73.6% of apps and was the largest single term in the score by a wide margin.
@@ -4842,7 +4857,7 @@ _STATIC_A11Y_IMPACT = {"missing-lang": "serious", "img-missing-alt": "critical",
                        "control-no-accessible-name": "critical", "low-contrast": "serious"}
 
 
-def _a11y_penalty(impacts: dict) -> int:
+def _a11y_penalty(impacts: dict, contrast_pen: float | None = None) -> float:
     """Diminishing-returns sum of the a11y penalty: each DISTINCT violated rule contributes its impact tier,
     but the worst counts FULL and each additional decays by _A11Y_DECAY (sorted desc) — the SAME damper every
     other multi-finding category gets. a11y was the lone raw-SUM category, which let barriers stack to a
@@ -4854,9 +4869,12 @@ def _a11y_penalty(impacts: dict) -> int:
     Tiers aim weight at exclusion over cosmetics; the live values are _A11Y_TIER (currently critical 20 >
     serious 12 > moderate 7 > minor 3) — read them there rather than here, because this sentence spelled out
     the PRE-re-price 30/18/10/4 for as long as it took someone to notice."""
-    tiers = sorted((_A11Y_TIER.get(level, _A11Y_TIER["minor"])
-                    for level, n in impacts.items() for _ in range(n)), reverse=True)
-    return round(sum(v * (_A11Y_DECAY ** i) for i, v in enumerate(tiers)))
+    tiers = [_A11Y_TIER.get(level, _A11Y_TIER["minor"])
+             for level, n in impacts.items() for _ in range(n)]
+    if contrast_pen is not None:
+        tiers.append(contrast_pen)   # the CONTINUOUS color-contrast barrier (a float shortfall penalty, not a tier)
+    tiers.sort(reverse=True)
+    return round(sum(v * (_A11Y_DECAY ** i) for i, v in enumerate(tiers)), 1)   # 1-decimal, like the score
 
 
 _CONTRAST_BANDS = ((0.30, "critical"), (0.50, "serious"), (0.75, "moderate"), (1.01, "minor"))
@@ -4925,15 +4943,20 @@ def a11y_violations_present(ctx, probe) -> bool:
     advisory = [v for v in viols if not _a11y_scored(v)]
     impacts: dict[str, int] = {}
     worst_shortfall = None
+    contrast_pen = None
     for v in scored:
         level = v.get("impact")
         if v["id"] == "color-contrast":
             graded = _contrast_level(v.get("contrast") or [])
             if graded:
-                level, worst_shortfall = graded
+                _lvl, worst_shortfall = graded
+                # CONTINUOUS contrast (not a discrete tier): the worst node's shortfall -> a float penalty,
+                # kept OUT of the tier-count impacts so it enters the a11y sum as its own graded barrier.
+                contrast_pen = max(contrast_pen or 0.0, _contrast_penalty(worst_shortfall))
+                continue
         impacts[level] = impacts.get(level, 0) + 1
     ctx.evidence.update(violations=len(scored), rules=sorted({v["id"] for v in scored})[:15],
-                        impacts=impacts, engine="axe-core", penalty_override=_a11y_penalty(impacts))
+                        impacts=impacts, engine="axe-core", penalty_override=_a11y_penalty(impacts, contrast_pen))
     if worst_shortfall is not None:
         ctx.evidence["contrast_shortfall"] = round(worst_shortfall, 2)
     if advisory:   # OFF-SCORE: captured for the 2026.3 re-grade to measure decorrelation, never scored here

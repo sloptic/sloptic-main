@@ -182,11 +182,11 @@ def test_a11y_penalty_damps_stacked_barriers():
     critical barrier cost 30 against a security ceiling of 40. The SHAPE is unchanged — worst counts full, each
     additional decays by 0.6 — only the tier values moved."""
     from sloptic.probes import _a11y_penalty
-    assert _a11y_penalty({"serious": 1}) == 12                  # a lone contrast miss
+    assert _a11y_penalty({"serious": 1}) == 12                  # a lone barrier (1-decimal float now: 12.0 == 12)
     assert _a11y_penalty({"critical": 1}) == 20                 # a screen-reader blocker -> HALF the sec ceiling
-    assert _a11y_penalty({"critical": 1, "serious": 1}) == 27   # additive but DAMPED: 20 + 12*.6 (not a raw 32)
-    assert _a11y_penalty({"serious": 3}) == 24                  # worst full, rest decay: 12 + 7.2 + 4.32
-    assert _a11y_penalty({"moderate": 1, "minor": 2}) == 10      # 7 + 3*.6 + 3*.36 -> cosmetics stay cheap
+    assert _a11y_penalty({"critical": 1, "serious": 1}) == 27.2  # additive but DAMPED: 20 + 12*.6 (1-decimal)
+    assert _a11y_penalty({"serious": 3}) == 23.5                # worst full, rest decay: 12 + 7.2 + 4.32 = 23.52
+    assert _a11y_penalty({"moderate": 1, "minor": 2}) == 9.9     # 7 + 3*.6 + 3*.36 = 9.88 -> cosmetics stay cheap
     assert _a11y_penalty({}) == 0
 
 
