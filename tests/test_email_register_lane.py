@@ -666,6 +666,50 @@ def test_reset_baas_recover_lane_fires_when_no_email(monkeypatch):
     assert recovered["email"] == "hl-tr@app.test" and ctx.evidence.get("no_reset_email_60s")
 
 
+def test_json_reset_endpoint_selection_request_side_only():
+    # the SPA analog of a forgot-password form: a JSON forgot/recover endpoint that takes an email, NOT the
+    # completion endpoint (token+password, mails nothing) and NOT an unrelated create.
+    eps = [Endpoint(path="/api/auth/forgot-password", method="post", raw_path="/api/auth/forgot-password", body_fields=["email"]),
+           Endpoint(path="/api/reset-password", method="post", raw_path="/api/reset-password", body_fields=["token", "password"]),
+           Endpoint(path="/api/recover", method="post", raw_path="/api/recover", body_fields=[]),
+           Endpoint(path="/api/items", method="post", raw_path="/api/items", body_fields=["name"])]
+    got = [e.path for e in probes._json_reset_endpoints(eps)]
+    assert got == ["/api/auth/forgot-password", "/api/recover"]
+
+
+def test_reset_json_lane_fires_when_no_reset_email_arrives(monkeypatch):
+    # a SPA with a JSON forgot endpoint (no server-rendered form, no Supabase) + an established account + no
+    # reset email -> the JSON trigger lane fires the lockout the form/baas lanes couldn't reach.
+    monkeypatch.setattr(probes, "_email_register_once", lambda ctx, suffix="": None)
+    monkeypatch.setattr(probes, "_baas_gateway", lambda ctx: None)     # no Supabase gateway
+    prof = Profile(base_url="http://app.test", forms=[],
+                   endpoints=[Endpoint(path="/api/auth/forgot-password", method="post",
+                                       raw_path="/api/auth/forgot-password", body_fields=["email"])])
+    ctx = _reset_ctx(prof)
+    acct = _acct(lambda r: httpx.Response(200, text='{"ok":true}'))    # the JSON forgot POST is accepted
+    acct.client.cookies.set("sessionid", "S")                          # -> the account exists
+    ctx._email_cache["_live"] = {"acct": acct, "lane": "httpx"}
+    assert probes.reset_email_unreliable(ctx, None) is True
+    assert ctx.evidence.get("no_reset_email_60s")
+    acct.client.close()
+
+
+def test_reset_json_lane_clean_when_email_arrives(monkeypatch):
+    monkeypatch.setattr(probes, "_email_register_once", lambda ctx, suffix="": None)
+    monkeypatch.setattr(probes, "_baas_gateway", lambda ctx: None)
+    prof = Profile(base_url="http://app.test", forms=[],
+                   endpoints=[Endpoint(path="/api/recover", method="post",
+                                       raw_path="/api/recover", body_fields=["email"])])
+    ctx = _reset_ctx(prof)
+    acct = _acct(lambda r: httpx.Response(200))                        # POST recover ok; GET link -> 200 (alive)
+    acct.client.cookies.set("sessionid", "S")
+    ctx._email_cache["_live"] = {"acct": acct, "lane": "httpx"}
+    ctx.email.inject("tr", EmailMessage.parse("hl-tr@app.test", "Reset your password",
+                                              "http://app.test/reset?token=abc"))
+    assert probes.reset_email_unreliable(ctx, None) is False           # delivered + live link -> recovery works
+    acct.client.close()
+
+
 def test_reset_na_without_an_established_account(monkeypatch):
     monkeypatch.setattr(probes, "_email_register_once", lambda ctx, suffix="": None)
     ctx = _reset_ctx(Profile(base_url="http://app.test",

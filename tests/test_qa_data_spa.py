@@ -14,7 +14,8 @@ from urllib.parse import urlparse
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from sloptic.net import make_client  # noqa: E402
 from sloptic.pipeline import _Ctx  # noqa: E402
-from sloptic.probes import data_integrity_list_roundtrip, race_resource_ids_api  # noqa: E402
+from sloptic.probes import (  # noqa: E402
+    api_bola_collection, data_integrity_list_roundtrip, race_resource_ids_api)
 from sloptic.schema import Endpoint, Profile  # noqa: E402
 
 
@@ -162,6 +163,51 @@ def test_integrity_browser_absence_stays_na_never_fires(monkeypatch):
     ctx.profile.capabilities["browser"] = True
     try:
         assert data_integrity_list_roundtrip(ctx, _Probe()) is None
+    finally:
+        ctx.client.close()
+        srv.shutdown()
+
+
+# ---- IDOR browser cross-user fallback: reaches the SPA client-rendered feed the httpx collection scan can't ----
+
+def _bola_ctx(monkeypatch, verdict):
+    from sloptic import probes
+    calls = {}
+    def fake(base, submit_value, locate, a_headers, b_headers, timeout=12.0):
+        calls["ran"] = True
+        return verdict
+    monkeypatch.setattr(probes.browser, "cross_user_read_back", fake)
+    srv = _serve("durable")
+    url = "http://127.0.0.1:%d" % srv.server_address[1]
+    ctx = _ctx(url, endpoints=[])                 # no collection endpoint -> httpx path can't test
+    ctx.profile.capabilities["browser"] = True
+    return srv, ctx, calls
+
+
+def test_bola_collection_browser_fallback_fires_cross_user(monkeypatch):
+    srv, ctx, calls = _bola_ctx(monkeypatch, True)
+    try:
+        assert api_bola_collection(ctx, _Probe()) is True        # B saw A's gated created value
+        assert calls.get("ran") and ctx.evidence.get("via") == "browser" and ctx.evidence.get("cross_user_read")
+    finally:
+        ctx.client.close()
+        srv.shutdown()
+
+
+def test_bola_collection_browser_fallback_clean_when_owner_scoped(monkeypatch):
+    srv, ctx, calls = _bola_ctx(monkeypatch, False)
+    try:
+        assert api_bola_collection(ctx, _Probe()) is False       # A saw it, anon+B did not -> observed clean
+        assert ctx.evidence.get("via") == "browser"
+    finally:
+        ctx.client.close()
+        srv.shutdown()
+
+
+def test_bola_collection_browser_fallback_na_when_create_unobservable(monkeypatch):
+    srv, ctx, calls = _bola_ctx(monkeypatch, None)               # A's create never surfaced -> untestable
+    try:
+        assert api_bola_collection(ctx, _Probe()) is None        # honest N/A, never a false clean
     finally:
         ctx.client.close()
         srv.shutdown()

@@ -184,3 +184,101 @@ def test_create_and_check_execution_clean_when_the_render_escapes():
         assert browser.create_and_check_execution(base, browser._XSS_PAYLOAD, "hl-domxss-9a2b") is False
     finally:
         srv.shutdown()
+
+
+# ---- two-session cross-user read-back (IDOR): auth-keyed SPA, leak vs owner-scoped -------------------------
+
+# An auth-gated feed keyed by the Authorization header. Anonymous requests see NOTHING (the private-by-
+# observation gate). A logged-in identity's GET returns EVERY identity's items (mode="leak") or only its own
+# (mode="scoped"). The create+list fetches carry the page's extra Authorization header, so each browser
+# context acts as a distinct identity.
+def _idor_spa_html():
+    return """<!doctype html><html><body>
+<form id="f"><input id="t" type="text"><button type="submit">Save</button></form>
+<ul id="list"></ul>
+<script>
+ async function load(){
+   const r = await fetch('/api/items');
+   const items = await r.json();
+   document.getElementById('list').innerHTML = items.map(function(x){return '<li>'+x+'</li>'}).join('');
+ }
+ document.getElementById('f').onsubmit = async function(e){
+   e.preventDefault();
+   await fetch('/api/items', {method:'POST', headers:{'Content-Type':'application/json'},
+                             body: JSON.stringify({text: document.getElementById('t').value})});
+   await load();
+ };
+ load();
+</script></body></html>"""
+
+
+def _make_idor_app(mode):
+    store = {}   # identity(Authorization) -> [items]
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _send(self, code, body, ctype):
+            b = body.encode() if isinstance(body, str) else body
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+
+        def _identity(self):
+            return self.headers.get("Authorization")
+
+        def do_GET(self):
+            import json as _j
+            if self.path == "/api/items":
+                ident = self._identity()
+                if not ident:
+                    return self._send(200, "[]", "application/json")     # anon sees nothing (gated)
+                if mode == "leak":
+                    items = [x for lst in store.values() for x in lst]   # every identity's items
+                else:
+                    items = store.get(ident, [])                         # owner-scoped
+                return self._send(200, _j.dumps(items), "application/json")
+            self._send(200, _idor_spa_html(), "text/html")
+
+        def do_POST(self):
+            import json as _j
+            if self.path == "/api/items":
+                ident = self._identity() or "anon"
+                body = _j.loads(self.rfile.read(int(self.headers.get("Content-Length", 0) or 0)) or b"{}")
+                store.setdefault(ident, []).append(str(body.get("text", "")))
+                return self._send(201, '{"ok":true}', "application/json")
+            self._send(404, "{}", "application/json")
+    return H
+
+
+def _serve_idor(mode):
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _make_idor_app(mode))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+@pytest.mark.skipif(not browser.browser_available(), reason="no headless browser")
+def test_cross_user_read_back_fires_when_the_feed_leaks_across_identities():
+    srv = _serve_idor("leak")
+    base = "http://127.0.0.1:%d" % srv.server_address[1]
+    try:
+        out = browser.cross_user_read_back(base, "HLidor7", "HLidor7",
+                                           {"Authorization": "Bearer A"}, {"Authorization": "Bearer B"})
+        assert out is True          # A created it, anon can't see it, but B (another identity) can -> IDOR
+    finally:
+        srv.shutdown()
+
+
+@pytest.mark.skipif(not browser.browser_available(), reason="no headless browser")
+def test_cross_user_read_back_clean_when_owner_scoped():
+    srv = _serve_idor("scoped")
+    base = "http://127.0.0.1:%d" % srv.server_address[1]
+    try:
+        out = browser.cross_user_read_back(base, "HLidor8", "HLidor8",
+                                           {"Authorization": "Bearer A"}, {"Authorization": "Bearer B"})
+        assert out is False         # A saw its own item, anon + B did not -> owner-scoped, no leak
+    finally:
+        srv.shutdown()
