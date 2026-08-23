@@ -694,6 +694,90 @@ def _extract_storage_token(page) -> dict:
     return {}
 
 
+# --- browser-driven DATA-PLANE READ-BACK (the SPA write round-trip httpx can't observe) --------------------
+# On an SPA the form action is a placeholder (the real submit is a JS fetch), the created item paints on a
+# CLIENT-SIDE route, and the create is often auth-gated -- so an httpx POST hits the shell and never sees the
+# value come back. Drive the create IN THE BROWSER (carrying any session), let the app's own JS make the real
+# call, then RE-RENDER and read the value back from the rendered DOM. One primitive the stateful cluster shares
+# (qa-input-002 encoding, qa-integrity persistence, stored-xss, IDOR). Best-effort + safe-degrading (flaky).
+def _fill_content_form(page, value: str, timeout: float) -> bool:
+    """Fill a CREATE/content form's text field with `value` (other fields benign) and submit via the app's OWN JS
+    (requestSubmit fires the onsubmit fetch). A content form = a VISIBLE form with a text input/textarea, NO
+    password field (that's login/signup), not a _NO_CLICK (delete/pay/logout) form. True once one is submitted."""
+    with contextlib.suppress(Exception):
+        for form in page.query_selector_all("form"):
+            with contextlib.suppress(Exception):
+                if not form.is_visible() or _NO_CLICK.search((form.inner_text() or "")[:200]):
+                    continue
+                if form.query_selector("input[type=password]"):
+                    continue                                     # a credential form, not content
+                target = None
+                for inp in form.query_selector_all(
+                        "input:not([type=hidden]):not([type=file]):not([type=password]), textarea"):
+                    t = (inp.get_attribute("type") or "text").lower()
+                    if t in ("submit", "button", "checkbox", "radio"):
+                        continue
+                    is_textish = t in ("text", "search", "") or bool(inp.evaluate("e => e.tagName === 'TEXTAREA'"))
+                    if target is None and is_textish:
+                        inp.fill(value)                          # the observable field -> our marker+value
+                        target = inp
+                    else:
+                        inp.fill("hl.probe@example.com" if t == "email" else "hlprobe")
+                if target is None:
+                    continue
+                form.evaluate("f => (f.requestSubmit ? f.requestSubmit() : f.submit())")
+                page.wait_for_timeout(int(timeout * 40))
+                return True
+    return False
+
+
+def _dom_text(page) -> str:
+    with contextlib.suppress(Exception):
+        return page.inner_text("body") or ""
+    return ""
+
+
+def create_and_read_back(base_url: str, submit_value: str, locate: str, headers=None, timeout: float = 12.0):
+    """Drive an SPA write round trip and observe the result: fill a create/content form's text field with
+    `submit_value` in the browser (carrying `headers` -- the register-lane session -> auth-gated creates work),
+    submit via the app's JS, RE-RENDER, and return the rendered DOM TEXT once `locate` (a unique marker the caller
+    embedded in submit_value) round-trips -- else None. The client-side-route read-back httpx can't do. Consumers
+    then check that text (qa-input-002 -> corruption, qa-integrity -> presence). Best-effort + safe-degrading."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return None
+    try:
+        with sync_playwright() as pw:
+            b = _launch(pw)
+            if b is None:
+                return None
+            try:
+                page = b.new_page()
+                _apply_auth(page, base_url, headers)
+                with contextlib.suppress(Exception):
+                    page.goto(base_url.rstrip("/") + "/", timeout=timeout * 1000, wait_until="load")
+                    page.wait_for_timeout(300)
+                    _reveal_hidden_controls(page)               # open a create modal/form if it's behind a CTA
+                if not _fill_content_form(page, submit_value, timeout):
+                    return None
+                with contextlib.suppress(Exception):
+                    page.wait_for_load_state("networkidle", timeout=6000)
+                page.wait_for_timeout(500)
+                for attempt in (0, 1):                           # the item may paint in place, or need a reload
+                    text = _dom_text(page)
+                    if locate in text:
+                        return text                              # the rendered round-trip -> hand to the consumer
+                    with contextlib.suppress(Exception):
+                        page.reload(timeout=timeout * 1000, wait_until="load")
+                        page.wait_for_timeout(600)
+                return None
+            finally:
+                b.close()
+    except Exception:
+        return None
+
+
 def register_in_browser(base_url: str, headers=None, timeout: float = 12.0, total_timeout: float = 45.0,
                         email: str | None = None, code_getter=None):
     """SPA self-registration THROUGH the browser (the auth self-oracle's client-rendered path): open the signup

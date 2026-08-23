@@ -176,3 +176,33 @@ def test_readback_lane_clean_when_create_stores_intact(app):
     ctx = _ctx(app, forms=[Form("/api/clean", "post", ["text"])])
     assert international_input_breaks(ctx, _Probe()) is False
     assert ctx.evidence.get("survived") >= 1
+
+
+# ---- browser read-back lane: fires when httpx observes nothing (the SPA data-plane unlock) ------------------
+
+def test_browser_readback_fires_corruption_when_httpx_is_blind(app, monkeypatch):
+    from sloptic import probes
+    def fake_rb(base, submit_value, locate, headers=None, timeout=12.0):
+        payload = submit_value[len(locate):] if submit_value.startswith(locate) else submit_value
+        return "<li>%s%s</li>" % (locate, payload.encode("utf-8").decode("latin-1"))   # client render, MOJIBAKED
+    monkeypatch.setattr(probes.browser, "create_and_read_back", fake_rb)
+    ctx = _ctx(app, endpoints=[_ep("/noecho")], capabilities={"browser": True})   # httpx sees no round trip
+    assert probes.international_input_breaks(ctx, _Probe()) is True
+    assert ctx.evidence.get("via") == "browser" and ctx.evidence.get("corrupted")
+
+
+def test_browser_readback_clean_when_the_value_survives(app, monkeypatch):
+    from sloptic import probes
+    monkeypatch.setattr(probes.browser, "create_and_read_back",
+                        lambda base, submit_value, locate, headers=None, timeout=12.0: "<li>%s</li>" % submit_value)
+    ctx = _ctx(app, endpoints=[_ep("/noecho")], capabilities={"browser": True})
+    assert probes.international_input_breaks(ctx, _Probe()) is False       # observed a clean browser round trip
+    assert ctx.evidence.get("via") == "browser"
+
+
+def test_browser_readback_skipped_without_a_browser(app, monkeypatch):
+    from sloptic import probes
+    monkeypatch.setattr(probes.browser, "create_and_read_back",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not launch a browser")))
+    ctx = _ctx(app, endpoints=[_ep("/noecho")])                           # no browser capability
+    assert probes.international_input_breaks(ctx, _Probe()) is None        # httpx-blind -> honest N/A, no browser

@@ -1023,11 +1023,36 @@ def international_input_breaks(ctx, probe) -> bool | None:
                             repro=_repro("POST", ctx.base_url.rstrip("/") + action,
                                          matched="%s input round-tripped corrupted (mojibake / ? / U+FFFD)" % script))
         return True
-    ctx.evidence.update(broke=False, **obs)
     if survived > 0:
+        ctx.evidence.update(broke=False, **obs)
         return False                                         # observed >=1 international round trip survive -> clean
+    # BROWSER READ-BACK lane: httpx saw no round trip (an SPA JSON sink / client-rendered create), so drive a
+    # content form in a browser (carrying the session), submit an international value, re-render, and read it back
+    # from the CLIENT-RENDERED DOM -- the SPA write round trip httpx structurally can't observe. One launch, the
+    # most fragile payload (4-byte emoji: if it survives, the narrower scripts do too). Gated on a real browser.
+    if getattr(ctx, "profile", None) is not None and ctx.profile.capabilities.get("browser"):
+        script, payload = _ENC_PROBES[0]                     # emoji (4-byte utf8mb4 -> breaks a 3-byte utf8 column)
+        sentinel = "HLenc" + secrets.token_hex(3)
+        try:
+            rendered = browser.create_and_read_back(ctx.base_url, sentinel + payload, sentinel,
+                                                    headers=_authed_headers(ctx))
+        except Exception:
+            rendered = None
+        if rendered is not None:
+            obs["fields_reflecting"] = obs.get("fields_reflecting", 0) + 1
+            verdict = _encoding_corrupted(rendered, sentinel, payload)
+            if verdict is True:                              # the 32 rung, observed via the browser read-back
+                ctx.evidence.update(broke=True, corrupted=True, kind="corruption", script=script, via="browser",
+                                    target="(browser create)", **obs,
+                                    repro=_repro("POST", ctx.base_url,
+                                                 matched="%s round-tripped corrupted via browser read-back" % script))
+                return True
+            if verdict is False:
+                ctx.evidence.update(broke=False, via="browser", **obs)
+                return False                                 # observed a CLEAN browser round trip -> handles unicode
+    ctx.evidence.update(broke=False, **obs)
     # tested fields, but none reflected their value (SPA JSON sink / non-echoing form) -> we never SAW a round
-    # trip, so a "clean" here would be false. Honest N/A: the recall gap a JSON create-then-read-back lane closes.
+    # trip, so a "clean" here would be false. Honest N/A: the recall gap the browser read-back lane closes.
     ctx.evidence["na_reason"] = (
         "no observable international round-trip (%d field(s) tested, none reflected the value)" % fields_tested
         if tested else "no writable text surface to test")
