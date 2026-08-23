@@ -6318,14 +6318,18 @@ def lighthouse_perf_score(ctx, probe) -> bool | None:
     if not rep:
         ctx.evidence["na_reason"] = "no lighthouse result (url unreachable or the run failed)"
         return None
-    score = lighthouse.perf_score(rep)      # 0..1, Lighthouse's own weighted headline
+    # PENALTY off the FULL-PRECISION score (recomputed from raw metric scores) -- Lighthouse's headline
+    # categories.score is 2-decimal-rounded, which quantized the penalty to whole numbers; the precise score
+    # gives a fractional shortfall so the 65%-fire perf probe actually de-clumps.
+    score = lighthouse.perf_score_precise(rep)   # 0..1, full precision
     if score is None:
         ctx.evidence["na_reason"] = "lighthouse produced no overall performance score"
         return None
+    headline = lighthouse.perf_score(rep) or score   # the familiar rounded 0-100 for the human-facing display
     scale = probe.probe.get("scale", 1.0)
     floor = probe.probe.get("green_floor", 0.90)      # Lighthouse's green cutoff: at/above it -> no perf slop
     slop = round(max(0.0, floor - score) * 100 * scale, 1)   # 1-decimal FLOAT: keep the continuous perf spread
-    ctx.evidence.update(performance=round(score * 100), runs=rep.get("runs"), versions=rep.get("versions"),
+    ctx.evidence.update(performance=round(headline * 100), runs=rep.get("runs"), versions=rep.get("versions"),
                         metrics=lighthouse.metric_breakdown(rep),
                         tier=("good" if score >= 0.90 else "needs-improvement" if score >= 0.50 else "poor"),
                         penalty_override=slop)

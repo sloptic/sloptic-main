@@ -40,6 +40,23 @@ def test_shortfall_below_green_is_the_slop():
         assert ctx.evidence["performance"] == round(perf * 100)
 
 
+def test_penalty_uses_full_precision_recompute_from_metric_scores():
+    # Lighthouse rounds its headline categories.score to 2 decimals, which quantized the perf penalty to whole
+    # numbers. Recompute from the raw metric audit scores at full precision -> a fractional shortfall that
+    # de-clumps. Headline 0.83 would give penalty 7; the precise 0.833 gives 6.7.
+    auds = {aid: {"score": 0.833} for aid in lh._PERF_WEIGHTS}
+    ctx = _Ctx({"lighthouseResult": {"categories": {"performance": {"score": 0.83}}, "audits": auds}, "runs": 3})
+    assert lighthouse_perf_score(ctx, _Probe()) is True
+    assert ctx.evidence["penalty_override"] == 6.7          # fractional (precise), not the rounded-headline 7.0
+    assert ctx.evidence["performance"] == 83                # display keeps the familiar rounded 0-100 headline
+
+
+def test_perf_score_precise_falls_back_to_headline_without_metric_audits():
+    assert lh.perf_score_precise(_rep(0.84)) == 0.84        # no metric audits -> the rounded headline stands
+    weighted = lh.perf_score_precise(_rep(0.83, audits={aid: {"score": 0.9} for aid in lh._PERF_WEIGHTS}))
+    assert abs(weighted - 0.9) < 1e-9                       # all metrics 0.9 -> weighted avg 0.9 (not the 0.83 headline)
+
+
 def test_scale_dials_the_axis_without_touching_the_mapping():
     ctx = _Ctx(_rep(0.50))
     assert lighthouse_perf_score(ctx, _Probe(scale=0.5)) is True

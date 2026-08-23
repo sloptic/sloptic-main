@@ -144,6 +144,29 @@ def perf_score(psi: dict) -> float | None:
     return (cats.get("performance") or {}).get("score")
 
 
+# Lighthouse v10+ performance weights (the pinned 13.4.1 uses these). The headline category score is this
+# weighted average of the metric AUDIT scores -- but Lighthouse ROUNDS categories.performance.score to 2
+# decimals in the report, which quantized our perf penalty to whole numbers (a 0.84 -> 6, never a 6.3). Recompute
+# from the raw metric scores at full float precision so the continuous perf shortfall actually de-clumps.
+_PERF_WEIGHTS = {"first-contentful-paint": 0.10, "speed-index": 0.10, "largest-contentful-paint": 0.25,
+                 "total-blocking-time": 0.30, "cumulative-layout-shift": 0.25}
+
+
+def perf_score_precise(psi: dict) -> float | None:
+    """The overall performance score recomputed from the raw metric audit scores x their weights, at full float
+    precision -- bypassing the 2-decimal rounding Lighthouse applies to its headline categories.score. Falls back
+    to perf_score (the rounded headline) when any weighted metric audit is missing (so it never zeroes)."""
+    auds = audits(psi)
+    total = weight = 0.0
+    for aid, w in _PERF_WEIGHTS.items():
+        s = (auds.get(aid) or {}).get("score")
+        if s is None:
+            return perf_score(psi)
+        total += w * s
+        weight += w
+    return total / weight if weight else perf_score(psi)
+
+
 # The metrics behind the headline, surfaced for OFF-SCORE reporting: a slow app still sees WHICH metric to fix,
 # but is charged once on the weighted overall score, not once per metric.
 BREAKDOWN_AUDITS = ("first-contentful-paint", "largest-contentful-paint", "total-blocking-time",
