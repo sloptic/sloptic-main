@@ -102,3 +102,11 @@ def test_broken_links_ignores_artifacts_and_access_control(server, mode):
 
 def test_broken_links_na_when_no_internal_links(server):
     assert broken_links(_ctx(server("none")), _Probe()) is None
+
+
+def test_broken_links_penalty_scales_with_dead_fraction(server):
+    # SPECTRUM: the "dead" page has 2 links (/good ok, /gone 404) -> fraction 0.5 -> 24*(1+0.5) = 36 (not flat 25)
+    ctx = _ctx(server("dead"))
+    assert broken_links(ctx, _Probe()) is True
+    assert ctx.evidence["dead_links"] == 1 and ctx.evidence["links_checked"] == 2
+    assert ctx.evidence["dead_fraction"] == 0.5 and ctx.evidence["penalty_override"] == 36.0

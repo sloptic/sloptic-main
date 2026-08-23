@@ -5435,18 +5435,31 @@ def broken_links(ctx, probe) -> bool | None:
         links = _same_origin_links(c, ctx, probe)
         if links is None:
             return None
-        for path in links[:budget]:
+        checked = links[:budget]
+        dead = []
+        for path in checked:
             try:
                 st = c.get(path).status_code
                 # a DEAD END is not-found (404/410) or a malformed request (400/414), NOT access-control:
                 # 401/403 = the page exists but is gated (a login-required nav item / deployment protection), and
                 # 429 = rate-limited -- the link WORKS, it isn't broken. So skip the access-control/limit statuses.
                 if 400 <= st < 500 and st not in (401, 403, 429):
-                    ctx.evidence.update(broken=True, link=path, status=st)
-                    return True                            # dead link: an internal href leads to a 4xx dead end
+                    dead.append((path, st))
             except (httpx.HTTPError, httpx.InvalidURL):
                 continue
-    ctx.evidence.update(broken=False, links_checked=len(links[:budget]))
+    if not checked:
+        return None
+    if dead:
+        # SPECTRUM: score by the FRACTION of internal navigation that's a dead end -- one dead link on a big
+        # site is a smaller defect than a site where half the nav 404s. Floor ~24 (any dead link), scaling to
+        # ~48 (all nav dead). Was a flat 25 regardless of how broken.
+        frac = len(dead) / len(checked)
+        ctx.evidence.update(broken=True, dead_links=len(dead), links_checked=len(checked),
+                            dead_fraction=round(frac, 2), link=dead[0][0], status=dead[0][1],
+                            examples=[p for p, _ in dead[:5]],
+                            penalty_override=round(24 * (1 + frac), 1))
+        return True
+    ctx.evidence.update(broken=False, links_checked=len(checked))
     return False
 
 

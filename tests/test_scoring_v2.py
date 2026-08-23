@@ -336,11 +336,13 @@ def test_qa_severity_classes_and_ladders():
 
 
 def test_every_scored_qa_probe_has_authority_anchored_severity():
-    """Every scored qa / non-Lighthouse-perf probe must carry iso_25010 + nielsen. Exempt: a11y (WCAG via
-    axe penalty_override), Lighthouse probes (CWV via penalty_override), qa-http-001 (report_only off-score)."""
+    """Every scored qa / non-Lighthouse-perf probe must carry iso_25010 + nielsen. Exempt: the probes scored via
+    a computed penalty_override instead of a severity block -- a11y (WCAG via axe), Lighthouse (CWV), and
+    broken_links (a CONTINUOUS penalty by dead-nav fraction) -- plus qa-http-001 (report_only off-score)."""
     from sloptic.catalog import default_catalog_dir, load_catalog
     exempt_ids = {"qa-http-001"}
-    exempt_preds = {"a11y_violations_present", "a11y_hard_fails", "lighthouse_audit", "lighthouse_perf_score"}
+    exempt_preds = {"a11y_violations_present", "a11y_hard_fails", "lighthouse_audit", "lighthouse_perf_score",
+                    "broken_links"}
     missing = []
     for p in load_catalog(default_catalog_dir()):
         if p.bundle not in ("qa", "performance"):
