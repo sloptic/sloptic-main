@@ -737,12 +737,12 @@ def _dom_text(page) -> str:
     return ""
 
 
-def create_and_read_back(base_url: str, submit_value: str, locate: str, headers=None, timeout: float = 12.0):
-    """Drive an SPA write round trip and observe the result: fill a create/content form's text field with
-    `submit_value` in the browser (carrying `headers` -- the register-lane session -> auth-gated creates work),
-    submit via the app's JS, RE-RENDER, and return the rendered DOM TEXT once `locate` (a unique marker the caller
-    embedded in submit_value) round-trips -- else None. The client-side-route read-back httpx can't do. Consumers
-    then check that text (qa-input-002 -> corruption, qa-integrity -> presence). Best-effort + safe-degrading."""
+def _drive_create_and_observe(base_url, submit_value, headers, timeout, observe):
+    """Core browser write round trip: fill a content form with `submit_value` (carrying `headers` -- the
+    register-lane session, so auth-gated creates work), submit via the app's OWN JS, RE-RENDER (in place, then one
+    reload), and return the first truthy `observe(page)`. `observe` reads whatever facet the caller needs -- the
+    rendered DOM text (encoding/integrity), or window.__hl_domxss (stored-xss execution). None if nothing observed.
+    Best-effort + safe-degrading (browser-flaky by nature)."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -765,9 +765,9 @@ def create_and_read_back(base_url: str, submit_value: str, locate: str, headers=
                     page.wait_for_load_state("networkidle", timeout=6000)
                 page.wait_for_timeout(500)
                 for attempt in (0, 1):                           # the item may paint in place, or need a reload
-                    text = _dom_text(page)
-                    if locate in text:
-                        return text                              # the rendered round-trip -> hand to the consumer
+                    result = observe(page)
+                    if result:
+                        return result
                     with contextlib.suppress(Exception):
                         page.reload(timeout=timeout * 1000, wait_until="load")
                         page.wait_for_timeout(600)
@@ -776,6 +776,28 @@ def create_and_read_back(base_url: str, submit_value: str, locate: str, headers=
                 b.close()
     except Exception:
         return None
+
+
+def create_and_read_back(base_url: str, submit_value: str, locate: str, headers=None, timeout: float = 12.0):
+    """Drive an SPA write round trip and READ THE VALUE BACK: fill a create form's text field with `submit_value`,
+    submit via the app's JS, re-render, and return the rendered DOM TEXT once `locate` (a unique marker in
+    submit_value) round-trips -- else None. The client-side-route read-back httpx can't do. Consumers check that
+    text (qa-input-002 -> corruption, qa-integrity -> presence)."""
+    def observe(page):
+        text = _dom_text(page)
+        return text if locate in text else None
+    return _drive_create_and_observe(base_url, submit_value, headers, timeout, observe)
+
+
+def create_and_check_execution(base_url: str, payload: str, marker: str, headers=None, timeout: float = 12.0) -> bool:
+    """Drive a STORED-XSS check through the browser create: submit `payload` (a script that sets
+    window.__hl_domxss = marker) into a content form, re-render, and return True iff it EXECUTED -- the stored
+    value ran unescaped in the DOM. Reaches auth-gated / SPA creates the httpx stored_xss_api can't POST to."""
+    def observe(page):
+        with contextlib.suppress(Exception):
+            return marker if page.evaluate("() => window.__hl_domxss") == marker else None
+        return None
+    return bool(_drive_create_and_observe(base_url, payload, headers, timeout, observe))
 
 
 def register_in_browser(base_url: str, headers=None, timeout: float = 12.0, total_timeout: float = 45.0,

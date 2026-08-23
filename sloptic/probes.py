@@ -1067,7 +1067,26 @@ def stored_xss_api(ctx, probe) -> bool | None:
     app that escapes on output — React {value} — never fires). The text analog of upload-002 (stored XSS via
     file). N/A without a JSON create endpoint, a browser, or (when the create is gated) a session."""
     creates = [e for e in ctx.profile.endpoints if e.method.lower() in ("post", "put", "patch") and e.body_fields]
+
+    def _browser_create_fallback():
+        """When the httpx create can't store (auth-gated, or the SPA form action is a placeholder so the real
+        create is a JS fetch), drive the create IN THE BROWSER with the session and check execution on the
+        re-render. Only ever CONFIRMS execution (True) -> never a false clean/fire; None = couldn't confirm."""
+        if not (getattr(ctx, "profile", None) is not None and ctx.profile.capabilities.get("browser")):
+            return None
+        marker = "hlsx" + secrets.token_hex(3)
+        xss = "<img src=x onerror=\"window.__hl_domxss='%s'\">" % marker
+        try:
+            if browser.create_and_check_execution(ctx.base_url, xss, marker, headers=_authed_headers(ctx)):
+                ctx.evidence.update(stored_xss=True, stored=True, execution_confirmed=True, via="browser-create")
+                return True
+        except Exception:
+            pass
+        return None
+
     if not creates:
+        if _browser_create_fallback():                     # no JSON create endpoint, but maybe a browser content form
+            return True
         ctx.evidence["na_reason"] = "no JSON create endpoint to store an XSS payload through"
         return None
     account = ctx.register()   # the create is usually auth-gated; a provided --header/--login session is used directly
@@ -1084,6 +1103,8 @@ def stored_xss_api(ctx, probe) -> bool | None:
             except (httpx.HTTPError, httpx.InvalidURL):
                 continue
         if not stored:
+            if _browser_create_fallback():                 # httpx couldn't POST (auth-gated / JS-fetch create) -> browser
+                return True
             ctx.evidence["na_reason"] = "no create accepted the stored-XSS write to render back"
             return None
         hdrs = dict(ctx.headers or {})   # render as the SAME identity so the stored item is on the authed feed
@@ -2773,7 +2794,29 @@ def data_integrity_list_roundtrip(ctx, probe) -> bool | None:
     data-durability with qa-integrity-001 (read-by-id) -> the two collapse to one data-loss finding."""
     creates = [e for e in ctx.profile.endpoints if e.method.lower() == "post" and e.body_fields
                and not _is_auth_endpoint(e)]   # a login/register POST is not a listable-data create
+
+    def _browser_persist_confirm():
+        """SPA fallback for the N/A cases (auth-gated / JS-fetch create the httpx round-trip can't see): drive the
+        create in a browser and read the canary back from the client-rendered DOM. ONE-DIRECTIONAL by design --
+        a canary that reads back CONFIRMS durability (clean, via browser); ABSENCE is ambiguous (form not found /
+        not submitted / render lag), so we never fire loss from the browser -- that stays N/A. So this only ever
+        turns an N/A into a confirmed clean, never into a false data-loss."""
+        if not (getattr(ctx, "profile", None) is not None and ctx.profile.capabilities.get("browser")):
+            return None
+        canary = "hldb" + secrets.token_hex(5)
+        try:
+            rendered = browser.create_and_read_back(ctx.base_url, canary, canary, headers=_authed_headers(ctx))
+        except Exception:
+            rendered = None
+        if rendered and canary in rendered:
+            ctx.evidence.update(tested=True, durable=True, via="browser", verified_by="browser-read-back")
+            return False                                     # the created canary rendered back -> write persisted
+        return None                                          # absent in the DOM is ambiguous -> stay N/A, never fire
+
     if not creates:
+        confirmed = _browser_persist_confirm()               # no JSON create endpoint, but maybe a browser content form
+        if confirmed is not None:
+            return confirmed
         ctx.evidence["na_reason"] = "no JSON create endpoint to round-trip through its collection"
         return None
     account = ctx.register()   # some creates are auth-gated; None -> fall back to an anon client
@@ -2815,6 +2858,9 @@ def data_integrity_list_roundtrip(ctx, probe) -> bool | None:
             except (httpx.HTTPError, httpx.InvalidURL):
                 continue
         if not tested:
+            confirmed = _browser_persist_confirm()           # httpx couldn't round-trip -> try the browser data plane
+            if confirmed is not None:
+                return confirmed
             ctx.evidence["na_reason"] = "no create round-tripped through a readable record collection"
             return None
         ctx.evidence.update(tested=True, durable=True)

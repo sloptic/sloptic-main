@@ -130,6 +130,43 @@ def test_integrity_na_on_an_auth_endpoint():
     assert _run(data_integrity_list_roundtrip, "durable", endpoints=auth) is None
 
 
+# ---- browser persist-confirm fallback: flips N/A -> confirmed-clean, NEVER fires loss (absence is ambiguous) --
+
+def test_integrity_browser_confirm_flips_na_to_clean(monkeypatch):
+    # httpx can't round-trip (no JSON create endpoint), but a browser drives the create and reads the canary back
+    # from the client-rendered DOM -> the write persisted -> confirmed clean, via="browser".
+    from sloptic import probes
+    monkeypatch.setattr(probes.browser, "create_and_read_back",
+                        lambda base, submit_value, locate, headers=None, timeout=12.0: "<li>%s</li>" % submit_value)
+    srv = _serve("durable")
+    url = "http://127.0.0.1:%d" % srv.server_address[1]
+    ctx = _ctx(url, endpoints=[])
+    ctx.profile.capabilities["browser"] = True
+    try:
+        assert data_integrity_list_roundtrip(ctx, _Probe()) is False
+        assert ctx.evidence.get("via") == "browser" and ctx.evidence.get("durable") is True
+    finally:
+        ctx.client.close()
+        srv.shutdown()
+
+
+def test_integrity_browser_absence_stays_na_never_fires(monkeypatch):
+    # the canary did NOT read back -> ambiguous (form not found / render lag), so we stay N/A and never fire a
+    # false data-loss from the browser lane.
+    from sloptic import probes
+    monkeypatch.setattr(probes.browser, "create_and_read_back",
+                        lambda base, submit_value, locate, headers=None, timeout=12.0: "<li>nothing</li>")
+    srv = _serve("durable")
+    url = "http://127.0.0.1:%d" % srv.server_address[1]
+    ctx = _ctx(url, endpoints=[])
+    ctx.profile.capabilities["browser"] = True
+    try:
+        assert data_integrity_list_roundtrip(ctx, _Probe()) is None
+    finally:
+        ctx.client.close()
+        srv.shutdown()
+
+
 def test_race_fires_on_duplicate_ids_under_concurrency():
     assert _run(race_resource_ids_api, "racy") is True               # timestamp ids collide across concurrent creates
 

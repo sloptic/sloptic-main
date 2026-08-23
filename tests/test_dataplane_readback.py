@@ -134,3 +134,53 @@ def test_create_and_read_back_observes_the_client_rendered_value():
         assert out is not None and "HLrb99" in out          # the marker round-tripped through the client render
     finally:
         srv.shutdown()
+
+
+_XSS_SPA_HTML = """<!doctype html><html><body>
+<form id="f"><input id="t" type="text"><button type="submit">Add</button></form>
+<div id="out"></div>
+<script>
+ document.getElementById('f').onsubmit = function(e){
+   e.preventDefault();
+   var d = document.createElement('div');
+   d.innerHTML = document.getElementById('t').value;   // UNESCAPED -> a stored img-onerror executes
+   document.getElementById('out').appendChild(d);
+ };
+</script></body></html>"""
+
+
+class _XssSpaApp(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        body = _XSS_SPA_HTML.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+@pytest.mark.skipif(not browser.browser_available(), reason="no headless browser")
+def test_create_and_check_execution_fires_when_the_stored_payload_runs():
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _XssSpaApp)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = "http://127.0.0.1:%d" % srv.server_address[1]
+    try:
+        # the payload sets window.__hl_domxss = 'hl-domxss-9a2b' when it executes
+        assert browser.create_and_check_execution(base, browser._XSS_PAYLOAD, "hl-domxss-9a2b") is True
+    finally:
+        srv.shutdown()
+
+
+@pytest.mark.skipif(not browser.browser_available(), reason="no headless browser")
+def test_create_and_check_execution_clean_when_the_render_escapes():
+    # the safe SPA (textContent, not innerHTML) never executes the stored value
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _SpaApp)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = "http://127.0.0.1:%d" % srv.server_address[1]
+    try:
+        assert browser.create_and_check_execution(base, browser._XSS_PAYLOAD, "hl-domxss-9a2b") is False
+    finally:
+        srv.shutdown()
