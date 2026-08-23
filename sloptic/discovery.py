@@ -14,7 +14,7 @@ from urllib.parse import parse_qs, urljoin, urlparse
 import httpx
 
 from . import jsmine, openapi, platform_id
-from .auth import is_password_change_form, login_form
+from .auth import _email_only_form, is_password_change_form, login_form
 from .net import make_client
 from .schema import Endpoint, Form, Profile
 
@@ -1560,6 +1560,12 @@ def surface_metrics(profile: Profile) -> dict:
         "sso_providers": caps.get("sso_providers") or [],
         "has_sso": bool(caps.get("sso_providers")),
         "captcha": caps.get("captcha"),
+        # SSO-ONLY: an SSO door with NO self-registerable alternative -- no password form AND no email-code /
+        # magic-link signup -- so we structurally cannot establish a session (we never drive social login). The
+        # hard-blocked slice, distinct from SSO-plus-password (which the password lane still registers).
+        "sso_only": (bool(caps.get("sso_providers"))
+                     and not bool(caps.get("any_form_has_password"))
+                     and _email_only_form(forms) is None),
         # composite "how much observable & HEALTHY APP surface we saw" — the parity denominator
         "surface_size": len(app_routes) + inputs + len(healthy_eps),
         "pointer": pointer,                          # LLM-pointer precision telemetry (off-score, build #2)

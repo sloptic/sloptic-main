@@ -39,3 +39,21 @@ def test_surface_metrics_carries_sso_and_captcha():
     # absent -> clean empty signal, not a crash
     m2 = surface_metrics(Profile(base_url="http://x"))
     assert m2["sso_providers"] == [] and m2["has_sso"] is False and m2["captcha"] is None
+
+
+def test_sso_only_flag_distinguishes_the_hard_blocked_slice():
+    from sloptic.discovery import surface_metrics
+    from sloptic.schema import Form
+    # SSO with no password form and no email-code/magic-link signup -> hard-blocked (we can't self-register)
+    only = surface_metrics(Profile(base_url="http://x", capabilities={"sso_providers": ["google"]}))
+    assert only["sso_only"] is True
+    # SSO + a password form -> the password lane still registers -> NOT sso-only
+    plus_pw = surface_metrics(Profile(base_url="http://x", capabilities={
+        "sso_providers": ["google"], "any_form_has_password": True}))
+    assert plus_pw["sso_only"] is False
+    # SSO + an email-code / magic-link signup form -> reachable via lane B -> NOT sso-only
+    plus_magic = surface_metrics(Profile(base_url="http://x", capabilities={"sso_providers": ["google"]},
+                                         forms=[Form(action="/auth/magic-link", method="post", fields=["email"])]))
+    assert plus_magic["sso_only"] is False
+    # no SSO at all -> not sso-only
+    assert surface_metrics(Profile(base_url="http://x"))["sso_only"] is False
