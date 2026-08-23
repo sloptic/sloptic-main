@@ -213,6 +213,8 @@ class _LivenessHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/gone":
             self.send_response(404); self.end_headers(); self.wfile.write(b"nope"); return
+        if self.path == "/blocked":                       # a WAF/edge block: server is UP, refusing us -> NOT dead
+            self.send_response(403); self.end_headers(); self.wfile.write(b"Forbidden"); return
         self.send_response(200); self.end_headers()
         self.wfile.write(b"There isn't a GitHub Pages site here"
                          if self.path == "/placeholder" else b"<h1>hello app</h1>")
@@ -230,6 +232,21 @@ def test_dead_url_reason_classifies_live_404_and_placeholder():
         assert _dead_url_reason(base + "/live") is None
         assert _dead_url_reason(base + "/gone") == "HTTP 404"
         assert _dead_url_reason(base + "/placeholder").startswith("host placeholder")
+    finally:
+        srv.shutdown()
+
+
+def test_dead_url_reason_marks_a_403_as_a_waf_block_not_dead():
+    # a 403/429/503 means the server is UP and refusing us (a transient WAF/edge block), NOT a dead URL. It gets
+    # the _WAF_MARK prefix so the caller records a recoverable CHALLENGE, never a permanent dead_url that would
+    # discard a live app (the sample3large DNF-wave root: a transient Vercel block mis-recorded as URL DEAD).
+    from deploy_and_grade import _WAF_MARK
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _LivenessHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        reason = _dead_url_reason(base + "/blocked")
+        assert reason.startswith(_WAF_MARK) and "403" in reason
     finally:
         srv.shutdown()
 

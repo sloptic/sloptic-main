@@ -573,14 +573,42 @@ def _signup_hrefs(page, base_url: str) -> list[str]:
     return out[:6]
 
 
+# A visible auth INTENT on a link/button: login / sign-in / sign-up / register / account. Its presence means the
+# app has a self-serve auth surface worth exploring; its ABSENCE (with no password field either) means there is
+# none, so the guessed-route fishing below is pure WAF antagonism with ~zero yield.
+_AUTH_INTENT = re.compile(r"log ?in|sign ?in|log ?on|sign ?up|register|create account|get started|"
+                          r"\baccount\b|\bjoin\b|my account", re.I)
+
+
+def _page_has_auth_entrypoint(page) -> bool:
+    """Any self-serve auth surface on the current page: a password field, or a link/button reading as a
+    login/signup/account intent. When NONE is present the app has no self-serve auth -> the guessed-route fishing
+    (8 _SIGNUP_ROUTES + the magic routes) hammers the app for nothing (a real /signup is always LINKED, so it was
+    already tried via _signup_hrefs). Preserves visibility where auth exists -- a login-only or magic-link app
+    still shows a sign-in link, so it is still fished -- and cuts the fishing only on genuinely no-auth pages,
+    which is where the walk is pure WAF-bait (the sample3large per-app-block trigger)."""
+    with contextlib.suppress(Exception):
+        if page.query_selector("input[type=password]"):
+            return True
+        for el in page.query_selector_all("a, button, [role=button], input[type=submit]"):
+            with contextlib.suppress(Exception):
+                txt = ((el.inner_text() or "") + " " + (el.get_attribute("aria-label") or "")
+                       + " " + (el.get_attribute("value") or ""))[:80]
+                if _AUTH_INTENT.search(txt):
+                    return True
+    return False
+
+
 def _reach_and_submit_signup(page, base_url, creds, timeout) -> bool:
     """Get to a fillable signup and submit it. The homepage (reveal an inline modal) first; if the signup lives
     on its OWN route — a 'Get Started' <a> link the reveal can't open — walk conventional signup paths and try
     each. True once a signup form was filled + submitted (the app's own JS then makes the real request)."""
+    homepage_has_auth = False
     with contextlib.suppress(Exception):
         page.goto(base_url.rstrip("/") + "/", timeout=timeout * 1000, wait_until="load")
         page.wait_for_timeout(300)
         _reveal_hidden_controls(page)
+        homepage_has_auth = _page_has_auth_entrypoint(page)   # gate the guessed-route fishing below
         # The homepage is the one place we have no route-name evidence, so require the form to LOOK like a
         # signup. Without this an app whose landing page is a login gets its login submitted and the walk to
         # /signup never happens.
@@ -588,7 +616,7 @@ def _reach_and_submit_signup(page, base_url, creds, timeout) -> bool:
             return True
     # THE APP'S OWN LINKS BEFORE OUR GUESSES. A hash-only href (#signup, #/signup) is client-side routing that
     # a goto may not re-trigger from the same document, so click those instead; anything with a path or query
-    # is navigable.
+    # is navigable. High signal + low antagonism -> always tried, even on a page with no other auth tell.
     for href in _signup_hrefs(page, base_url):
         with contextlib.suppress(Exception):
             if "#" in href and href.split("#", 1)[0].rstrip("/") in (page.url or "").rstrip("/"):
@@ -600,6 +628,11 @@ def _reach_and_submit_signup(page, base_url, creds, timeout) -> bool:
             _reveal_hidden_controls(page)
             if _fill_and_submit_signup(page, creds):
                 return True
+    # GUESSED-ROUTE FISHING: 8 conventional /signup paths. Worth it only when the app SHOWS a self-serve auth
+    # surface; on a no-auth page these 8 navigations are pure WAF antagonism (~zero yield -- a real signup is
+    # linked, tried above) and were a chunk of the per-app-block trigger. Skip them when there's no auth tell.
+    if not homepage_has_auth:
+        return False
     for route in _SIGNUP_ROUTES:
         with contextlib.suppress(Exception):
             page.goto(base_url.rstrip("/") + route, timeout=timeout * 1000, wait_until="load")
@@ -615,12 +648,15 @@ def _reach_and_submit_magic(page, base_url, creds, timeout) -> bool:
     email-first submitter. THE LAST RESORT -- register_in_browser calls this only after the password-signup lane
     AND the email-first wizard (LANE B) both found nothing, so it converts a dead-end N/A and never preempts a
     password signup or a code wizard. True once an email-only auth form was submitted (the app then mails a link
-    that verify_in_browser follows)."""
-    for route in ("/", "/login", "/signin"):                 # where a magic-link / passwordless form actually lives
+    that verify_in_browser follows). Gated on the homepage showing an auth surface -- a magic-link app still shows
+    a sign-in link, so it's still tried; a no-auth page skips the fishing (same WAF-antagonism cut as above)."""
+    for i, route in enumerate(("/", "/login", "/signin")):   # where a magic-link / passwordless form actually lives
         with contextlib.suppress(Exception):
             page.goto(base_url.rstrip("/") + route, timeout=timeout * 1000, wait_until="load")
             page.wait_for_timeout(350)
             _reveal_hidden_controls(page)
+            if i == 0 and not _page_has_auth_entrypoint(page):
+                return False                                 # no auth surface -> skip the magic fishing too
             if _fill_and_submit_magic(page, creds):
                 return True
     return False

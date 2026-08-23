@@ -966,6 +966,10 @@ def grade(url: str, use_browser: bool, timeout=None, features=None,
 # unreachable, a 4xx/5xx entry, or a known host placeholder (a Pages/Vercel/Netlify "no site here" page
 # that answers 200/404 but hosts no app — otherwise we'd grade the placeholder to meaningless garbage).
 _UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+# preflight statuses that mean "the server is UP and refusing/rate-limiting us" (a transient WAF/edge block), NOT
+# a dead deployment -> recorded as a challenge (recoverable), never dead_url. _WAF_MARK tags the reason string.
+_WAF_STATUS = frozenset({403, 429, 503})
+_WAF_MARK = "WAF-BLOCK"
 _DEAD_PAGE = re.compile(
     r"There isn't a GitHub Pages site here|"                          # GitHub Pages: no site published
     r"DEPLOYMENT_NOT_FOUND|The deployment could not be found|"        # Vercel
@@ -1159,6 +1163,11 @@ def _dead_url_reason(url: str, render=None, timeout: float = 10.0, platform_host
                       headers={"User-Agent": _UA})
     except httpx.HTTPError as e:
         return f"unreachable ({type(e).__name__})"
+    if r.status_code in _WAF_STATUS:   # 403/429/503 = access-denied / rate-limited / temporarily-unavailable: the
+        return f"{_WAF_MARK} HTTP {r.status_code}"   # server is UP and refusing us (a WAF/edge block, transient), NOT a
+        #                                             dead URL. Marked so the caller records a CHALLENGE (recoverable,
+        #                                             visible to the retry circuit breaker), never dead_url -- else a
+        #                                             transient per-app Vercel block permanently discards a live app.
     if r.status_code >= 400:
         return f"HTTP {r.status_code}"
     if _DEAD_PAGE.search(r.text[:6000]):
@@ -1384,6 +1393,15 @@ def main():
             # also catches a client-side 404 (SPA renders 'not found' at HTTP 200) via a one-route render.
             dead = _dead_url_reason(url, render=(browser.render_routes if args.browser else None),
                                     platform_hosts=set(args.inferred_platform_hosts or []), is_anchor=is_anchor)
+            if dead and dead.startswith(_WAF_MARK):
+                # the server is UP but WAF/edge-blocking our client (a transient per-app block, e.g. Vercel under
+                # our automated traffic) -> a CHALLENGE, not a dead URL. Recorded like an entry-challenge so it's
+                # recoverable and VISIBLE to the retry's IP-block circuit breaker (which keys on bot_challenge),
+                # instead of a permanent dead_url that discards a live app and hides the cascade.
+                result.update(bot_challenge=True, challenge_stage="entry",
+                              deploy_error=f"WAF/edge block — {dead[len(_WAF_MARK):].strip()}")
+                print(f"\n  WAF/EDGE BLOCK ({dead}) — recorded as a challenge (recoverable), not a dead URL.")
+                return
             if dead:
                 result["dead_url"] = True                         # counted as "url does not work" (deployed=False)
                 result["deploy_error"] = f"URL DEAD — {dead}"
@@ -1528,7 +1546,10 @@ def main():
                       challenge_stage=report.challenge_stage, challenge_onset=report.challenge_onset,
                       request_counts=report.request_counts, blocked_probes=report.blocked_probes,
                       incomplete_axes=report.incomplete_axes, findings=findings,
-                      verdicts=_verdicts(report.outcomes))   # applied-but-unfired probes -> dark-recall audit set
+                      verdicts=_verdicts(report.outcomes),   # applied-but-unfired probes -> dark-recall audit set
+                      session_established=report.session_established)
+        if report.session_replay:   # the session the grade established -> retry_blocked replays it via --header and
+            result["session_replay"] = report.session_replay   # SKIPS the 26-nav register walk (the block re-trip)
         if report.trace:   # --trace only: per-probe request log (payloads/endpoints), viewable via stats.py --audit
             result["trace"] = report.trace
         if args.recon:

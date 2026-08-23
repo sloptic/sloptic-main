@@ -204,6 +204,13 @@ class Report:
     incomplete_axes: list = field(default_factory=list)    # bundles with >=1 blocked probe -> that axis is PARTIAL, must not
     #                                                        rank as clean (e.g. "security: partial — N severe edge-blocked")
     trace: list = field(default_factory=list)              # --trace only: every request each probe sent (net.start_trace)
+    session_replay: dict | None = None                     # the replayable session (Cookie/Bearer/apikey) the grade
+    #                                                        ESTABLISHED, so a subset RETRY can --header it and SKIP the
+    #                                                        26-nav browser register walk (which re-hammers the app and
+    #                                                        re-trips its per-app WAF block). None = no session captured.
+    session_established: object = None                     # True = session captured; False = registration was ATTEMPTED
+    #                                                        and FAILED (no self-serve signup / SSO / captcha) -> a retry
+    #                                                        must NOT re-walk a doomed signup; None = never attempted.
 
     @property
     def by_id(self) -> dict[str, str]:

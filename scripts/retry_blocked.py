@@ -130,6 +130,11 @@ def _status(blocked, rec):
       none    — re-challenged immediately, recovered nothing (sticky/collapse app)
       dnf     — the retry grade itself failed (dead url / timeout) -> recovered nothing, NOT a WAF verdict"""
     total = len(blocked)
+    if rec and rec.get("bot_challenge") and not _graded(rec):
+        # WAF/edge-blocked at the PREFLIGHT (deploy_and_grade recorded a challenge, not dead_url) -> re-challenged,
+        # recovered nothing. Counts as a WAF verdict (unlike a dead-url DNF) so a CASCADE of these trips the
+        # IP-block circuit breaker, which aborts the rest instead of re-hammering and re-warming the flag.
+        return "none", 0, total, "preflight"
     if not _graded(rec):
         return "dnf", 0, total, None
     still = set(rec.get("blocked_probes") or []) & set(blocked)
@@ -179,8 +184,25 @@ def _load_jobs(records):
         url = _url_of(r)
         if r.get("blocked_probes") and url and url not in seen:
             seen.add(url)
-            jobs.append((url, r.get("blocked_probes")))
+            jobs.append((url, r.get("blocked_probes"), r))
     return jobs
+
+
+def _session_flags(rec, browser_auth_flag):
+    """Per-app flags so the retry REUSES the main grade's session instead of re-doing the 26-nav register walk
+    (which re-hammers the app and re-trips its per-app WAF block -- the DNF-wave root cause). REUSE a captured
+    session via --header; if the main grade proved NO self-serve session (attempted + failed), DROP --browser-auth
+    so the retry never re-walks a doomed signup (browser render still runs -- --browser is on by default). Returns
+    the per-app browser/session flags to use in place of the shared browser_auth_flag."""
+    sess = rec.get("session_replay")
+    if isinstance(sess, dict) and sess:
+        flags = list(browser_auth_flag)                    # keep browser probes running; --header short-circuits the walk
+        for k, v in sess.items():
+            flags += ["--header", "%s: %s" % (k, v)]
+        return flags, "reuse"
+    if rec.get("session_established") is False and browser_auth_flag:
+        return [], "no-signup"                             # drop --browser-auth -> no doomed re-walk
+    return list(browser_auth_flag), "as-is"
 
 
 def _fold_and_summary(records, collected, tally, merged_file, results_path, retry_file):
@@ -239,18 +261,31 @@ def main():
             print(f"no retry records at {retry_file} — run the retry first (without --remerge)."); return
         print(f"re-merge only: folding {len(collected)} existing retry records from {retry_file}", flush=True)
         tally = Counter()
-        for url, bp in jobs:
+        for url, bp, _r in jobs:
             tally[_status(bp, collected.get(url))[0]] += 1
         _fold_and_summary(records, collected, tally, merged_file, args.results, retry_file)
         return
 
-    extra = (["--browser-auth"] if args.browser_auth else []) + (["--no-browser"] if args.no_browser else [])
+    # --browser-auth is decided PER APP now (session reuse), so it's split out of the shared `common` flags.
+    browser_auth_flag = ["--browser-auth"] if args.browser_auth else []
+    common = ["--no-browser"] if args.no_browser else []
     if args.email_domain:
-        extra += ["--email-domain", args.email_domain]
+        common += ["--email-domain", args.email_domain]
     if args.email_endpoint:
-        extra += ["--email-endpoint", args.email_endpoint]
+        common += ["--email-endpoint", args.email_endpoint]
     if args.email_token:
-        extra += ["--email-token", args.email_token]
+        common += ["--email-token", args.email_token]
+    # per-app flags: replay a captured session (no re-walk) / skip a doomed signup / re-walk as before.
+    modes = Counter()
+    job_flags = []
+    for url, bp, rec in jobs:
+        sflags, mode = _session_flags(rec, browser_auth_flag)
+        modes[mode] += 1
+        job_flags.append((url, bp, common + sflags))
+    if browser_auth_flag:
+        print("  session reuse: %d replay a captured session, %d skip a doomed signup, %d re-walk (no session "
+              "info) -- fewer register walks -> fewer re-tripped WAF blocks" %
+              (modes["reuse"], modes["no-signup"], modes["as-is"]), flush=True)
     tmpdir = tempfile.mkdtemp(prefix="sloptic-retry-")
     collected = {}                    # url -> retry record (None on DNF or a circuit-breaker skip)
     tally = Counter()
@@ -258,7 +293,7 @@ def main():
     abort = threading.Event()         # set by the IP-block circuit breaker; pending jobs then skip immediately
     statuses = []                     # (kind, bot_challenge) per graded app, for the breaker's verdict
     with ThreadPoolExecutor(max_workers=args.concurrency) as ex:
-        futs = [ex.submit(_retry_one, url, bp, tmpdir, extra, args.grade_timeout, abort) for url, bp in jobs]
+        futs = [ex.submit(_retry_one, url, bp, tmpdir, flags, args.grade_timeout, abort) for url, bp, flags in job_flags]
         for f in as_completed(futs):
             done += 1
             url, blocked, rec = f.result()

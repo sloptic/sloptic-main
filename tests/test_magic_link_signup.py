@@ -103,3 +103,33 @@ def test_magic_submit_fills_a_required_field_so_the_submit_is_not_blocked():
     page = _Page([email, extra], [btn])
     assert browser._fill_and_submit_magic(page, CREDS) is True
     assert extra.filled == "hl-x@app.test" and btn.clicked        # required field filled -> native validation won't block
+
+
+# ---- the auth-surface gate: skip the guessed-route fishing on a no-auth page (WAF-antagonism cut) --------------
+
+class _GatePage:
+    def __init__(self, inputs, links):
+        self.inputs, self.links = inputs, links
+
+    def query_selector(self, sel):
+        if "password" in sel:
+            return next((i for i in self.inputs if (i.get_attribute("type") or "") == "password"), None)
+        return None
+
+    def query_selector_all(self, sel):
+        return self.links if ("a," in sel or "button" in sel) else []
+
+
+def test_auth_entrypoint_true_on_a_password_field():
+    p = _GatePage([_El(attrs={"type": "password"})], [])
+    assert browser._page_has_auth_entrypoint(p) is True
+
+
+def test_auth_entrypoint_true_on_a_login_link():
+    p = _GatePage([], [_El(tag="a", text="Log in"), _El(tag="a", text="Pricing")])
+    assert browser._page_has_auth_entrypoint(p) is True           # a sign-in link -> auth exists -> keep fishing
+
+
+def test_auth_entrypoint_false_on_a_pure_no_auth_page():
+    p = _GatePage([], [_El(tag="a", text="Features"), _El(tag="a", text="Pricing")])
+    assert browser._page_has_auth_entrypoint(p) is False          # no password, no auth link -> skip the fishing

@@ -385,6 +385,28 @@ def _blocked(probes: list[Probe]) -> tuple[list[str], list[str]]:
     return [p.id for p in probes], sorted({p.bundle for p in probes})
 
 
+def _captured_session(ctx) -> dict | None:
+    """The replayable session (Cookie/Bearer/apikey) the grade ESTABLISHED, read from what the register / auth-crawl
+    / email lane already memoized on ctx -- never triggers a fresh registration. A subset RETRY replays this via
+    --header and SKIPS the 26-nav browser register walk (the walk re-hammers the app and re-trips its per-app WAF
+    block). Reads the unified crawl/email session first, else whatever the authed injection probes captured."""
+    cache = getattr(ctx, "_email_cache", None)
+    if not isinstance(cache, dict):
+        return None
+    base = {k.lower() for k in (getattr(ctx, "headers", None) or {})}
+
+    def _sess(hdrs):
+        return {k: v for k, v in hdrs.items()
+                if k.lower() in ("cookie", "authorization", "apikey") and k.lower() not in base}
+    snap = cache.get("account_session")                    # unified session (auth-crawl Gap B / email flow)
+    if isinstance(snap, dict) and isinstance(snap.get("headers"), dict) and _sess(snap["headers"]):
+        return _sess(snap["headers"])
+    hdrs = cache.get("_authed_headers")                    # else whatever the authed injection probes captured
+    if isinstance(hdrs, dict) and _sess(hdrs):
+        return _sess(hdrs)
+    return None
+
+
 def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_progress=None,
         source_dir=None, seed_features=None, cached_profile=None, on_profile=None, perceive=None,
         browser_register=None, recon: bool = False, auth_crawl: bool = False, trace: bool = False,
@@ -548,11 +570,16 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
         if ctx.lighthouse:   # capture the Lighthouse performance score (0-100) onto the record -- the perf axis
             perf = lighthouse.perf_score(ctx.lighthouse)   # already grades on it; this surfaces it for the stats.
             surface["lighthouse"] = {"performance": round(perf * 100) if perf is not None else None}
+        sess = _captured_session(ctx)               # the session the grade established -> a retry replays it, no re-walk
+        attempted = (ctx.browser_register is not None
+                     or (isinstance(ctx._email_cache, dict) and "_authed_headers" in ctx._email_cache))
         return Report(slop_score=compute_slop_score(outcomes), outcomes=outcomes,
                       axis_slop=compute_axis_slop(outcomes), surface=surface,
                       coverage=coverage_metrics(outcomes), platform=plat, bot_challenge=bot_challenge,
                       challenge_stage=stage, challenge_onset=onset_probe or "", request_counts=req_counts,
-                      blocked_probes=blocked_probes, incomplete_axes=incomplete_axes, trace=trace_sink or [])
+                      blocked_probes=blocked_probes, incomplete_axes=incomplete_axes, trace=trace_sink or [],
+                      session_replay=sess,
+                      session_established=(True if sess else (False if attempted else None)))
     finally:
         deployer.teardown()
 

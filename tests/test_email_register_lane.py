@@ -710,6 +710,19 @@ def test_reset_json_lane_clean_when_email_arrives(monkeypatch):
     acct.client.close()
 
 
+def test_captured_session_reads_the_established_session_for_retry_replay():
+    # the grade persists the session it established so a subset retry replays it (--header) and SKIPS the 26-nav
+    # register walk (the walk re-hammers the app -> re-trips its per-app WAF block -> the DNF wave).
+    c = pipeline._Ctx(base_url="http://app.test", client=None, profile=None)
+    c._email_cache["account_session"] = {"headers": {"Authorization": "Bearer T", "Cookie": "sid=1"}}
+    assert pipeline._captured_session(c) == {"Authorization": "Bearer T", "Cookie": "sid=1"}
+
+
+def test_captured_session_none_when_no_session_established():
+    c = pipeline._Ctx(base_url="http://app.test", client=None, profile=None)
+    assert pipeline._captured_session(c) is None      # -> record marks session_established False (retry won't re-walk)
+
+
 def test_reset_na_without_an_established_account(monkeypatch):
     monkeypatch.setattr(probes, "_email_register_once", lambda ctx, suffix="": None)
     ctx = _reset_ctx(Profile(base_url="http://app.test",
