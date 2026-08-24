@@ -107,23 +107,33 @@ class IngestCache:
             append_jsonl(self.path, {"k": key, "v": val})
 
 
-_BLOCK_STATUS = frozenset({403, 429, 503})   # Devpost's AWS-WAF block / rate-limit, NOT an empty gallery
+# Devpost's AWS-WAF answers a rate-limited client several ways, NONE of them an empty gallery: 403/429/503,
+# and -- observed on the Dell under fan-out load -- a 202 or 405 CAPTCHA/Challenge with a 0-byte body. A real
+# gallery is always 200 + ~140KB, so every one of these on this endpoint is a block to retry, never "no page".
+_BLOCK_STATUS = frozenset({202, 403, 405, 429, 503})
 _DEBUG = bool(os.environ.get("DEVPOST_DEBUG"))   # DEVPOST_DEBUG=1 -> page_projects logs status/size/item-count
 
 
-def _get(client, url, tries=4, **kw):
-    """GET with retry + backoff on a transient WAF block (403 / 429 / 503). Devpost fronts its submissions
-    subdomains with an AWS WAF that rate-limits per client under load, a burst of slugs/pages can start 403ing
-    mid-run. Returns the response (even a FINAL block, so the caller can tell a WAF 403 from a 404 / empty
-    gallery and warn instead of silently reading it as 'no projects'), or None on a transport error."""
-    delay = 1.0
+def _get(client, url, tries=5, **kw):
+    """GET with retry + backoff on a transient WAF block (202 / 403 / 405 / 429 / 503) OR a transport error.
+    Devpost fronts its submissions subdomains with an AWS WAF that rate-limits per client under load, a burst
+    of slugs/pages can start challenging mid-run (a 0-byte 202/405 CAPTCHA, a 403/429/503, or a dropped
+    connection). Returns the response (even a FINAL block, so the caller can tell a WAF challenge from a 404 /
+    empty gallery and warn instead of silently reading it as 'no projects'), or None if it never got one."""
+    delay = 1.5
     r = None
     for i in range(tries):
         try:
             r = client.get(url, headers={"User-Agent": UA}, timeout=25, **kw)
-        except httpx.HTTPError as e:
+        except httpx.HTTPError as e:                    # RST / SSL / timeout: the WAF drops connections too
             if _DEBUG:
-                sys.stderr.write(f"  [debug] _get TRANSPORT-ERROR {type(e).__name__}: {e}  url={url}\n")
+                sys.stderr.write(f"  [debug] _get TRANSPORT-ERROR {type(e).__name__}: {e} "
+                                 f"(try {i + 1}/{tries})  url={url}\n")
+            r = None
+            if i < tries - 1:
+                time.sleep(delay)
+                delay *= 2
+                continue
             return None
         if r.status_code not in _BLOCK_STATUS:
             return r
@@ -131,7 +141,7 @@ def _get(client, url, tries=4, **kw):
             sys.stderr.write(f"  [debug] _get block HTTP {r.status_code} (try {i + 1}/{tries})  url={url}\n")
         if i < tries - 1:
             time.sleep(delay)
-            delay *= 2                # backoff 1s, 2s, 4s: rides out a transient rate window
+            delay *= 2                # backoff 1.5s, 3s, 6s, 12s: rides out a transient rate window
     return r                          # still blocked after retries -> hand the 403 back so the caller warns
 
 

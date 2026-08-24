@@ -164,3 +164,14 @@ def test_empty_gallery_200_is_cacheable_not_a_block(tmp_path):
     cache = IngestCache(str(tmp_path / "c.jsonl"))
     assert page_projects(_Stub("<html>no items</html>", status=200), "empty-slug", 9, cache) == []
     assert cache.has("page:empty-slug:9")            # empty 200 IS cached; a 403 would not be
+
+
+def test_waf_202_and_405_captcha_are_blocks_not_empty_galleries(monkeypatch, capsys):
+    # AWS-WAF's CAPTCHA/Challenge answers a rate-limited client with a 0-byte 202 or 405 (observed on the Dell
+    # under fan-out load), NOT a 403. Both must warn + return [] UNCACHED, never be read as 'gallery exhausted'.
+    import devpost_repos
+    monkeypatch.setattr(devpost_repos.time, "sleep", lambda *_a: None)
+    for status in (202, 405):
+        out = page_projects(_Stub("", status=status), f"waf{status}", 1)
+        assert out == []
+        assert "WAF-blocked" in capsys.readouterr().err
