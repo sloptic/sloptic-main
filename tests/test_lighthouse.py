@@ -30,7 +30,10 @@ def test_missing_report_is_empty_not_crash():
 def test_mapped_audit_ids_are_declared_and_versions_pinned():
     ids = lh.INSIGHT_AUDITS + lh.NUMERIC_AUDITS + lh.METRIC_AUDITS
     assert len(ids) == 19 and all(isinstance(a, str) and a for a in ids)
-    assert lh.LIGHTHOUSE_VERSION and lh.DEFAULT_RUNS == 3   # pinned version + median default (env unset)
+    # pinned CLI version. (The median-of-N DEFAULT is 3, but DEFAULT_RUNS is env-derived at import, so asserting
+    # it here breaks a suite run with SLOPTIC_LIGHTHOUSE_RUNS set, e.g. mid-grade tuning -> the default is locked
+    # env-isolated in test_runs_env_override via monkeypatch.delenv instead.)
+    assert lh.LIGHTHOUSE_VERSION
 
 
 def test_runs_env_override(monkeypatch):
