@@ -121,10 +121,14 @@ def _get(client, url, tries=4, **kw):
     for i in range(tries):
         try:
             r = client.get(url, headers={"User-Agent": UA}, timeout=25, **kw)
-        except httpx.HTTPError:
+        except httpx.HTTPError as e:
+            if _DEBUG:
+                sys.stderr.write(f"  [debug] _get TRANSPORT-ERROR {type(e).__name__}: {e}  url={url}\n")
             return None
         if r.status_code not in _BLOCK_STATUS:
             return r
+        if _DEBUG:
+            sys.stderr.write(f"  [debug] _get block HTTP {r.status_code} (try {i + 1}/{tries})  url={url}\n")
         if i < tries - 1:
             time.sleep(delay)
             delay *= 2                # backoff 1s, 2s, 4s: rides out a transient rate window
@@ -168,6 +172,8 @@ def page_projects(client, slug, page, cache=None):
         return [tuple(x) for x in cache.get(ck)]        # JSON stored each (url, winner) pair as a list
     r = _get(client, _SUBS.format(slug=slug, page=page))
     if r is None:
+        if _DEBUG:
+            sys.stderr.write(f"  [debug] {slug} p{page}: _get returned None (transport error) -> [] uncached\n")
         return []                                       # transport error -> transient, retry next run (uncached)
     if r.status_code in _BLOCK_STATUS:                  # AWS-WAF block AFTER retries -> NOT an empty gallery
         sys.stderr.write(f"  ⚠ {slug} page {page}: Devpost WAF-blocked ({r.status_code}) after retries — this "
@@ -175,6 +181,9 @@ def page_projects(client, slug, page, cache=None):
                          f"less-loaded client, slow down (raise the politeness delay), or wait for the window.\n")
         return []                                       # uncached (retries next run), but the user now KNOWS why
     if r.status_code != 200:
+        if _DEBUG:
+            sys.stderr.write(f"  [debug] {slug} p{page}: HTTP {r.status_code} (not 200, not in block set) "
+                             f"{len(r.text)}B -> [] uncached  <-- silent non-200 (WAF CAPTCHA is often 202/405?)\n")
         return []                                       # genuine 404 / other -> no such gallery page
     out, seen = [], set()
     for block in _GALLERY_SPLIT.split(r.text)[1:]:
