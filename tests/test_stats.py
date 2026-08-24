@@ -117,7 +117,7 @@ def test_modalities_reports_spread_and_clumps():
 
 def test_modalities_none_when_every_score_is_distinct():
     out = _modalities([12.5, 13.7, 45.6])
-    assert "100% unique" in out[0] and "none — every score is distinct" in out[1]
+    assert "100% unique" in out[0] and "none, every score is distinct" in out[1]
 
 
 def test_dnf_reason_buckets_each_failure_most_specific_first():
