@@ -1440,6 +1440,10 @@ _CMDI_MAX_REQUESTS = _INJECT_MAX_REQUESTS   # kept for the cmdi reference below;
 # SQLi timing) must NEVER use this -- concurrent requests confound the latency they measure. Env-tunable so the
 # burst can be dialed on a flaky corpus without a code change.
 _INJECT_POOL = max(1, int(os.environ.get("SLOPTIC_INJECT_POOL", "6")))
+# Separate, LOWER default for the sensitive-file path scan: the enumeration probes are where the per-origin WAF
+# challenge onsets first (measured: sec-exposure-007 is the #1 challenge trigger), because they spray many paths
+# at one origin. A smaller pool keeps that burst gentler; retry_blocked still salvages anything it trips.
+_EXPOSURE_POOL = max(1, int(os.environ.get("SLOPTIC_EXPOSURE_POOL", "4")))
 
 
 def _fan_out_first(send, specs, oracle, pool=_INJECT_POOL, cap_check=None):
@@ -3626,7 +3630,6 @@ def exposed_sensitive_file(ctx, probe) -> bool | None:
     resolved under the app root (_at), because a sub-path deployment's files live there and not at the origin.
     N/A when nothing matched AND nothing was even reachable, so a host that refused every request isn't scored
     as clean."""
-    reached = False
     # Dedup is CONTENT-based, not path-based. Skipping every path discovery happened to list was backwards:
     # measured on the repro, the SAME bytes on the SAME server flipped True -> False purely because the crawl
     # named the file, so an app whose sitemap exposes /.docker/config.json got a free pass while one that hid
@@ -3635,25 +3638,33 @@ def exposed_sensitive_file(ctx, probe) -> bool | None:
     # case that moved the anchor 664 -> 673) and sec-exposure-005 claims it when the body carries credential
     # material. Absent both, no other probe fires on this file and skipping it just loses the finding.
     known = {(r or "").split("?")[0].rstrip("/") for r in getattr(ctx.profile, "routes", None) or []}
+    seen = [False]   # monotonic False->True 'any path was reachable' flag; safe under the pool (idempotent set)
     with make_client(ctx.base_url, ctx.headers, timeout=8.0, follow_redirects=True) as c:
-        for path, check in _SENSITIVE_FILES:
+        # INDEPENDENT candidate GETs with a CONTENT oracle -> fan out (lower pool: this scan is the #1 per-origin
+        # challenge trigger) and stop on the FIRST proven file, so a repo leaking three files is still one finding.
+        def _send(spec):
+            path, check = spec
             try:
                 r = c.get(_at(ctx, path))
             except (httpx.HTTPError, httpx.InvalidURL):
-                continue
-            reached = True
+                return spec, None
+            seen[0] = True
             if _is_phantom_shell(ctx, r):
-                continue          # catch-all host echoing its shell -> not a served file
+                return spec, None          # catch-all host echoing its shell -> not a served file
             if path.rstrip("/") in known and _claimed_by_a_routes_probe(r):
-                continue          # a discovered path another probe already bills -> theirs, not ours
+                return spec, None          # a discovered path another probe already bills -> theirs, not ours
             with contextlib.suppress(Exception):
                 if check(r):
-                    ctx.evidence.update(exposed=True, high_privilege=True, path=path, status=r.status_code,
-                                        bytes=len(r.content or b""),
-                                        repro=_repro("GET", str(r.url), status=r.status_code,
-                                                     matched=f"served {path}"))
-                    return True
-    if not reached:
+                    return spec, r
+            return spec, None
+        got = _fan_out_first(_send, _SENSITIVE_FILES, lambda s, r: r is not None, pool=_EXPOSURE_POOL)
+        if got is not None:
+            path, r = got[0][0], got[1]
+            ctx.evidence.update(exposed=True, high_privilege=True, path=path, status=r.status_code,
+                                bytes=len(r.content or b""),
+                                repro=_repro("GET", str(r.url), status=r.status_code, matched=f"served {path}"))
+            return True
+    if not seen[0]:
         ctx.evidence["na_reason"] = "no candidate path was reachable (host refused every request)"
         return None
     ctx.evidence.update(exposed=False, paths_checked=len(_SENSITIVE_FILES))
