@@ -239,14 +239,16 @@ def _last_record_for(results_path, target):
     return rec
 
 
-def _tldr_line(done, total, label, rec, secs, eta, tail):
-    """The compact per-app line: [i/N] label  <slop N | DNF | FAIL>  missed: kinds  · Ns ETA m:ss."""
+def _tldr_line(done, total, label, rec, secs, eta, tail, url=""):
+    """The compact per-app line: [i/N] label  <slop N | DNF | FAIL>  missed: kinds  · Ns ETA m:ss  URL."""
     prog = f"[{done}/{total}]"
     eta_s = f"ETA {int(eta) // 60}:{int(eta) % 60:02d}" if eta else ""
+    tag = f"  {url}" if url else ""             # the app's URL, appended last so it stays clickable and the
+    #                                             fixed-width columns before it don't shift with the URL length
     if tail:                                    # wedged / job error — tail carries the reason
-        return f"{prog} {label:<30} ✗ {tail.strip().lstrip('!').strip()[:50]}  ·{secs:4.0f}s {eta_s}"
+        return f"{prog} {label:<30} ✗ {tail.strip().lstrip('!').strip()[:50]}  ·{secs:4.0f}s {eta_s}{tag}"
     if rec is None:
-        return f"{prog} {label:<30} ? no record  ·{secs:4.0f}s {eta_s}"
+        return f"{prog} {label:<30} ? no record  ·{secs:4.0f}s {eta_s}{tag}"
     audit = rec.get("coverage_audit") or {}
     state = audit.get("page_state")
     if rec.get("functional") is False or state in ("broken", "not-an-app", "placeholder"):
@@ -265,7 +267,7 @@ def _tldr_line(done, total, label, rec, secs, eta, tail):
         onset = rec.get("challenge_onset") or "end"
         kept = "kept" if rec.get("challenge_stage") == "late" else "withheld"
         miss = f"⚠ challenge@{onset} ({kept})"
-    return f"{prog} {label:<30} {score:<20} {miss:<34} ·{secs:4.0f}s {eta_s}"
+    return f"{prog} {label:<30} {score:<20} {miss:<34} ·{secs:4.0f}s {eta_s}{tag}"
 
 
 def _build_cmd(j, args, ckpt):
@@ -374,7 +376,7 @@ def _run_job(j, idx, total, args, capture, progress=None):
     if args.tldr:                          # terse: one line from the child's record, not its full dump
         rec_out = _last_record_for(args.results, target)
         with _print_lock:
-            print(_tldr_line(done, gtotal, _label(j), rec_out, secs, eta, tail), flush=True)
+            print(_tldr_line(done, gtotal, _label(j), rec_out, secs, eta, tail, url=target), flush=True)
     else:                                  # full dump -> append a batch progress + ETA footer (right after the
         foot = _eta_footer(done, gtotal, secs, eta)              # child's own timing/model line)
         if capture:
