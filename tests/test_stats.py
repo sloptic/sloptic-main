@@ -7,7 +7,8 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
-from stats import _dnf_reason, _is_graded, _modalities, auth_surface, by_hackathon, lighthouse_scores  # noqa: E402
+from stats import (  # noqa: E402
+    _dnf_reason, _is_graded, _modalities, _severity_tier, auth_surface, by_hackathon, lighthouse_scores)
 
 from sloptic.eligibility import is_ungradeable_challenge  # noqa: E402
 
@@ -153,3 +154,11 @@ def test_auth_surface_sizes_registerable_hard_blocked_and_no_auth_slices():
 def test_auth_surface_empty_on_a_pre_field_corpus():
     a = auth_surface([{"deployed": True, "slop_score": 40}, {"deployed": True, "slop_score": 10}])
     assert a["n"] == 0 and a["self_registerable"] == 0 and dict(a["sso_providers"]) == {}
+
+
+def test_severity_tier_buckets_by_penalty_at_the_boundaries():
+    # [6] FINDING SEVERITY derives tiers from the risk-priced penalty (no severity field in the record).
+    assert _severity_tier(40) == "critical" and _severity_tier(30) == "critical"
+    assert _severity_tier(29) == "serious" and _severity_tier(16) == "serious"
+    assert _severity_tier(15) == "moderate" and _severity_tier(8) == "moderate"
+    assert _severity_tier(7) == "minor" and _severity_tier(1) == "minor"

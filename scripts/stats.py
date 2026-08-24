@@ -30,6 +30,21 @@ from sloptic.catalog import load_catalog  # noqa: E402
 from sloptic.eligibility import is_shell_only, is_ungradeable_challenge, is_wrong_owner  # noqa: E402
 from sloptic.schema import Outcome  # noqa: E402
 
+# probes that cannot fire without a SESSION / ACCOUNT (behind login): the authed surface cluster. Used to
+# cross tab the AUTH SURFACE reach against real coverage, did establishing a session actually surface a defect.
+_AUTHED_PROBES = frozenset({
+    "qa-reset-001", "qa-email-001", "qa-email-002", "qa-integrity-001", "qa-integrity-002",
+    "sec-idor-002", "sec-idor-003", "sec-idor-004", "sec-idor-005",
+    "sec-backend-002", "sec-backend-003", "sec-xss-002", "qa-input-002",
+})
+
+
+def _severity_tier(penalty):
+    """A finding's severity tier, derived from its risk priced penalty (no explicit severity field in the record):
+    critical >= 30, serious 16..29, moderate 8..15, minor 1..7."""
+    return ("critical" if penalty >= 30 else "serious" if penalty >= 16
+            else "moderate" if penalty >= 8 else "minor")
+
 
 def load(path):
     """Records, deduped by repo (latest ts wins) so re-runs don't double-count. The dedup key is the
@@ -508,6 +523,14 @@ def main():
     n_sf, sf_login, sf_signup, sf_pw = A["n"], A["has_login"], A["has_signup"], A["self_registerable"]
     sf_sso, sf_ssoonly, no_auth = A["has_sso"], A["sso_only"], A["no_auth"]
     sso_providers, captcha_kinds = A["sso_providers"], A["captcha"]
+    # reach x yield: of the self-registerable apps (a password signup we can drive), how many actually got an
+    # authed-cluster finding, i.e. did establishing a session surface a defect. Ties the reach to real coverage.
+    reg_apps = [r for r in graded if isinstance(r.get("observed_surface"), dict)
+                and r["observed_surface"].get("has_password_form")]
+    reg_fired = [r for r in reg_apps if any(_scored(f) and f["probe_id"] in _AUTHED_PROBES
+                                            for f in r.get("findings", []))]
+    authed_fire_probes = Counter(f["probe_id"] for r in reg_apps for f in r.get("findings", [])
+                                 if _scored(f) and f["probe_id"] in _AUTHED_PROBES)
 
     if args.json:
         print(json.dumps({
@@ -528,11 +551,20 @@ def main():
                           "graded_pct": round(100 * len(graded) / (len(attempted) or 1), 1),
                           "dnf": len(dnf), "dnf_pct": round(100 * len(dnf) / (len(attempted) or 1), 1),
                           "skipped_out_of_scope": len(skipped), "dnf_by_reason": dict(dnf_reasons.most_common())},
+            "clean_rate": {"clean": len(zeros), "graded": len(graded),
+                           "pct": round(100 * len(zeros) / (len(graded) or 1), 1)},
             "auth_surface": {"n": n_sf, "has_login": sf_login, "has_signup": sf_signup,
                              "has_password_form": sf_pw, "self_registerable": sf_pw, "has_sso": sf_sso,
                              "sso_only_hard_blocked": sf_ssoonly, "no_auth": no_auth,
                              "sso_providers": dict(sso_providers.most_common()),
-                             "captcha": dict(captcha_kinds.most_common())},
+                             "captcha": dict(captcha_kinds.most_common()),
+                             "reach_yield": {"registerable": sf_pw, "with_authed_finding": len(reg_fired),
+                                             "authed_fire_probes": dict(authed_fire_probes.most_common())}},
+            "finding_severity": {t: {"findings": sum(1 for r in graded for f in r.get("findings", [])
+                                                     if _scored(f) and _severity_tier(f["penalty"]) == t),
+                                     "apps": len({r["repo"] for r in graded for f in r.get("findings", [])
+                                                  if _scored(f) and _severity_tier(f["penalty"]) == t})}
+                                 for t in ("critical", "serious", "moderate", "minor")},
             "category_concentration": {k: round(v, 1) for k, v in sorted(cat_total.items(), key=lambda x: -x[1])},
             "probe_fire_frequency": {pid: n for pid, n in freq},
             "email_verification": email_break,
@@ -575,6 +607,8 @@ def main():
           + (f"   ·   {len(skipped)} skipped (not a web app)" if skipped else ""))
     for reason, n in dnf_reasons.most_common():
         print(f"      {n:>3} DNF  {reason}")
+    print(f"    clean: {len(zeros)}/{len(graded)} graded scored 0 (fully clean, no slop found)"
+          f"   ·   {100 * len(zeros) / (len(graded) or 1):.0f}% clean rate")
     print(f"\n    deploy success (reproducibility, REPO apps only):")
     n_try = len(repo_recs) - len(skipped)   # over REPO web apps we tried to deploy (not skips, not live URLs)
     print(f"    {len(deployed)}/{n_try} deployed  ({len(deployed)/(n_try or 1)*100:.0f}%)   "
@@ -634,6 +668,10 @@ def main():
               f"({100*sf_signup/n_sf:.0f}%)   ·   no auth at all {no_auth} ({100*no_auth/n_sf:.0f}%)")
         print(f"     self registerable (password signup we can drive): {sf_pw} ({100*sf_pw/n_sf:.0f}%)"
               f"   <- the reach for the authed / email / browser data plane probes")
+        if sf_pw:   # reach x yield: did that reach actually surface a defect?
+            note = ("  ".join(f"{p} {n}" for p, n in authed_fire_probes.most_common())
+                    if authed_fire_probes else "no authed finding, the reach did not surface a defect")
+            print(f"       reach x yield: {len(reg_fired)}/{sf_pw} of them had an authed surface finding  ({note})")
         print(f"     SSO present {sf_sso} ({100*sf_sso/n_sf:.0f}%)   ·   SSO only, no self serve alternative "
               f"(hard blocked): {sf_ssoonly} ({100*sf_ssoonly/n_sf:.0f}%)")
         if sso_providers:
@@ -675,6 +713,22 @@ def main():
             xs = axis_vals[ax]
             print(f"    {ax:12} {axis_total[ax]/all_axis*100:4.0f}% of all slop   "
                   f"median {statistics.median(xs):5.1f}   mean {statistics.mean(xs):5.1f}   (n {len(xs)} apps)")
+
+    # FINDING SEVERITY, the scored findings bucketed by risk-priced penalty into tiers, with the # of apps carrying
+    # at least one at that tier. Shows the SHAPE of the harm (are the fires a few critical breaches or a long tail
+    # of minor ones), which the summed score alone hides.
+    sev_findings, sev_apps = Counter(), defaultdict(set)
+    for r in graded:
+        for f in r.get("findings", []):
+            if _scored(f):
+                t = _severity_tier(f["penalty"])
+                sev_findings[t] += 1
+                sev_apps[t].add(r["repo"])
+    if sev_findings:
+        sec("FINDING SEVERITY  (scored findings by risk-priced penalty tier; apps = # with >=1 at that tier)")
+        for tier in ("critical", "serious", "moderate", "minor"):
+            print(f"    {tier:9} (pen {'>=30' if tier=='critical' else '16-29' if tier=='serious' else '8-15' if tier=='moderate' else '1-7':>5})"
+                  f"   {sev_findings.get(tier, 0):>4} findings   across {len(sev_apps.get(tier, set())):>3} apps")
 
     # (b2) Lighthouse PERFORMANCE score, 0-100, the number the perf axis grades on, surfaced here. Absent on a
     # pre-Lighthouse-cutover corpus, so the section self-skips. (a11y is scored by qa-a11y, not shown here.)
