@@ -314,11 +314,26 @@ def auth_surface(graded):
 
     def sf(key):
         return sum(1 for r in surfaced if r["observed_surface"].get(key))
+
+    def bucket(s):
+        # ONE auth type per app, keyed on what we can DRIVE, so the buckets are mutually exclusive and sum to n
+        # (the old flat has_signup / self_registerable / sso_only counts OVERLAP -> can't reconcile, and the
+        # password+SSO app is invisible: counted in self_registerable, excluded from sso_only). has_password_form
+        # is the drivable-signup signal; has_signup can be True with no drivable form (SDK/SSO-signup/wizard).
+        pw, sso = s.get("has_password_form"), s.get("has_sso")
+        if pw and sso:        return "password_and_sso"        # self-serve password AND SSO offered (BOTH)
+        if pw:                return "password_only"           # self-serve password, no SSO
+        if sso:               return "sso_only"                # SSO present, no drivable password form
+        if s.get("has_signup"): return "signup_undrivable"     # signup detected but no form we can drive, no SSO
+        if s.get("has_login"):  return "login_only"            # a login wall, no self-serve way in
+        return "no_auth"                                       # no login / signup / sso at all
+    partition = Counter(bucket(r["observed_surface"]) for r in surfaced)   # sums to len(surfaced) by construction
     return {"n": len(surfaced), "has_login": sf("has_login"), "has_signup": sf("has_signup"),
             "self_registerable": sf("has_password_form"), "has_sso": sf("has_sso"), "sso_only": sf("sso_only"),
             "no_auth": sum(1 for r in surfaced if not r["observed_surface"].get("has_login")
                            and not r["observed_surface"].get("has_signup")
                            and not r["observed_surface"].get("has_sso")),
+            "partition": partition,
             "sso_providers": Counter(p for r in surfaced for p in (r["observed_surface"].get("sso_providers") or [])),
             "captcha": Counter(r["observed_surface"].get("captcha") for r in surfaced
                                if r["observed_surface"].get("captcha"))}
@@ -1324,6 +1339,7 @@ def main():
             "auth_surface": {"n": n_sf, "has_login": sf_login, "has_signup": sf_signup,
                              "has_password_form": sf_pw, "self_registerable": sf_pw, "has_sso": sf_sso,
                              "sso_only_hard_blocked": sf_ssoonly, "no_auth": no_auth,
+                             "partition": dict(A["partition"].most_common()),
                              "sso_providers": dict(sso_providers.most_common()),
                              "captcha": dict(captcha_kinds.most_common()),
                              "reach_yield": {"registerable": sf_pw, "with_authed_finding": len(reg_fired),
@@ -1433,15 +1449,27 @@ def main():
     if n_sf:
         sec(f"AUTH SURFACE  ({n_sf} graded apps carry the surface fields)")
         print(f"     has login {sf_login} ({100*sf_login/n_sf:.0f}%)   |   has signup {sf_signup} "
-              f"({100*sf_signup/n_sf:.0f}%)   |   no auth at all {no_auth} ({100*no_auth/n_sf:.0f}%)")
-        print(f"     self registerable (password signup we can drive): {sf_pw} ({100*sf_pw/n_sf:.0f}%)"
+              f"({100*sf_signup/n_sf:.0f}%)   |   SSO present {sf_sso} ({100*sf_sso/n_sf:.0f}%)")
+        # auth TYPE as a mutually-exclusive partition (sums to n_sf) so the password+SSO app is visible and the
+        # 'has_signup but not drivable' gap is named, instead of overlapping counts that can't be reconciled.
+        part = A["partition"]
+        print(f"     auth type (partition of {n_sf}, one per app):")
+        for key, label in (("password_only", "password self-serve only (drivable)"),
+                           ("password_and_sso", "password self-serve + SSO (both, drivable)"),
+                           ("sso_only", "SSO only, no self-serve (hard blocked)"),
+                           ("signup_undrivable", "signup present but NOT drivable (SDK/SSO-signup/wizard)"),
+                           ("login_only", "login wall, no self-serve way in"),
+                           ("no_auth", "no auth at all")):
+            v = part.get(key, 0)
+            if v:
+                print(f"       {label:48s} {v:4d} ({100*v/n_sf:2.0f}%)")
+        # reach = the DRIVABLE slice = password_only + password_and_sso (== self_registerable / sf_pw)
+        print(f"     -> self registerable (drivable password signup): {sf_pw} ({100*sf_pw/n_sf:.0f}%)"
               f"   <- the reach for the authed / email / browser data plane probes")
         if sf_pw:   # reach x yield: did that reach actually surface a defect?
             note = ("  ".join(f"{p} {n}" for p, n in authed_fire_probes.most_common())
                     if authed_fire_probes else "no authed finding, the reach did not surface a defect")
             print(f"       reach x yield: {len(reg_fired)}/{sf_pw} of them had an authed surface finding  ({note})")
-        print(f"     SSO present {sf_sso} ({100*sf_sso/n_sf:.0f}%)   |   SSO only, no self serve alternative "
-              f"(hard blocked): {sf_ssoonly} ({100*sf_ssoonly/n_sf:.0f}%)")
         if sso_providers:
             print("     SSO providers: " + "  ".join(f"{p} {c}" for p, c in sso_providers.most_common()))
         if captcha_kinds:

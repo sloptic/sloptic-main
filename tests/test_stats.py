@@ -149,6 +149,35 @@ def test_auth_surface_sizes_registerable_hard_blocked_and_no_auth_slices():
     assert a["n"] == 4                                          # the surface-less record drops out
     assert a["self_registerable"] == 1 and a["sso_only"] == 1 and a["no_auth"] == 1
     assert a["has_sso"] == 1 and a["sso_providers"]["google"] == 1 and a["captcha"]["hcaptcha"] == 1
+    # the partition is mutually exclusive and sums to n: here the 4 surfaced apps land in 4 distinct buckets
+    assert sum(a["partition"].values()) == a["n"]
+    assert a["partition"]["password_only"] == 1        # self registerable, no SSO
+    assert a["partition"]["sso_only"] == 1             # SSO only, hard blocked
+    assert a["partition"]["login_only"] == 1           # captcha app: has_login, no signup/form/SSO -> login wall
+    assert a["partition"]["no_auth"] == 1
+
+
+def test_auth_surface_partition_makes_the_password_plus_sso_both_case_visible():
+    # the bug the flat counts hid: an app offering BOTH a password signup AND SSO is counted in self_registerable
+    # yet excluded from sso_only, so self_registerable + sso_only never reconciles against has_signup. The
+    # partition gives it its own bucket, and a has_signup app with no drivable form lands in signup_undrivable.
+    def app(**kw):
+        s = {"has_login": True, "has_signup": True, "has_password_form": False, "has_sso": False,
+             "sso_only": False, "sso_providers": [], "captcha": None}
+        s.update(kw)
+        return _rec(observed_surface=s)
+    a = auth_surface([
+        app(has_password_form=True, has_sso=True, sso_providers=["google"]),   # BOTH
+        app(has_password_form=True),                                           # password only
+        app(has_password_form=False, has_sso=False),                          # signup flagged, not drivable
+    ])
+    assert a["partition"]["password_and_sso"] == 1
+    assert a["partition"]["password_only"] == 1
+    assert a["partition"]["signup_undrivable"] == 1
+    assert sum(a["partition"].values()) == a["n"] == 3
+    # self_registerable (the drivable reach) == password_only + password_and_sso, and it can be < has_signup
+    assert a["self_registerable"] == a["partition"]["password_only"] + a["partition"]["password_and_sso"]
+    assert a["self_registerable"] == 2 and a["has_signup"] == 3
 
 
 def test_auth_surface_empty_on_a_pre_field_corpus():
