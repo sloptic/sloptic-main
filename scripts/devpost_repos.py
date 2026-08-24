@@ -108,6 +108,7 @@ class IngestCache:
 
 
 _BLOCK_STATUS = frozenset({403, 429, 503})   # Devpost's AWS-WAF block / rate-limit, NOT an empty gallery
+_DEBUG = bool(os.environ.get("DEVPOST_DEBUG"))   # DEVPOST_DEBUG=1 -> page_projects logs status/size/item-count
 
 
 def _get(client, url, tries=4, **kw):
@@ -181,6 +182,11 @@ def page_projects(client, slug, page, cache=None):
         if m and m.group(0) not in seen:
             seen.add(m.group(0))
             out.append((m.group(0), bool(re.search(r"\bwinner\b", block, re.I))))
+    if _DEBUG:                                          # DEVPOST_DEBUG=1: what did the REAL fetch actually return?
+        items = len(_GALLERY_SPLIT.split(r.text)) - 1
+        sys.stderr.write(f"  [debug] {slug} p{page}: HTTP {r.status_code} {len(r.text)}B "
+                         f"gallery-items={items} parsed={len(out)}"
+                         f"{'  <-- 200 but 0 items (interstitial?)' if items == 0 else ''}\n")
     if cache is not None:
         cache.put(ck, out)                              # a genuine 200 (even empty = gallery end) is cacheable
     return out
