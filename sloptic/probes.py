@@ -697,26 +697,42 @@ def api_sqli(ctx, probe) -> bool | None:
             if not _endpoint_is_live(ctx, c, ep.raw_path, method, base):
                 continue  # phantom endpoint (root or per-prefix catch-all shell) -> not a real SQL sink
             eps_tested.append(ep.raw_path)
-            for slot in _sqli_slots(ep):
-                if budget <= 0 or capped():
-                    break
-                budget -= 1
+            if budget <= 0:
+                break
+            # DETERMINISTIC error + boolean per slot: both are pure CONTENT differentials (no latency), so the
+            # slots fan out concurrently and stop on the first confirmed injection. The blind TIME technique is
+            # NOT here -- it stays in the sequential `deep` pass below, where concurrent requests can't confound
+            # the latency it measures. A no-hit endpoint's slots are deferred to that time pass (advisory).
+            slots = list(_sqli_slots(ep))[:budget]
+            budget -= len(slots)
+            if slots:
                 tested = True
-                slots_tested += 1
-                reqfn = (lambda ep=ep, slot=slot: lambda v: _sqli_request(ep, slot, v))()
-                try:
-                    err, err_pay = _tech_error(c, method, reqfn)
-                    if err or _tech_boolean(c, method, reqfn):
-                        pay = err_pay if err else _SQLI_TRUE   # the injected value that ACTUALLY revealed it
-                        ctx.evidence.update(injectable=True, via=("error" if err else "boolean"), param=slot,
-                                            endpoint=ep.raw_path, sql_error=err, techniques_tried=techs,
-                                            repro=_sqli_repro(ctx, method, reqfn, pay, matched=err))
-                        return True
-                except (httpx.HTTPError, httpx.InvalidURL):
-                    continue
-                if len(deep) < _DEEP_SLOTS:
-                    deep.append((method, reqfn, ep.raw_path, slot))
-            if budget <= 0 or capped():
+                slots_tested += len(slots)
+
+                def _sqli_send(slot, ep=ep, method=method):
+                    reqfn = lambda v: _sqli_request(ep, slot, v)
+                    try:
+                        err, err_pay = _tech_error(c, method, reqfn)
+                        if err or _tech_boolean(c, method, reqfn):
+                            return slot, {"via": "error" if err else "boolean", "err": err,
+                                          "pay": err_pay if err else _SQLI_TRUE, "reqfn": reqfn,
+                                          "method": method, "path": ep.raw_path}
+                    except (httpx.HTTPError, httpx.InvalidURL):
+                        return slot, None
+                    return slot, None
+                got = _fan_out_first(_sqli_send, slots, lambda s, r: r is not None, cap_check=capped)
+                if got is not None:
+                    slot, info = got
+                    ctx.evidence.update(injectable=True, via=info["via"], param=slot, endpoint=info["path"],
+                                        sql_error=info["err"], techniques_tried=techs,
+                                        repro=_sqli_repro(ctx, info["method"], info["reqfn"], info["pay"],
+                                                          matched=info["err"]))
+                    return True
+                for slot in slots:   # no deterministic hit -> defer these to the blind TIME pass (advisory, off-score)
+                    if len(deep) < _DEEP_SLOTS:
+                        deep.append((method, (lambda v, ep=ep, slot=slot: _sqli_request(ep, slot, v)),
+                                     ep.raw_path, slot))
+            if capped():
                 break
         for method, reqfn, path, slot in deep:   # blind TIME pass -> ADVISORY only, never scored
             if capped():
@@ -1721,24 +1737,33 @@ def ssti_injectable(ctx, probe) -> bool | None:
                     continue
             except (httpx.HTTPError, httpx.InvalidURL):
                 continue
-            for field in fields:
-                for engine, p in payloads:
-                    if budget <= 0 or capped():
-                        break
-                    budget -= 1
-                    tested = True
-                    fields_seen.add((action, field))
-                    data = {fn: (p if fn == field else _XSS_FILLER) for fn in fields}
+            if budget <= 0:
+                break
+            # DETERMINISTIC hash oracle across (field x engine-gadget): independent requests, so fan them out
+            # concurrently and stop on the first engine that hashes the salt. The winning spec carries the engine
+            # that executed it (the execution-proven fingerprint), so attribution is unchanged.
+            specs = [(fld, engine, p) for fld in fields for engine, p in payloads][:budget]
+            budget -= len(specs)
+            if specs:
+                tested = True
+                for fld in fields:
+                    fields_seen.add((action, fld))
+
+                def _ssti_send(spec):
+                    fld, _engine, p = spec
+                    data = {fn: (p if fn == fld else _XSS_FILLER) for fn in fields}
                     try:
-                        if any(w in _xss_send(c, method, action, data).text for w in wanted):
-                            ctx.evidence.update(injectable=True, execution_confirmed=True, via="hash oracle", engine=engine,
-                                                target=action, field=field)
-                            return True  # the engine hashed the salt to its exact digest -> real injection
+                        resp = _xss_send(c, method, action, data)
                     except (httpx.HTTPError, httpx.InvalidURL):
-                        continue
-                if budget <= 0 or capped():
-                    break
-            if budget <= 0 or capped():
+                        return spec, None
+                    return (spec, resp) if any(w in resp.text for w in wanted) else (spec, None)
+                got = _fan_out_first(_ssti_send, specs, lambda s, r: r is not None, cap_check=capped)
+                if got is not None:
+                    fld, engine, _p = got[0]
+                    ctx.evidence.update(injectable=True, execution_confirmed=True, via="hash oracle",
+                                        engine=engine, target=action, field=fld)
+                    return True  # the engine hashed the salt to its exact digest -> real injection
+            if capped():
                 break
     ctx.evidence.update(injectable=False, fields_tested=len(fields_seen), expr_shapes=len(_SSTI_HASH_TMPL))
     return False if tested else None
@@ -1969,40 +1994,49 @@ def path_traversal(ctx, probe) -> bool | None:
             if method != "postjson" and not _endpoint_is_live(ctx, c, action, method, base):
                 continue  # catch-all / soft-404 shell -> phantom endpoint, not a real file sink; a fabricated
                 #           /etc/passwd (an LLM handed ?file=/etc/passwd can invent one) fails this gate too
-            for field in fields:
-                for payload in _LFI_PAYLOADS:
-                    if budget <= 0 or capped():
-                        break
-                    budget -= 1
-                    tested = True
-                    fields_seen.add((action, field))
-                    data = {fn: (payload if fn == field else _XSS_FILLER) for fn in fields}
+            if budget <= 0:
+                break
+            # DETERMINISTIC content-signature oracle over (field x payload): independent requests, so fan them
+            # out concurrently and stop on the first CONFIRMED read. The signature match's paired-canary +
+            # reproduces verification runs INSIDE the worker, so a returned hit is already precision-checked (the
+            # same reflection / hallucination / nondeterminism guards, just per-candidate in parallel).
+            specs = [(fld, payload) for fld in fields for payload in _LFI_PAYLOADS][:budget]
+            budget -= len(specs)
+            if specs:
+                tested = True
+                for fld in fields:
+                    fields_seen.add((action, fld))
+
+                def _lfi_send(spec):
+                    fld, payload = spec
+                    data = {fn: (payload if fn == fld else _XSS_FILLER) for fn in fields}
                     try:
                         r = _xss_send(c, method, action, data)
-                        ct = r.headers.get("content-type", "").lower()
-                        # a served /etc/passwd or win.ini is text/plain or octet-stream, NEVER the app's own
-                        # bundle — skip js/css so a signature can't match noise inside a minified script.
-                        if "javascript" in ct or "css" in ct:
-                            continue
-                        if _LFI_SIG.search(r.text):
-                            # paired canary: the bare filename (traversal stripped) must NOT also return the
-                            # file signature; if it does, the content is reflected/hallucinated, not traversed.
-                            cdata = {fn: (_lfi_canary(payload) if fn == field else _XSS_FILLER) for fn in fields}
-                            try:
-                                if _LFI_SIG.search(_xss_send(c, method, action, cdata).text):
-                                    continue   # not caused by traversal -> reflection/hallucination -> suppress (#2)
-                                if not _reproduces(lambda: _xss_send(c, method, action, data),
-                                                   lambda rr: _LFI_SIG.search(rr.text)):
-                                    continue   # file signature does not reproduce -> nondeterministic (#1)
-                            except (httpx.HTTPError, httpx.InvalidURL):
-                                pass       # control probe unreachable -> fall through and fire on direct evidence
-                            ctx.evidence.update(found=True, sensitive_fields=True, target=action, field=field, canary_clean=True)
-                            return True  # returned the contents of a system file -> traversal/LFI
                     except (httpx.HTTPError, httpx.InvalidURL):
-                        continue
-                if budget <= 0 or capped():
-                    break
-            if budget <= 0 or capped():
+                        return spec, None
+                    ct = r.headers.get("content-type", "").lower()
+                    # a served /etc/passwd or win.ini is text/plain or octet-stream, NEVER the app's own bundle —
+                    # skip js/css so a signature can't match noise inside a minified script.
+                    if "javascript" in ct or "css" in ct or not _LFI_SIG.search(r.text):
+                        return spec, None
+                    # paired canary: the bare filename (traversal stripped) must NOT also return the file
+                    # signature; if it does, the content is reflected/hallucinated, not traversed.
+                    cdata = {fn: (_lfi_canary(payload) if fn == fld else _XSS_FILLER) for fn in fields}
+                    try:
+                        if _LFI_SIG.search(_xss_send(c, method, action, cdata).text):
+                            return spec, None   # reflection/hallucination -> suppress (#2)
+                        if not _reproduces(lambda: _xss_send(c, method, action, data),
+                                           lambda rr: _LFI_SIG.search(rr.text)):
+                            return spec, None   # signature doesn't reproduce -> nondeterministic (#1)
+                    except (httpx.HTTPError, httpx.InvalidURL):
+                        pass                    # control probe unreachable -> fire on the direct evidence
+                    return spec, r              # returned the contents of a system file -> traversal/LFI
+                got = _fan_out_first(_lfi_send, specs, lambda s, r: r is not None, cap_check=capped)
+                if got is not None:
+                    ctx.evidence.update(found=True, sensitive_fields=True, target=action,
+                                        field=got[0][0], canary_clean=True)
+                    return True
+            if capped():
                 break
     ctx.evidence.update(found=False, fields_tested=len(fields_seen), payloads=len(_LFI_PAYLOADS))
     return False if tested else None
