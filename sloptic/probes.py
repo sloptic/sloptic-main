@@ -13,12 +13,13 @@ import gzip
 import hashlib
 import html
 import json
+import os
 import re
 import secrets
 import statistics
 import time
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import replace
 
 import httpx
@@ -1415,6 +1416,56 @@ _INJECT_MAX_REDIRECTS = 2
 _INJECT_MAX_REQUESTS = 150
 _CMDI_MAX_REQUESTS = _INJECT_MAX_REQUESTS   # kept for the cmdi reference below; same value
 
+# Per-app HTTP concurrency for the DETERMINISTIC injection payloads. Injection is I/O-bound (waiting on the
+# remote origin), so firing N at once is ~free on CPU and doesn't compete for the grade box's cores -- it just
+# fills the network wait. N IS the per-origin burst rate, so keep it modest: a per-origin rate-limit it trips is
+# salvaged by retry_blocked's low-traffic subset re-grade. Score-safe: same payloads + same oracle, only the
+# ORDER/TIMING changes, so the deterministic verdict is identical. TIME-BASED oracles (dose-response sleep, blind
+# SQLi timing) must NEVER use this -- concurrent requests confound the latency they measure. Env-tunable so the
+# burst can be dialed on a flaky corpus without a code change.
+_INJECT_POOL = max(1, int(os.environ.get("SLOPTIC_INJECT_POOL", "6")))
+
+
+def _fan_out_first(send, specs, oracle, pool=_INJECT_POOL, cap_check=None):
+    """Fire `specs` through a bounded thread pool and return the FIRST (spec, resp) whose oracle(spec, resp) is
+    truthy, then STOP submitting (short-circuit -- an injection probe wants one confirmed hit, not all of them).
+    `send(spec) -> (spec, resp_or_None)`; a spec that errors should return (spec, None). `cap_check() is True`
+    stops further submission (the request budget). Returns None if nothing hit. A single httpx.Client is
+    thread-safe for concurrent requests, so callers share one client across the pool.
+
+    DETERMINISTIC oracles ONLY. A latency/time oracle is invalid here -- concurrent requests contend and inflate
+    each other's measured response time into false positives; those probes keep their sequential path."""
+    it = iter(specs)
+    hit = None
+    with ThreadPoolExecutor(max_workers=max(1, pool)) as ex:
+        pending = set()
+
+        def _refill():
+            while len(pending) < max(1, pool):
+                if cap_check is not None and cap_check():
+                    return
+                nxt = next(it, None)
+                if nxt is None:
+                    return
+                pending.add(ex.submit(send, nxt))
+        _refill()
+        while pending and hit is None:
+            done, keep = wait(pending, return_when=FIRST_COMPLETED)
+            pending = keep
+            for fut in done:
+                try:
+                    spec, resp = fut.result()
+                except Exception:              # a worker that raised past its own guards -> treat as a miss
+                    spec, resp = None, None
+                if resp is not None and oracle(spec, resp):
+                    hit = (spec, resp)
+                    break
+            if hit is None:
+                _refill()
+        for fut in pending:                    # short-circuit: cancel whatever hasn't started (running ones drain)
+            fut.cancel()
+    return hit
+
 
 def _request_capped(probe, default: int = _INJECT_MAX_REQUESTS):
     """Return a no-arg predicate that's True once THIS probe has sent `max_requests` ACTUAL requests (every
@@ -1564,28 +1615,37 @@ def command_injection(ctx, probe) -> bool | None:
                 continue  # proxies a third-party API -> latency/output track the upstream, not a shell
             if not _endpoint_is_live(ctx, c, action, method, base):
                 continue  # catch-all / soft-404 shell -> phantom endpoint, not a real command sink
-            for field in fields:
-                if budget <= 0 or _capped():
-                    break
-                checked += 1
-                for sep in _CMD_SEPS:
-                    if budget <= 0 or _capped():
-                        break
-                    budget -= 1
-                    tested = True
+            # DETERMINISTIC in-band hash oracle across (field x separator): the requests are independent and the
+            # oracle is a fixed digest, so fire them CONCURRENTLY (I/O-bound, ~free on CPU) and stop on the first
+            # shell that hashes the salt. Each (field, sep) spec = 1 attempt = the 2 hash-template hops. The
+            # time-based dose-response stays sequential (deep), below -- concurrency would confound its latency.
+            if budget > 0 and not _capped():
+                pairs = [(fld, sep) for fld in fields for sep in _CMD_SEPS][:budget]  # respect the attempt budget
+                budget -= len(pairs)
+                checked += len(fields)
+                tested = True
+
+                def _cmd_send(spec):
+                    fld, sep = spec
                     for htmpl in _CMD_HASH:
-                        data = {fn: (sep % htmpl.format(s=salt) if fn == field else _XSS_FILLER) for fn in fields}
+                        data = {fn: (sep % htmpl.format(s=salt) if fn == fld else _XSS_FILLER) for fn in fields}
                         try:
-                            if any(w in _xss_send(c, method, action, data).text for w in wanted):
-                                ctx.evidence.update(injectable=True, execution_confirmed=True, via="in-band hash",
-                                                    target=action, field=field)
-                                return True  # a shell hashed the salt to its exact digest -> real injection
+                            resp = _xss_send(c, method, action, data)
                         except (httpx.HTTPError, httpx.InvalidURL):
                             continue
+                        if any(w in resp.text for w in wanted):
+                            return spec, resp        # a shell hashed the salt to its exact digest -> real injection
+                    return spec, None
+                got = _fan_out_first(_cmd_send, pairs, lambda s, r: r is not None, cap_check=_capped)
+                if got is not None:
+                    ctx.evidence.update(injectable=True, execution_confirmed=True, via="in-band hash",
+                                        target=action, field=got[0][0])
+                    return True
+            for fld in fields:
                 if len(deep) < _DEEP_SLOTS and method != "postjson":
                     # blind time-based stays OFF JSON API sinks (a slow JSON endpoint's latency variance ~= the
                     # FP failure mode); the deterministic hard-product oracle still runs on them and IS specific.
-                    deep.append((action, method, fields, field))
+                    deep.append((action, method, fields, fld))
         for action, method, fields, field in deep:  # blind: DOSE-RESPONSE sleep (delay must scale with the dose)
             if _capped():
                 break
