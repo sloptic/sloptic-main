@@ -325,7 +325,7 @@ def auth_surface(graded):
 # PARITY (cross stack visibility): observed vs expected surface per stack -> blind spots.
 # ==========================================================================================================
 # categorical surfaces with an observed<->expected pair, so parity = "did we see what the source implies?"
-_TYPES = ("login", "upload", "api")
+_TYPES = ("login", "signup", "upload", "api")   # signup added after discovery emitted has_signup (SSO work)
 
 
 def _row(rec: dict) -> dict:
@@ -353,8 +353,9 @@ def _row(rec: dict) -> dict:
         # endpoints reached vs healthy: many-reached-few-healthy = env-var-dead surface (dummy keys)
         "obs_endpoints_reached": obs.get("endpoints_reached"), "obs_endpoints_dead": obs.get("endpoints_dead"),
         "obs_surface_size": size,
-        "obs_login": obs.get("has_login"), "obs_upload": obs.get("has_upload"), "obs_api": obs.get("has_api"),
-        "exp_login": exp.get("login"), "exp_upload": exp.get("upload"),
+        "obs_login": obs.get("has_login"), "obs_signup": obs.get("has_signup"),
+        "obs_upload": obs.get("has_upload"), "obs_api": obs.get("has_api"),
+        "exp_login": exp.get("login"), "exp_signup": exp.get("signup"), "exp_upload": exp.get("upload"),
         "exp_search": exp.get("search"), "exp_api": exp.get("api"), "exp_views": exp.get("views"),
         "slop_score": slop, "findings": len(rec.get("findings", [])),
         # how much of the battery APPLIED, the fuzzer's-eye coverage. Low pct or many n/a kinds = we
@@ -429,7 +430,7 @@ def blind_spots(rows: list, key: str) -> list:
 _CSV_COLS = ["repo", "app_kind", "web_gradeable", "deployed", "framework", "routing", "api_style", "stack",
              "n_features", "obs_routes", "obs_forms", "obs_inputs", "obs_endpoints",
              "obs_endpoints_reached", "obs_endpoints_dead", "obs_surface_size",
-             "obs_login", "obs_upload", "obs_api", "exp_login", "exp_upload", "exp_search",
+             "obs_login", "obs_signup", "obs_upload", "obs_api", "exp_login", "exp_signup", "exp_upload", "exp_search",
              "exp_api", "exp_views", "pct_applicable", "na_kinds", "deploy_s", "grade_s", "total_s",
              "slop_score", "findings", "slop_per_surface"]
 
@@ -514,6 +515,14 @@ def parity_report(recs, args):
               f"{str(agg['coverage_avg']):>5} {str(agg['findings_avg']):>5} "
               f"{str(agg['slop_avg']):>5}   {par}")
 
+    # COVERAGE % BAR per stack, the cov% column above drawn as a bar so a blind / barely-tested stack pops out
+    # (a short bar = we applied little of the battery there, so its low slop means little). Scaled to 100% = full.
+    cov_rows = [(g, agg["coverage_avg"], agg["n"]) for g, agg in gp.items() if agg["coverage_avg"] is not None]
+    if cov_rows:
+        print(f"\nCOVERAGE % BY {args.by.upper()}  (probe battery applied; short bar = blind / tiny stack)")
+        for g, cov, n in sorted(cov_rows, key=lambda x: -x[1]):
+            print(f"  {g:16} {cov:5.1f}% │ {'█' * round(cov / 100 * 40)} (n{n})")
+
     # TEST COVERAGE PER APP, the cross-app spread of how much of the battery APPLIED. The per-stack cov%
     # above is only an average; this is the full distribution. A wide stdev = coverage swings hard app-to-app
     # (some apps barely tested), which bounds how comparable their slop scores are, a low slop on a
@@ -529,6 +538,10 @@ def parity_report(recs, args):
         print(f"  probes applied   n={cov_cnt['n']}  avg={cov_cnt['avg']}  median={cov_cnt['median']}  "
               f"stdev={cov_cnt['stdev']}  min={cov_cnt['min']:.0f}  max={cov_cnt['max']:.0f}  "
               f"(q1={cov_cnt['q1']} q3={cov_cnt['q3']})")
+    if cov_pct:   # the app-level cov% spread as a histogram, a left-heavy shape = many barely-tested apps
+        print("  distribution (pct applicable across apps):")
+        for line in _histogram([r["pct_applicable"] for r in web if r["pct_applicable"] is not None]):
+            print(line)
     if not cov_pct:
         print("  (no coverage data on these records)")
 
@@ -573,6 +586,13 @@ _PHANTOM_SENSITIVE = ("sec-sqli", "sec-csrf", "sec-cmdi", "sec-ssti", "sec-lfi",
 # TRUST the gate for these and never call their fires catch-all phantoms.
 _GATE_VETTED = ("sec-sqli-004", "sec-ratelimit-001", "sec-csrf-001", "qa-crash-010", "sec-dos-001",
                 "sec-hosthdr-001")
+# EFFECT-CONFIRMED probes (added after the browser data-plane + integrity/IDOR lanes shipped; precision predates
+# them): they fire ONLY on an OBSERVED effect a catch-all shell cannot fake, stored XSS that EXECUTES in the DOM,
+# a create that READS BACK, a cross-user READ of a real owned object, an international round-trip. A catch-all
+# serves the same inert shell to everyone, so these self-gate there, a SURVIVING fire is real, never a phantom.
+# Without this they matched _PHANTOM_SENSITIVE ("sec-xss" / "sec-idor") and were falsely flagged on a catch-all.
+_EFFECT_CONFIRMED = ("sec-xss-002", "sec-idor-002", "sec-idor-003", "sec-idor-004", "sec-idor-005",
+                     "qa-integrity-001", "qa-integrity-002", "qa-input-002", "qa-race-002")
 # Everything else (headers/a11y/seo/perf/compression/dead-controls/...) measures the ACTUAL served
 # response and stays real even on a catch-all, a missing CSP header is missing regardless.
 _NON_WORKING = {"broken", "not-an-app", "placeholder"}   # page states where the WHOLE surface is untrustworthy
@@ -662,8 +682,8 @@ def _suspect(f, catch_all):
     if pid in _SIGNAL_SENSITIVE:   # timing / load-induced-error signal: reliable only if graded in isolation.
         return ("unconfirmed", "timing / load-induced-error signal, not verifiable from batch data; clean if "
                                "graded in isolation, else re-fire isolated to confirm (not counted clean or FP)")
-    if pid in _GATE_VETTED:
-        return None   # liveness-gated: a surviving fire is on a REAL endpoint, not a catch-all phantom
+    if pid in _GATE_VETTED or pid in _EFFECT_CONFIRMED:
+        return None   # liveness-gated OR effect-confirmed: a surviving fire is real, not a catch-all phantom
     if _phantom_sensitive(pid) and catch_all:
         return ("fp", "catch-all / soft-404 host, the targeted endpoint likely doesn't exist server-side "
                       "(un-gated phantom-sensitive probe)")
@@ -687,7 +707,10 @@ def _gated(r):
     real surface was captured, so it's SCORED, never gated (and its fires ARE audited like any scored app)."""
     if r.get("disputed_broken"):
         return False
-    return r.get("functional") is False or _page_state(r) in _NON_WORKING
+    # entry-challenge withholds (bot_challenge from the first fetch) score 0 but are NOT real grades, gate them
+    # too so they don't inflate the SCORED count (precision predates the challenge_stage field).
+    return (r.get("functional") is False or _page_state(r) in _NON_WORKING
+            or is_ungradeable_challenge(r))
 
 
 def analyze(recs):
@@ -886,7 +909,7 @@ def precision_report(recs, args):
             print("    (no phantom-sensitive probes fired on scored apps)")
             break
         prec = (fires - fp) / fires * 100
-        tag = " [gated]" if pid in _GATE_VETTED else ""
+        tag = " [gated]" if pid in _GATE_VETTED else " [effect]" if pid in _EFFECT_CONFIRMED else ""
         print(f"    {pid:20} {fires:>4} fires · {fp:>4} FP · {prec:5.0f}% not-phantom {'█' * int(round(prec / 5))}{tag}")
 
     combined = [("   ", *x) for x in a["flagged"]] + [("[A]", *x) for x in a["advisories"]]

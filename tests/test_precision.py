@@ -4,7 +4,7 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
-from stats import analyze, _audited, _wilson  # noqa: E402
+from stats import analyze, _audited, _suspect, _wilson  # noqa: E402
 
 
 def _f(pid, pen=10, bundle="security", evidence=None, category=None, count=1, group=None):
@@ -127,3 +127,16 @@ def test_audited_predicate_and_wilson_keeps_an_honest_upper_bound():
     lo, hi = _wilson(0, 30)                                       # 0/30 is NOT "0% FP, done"
     assert lo == 0.0 and 0.08 < hi < 0.14                         # honest ceiling ~11%
     assert _wilson(0, 0) == (0.0, 0.0)
+
+
+def test_effect_confirmed_probes_are_not_catch_all_phantoms():
+    # precision predates the browser data-plane + integrity/IDOR lanes. Those probes match _PHANTOM_SENSITIVE
+    # ("sec-xss" / "sec-idor") but fire ONLY on an observed effect a catch-all shell can't fake, so a fire on a
+    # catch-all host is REAL, not a phantom. _EFFECT_CONFIRMED must exempt them; an ungated phantom probe stays flagged.
+    xss2 = {"probe_id": "sec-xss-002", "evidence": {}}
+    idor = {"probe_id": "sec-idor-005", "evidence": {}}
+    lfi = {"probe_id": "sec-lfi-001", "evidence": {}}
+    assert _suspect(xss2, catch_all=True) is None          # execution-confirmed stored XSS -> not a phantom
+    assert _suspect(idor, catch_all=True) is None           # cross-user read of a real object -> not a phantom
+    res = _suspect(lfi, catch_all=True)
+    assert res is not None and res[0] == "fp"               # an ungated phantom-sensitive probe still flagged
