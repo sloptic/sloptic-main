@@ -16,6 +16,10 @@ Input is the JSONL that `deploy_and_grade.py --record FILE` appends (one line pe
     uv run python scripts/stats.py results.jsonl --precision [--show N]         # false positive audit
     uv run python scripts/stats.py results.jsonl --precision --sample 30 > w.tsv  # hand-audit worksheet
     uv run python scripts/stats.py w.tsv --tally                        # -> FP rate + 95% Wilson CI
+    uv run python scripts/stats.py cur.jsonl --diff prev.jsonl          # run to run regression (what moved)
+
+The default report also carries a probe COST vs VALUE join (request volume vs fire rate, the trim / pacing
+candidates); the precision audit ends with a SCORE TRUST join (parity x precision: blind / inflated apps).
 
 The default report prints numbered sections [1..N] in order; each self suppresses when its data is absent, so the
 numbering stays contiguous. Sections: yield and attrition (the DNF rate), per hackathon breakdown, auth
@@ -917,8 +921,129 @@ def precision_report(recs, args):
         print(f"\n(3) FLAGGED FINDINGS  (top {args.show} by penalty; [A] = advisory/ownership, not an FP)")
         for mark, repo, pid, pen, cnt, why in sorted(combined, key=lambda x: -x[3])[:args.show]:
             print(f"    {mark} {(repo or '').rsplit('/', 1)[-1][:28]:28} {pid:18} pen={pen:>3}×{cnt:<2}, {why[:52]}")
+
+    # SCORE TRUST (parity x precision join), per scored app: is its slop trustworthy? Two ways it is not, we were
+    # BLIND (coverage <= Q1 -> a low score is uninformative, not clean, parity's concern) OR the score is INFLATED
+    # (a known-class FP fire, precision's concern). Everything else is a trustworthy score.
+    flagged_repos = {x[0] for x in a["flagged"]}
+    covs = [c for r in a["scored"] if (c := (r.get("coverage") or {}).get("pct_applicable")) is not None]
+    q1 = (statistics.quantiles(covs, n=4)[0] if len(covs) >= 4 else min(covs)) if covs else 0
+
+    def _cov(r):
+        return (r.get("coverage") or {}).get("pct_applicable")
+    blind, inflated, trust = [], [], 0
+    for r in a["scored"]:
+        if r.get("repo") in flagged_repos:
+            inflated.append(r)
+        elif _cov(r) is not None and _cov(r) <= q1:
+            blind.append(r)
+        else:
+            trust += 1
+    if a["scored"]:
+        print(f"\n(4) SCORE TRUST  (parity x precision join, over {len(a['scored'])} scored apps)")
+        print(f"    {trust:>4} trustworthy   ·   {len(blind):>4} UNDER-OBSERVED (cov <= Q1 {q1:.0f}%, score "
+              f"uninformative)   ·   {len(inflated):>4} INFLATED (>=1 known-class FP fire)")
+        # INFLATED: highest slop first (most FP-affected). BLIND: LOWEST slop first, a low score on low coverage
+        # is the suspect case (looks clean but we barely tested it, not the same as genuinely clean).
+        for r in sorted(inflated, key=lambda r: -(r.get("slop_score") or 0))[:6]:
+            label = (r.get("repo") or "").rstrip("/").rsplit("/", 1)[-1][:32] or "?"
+            print(f"      INFLATED  {label:32} slop {r['slop_score']:>6.1f}   cov {_cov(r)}%   (a phantom fire inflates it)")
+        for r in sorted(blind, key=lambda r: (r.get("slop_score") or 0))[:6]:
+            label = (r.get("repo") or "").rstrip("/").rsplit("/", 1)[-1][:32] or "?"
+            print(f"      BLIND     {label:32} slop {r['slop_score']:>6.1f}   cov {_cov(r)}%   (low score may be blindness)")
     print()
 
+
+
+# ==========================================================================================================
+# DIFF (run to run regression): join a CURRENT run against a PREVIOUS one -> what moved. The grade -> fix ->
+# regrade loop's answer to "did my change help, and what moved?"
+# ==========================================================================================================
+def diff_report(cur, prev, args):
+    """Join CURRENT vs a PREVIOUS run by app (repo) and report what moved, score deltas, per-probe fire gains /
+    losses, coverage / challenge / DNF shifts. Apps present in only one run are counted but never differenced."""
+    cg = {r.get("repo"): r for r in cur if _is_graded(r)}
+    pg = {r.get("repo"): r for r in prev if _is_graded(r)}
+    common = sorted(set(cg) & set(pg))
+    added, removed = sorted(set(cg) - set(pg)), sorted(set(pg) - set(cg))
+    deltas = sorted(((k, cg[k]["slop_score"] - pg[k]["slop_score"]) for k in common), key=lambda x: x[1])
+
+    def fired(r):
+        return {f["probe_id"] for f in r.get("findings", []) if _scored(f)}
+    probe_delta, new_pairs, gone_pairs = Counter(), 0, 0     # per-probe app-fire gain/loss over common apps
+    for k in common:
+        cf, pf = fired(cg[k]), fired(pg[k])
+        new_pairs += len(cf - pf)
+        gone_pairs += len(pf - cf)
+        for pid in cf - pf:
+            probe_delta[pid] += 1
+        for pid in pf - cf:
+            probe_delta[pid] -= 1
+    covc = [x for k in common if (x := (cg[k].get("coverage") or {}).get("pct_applicable")) is not None]
+    covp = [x for k in common if (x := (pg[k].get("coverage") or {}).get("pct_applicable")) is not None]
+
+    def chal(recs):
+        return sum(1 for r in recs if r.get("bot_challenge"))
+
+    def ndnf(recs):
+        return sum(1 for r in recs if not r.get("skipped") and not _is_graded(r))
+    net = sum(d for _, d in deltas)
+    moved = [d for _, d in deltas if d]
+
+    if args.json:
+        print(json.dumps({
+            "common": len(common), "added": added, "removed": removed,
+            "score_delta": {"net": round(net, 1), "mean": round(net / (len(common) or 1), 1),
+                            "improved": sum(1 for _, d in deltas if d < 0),
+                            "regressed": sum(1 for _, d in deltas if d > 0),
+                            "biggest_improvement": deltas[0] if deltas else None,
+                            "biggest_regression": deltas[-1] if deltas else None},
+            "probe_fire_delta": dict(probe_delta.most_common()),
+            "new_fire_pairs": new_pairs, "gone_fire_pairs": gone_pairs,
+            "coverage_pct": {"prev_mean": round(statistics.mean(covp), 1) if covp else None,
+                             "cur_mean": round(statistics.mean(covc), 1) if covc else None},
+            "bot_challenge": {"prev": chal(prev), "cur": chal(cur)},
+            "dnf": {"prev": ndnf(prev), "cur": ndnf(cur)}}, indent=2))
+        return
+
+    print(f"\n═══ run diff, {len(common)} common apps (current {len(cg)} graded · previous {len(pg)}) ═══")
+    print(f"\n(1) APP SET   {len(common)} in both · {len(added)} new this run · {len(removed)} gone from last run")
+    if added:
+        print("    new:  " + ", ".join((a or "").rstrip("/").rsplit("/", 1)[-1] for a in added[:8]) + (" ..." if len(added) > 8 else ""))
+    if removed:
+        print("    gone: " + ", ".join((a or "").rstrip("/").rsplit("/", 1)[-1] for a in removed[:8]) + (" ..." if len(removed) > 8 else ""))
+
+    print(f"\n(2) SCORE  (over the {len(common)} common apps; negative = CLEANER now, positive = WORSE)")
+    print(f"    net {net:+.1f}   mean {net/(len(common) or 1):+.1f}/app   ·   "
+          f"{sum(1 for d in moved if d < 0)} improved · {sum(1 for d in moved if d > 0)} regressed · "
+          f"{len(common)-len(moved)} unchanged")
+    if deltas:
+        print("    biggest improvements (score dropped):")
+        for k, d in deltas[:6]:
+            if d < 0:
+                print(f"      {((k or '').rstrip('/').rsplit('/', 1)[-1] or '?')[:34]:34} {pg[k]['slop_score']:>6.1f} -> {cg[k]['slop_score']:<6.1f} ({d:+.1f})")
+        print("    biggest regressions (score rose):")
+        for k, d in reversed(deltas[-6:]):
+            if d > 0:
+                print(f"      {((k or '').rstrip('/').rsplit('/', 1)[-1] or '?')[:34]:34} {pg[k]['slop_score']:>6.1f} -> {cg[k]['slop_score']:<6.1f} ({d:+.1f})")
+
+    print(f"\n(3) FIRES  ({new_pairs} new app-fires · {gone_pairs} gone · per-probe net over common apps)")
+    gained = [(p, n) for p, n in probe_delta.most_common() if n > 0]
+    lost = [(p, n) for p, n in sorted(probe_delta.items(), key=lambda x: x[1]) if n < 0]
+    if gained:
+        print("    firing MORE now:  " + "  ".join(f"{p} {n:+d}" for p, n in gained[:8]))
+    if lost:
+        print("    firing LESS now:  " + "  ".join(f"{p} {n:+d}" for p, n in lost[:8]))
+    if not gained and not lost:
+        print("    (no per-probe fire changes over the common apps)")
+
+    print(f"\n(4) COVERAGE / TAINT")
+    if covc and covp:
+        print(f"    pct applicable   prev mean {statistics.mean(covp):.1f}%  ->  cur mean {statistics.mean(covc):.1f}%  "
+              f"({statistics.mean(covc)-statistics.mean(covp):+.1f})")
+    print(f"    bot challenged   prev {chal(prev)}  ->  cur {chal(cur)}   ·   "
+          f"DNF   prev {ndnf(prev)}  ->  cur {ndnf(cur)}")
+    print(f"\n    → per-probe / per-app detail: --json, or --audit <probe id> on either run\n")
 
 
 def main():
@@ -945,6 +1070,7 @@ def main():
     ap.add_argument("--tally", action="store_true",
                     help="precision: treat `results` as a filled worksheet -> FP rate + 95%% Wilson CI")
     ap.add_argument("--seed", type=int, default=0, help="precision: RNG seed for --sample (reproducible draw)")
+    ap.add_argument("--diff", metavar="PREV", help="run to run regression: diff `results` against a PREVIOUS run's JSONL")
     args = ap.parse_args()
 
     if args.tally:                                    # precision: `results` is a filled worksheet, not a JSONL
@@ -953,6 +1079,9 @@ def main():
     recs = load(args.results)
     if not recs:
         sys.exit("no records")
+    if args.diff:
+        diff_report(recs, load(args.diff), args)
+        return
     if args.parity:
         parity_report(recs, args)
         return
@@ -1610,6 +1739,16 @@ def main():
         sec("REQUEST VOLUME per probe (median across apps · worst single app), the high fan out probes")
         for pid, med, mx, n in req_rank[:12]:
             print(f"    {pid:<22} median {med:>5.0f}   worst {mx:>5}   (n={n} apps)")
+
+        # PROBE COST vs VALUE, the request volume (cost) joined to the fire rate (value). A high-cost, low/zero
+        # yield probe is a WAF-trip / pacing / trim candidate (the sec-dos / sec-cmdi fan out that trips Vercel).
+        sec("PROBE COST vs VALUE  (median requests = cost · apps fired on = value · worst cost-per-fire first)")
+        cv = [(pid, med, len(probe_apps.get(pid, set()))) for pid, med, mx, n in req_rank]
+        cv = [(pid, med, fires, med / fires if fires else med * 2) for pid, med, fires in cv]   # never-fired ranks worst
+        for pid, med, fires, ratio in sorted(cv, key=lambda x: -x[3])[:12]:
+            flag = ("   <- expensive, ZERO yield (trim / pace)" if fires == 0 and med >= 30
+                    else "   <- high cost per fire" if ratio >= 100 else "")
+            print(f"    {pid:<22} cost {med:>5.0f} req · value {fires:>3} apps · {ratio:>6.0f} req/fire{flag}")
 
     # (i7) EMAIL VERIFICATION (qa-email, now scoring), of the email-gated signups, which locked a user out. The
     # qa-email-001 ladder (no mail in 60s = locked out · only after the 30s checkpoint = unreliable · no resend

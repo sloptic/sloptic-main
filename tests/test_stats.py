@@ -162,3 +162,19 @@ def test_severity_tier_buckets_by_penalty_at_the_boundaries():
     assert _severity_tier(29) == "serious" and _severity_tier(16) == "serious"
     assert _severity_tier(15) == "moderate" and _severity_tier(8) == "moderate"
     assert _severity_tier(7) == "minor" and _severity_tier(1) == "minor"
+
+
+def test_diff_report_json_movers_and_fire_deltas(capsys):
+    import json as _json
+    import types
+
+    from stats import diff_report
+    prev = [_rec(repo="https://a", slop_score=50, findings=[{"probe_id": "sec-x", "penalty": 10}]),
+            _rec(repo="https://b", slop_score=30, findings=[])]
+    cur = [_rec(repo="https://a", slop_score=20, findings=[]),   # improved -30, lost the sec-x fire
+           _rec(repo="https://c", slop_score=40, findings=[])]   # new app this run
+    diff_report(cur, prev, types.SimpleNamespace(json=True))
+    d = _json.loads(capsys.readouterr().out)
+    assert d["common"] == 1 and d["added"] == ["https://c"] and d["removed"] == ["https://b"]
+    assert d["score_delta"]["net"] == -30 and d["score_delta"]["improved"] == 1 and d["score_delta"]["regressed"] == 0
+    assert d["probe_fire_delta"]["sec-x"] == -1 and d["gone_fire_pairs"] == 1 and d["new_fire_pairs"] == 0
