@@ -3382,7 +3382,15 @@ def oauth_redirect_localhost(ctx, probe) -> bool | None:
                 and urllib.parse.urlparse(ru).netloc.lower() != origin_netloc:
             ctx.evidence.update(oauth_redirect_uri=ru, authorize_url=url[:160], origin=ctx.base_url)
             return True
-    return False if found else None
+    if not found:
+        # No server-emitted OAuth authorization URL (in the homepage HTML or a one-hop auth-route redirect). An
+        # app CAN show a 'Sign in with Google' button and still land here: modern SSO (Supabase/Firebase/NextAuth/
+        # Auth0/Clerk SDKs) builds the authorize URL -- redirect_uri and all -- CLIENT-SIDE at click time, so it
+        # never appears server-side. So has_sso=true but redirect_uri unobservable without DRIVING the click.
+        ctx.evidence["na_reason"] = ("no server-emitted OAuth authorization URL found (homepage + one auth-route "
+                                     "hop); SSO here is SDK-initiated client-side, so redirect_uri needs a browser click")
+        return None
+    return False
 
 
 # v2.0 FAMILY 1 -- a PUBLIC origin served over plain http:// with no upgrade to TLS: every visitor's
