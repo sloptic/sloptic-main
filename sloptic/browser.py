@@ -13,8 +13,11 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import pathlib
 import re
+import signal
+import threading
 import time
 import urllib.parse
 
@@ -52,6 +55,61 @@ _LAUNCH_ORDER = ({"channel": "chrome"}, {"channel": "msedge"}, {"channel": "chro
 
 
 _LAST_LAUNCH_ERROR = ""
+
+
+_RENDER_HANG_GRACE = 45.0   # a render that blows total_timeout by this much is WEDGED (a CPU-spun renderer whose
+#                             Playwright timeout never fired) -> kill the browser so the call raises. Bounds a hang
+#                             to ~total_timeout+45 (~105s) instead of the 900s external grade SIGKILL, and lets the
+#                             grade fall through to the HTTP probes instead of recording an empty 900s DNF.
+
+
+def _descendant_pids(root: int) -> list[int]:
+    """PIDs descending from `root` (the chromium tree + its node driver), read from /proc -- no psutil dep.
+    Kills ONLY descendants of THIS process, never a process group, so it is safe whether or not the caller
+    ran setsid (render_routes is also called from direct CLI runs / tests under the user's own shell group)."""
+    children: dict[int, list[int]] = {}
+    try:
+        pids = [int(e) for e in os.listdir("/proc") if e.isdigit()]
+    except OSError:
+        return []
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                data = f.read()
+            # fields after the (possibly space/paren-containing) comm: state ppid pgrp ... -> ppid is index 1
+            ppid = int(data[data.rindex(")") + 1:].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+        children.setdefault(ppid, []).append(pid)
+    out, stack = [], [root]
+    while stack:                                   # BFS the child map; a wedged chromium spawns zygote/gpu/renderers
+        for c in children.get(stack.pop(), []):
+            out.append(c)
+            stack.append(c)
+    return out
+
+
+@contextlib.contextmanager
+def _kill_browser_on_stall(deadline_s: float):
+    """Arm a one-shot timer that force-kills this process's browser descendants if the wrapped block runs past
+    `deadline_s`. A Playwright sync call on a CPU-spun renderer does NOT honor its own timeout (the driver can't
+    talk to a wedged renderer) -- only killing the process makes the blocked call raise. Yields a {'v': bool}
+    that reads True iff the kill fired, so the caller can flag the hang. Kills descendants only (never a group)."""
+    root = os.getpid()
+    fired = {"v": False}
+
+    def _fire():
+        fired["v"] = True
+        for pid in _descendant_pids(root):
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+    timer = threading.Timer(deadline_s, _fire)
+    timer.daemon = True
+    timer.start()
+    try:
+        yield fired
+    finally:
+        timer.cancel()
 
 
 def _launch(p):
@@ -301,8 +359,14 @@ def render_routes(base_url: str, paths, headers=None, timeout: float = 12.0,
         from playwright.sync_api import sync_playwright
     except ImportError:
         return out
+    hung = {"v": False}   # rebound to the watchdog's flag once we enter the with; stays False if we never do
     try:
-        with sync_playwright() as pw:
+        # WEDGE BACKSTOP: total_timeout is only checked BETWEEN routes, so a single route op that never returns
+        # (a goto on a CPU-spun renderer whose 12s Playwright timeout can't fire, a hanging _drive_actions) escapes
+        # it and burns to the 900s external grade kill (measured: ~8% of a corpus, empty records). The watchdog
+        # kills the browser at total_timeout+grace so the wedged call raises -> we return the partial render and
+        # the grade proceeds to the HTTP probes. meta_sink records the hang.
+        with _kill_browser_on_stall(total_timeout + _RENDER_HANG_GRACE) as hung, sync_playwright() as pw:
             b = _launch(pw)
             if b is None:
                 return out
@@ -346,7 +410,9 @@ def render_routes(base_url: str, paths, headers=None, timeout: float = 12.0,
             finally:
                 b.close()
     except Exception:
-        return out
+        pass                       # a wedge-kill tears the browser down mid-op; return whatever rendered so far
+    if hung["v"] and meta_sink is not None:
+        meta_sink["render_hang"] = True   # observability: this app wedged the renderer and was force-unblocked
     return out
 
 
