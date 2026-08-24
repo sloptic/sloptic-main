@@ -282,3 +282,69 @@ def test_cross_user_read_back_clean_when_owner_scoped():
         assert out is False         # A saw its own item, anon + B did not -> owner-scoped, no leak
     finally:
         srv.shutdown()
+
+
+# ---- FORMLESS SPA create (no <form>): the React shape _fill_content_form's <form> scan alone misses ---------
+
+_FORMLESS_HTML = """<!doctype html><html><body>
+<input id="t" type="text" placeholder="add a task">
+<button id="b">Add</button>
+<ul id="list"></ul>
+<script>
+ document.getElementById('b').onclick = function(){         /* NO <form>: bare input + button, JS renders in place */
+   var li = document.createElement('li');
+   li.textContent = document.getElementById('t').value;
+   document.getElementById('list').appendChild(li);
+ };
+</script></body></html>"""
+
+_ENTER_HTML = """<!doctype html><html><body>
+<input id="t" type="text" placeholder="new note">
+<ul id="list"></ul>
+<script>
+ document.getElementById('t').addEventListener('keydown', function(e){   /* single input, submits on Enter */
+   if (e.key === 'Enter'){
+     var li = document.createElement('li'); li.textContent = e.target.value;
+     document.getElementById('list').appendChild(li);
+   }
+ });
+</script></body></html>"""
+
+
+def _serve(html):
+    class _A(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            body = html.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _A)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+@pytest.mark.skipif(not browser.browser_available(), reason="no headless browser")
+def test_read_back_drives_a_formless_input_plus_button():
+    srv = _serve(_FORMLESS_HTML)
+    base = "http://127.0.0.1:%d" % srv.server_address[1]
+    try:
+        out = browser.create_and_read_back(base, "HLform42", "HLform42")
+        assert out is not None and "HLform42" in out        # filled the bare input + clicked 'Add' (no <form>)
+    finally:
+        srv.shutdown()
+
+
+@pytest.mark.skipif(not browser.browser_available(), reason="no headless browser")
+def test_read_back_drives_a_single_input_that_submits_on_enter():
+    srv = _serve(_ENTER_HTML)
+    base = "http://127.0.0.1:%d" % srv.server_address[1]
+    try:
+        out = browser.create_and_read_back(base, "HLenter7", "HLenter7")
+        assert out is not None and "HLenter7" in out         # no button -> the Enter fallback fired the create
+    finally:
+        srv.shutdown()

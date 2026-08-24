@@ -182,6 +182,15 @@ _NO_CLICK = re.compile(
     r"log ?out|sign ?out|delete|remove|pay\b|buy\b|checkout|subscribe|purchase|confirm|"
     r"send\b|publish|invite|download|share|tweet|facebook|instagram|external|https?://", re.I)
 
+# FORMLESS-create discovery (the React shape with no <form>): which text input is the content field, which button
+# triggers the write. The content is a benign canary, so Send/Post/Publish ARE safe create triggers here -- only a
+# delete/pay/logout is off-limits (that's what _DESTRUCTIVE_BTN blocks).
+_CREATE_INPUT_HINT = re.compile(
+    r"add|create|new|title|name|task|todo|note|post|message|comment|reply|write|caption|body|content|item|"
+    r"description|label|subject|say something|type here|what.?s", re.I)
+_CREATE_BTN = re.compile(r"\b(add|create|new|post|save|submit|publish|send|comment|reply|insert|share)\b|^\s*\+\s*$", re.I)
+_DESTRUCTIVE_BTN = re.compile(r"delete|remove|\bpay\b|\bbuy\b|checkout|purchase|log ?out|sign ?out|cancel|unsubscribe", re.I)
+
 
 _MAX_REVEALED = 120   # bound the appended fragment: with a[href] in the harvest, a link-heavy nav could
 #                       otherwise paste hundreds of elements onto every route's dom
@@ -993,6 +1002,51 @@ def _fill_content_form(page, value: str, timeout: float) -> bool:
                 form.evaluate("f => (f.requestSubmit ? f.requestSubmit() : f.submit())")
                 page.wait_for_timeout(int(timeout * 40))
                 return True
+    return _fill_formless_create(page, value, timeout)   # no <form> matched -> the SPA formless-create shape
+
+
+def _fill_formless_create(page, value: str, timeout: float) -> bool:
+    """FORMLESS create -- a bare text input/textarea/contenteditable + a separate Add/Create/Post/Send button
+    (onClick -> fetch), or a single input that submits on Enter. The common React shape _fill_content_form's
+    <form> scan misses. Fills the most create-hinted content field, then triggers the write. True if it filled +
+    triggered something plausible; the caller's read-back decides if it actually persisted (a wrong guess just
+    fails to read back and stays N/A, never a false fire -- the consumers are one-directional or oracle-gated)."""
+    with contextlib.suppress(Exception):
+        cands = []
+        for i in page.query_selector_all(
+                "input[type=text], input[type=search], input:not([type]), textarea, [contenteditable='true']"):
+            with contextlib.suppress(Exception):
+                if not i.is_visible():
+                    continue
+                if i.evaluate("e => { const f = e.closest('form'); return !!(f && f.querySelector('input[type=password]')); }"):
+                    continue                                     # a login/signup field -> content it is not (register lane's job)
+                cands.append(i)
+        if not cands:
+            return False
+
+        def _hinted(i):
+            with contextlib.suppress(Exception):
+                blob = " ".join((i.get_attribute(a) or "") for a in ("placeholder", "aria-label", "name", "id"))
+                return 1 if _CREATE_INPUT_HINT.search(blob) else 0
+            return 0
+        target = max(cands, key=_hinted)                         # prefer a 'add a task'/'write a post' field
+        with contextlib.suppress(Exception):
+            if (target.get_attribute("contenteditable") or "").lower() == "true":
+                target.click()
+                target.type(value)
+            else:
+                target.fill(value)
+        for b in page.query_selector_all("button, [role='button'], input[type='submit'], input[type='button']"):
+            with contextlib.suppress(Exception):
+                if not b.is_visible():
+                    continue
+                label = (b.inner_text() or b.get_attribute("value") or b.get_attribute("aria-label") or "")[:40]
+                if _CREATE_BTN.search(label) and not _DESTRUCTIVE_BTN.search(label):
+                    b.click(timeout=2500)                        # benign content -> Add/Post/Send are safe triggers
+                    return True
+        with contextlib.suppress(Exception):
+            target.press("Enter")                                # single-input creates usually submit on Enter
+            return True
     return False
 
 
