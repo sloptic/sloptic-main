@@ -1,14 +1,23 @@
 #!/usr/bin/env python3
-"""Aggregate deploy_and_grade results into statistics, every number auditable back to the specific
-app / probe / evidence that produced it (not a black-box figure).
+"""Analyze deploy_and_grade results, every number auditable back to the specific app / probe / evidence that
+produced it (not a black-box figure). One tool, three complementary lenses on one results JSONL:
+
+  * default          RECALL, where does slop concentrate + the yield / auth / axis / severity picture.
+  * --parity         VISIBILITY, did we SEE the app's surface? observed vs expected per stack -> blind spots.
+                     (a low slop is only meaningful if discovery saw the surface; blindness clusters by stack.)
+  * --precision      the FALSE POSITIVE audit, are the fires REAL? + a hand-audit worksheet with a Wilson CI.
 
 Input is the JSONL that `deploy_and_grade.py --record FILE` appends (one line per app).
 
-    uv run python scripts/stats.py results.jsonl
+    uv run python scripts/stats.py results.jsonl                        # the recall report (default)
     uv run python scripts/stats.py results.jsonl --audit sec-sqli-004   # every app + evidence for one probe
     uv run python scripts/stats.py results.jsonl --json                 # machine-readable summary
+    uv run python scripts/stats.py results.jsonl --parity [--by X] [--csv F]   # cross stack visibility
+    uv run python scripts/stats.py results.jsonl --precision [--show N]         # false positive audit
+    uv run python scripts/stats.py results.jsonl --precision --sample 30 > w.tsv  # hand-audit worksheet
+    uv run python scripts/stats.py w.tsv --tally                        # -> FP rate + 95% Wilson CI
 
-The report prints numbered sections [1..N] in order; each self suppresses when its data is absent, so the
+The default report prints numbered sections [1..N] in order; each self suppresses when its data is absent, so the
 numbering stays contiguous. Sections: yield and attrition (the DNF rate), per hackathon breakdown, auth
 surface (login / signup / SSO reach), slop distribution + histogram + modalities, slop by axis (security /
 qa / performance), Lighthouse performance, per probe fire frequency, never applied, winners vs non winners,
@@ -16,8 +25,10 @@ anomalies for hand verification, timing, paired repo vs URL, coverage audit, the
 platform / backend tier / bot challenge / request volume / email diagnostics.
 """
 import argparse
+import csv
 import json
 import pathlib
+import random
 import statistics
 import sys
 from collections import Counter, defaultdict
@@ -309,20 +320,625 @@ def auth_surface(graded):
                                if r["observed_surface"].get("captcha"))}
 
 
+
+# ==========================================================================================================
+# PARITY (cross stack visibility): observed vs expected surface per stack -> blind spots.
+# ==========================================================================================================
+# categorical surfaces with an observed<->expected pair, so parity = "did we see what the source implies?"
+_TYPES = ("login", "upload", "api")
+
+
+def _row(rec: dict) -> dict:
+    """Flatten one record to a per-app parity row (stack + observed + expected + slop + ratio)."""
+    sp = rec.get("stack_profile") or {}
+    obs = rec.get("observed_surface") or {}
+    exp = rec.get("expected_surface") or {}
+    cov = rec.get("coverage") or {}
+    tm = rec.get("timings") or {}
+    slop = rec.get("slop_score")
+    size = obs.get("surface_size")
+    return {
+        "repo": rec.get("repo"),
+        "deployed": bool(rec.get("deployed")),
+        "app_kind": rec.get("app_kind") or "?",
+        # web_gradeable defaults True when unknown (old records) so they still count toward parity
+        "web_gradeable": rec.get("web_gradeable") is not False,
+        "n_features": len(rec.get("features") or []),
+        "framework": sp.get("framework") or "?",
+        "routing": sp.get("routing") or "?",
+        "api_style": sp.get("api_style") or "?",
+        "stack": rec.get("stack") or "?",
+        "obs_routes": obs.get("routes"), "obs_forms": obs.get("forms"),
+        "obs_inputs": obs.get("inputs"), "obs_endpoints": obs.get("endpoints"),
+        # endpoints reached vs healthy: many-reached-few-healthy = env-var-dead surface (dummy keys)
+        "obs_endpoints_reached": obs.get("endpoints_reached"), "obs_endpoints_dead": obs.get("endpoints_dead"),
+        "obs_surface_size": size,
+        "obs_login": obs.get("has_login"), "obs_upload": obs.get("has_upload"), "obs_api": obs.get("has_api"),
+        "exp_login": exp.get("login"), "exp_upload": exp.get("upload"),
+        "exp_search": exp.get("search"), "exp_api": exp.get("api"), "exp_views": exp.get("views"),
+        "slop_score": slop, "findings": len(rec.get("findings", [])),
+        # how much of the battery APPLIED, the fuzzer's-eye coverage. Low pct or many n/a kinds = we
+        # tested little here (blind, or a genuinely tiny app); a low slop score then means little.
+        "pct_applicable": cov.get("pct_applicable"),
+        "probes_applicable": cov.get("probes_applicable"),
+        "na_kinds": len(cov.get("na_kinds") or []),
+        # wall-clock per phase (measurement): which stacks are expensive to deploy vs grade
+        "deploy_s": tm.get("deploy_s"), "grade_s": tm.get("grade_s"), "total_s": tm.get("total_s"),
+        # slop normalized by how much we SAW: high surface + low ratio = clean; low surface = suspect
+        "slop_per_surface": round(slop / size, 2) if (slop is not None and size) else None,
+    }
+
+
+def _avg(xs):
+    xs = [x for x in xs if x is not None]
+    return round(statistics.mean(xs), 1) if xs else None
+
+
+def _dist(xs) -> dict | None:
+    """avg/median/stdev/min/max + quartiles over the non-None values (None if empty)."""
+    xs = [x for x in xs if x is not None]
+    if not xs:
+        return None
+    q = statistics.quantiles(xs, n=4) if len(xs) > 1 else [xs[0], xs[0], xs[0]]
+    return {"n": len(xs), "avg": round(statistics.mean(xs), 1), "median": round(statistics.median(xs), 1),
+            "stdev": round(statistics.stdev(xs), 1) if len(xs) > 1 else 0.0,
+            "min": round(min(xs), 1), "max": round(max(xs), 1),
+            "q1": round(q[0], 1), "q3": round(q[2], 1)}
+
+
+def group_parity(rows: list, key: str) -> dict:
+    """Per-stack aggregates + TYPE parity. Parity for a surface type = of the DEPLOYED apps whose source
+    says they HAVE it (expected), on how many did discovery actually OBSERVE it, i.e. the recall of that
+    surface type for this stack. Low + clustered = a blind spot."""
+    groups = defaultdict(list)
+    for r in rows:
+        groups[r[key]].append(r)
+    out = {}
+    for g, rs in groups.items():
+        dep = [r for r in rs if r["deployed"] and r["obs_surface_size"] is not None]
+        parity = {}
+        for t in _TYPES:
+            expected = [r for r in dep if r.get(f"exp_{t}")]                 # source says the surface exists
+            observed = [r for r in expected if r.get(f"obs_{t}")]            # ...and discovery saw it
+            parity[t] = (len(observed), len(expected))                       # (saw, should-have-seen)
+        out[g] = {
+            "n": len(rs), "deployed": sum(r["deployed"] for r in rs),
+            "surface_avg": _avg([r["obs_surface_size"] for r in dep]),
+            "coverage_avg": _avg([r["pct_applicable"] for r in dep]),   # avg % of battery that applied
+            "findings_avg": _avg([r["findings"] for r in dep]),
+            "slop_avg": _avg([r["slop_score"] for r in dep]),
+            "slop_per_surface_avg": _avg([r["slop_per_surface"] for r in dep]),
+            "parity": parity,
+        }
+    return out
+
+
+def blind_spots(rows: list, key: str) -> list:
+    """Ranked (stack, type, missed, observed, expected), missed = expected−observed = the number of apps
+    where the source says a surface exists but we didn't see it. This IS prevalence × brokenness (how many
+    apps of the stack have it × the fraction we miss), so the ranking is the fix-order."""
+    gp = group_parity(rows, key)
+    spots = []
+    for g, agg in gp.items():
+        for t, (obs, exp) in agg["parity"].items():
+            if exp and obs < exp:
+                spots.append({"stack": g, "type": t, "missed": exp - obs, "observed": obs, "expected": exp})
+    return sorted(spots, key=lambda s: (-s["missed"], -s["expected"]))
+
+
+_CSV_COLS = ["repo", "app_kind", "web_gradeable", "deployed", "framework", "routing", "api_style", "stack",
+             "n_features", "obs_routes", "obs_forms", "obs_inputs", "obs_endpoints",
+             "obs_endpoints_reached", "obs_endpoints_dead", "obs_surface_size",
+             "obs_login", "obs_upload", "obs_api", "exp_login", "exp_upload", "exp_search",
+             "exp_api", "exp_views", "pct_applicable", "na_kinds", "deploy_s", "grade_s", "total_s",
+             "slop_score", "findings", "slop_per_surface"]
+
+
+def parity_report(recs, args):
+    rows = [_row(r) for r in recs]
+    if not rows:
+        sys.exit("no records")
+
+    if args.csv:
+        with open(args.csv, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=_CSV_COLS, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(rows)
+        print(f"wrote {len(rows)} rows -> {args.csv}")
+        return
+
+    # parity/blind-spots are only meaningful for apps the black-box HTTP grader can actually assess,
+    # a mobile/CLI/notebook scoring low isn't a blind spot, it's out of scope. Split them out.
+    web = [r for r in rows if r["web_gradeable"]]
+    nonweb = [r for r in rows if not r["web_gradeable"]]
+    gp = group_parity(web, args.by)
+    spots = blind_spots(web, args.by)
+
+    # ASSESSABILITY: parity CONTRASTS stacks against source-derived expected-surface labels. The url-ingest
+    # path grades a bare URL with no source, so it emits no expected_surface and one flat stack -> there is
+    # nothing to contrast. Report that honestly instead of a silent one-row "clean" (an unassessable file is
+    # NOT a clean bill). The SPA-vs-server-rendered false-negative comparison is the group-by-routing columns
+    # below; it needs >1 routing class AND expected labels, i.e. deploy_and_grade records, to appear.
+    has_expected = any(r[f"exp_{t}"] is not None for r in web for t in _TYPES)
+    single_stack = len(gp) <= 1
+    assessable = has_expected and not single_stack
+
+    if args.json:
+        kinds = Counter(r["app_kind"] for r in rows)
+        print(json.dumps({"n_apps": len(rows), "web_gradeable": len(web),
+                          "app_kinds": dict(kinds), "group_by": args.by,
+                          "assessable": assessable, "has_expected_labels": has_expected,
+                          "single_stack": single_stack,
+                          "groups": gp, "blind_spots": spots}, indent=2))
+        return
+
+    print(f"\n═══ cross-stack parity, {len(rows)} apps ({len(web)} web-gradeable), grouped by {args.by} ═══")
+
+    if not assessable:
+        print("\n⚠ CANNOT ASSESS CROSS-STACK PARITY on this results file (this is not a clean bill):")
+        if single_stack:
+            only = repr(next(iter(gp))) if gp else "?"
+            print(f"    all {len(web)} web-gradeable apps are a SINGLE stack ({only}), parity contrasts stacks,")
+            print("    so there is nothing to contrast. The SPA-vs-server-rendered false-negative comparison is")
+            print(f"    the group-by-{args.by} columns below and needs >1 class to appear.")
+        if not has_expected:
+            print("    NO source-derived expected-surface labels are present (the url-ingest path grades a bare")
+            print("    URL with no source, so it emits none), observed-vs-expected parity and blind spots are")
+            print("    undefined without them.")
+        print("    → re-run via deploy_and_grade with --submission <source> to produce assessable records.")
+
+    # APP-KIND distribution, how much of the field is even a web app? (out-of-scope ≠ blind spot)
+    print("\nAPP-KIND DISTRIBUTION  (only web apps are gradeable; the rest are out of scope, not blind spots)")
+    for kind, n in Counter(r["app_kind"] for r in rows).most_common():
+        tag = "" if kind in ("web-app", "web-api", "static-site", "?") else "   ← not web-gradeable"
+        print(f"  {kind:14} {n:>3}{tag}")
+    if nonweb:
+        print(f"  → {len(nonweb)}/{len(rows)} ({len(nonweb)/len(rows)*100:.0f}%) are NOT web apps, "
+              f"excluded from the parity below")
+
+    # stack DISTRIBUTION (which stacks dominate, the head to cover first)
+    print("\nSTACK DISTRIBUTION  (cover the head)")
+    for g, agg in sorted(gp.items(), key=lambda kv: -kv[1]["n"]):
+        print(f"  {g:16} {agg['n']:>3} apps  ({agg['deployed']} deployed)")
+
+    # per-stack observed surface + test COVERAGE + TYPE parity. cov% = avg share of the battery that
+    # applied; a low cov% (lots of n/a) means a low slop score is uninformative, not necessarily clean.
+    print(f"\nOBSERVED SURFACE & TYPE PARITY  (per {args.by}; parity = saw / source-says-exists)")
+    print(f"  {'stack':16} {'dep':>4} {'surf':>5} {'cov%':>5} {'find':>5} {'slop':>5}   "
+          + "  ".join(f"{t:>9}" for t in _TYPES))
+    for g, agg in sorted(gp.items(), key=lambda kv: -kv[1]["n"]):
+        par = "  ".join(
+            (f"{o}/{e}".rjust(9) if e else "   -".rjust(9)) for o, e in
+            (agg["parity"][t] for t in _TYPES))
+        print(f"  {g:16} {agg['deployed']:>4} {str(agg['surface_avg']):>5} "
+              f"{str(agg['coverage_avg']):>5} {str(agg['findings_avg']):>5} "
+              f"{str(agg['slop_avg']):>5}   {par}")
+
+    # TEST COVERAGE PER APP, the cross-app spread of how much of the battery APPLIED. The per-stack cov%
+    # above is only an average; this is the full distribution. A wide stdev = coverage swings hard app-to-app
+    # (some apps barely tested), which bounds how comparable their slop scores are, a low slop on a
+    # low-coverage app means little. Over web-gradeable apps.
+    cov_pct = _dist([r["pct_applicable"] for r in web])
+    cov_cnt = _dist([r["probes_applicable"] for r in web])
+    print("\nTEST COVERAGE PER APP  (share of the probe battery that APPLIED, bounds slop comparability)")
+    if cov_pct:
+        print(f"  pct applicable   n={cov_pct['n']}  avg={cov_pct['avg']}%  median={cov_pct['median']}%  "
+              f"stdev={cov_pct['stdev']}  min={cov_pct['min']}%  max={cov_pct['max']}%  "
+              f"(q1={cov_pct['q1']}% q3={cov_pct['q3']}%)")
+    if cov_cnt:
+        print(f"  probes applied   n={cov_cnt['n']}  avg={cov_cnt['avg']}  median={cov_cnt['median']}  "
+              f"stdev={cov_cnt['stdev']}  min={cov_cnt['min']:.0f}  max={cov_cnt['max']:.0f}  "
+              f"(q1={cov_cnt['q1']} q3={cov_cnt['q3']})")
+    if not cov_pct:
+        print("  (no coverage data on these records)")
+
+    # blind-spot ranking (prevalence × brokenness = # apps where we missed a surface the source implies)
+    print("\nBLIND SPOTS  (fix order, apps where the source says a surface exists but we didn't see it)")
+    if not has_expected:
+        print("  CANNOT ASSESS, no source-derived expected-surface labels in this file (url-ingest emits")
+        print("  none). This is an unassessable condition, NOT a clean bill; blind spots are undefined without")
+        print("  ground truth. Re-run deploy_and_grade with --submission <source> to assess.")
+    elif not spots:
+        print("  (none, observed surface matches expected across every assessed stack)")
+    for s in spots[:12]:
+        print(f"  {s['stack']:16} {s['type']:8} missed {s['missed']}/{s['expected']} apps "
+              f"(saw {s['observed']})")
+    print(f"\n  → per-app ledger: scripts/stats.py {args.results} --parity --csv rows.csv\n")
+
+
+# ==========================================================================================================
+# PRECISION (false positive audit): phantom / vendor / signal fires, + a hand audit worksheet.
+# ==========================================================================================================
+def _unvalidated_probes(recs, min_penalty: int = 25) -> list:
+    """Catalog probes that fired 0x across `recs`, 0 fires is ABSENCE OF EVIDENCE, not precision (the corpus
+    is auth-dark for the authed-surface probes, so they never get to fire). Returns (id, penalty), high first,
+    so the report NEVER lets a never-fired high-penalty probe read as 'precise / 0 FP'."""
+    fired = {f["probe_id"] for r in recs for f in (r.get("findings") or [])}
+    try:
+        catalog = load_catalog(str(pathlib.Path(__file__).resolve().parent.parent / "catalog"))
+    except Exception:
+        return []
+    return sorted([(p.id, p.penalty) for p in catalog if p.id not in fired and p.penalty >= min_penalty],
+                  key=lambda x: -x[1])
+
+# Probes that require a REAL server-side endpoint or state change, hallucinated on a catch-all/broken shell.
+_PHANTOM_SENSITIVE = ("sec-sqli", "sec-csrf", "sec-cmdi", "sec-ssti", "sec-lfi", "sec-hosthdr",
+                      "sec-split", "sec-ratelimit", "sec-idor", "sec-redirect", "sec-dos", "sec-xss",
+                      "sec-ssrf", "qa-crash", "qa-race")
+# These probes now route through the endpoint-level LIVENESS GATE (_endpoint_is_live in probes.py): they
+# only fire on an endpoint proven distinct from a nonexistent sibling under its own prefix. So a SURVIVING
+# fire is on a REAL server endpoint, and the host-level catch-all flag no longer implies a phantom, a modern
+# app routinely pairs a catch-all SPA FRONTEND with a real API BACKEND (roadio's /api/locations/search, a real
+# SQLi, was firing correctly but getting false-flagged here just because the frontend is a catch-all). We
+# TRUST the gate for these and never call their fires catch-all phantoms.
+_GATE_VETTED = ("sec-sqli-004", "sec-ratelimit-001", "sec-csrf-001", "qa-crash-010", "sec-dos-001",
+                "sec-hosthdr-001")
+# Everything else (headers/a11y/seo/perf/compression/dead-controls/...) measures the ACTUAL served
+# response and stays real even on a catch-all, a missing CSP header is missing regardless.
+_NON_WORKING = {"broken", "not-an-app", "placeholder"}   # page states where the WHOLE surface is untrustworthy
+# Third-party fields that reflect by design (anti-bot tokens), an XSS "reflection" here is the vendor's, not the app's.
+_VENDOR_FIELDS = ("cf-turnstile-response", "g-recaptcha-response", "h-captcha-response", "__requestverificationtoken")
+# Fires whose SIGNAL is timing (perf) or a load-induced error (crash / sqli-error), trustworthy only when the
+# app was graded in ISOLATION at stable latency. Under a concurrent batch a saturated grader inflates timing and
+# a shared backend leaks 500s, so precision.py CANNOT vouch for these from the record alone: it reports them
+# UNCONFIRMED (neither clean nor FP) -> re-fire in isolation to resolve. This is the anti-"0 FP is a lie" fix,
+# the audit never again counts a concurrency-sensitive fire as verified-clean. (sqli-004's TIME technique is now
+# dose-response-hardened and load-robust, but its error technique and crash can still ride a load-induced 500.)
+_SIGNAL_SENSITIVE = {"perf-lighthouse-001",   # scored off the Lighthouse headline, which shifts with grader-side load
+                     "perf-cwv-001", "perf-cwv-002", "perf-loadtime-001", "perf-ttfb-001",
+                     "perf-load-001",   # a 12-connection concurrent BURST -> under a --concurrency batch the
+                                        # grader's own ~96 simultaneous conns can DROP (counted as failure);
+                                        # only trustworthy graded in ISOLATION. Was missing -> false "verified".
+                     "qa-crash-010", "sec-sqli-004"}
+
+
+def _phantom_sensitive(pid):
+    return pid.startswith(_PHANTOM_SENSITIVE)
+
+
+def _audited(pid):
+    """True iff precision.py has an ACTUAL rule that inspects this probe (phantom/catch-all, signal-
+    instability, or the exposure/secret guard). When False, a `_suspect()==None` verdict means NO OPINION
+   , the finding is UNAUDITED, not verified. The unaudited surface (a11y / headers / seo / perf-requests /
+    web-vitals-count / …) is the MAJORITY of the score and exactly where scope & attribution FPs hide (the
+    asi1 perf-requests fire is here: real signal, correct probe, live endpoint, wrong owner, every rule
+    the audit owns says 'real'). Only a hand-sample (--sample) can vouch for it. See [[fuzz-runner]]."""
+    return _phantom_sensitive(pid) or pid in _SIGNAL_SENSITIVE or pid.startswith("sec-secret")
+
+
+def _damped_by_probe(findings, decay=CATEGORY_DECAY):
+    """Per-probe DAMPED penalty for one app, what each fire actually COSTS in the score, not the raw
+    `penalty x count` this tool used to report. Mirrors aggregate._damped_total: a variant group counts once
+    (its highest-penalty member), then per-category diminishing returns (sorted desc, penalty * decay**i).
+    Raw sums badly over-state a fan-out probe: sec-headers-001 fires per-ROUTE, so its raw mass looked like
+    ~25k on the corpus while its damped cost collapses to near-zero behind the higher-penalty header fires."""
+    items = []                                    # expand a fan-out finding back into its per-target outcomes
+    for f in findings:
+        pid, grp = f.get("probe_id", ""), f.get("group")
+        cat, pen = (f.get("category") or ""), f.get("penalty", 0)
+        items.extend([(pid, cat, grp, pen)] * max(1, f.get("count", 1)))
+    groups, singles = {}, []
+    for it in items:
+        if it[2]:                                 # variant group -> only its highest-penalty member counts
+            cur = groups.get(it[2])
+            if cur is None or it[3] > cur[3]:
+                groups[it[2]] = it
+        else:
+            singles.append(it)
+    by_cat = defaultdict(list)
+    for it in (*singles, *groups.values()):
+        by_cat[it[1]].append(it)
+    out = defaultdict(float)
+    for cat_items in by_cat.values():
+        for i, it in enumerate(sorted(cat_items, key=lambda x: -x[3])):
+            out[it[0]] += it[3] * (decay ** i)    # the worst counts full; each additional decays
+    return out
+
+
+def _page_state(r):
+    return (r.get("coverage_audit") or {}).get("page_state")
+
+
+def _soft404(r):
+    return any(f.get("probe_id") == "qa-http-001" for f in r.get("findings", []))
+
+
+def _suspect(f, catch_all):
+    """Classify finding f on a scored app as one of:
+      - ("fp", reason)        a likely FALSE POSITIVE (counts toward the precision gap)
+      - ("advisory", reason)  a REAL finding flagged for review (NOT an FP), e.g. a third-party platform login
+      - None                  looks real
+    Gate-aware: sec-sqli-004 / sec-ratelimit-001 / sec-csrf-001 / qa-crash-010 route through the liveness gate,
+    so a surviving fire is on a real endpoint, never a catch-all phantom. Rate-limit on a catch-all-frontend
+    host is the one nuance: the login is live but is often a THIRD-PARTY platform login (real endpoint, wrong
+    OWNER), so it is an advisory, not an FP, it dissolves when teams submit their own URLs."""
+    pid = f.get("probe_id", "")
+    ev = f.get("evidence") or {}
+    if pid.startswith("sec-xss") and (ev.get("field") or "").lower() in _VENDOR_FIELDS:
+        return ("fp", f"reflection is a vendor anti-bot field ({ev.get('field')}), not app-controlled XSS")
+    if pid == "sec-ratelimit-001" and catch_all:
+        return ("advisory", "rate-limit on a live login on a catch-all-frontend host, likely a third-party "
+                            "platform login (real endpoint, verify it is the team's own app)")
+    if pid in _SIGNAL_SENSITIVE:   # timing / load-induced-error signal: reliable only if graded in isolation.
+        return ("unconfirmed", "timing / load-induced-error signal, not verifiable from batch data; clean if "
+                               "graded in isolation, else re-fire isolated to confirm (not counted clean or FP)")
+    if pid in _GATE_VETTED:
+        return None   # liveness-gated: a surviving fire is on a REAL endpoint, not a catch-all phantom
+    if _phantom_sensitive(pid) and catch_all:
+        return ("fp", "catch-all / soft-404 host, the targeted endpoint likely doesn't exist server-side "
+                      "(un-gated phantom-sensitive probe)")
+    # Exposure fires on a catch-all host are deliberately NOT flagged. The shell guard now lives at the PROBE
+    # level (response_is_dotenv rejects an HTML-shell body/content-type; .git/.aws use signatures HTML can't
+    # satisfy; 006 validates the .map parses), so a SURVIVING exposure fire has already cleared it and is REAL.
+    # Verified live: 8yhjs2.csb.app is a soft-404 SPA that ALSO serves a genuine /.env (application/octet-stream,
+    # real Amplitude/Sentry keys). A host-level catch-all heuristic here DISMISSES real leaks, a false negative
+    # on the most severe finding class, strictly worse than the false positive it was meant to catch.
+    if pid.startswith("sec-secret") and catch_all:
+        return ("advisory", "secret-pattern match in the bundle of a catch-all-frontend host, verify it's a "
+                            "real embedded key (sk-ant / sk-live / AKIA…), not a library constant or the shell")
+    # NOTE: a login-wall is NOT flagged, its login form + rate-limiting ARE real, testable surface.
+    return None
+
+
+def _gated(r):
+    """DNF-class: excluded from scoring. functional=False is the grader's authoritative verdict (set with
+    corroboration, a deterministic broken signal, or no real surface); the page_state fallback covers records
+    graded before the veto. A `disputed_broken` record is the veto's product, the LLM called it broken but
+    real surface was captured, so it's SCORED, never gated (and its fires ARE audited like any scored app)."""
+    if r.get("disputed_broken"):
+        return False
+    return r.get("functional") is False or _page_state(r) in _NON_WORKING
+
+
+def analyze(recs):
+    have_score = [r for r in recs if isinstance(r.get("slop_score"), (int, float))]
+    gated = [r for r in have_score if _gated(r)]          # correctly DNF'd by the gate -> not a precision problem
+    scored = [r for r in have_score if not _gated(r)]     # the apps that ACTUALLY count toward the score
+    per_probe = defaultdict(lambda: [0, 0])              # pid -> [fires, FALSE-positives]
+    unaudited = defaultdict(lambda: [0, 0])              # pid -> [fires, penalty] the audit has NO rule for
+    vouched = 0                                          # fires where a real precision rule ran and passed
+    scored_penalty = 0                                   # total penalty across scored fires (for the share)
+    fp_reasons, adv_reasons, unconf_reasons = Counter(), Counter(), Counter()
+    flagged, advisories, unconfirmed = [], [], []        # (repo, pid, penalty, count, reason)
+    catchall_apps = 0
+    for r in scored:                                     # measure precision ONLY on what's actually scored
+        catch_all = _soft404(r) or bool((r.get("observed_surface") or {}).get("catch_all"))
+        catchall_apps += bool(catch_all)
+        damped = _damped_by_probe(r.get("findings") or [])   # REAL in-score cost, not raw penalty*count
+        for f in r.get("findings", []):
+            pid = f["probe_id"]
+            pen = damped.get(pid, 0.0)
+            per_probe[pid][0] += 1
+            scored_penalty += pen
+            res = _suspect(f, catch_all)
+            if not res:                                  # `looks real` forks: a rule vouched for it, OR no rule
+                if _audited(pid):                        # exists and the audit simply has no opinion (unaudited)
+                    vouched += 1
+                else:
+                    unaudited[pid][0] += 1
+                    unaudited[pid][1] += pen
+                continue
+            klass, why = res
+            row = (r.get("repo", ""), pid, f.get("penalty", 0), f.get("count", 1), why)
+            if klass == "fp":
+                per_probe[pid][1] += 1
+                fp_reasons[why.split(", ")[0].split(" (")[0]] += 1
+                flagged.append(row)
+            elif klass == "unconfirmed":                 # concurrency/latency-sensitive, NOT counted clean or FP
+                unconf_reasons[why.split(", ")[0].split(" (")[0]] += 1
+                unconfirmed.append(row)
+            else:                                        # advisory: a REAL finding flagged for review, not an FP
+                adv_reasons[why.split(", ")[0].split(" (")[0]] += 1
+                advisories.append(row)
+    return {"scored": scored, "gated": gated, "gated_slop": sum(r.get("slop_score") or 0 for r in gated),
+            "per_probe": per_probe, "fp_reasons": fp_reasons, "adv_reasons": adv_reasons,
+            "unconf_reasons": unconf_reasons, "unconfirmed": unconfirmed,
+            "vouched": vouched, "unaudited": dict(unaudited), "scored_penalty": scored_penalty,
+            "flagged": flagged, "advisories": advisories, "catchall_apps": catchall_apps}
+
+
+def _wilson(k, n, z=1.96):
+    """95% Wilson score interval for a binomial proportion. Unlike the normal approximation it stays inside
+    [0,1] and does not collapse to a fake-tight band at k=0 (0/30 hand-audited is NOT '0% FP, done', Wilson
+    reports it as ~0–11%, which is the honest read on a small sample). This is the whole point of the CI."""
+    if n == 0:
+        return (0.0, 0.0)
+    p = k / n
+    d = 1 + z * z / n
+    c = (p + z * z / (2 * n)) / d
+    h = z * ((p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5) / d
+    return (max(0.0, c - h), min(1.0, c + h))
+
+
+def _fire_target(f):
+    ev = f.get("evidence") or {}
+    return ev.get("endpoint") or ev.get("target") or ev.get("path") or ""
+
+
+def _sample_worksheet(recs, n, seed):
+    """Emit N random SCORED fires as a hand-audit worksheet (TSV). The human fills the `verdict` column
+    (fp | ok), then `precision.py --tally FILE` turns it into a real FP rate + 95% CI, the ground-truth
+    number the heuristic audit structurally cannot produce (it has no oracle; this IS the oracle)."""
+    a = analyze(recs)
+    fires = [(r.get("repo", ""), f) for r in a["scored"] for f in r.get("findings", [])]
+    random.Random(seed).shuffle(fires)                   # seeded -> the draw is reproducible / auditable
+    pick = fires[: min(n, len(fires))]
+    print(f"# hand-audit worksheet, {len(pick)} of {len(fires)} scored fires (seed={seed}). Reproduce each")
+    print(f"# and set VERDICT = fp (false positive) | ok (real) | blank to skip. Then:")
+    print(f"#   uv run python scripts/stats.py THIS_FILE --tally")
+    print("verdict\trepo\tprobe_id\tpenalty\ttarget\trepro")
+    for repo, f in pick:
+        repro = " ".join(str((f.get("evidence") or {}).get("repro") or "").split())[:200]
+        print(f"\t{repo}\t{f.get('probe_id', '')}\t{f.get('penalty', 0)}\t{_fire_target(f)}\t{repro}")
+
+
+def _tally(path):
+    """Read a filled worksheet and print the hand-audited FP rate + 95% Wilson CI over the resolved verdicts."""
+    k = n = 0
+    per_probe = defaultdict(lambda: [0, 0])              # pid -> [audited, fp]
+    for line in open(path):
+        if line.startswith("#") or line.startswith("verdict\t"):
+            continue
+        cols = line.rstrip("\n").split("\t")
+        v = (cols[0].strip().lower() if cols else "")
+        if v not in ("fp", "ok"):
+            continue                                     # blank / unresolved -> not counted either way
+        n += 1
+        k += (v == "fp")
+        pid = cols[2] if len(cols) > 2 else "?"
+        per_probe[pid][0] += 1
+        per_probe[pid][1] += (v == "fp")
+    if not n:
+        print("no resolved verdicts (fill the `verdict` column with fp/ok, then re-run --tally)")
+        return
+    lo, hi = _wilson(k, n)
+    print(f"\n═══ hand-audited precision, {n} fires resolved, {k} false positive(s) ═══")
+    print(f"    FP rate    {k / n * 100:5.1f}%     95% CI  {lo * 100:4.1f}% – {hi * 100:4.1f}%")
+    print(f"    precision  {(1 - k / n) * 100:5.1f}%     95% CI  {(1 - hi) * 100:4.1f}% – {(1 - lo) * 100:4.1f}%")
+    print(f"    -> at n={n}, the TRUE FP rate is plausibly as high as {hi * 100:.1f}%. Widen the draw to tighten it.")
+    worst = sorted(((pid, c, fp) for pid, (c, fp) in per_probe.items() if fp), key=lambda x: -x[2])
+    if worst:
+        print("    by probe (only those with an FP):")
+        for pid, c, fp in worst:
+            print(f"      {fp}/{c}  {pid}")
+    print()
+
+
+def precision_report(recs, args):
+    a = analyze(recs)
+    scored = a["scored"]
+    total_fires = sum(v[0] for v in a["per_probe"].values())
+    total_fp = sum(v[1] for v in a["per_probe"].values())
+    fp_apps = len({x[0] for x in a["flagged"]})
+    adv_apps = len({x[0] for x in a["advisories"]})
+    total_unconf = len(a["unconfirmed"])
+    unconf_apps = len({x[0] for x in a["unconfirmed"]})
+    vouched = a["vouched"]
+    unaudited = a["unaudited"]                            # pid -> [fires, penalty]
+    unaudited_fires = sum(v[0] for v in unaudited.values())
+    unaudited_pen = sum(v[1] for v in unaudited.values())
+    pen_share = (unaudited_pen / a["scored_penalty"] * 100) if a["scored_penalty"] else 0.0
+
+    if args.json:
+        print(json.dumps({
+            "n_scored": len(scored), "n_gated_dnf": len(a["gated"]), "gated_slop": a["gated_slop"],
+            "scored_fires": total_fires, "false_positive_fires": total_fp, "fp_apps": fp_apps,
+            "advisory_fires": len(a["advisories"]), "advisory_apps": adv_apps, "catchall_apps": a["catchall_apps"],
+            "vouched_fires": vouched, "unaudited_fires": unaudited_fires,
+            "unvalidated_zero_fire": [{"id": pid, "penalty": pen} for pid, pen in _unvalidated_probes(recs)],
+            "unaudited_penalty_pct": round(pen_share, 1),
+            "unaudited_by_probe": {pid: v[0] for pid, v in sorted(unaudited.items(), key=lambda x: -x[1][1])},
+            "unconfirmed_fires": total_unconf, "unconfirmed_apps": unconf_apps,
+            "unconfirmed_reasons": dict(a["unconf_reasons"].most_common()),
+            "per_probe_precision": {pid: {"fires": v[0], "false_positives": v[1],
+                                          "precision_pct": round((v[0] - v[1]) / v[0] * 100, 1) if v[0] else None}
+                                    for pid, v in sorted(a["per_probe"].items())},
+            "fp_reasons": dict(a["fp_reasons"].most_common()),
+            "advisory_reasons": dict(a["adv_reasons"].most_common()),
+        }, indent=2))
+        return
+
+    print(f"\n═══ precision audit, {len(scored)} SCORED apps  ({len(a['gated'])} DNF'd by the gate, excluded) ═══")
+    print(f"\n⚠  NOT a true-precision number. This audit recognizes a FIXED list of FP classes (catch-all")
+    print(f"   phantom · vendor-reflection · signal-instability) and has NO ground-truth oracle. It is blind")
+    print(f"   to scope/attribution FPs, a REAL finding on the wrong owner's page (the asi1 perf case). For")
+    print(f"   the real number, hand-sample:  python scripts/stats.py {args.results} --precision --sample 30 > w.tsv")
+
+    print(f"\n(0) DNF GATE, {len(a['gated'])} apps broken/not-an-app -> DNF-class, EXCLUDED "
+          f"({a['gated_slop']} slop correctly kept out of the distribution; not a precision gap).")
+
+    print(f"\n(1) WHAT THE AUDIT CAN / CANNOT VOUCH FOR")
+    print(f"    {vouched:>5} / {total_fires} VOUCHED    , a precision rule ran and passed (liveness-gate / "
+          f"catch-all / vendor-field).")
+    print(f"    {unaudited_fires:>5} / {total_fires} UNAUDITED  , NO rule exists; neither confirmed nor suspect. "
+          f"{pen_share:.0f}% of DAMPED in-score penalty. Hand-sample these:")
+    for pid, (fires, pen) in sorted(unaudited.items(), key=lambda x: -x[1][1])[:12]:
+        print(f"            {fires:>5} fires · {pen:>7.0f} in-score pen   {pid}")
+    unval = _unvalidated_probes(recs)
+    if unval:
+        print(f"\n(1b) UNVALIDATED, {len(unval)} high-penalty probe(s) fired 0× on this corpus.")
+        print(f"     0 fires is ABSENCE OF EVIDENCE, not precision (corpus auth-dark / no applicable surface).")
+        print(f"     Do NOT read their 0 FP as 'precise', unvalidated until they fire on real surface:")
+        for pid, pen in unval[:15]:
+            print(f"            pen {pen:>3}   {pid}")
+    if total_unconf:
+        print(f"    {total_unconf:>5} / {total_fires} UNCONFIRMED, timing / load-induced-error ({unconf_apps} apps); "
+              f"re-fire in isolation to resolve:")
+        for why, n in a["unconf_reasons"].most_common():
+            print(f"            {n:>5}  {why}")
+    print(f"    {total_fp:>5} / {total_fires} KNOWN-CLASS FP ({fp_apps} apps), only the classes this audit can see:")
+    for why, n in a["fp_reasons"].most_common():
+        print(f"            {n:>5}  {why}")
+    if not a["fp_reasons"]:
+        print(f"            (none of the KNOWN classes survived, this says NOTHING about the unaudited surface above)")
+
+    if a["advisories"]:
+        print(f"\n(1b) OWNERSHIP-FLAGGED, REAL findings on live endpoints, NOT false positives")
+        print(f"    {len(a['advisories'])} fires across {adv_apps} apps. These dissolve when teams submit their OWN URLs:")
+        for why, n in a["adv_reasons"].most_common():
+            print(f"      {n:>4}  {why}")
+
+    print(f"\n(2) PER-PROBE CATCH-ALL/PHANTOM PRECISION  (audited probes only, NOT the whole surface; "
+          f"[gated] = liveness-vetted)")
+    rows = [(pid, v[0], v[1]) for pid, v in a["per_probe"].items() if _phantom_sensitive(pid) and v[0]]
+    for pid, fires, fp in sorted(rows, key=lambda x: -x[2]) or [(None, 0, 0)]:
+        if pid is None:
+            print("    (no phantom-sensitive probes fired on scored apps)")
+            break
+        prec = (fires - fp) / fires * 100
+        tag = " [gated]" if pid in _GATE_VETTED else ""
+        print(f"    {pid:20} {fires:>4} fires · {fp:>4} FP · {prec:5.0f}% not-phantom {'█' * int(round(prec / 5))}{tag}")
+
+    combined = [("   ", *x) for x in a["flagged"]] + [("[A]", *x) for x in a["advisories"]]
+    if combined:
+        print(f"\n(3) FLAGGED FINDINGS  (top {args.show} by penalty; [A] = advisory/ownership, not an FP)")
+        for mark, repo, pid, pen, cnt, why in sorted(combined, key=lambda x: -x[3])[:args.show]:
+            print(f"    {mark} {(repo or '').rsplit('/', 1)[-1][:28]:28} {pid:18} pen={pen:>3}×{cnt:<2}, {why[:52]}")
+    print()
+
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Aggregate deploy_and_grade results into auditable statistics.")
-    ap.add_argument("results", help="the JSONL from deploy_and_grade --record")
+    ap = argparse.ArgumentParser(
+        description="Analyze deploy_and_grade results: the default RECALL report, plus --parity (cross stack "
+                    "visibility) and --precision (false positive audit). One tool, three lenses on one file.")
+    ap.add_argument("results", help="the JSONL from deploy_and_grade --record (or a filled worksheet, with --tally)")
     ap.add_argument("--audit", metavar="PROBE", help="list every app + evidence where PROBE fired, then exit")
     ap.add_argument("--json", action="store_true", help="emit a machine-readable summary instead of the report")
     ap.add_argument("--sigma", type=float, default=2.0, help="high outlier threshold in stdevs (default 2)")
     ap.add_argument("--charts", action="store_true",
                     help="render the corpus-writeup PNG charts (+ sibling CSVs) to docs/charts/, then exit "
                          "(needs matplotlib: run via `uv run --with matplotlib`)")
+    # --- PARITY mode (cross stack visibility): observed vs expected surface, blind spots ---
+    ap.add_argument("--parity", action="store_true", help="run the cross stack PARITY dashboard instead of the report")
+    ap.add_argument("--by", default="routing", choices=["routing", "framework", "api_style"],
+                    help="parity group key (default routing, the discovery-relevant axis)")
+    ap.add_argument("--csv", metavar="FILE", help="parity: write the per-app rows to FILE (the ledger) and exit")
+    # --- PRECISION mode (false positive audit) ---
+    ap.add_argument("--precision", action="store_true", help="run the PRECISION (false positive) audit instead")
+    ap.add_argument("--show", type=int, default=20, help="precision: how many flagged findings to list")
+    ap.add_argument("--sample", type=int, metavar="N",
+                    help="precision: emit N random fires as a hand-audit worksheet (TSV), then exit")
+    ap.add_argument("--tally", action="store_true",
+                    help="precision: treat `results` as a filled worksheet -> FP rate + 95%% Wilson CI")
+    ap.add_argument("--seed", type=int, default=0, help="precision: RNG seed for --sample (reproducible draw)")
     args = ap.parse_args()
 
+    if args.tally:                                    # precision: `results` is a filled worksheet, not a JSONL
+        _tally(args.results)
+        return
     recs = load(args.results)
     if not recs:
         sys.exit("no records")
+    if args.parity:
+        parity_report(recs, args)
+        return
+    if args.precision:
+        if args.sample:
+            _sample_worksheet(recs, args.sample, args.seed)
+        else:
+            precision_report(recs, args)
+        return
     if args.audit:
         audit(recs, args.audit)
         return

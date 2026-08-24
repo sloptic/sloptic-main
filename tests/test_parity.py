@@ -3,7 +3,7 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
-from parity import _row, blind_spots, group_parity  # noqa: E402
+from stats import _row, blind_spots, group_parity  # noqa: E402
 
 
 def _rec(repo, routing, *, deployed=True, slop=10, size=20, findings=3, exp=None, obs=None):

@@ -4,7 +4,7 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
-from precision import analyze, _audited, _wilson  # noqa: E402
+from stats import analyze, _audited, _wilson  # noqa: E402
 
 
 def _f(pid, pen=10, bundle="security", evidence=None, category=None, count=1, group=None):
