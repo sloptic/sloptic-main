@@ -1363,6 +1363,7 @@ def main():
                           "high_outliers": [(r["repo"], r["slop_score"]) for r in highs]},
             "timing_s": {label: {"avg": round(statistics.mean(xs), 1), "median": round(statistics.median(xs), 1),
                                  "max": max(xs)} for key, label in _PHASES for xs in [_phase(key)] if xs},
+            "grade_timeout_ceiling": sum(1 for r in timed if r.get("grade_timeout")),
             "pointer": {"apps": len(ptr_active), "endpoints_seeded": ptr_seeded, "reachable": ptr_reach,
                         "hallucinated": ptr_halluc, "params_seeded": ptr_params, "precision_pct": ptr_prec},
             "perception": {"apps": len(pcv_active), "endpoints_seeded": pcv_eps, "reachable": pcv_reach,
@@ -1616,6 +1617,15 @@ def main():
             xs = _phase(key)
             if xs:
                 print(f"    {label:10} {_stat_line(xs)}")
+        gs = _phase("grade_s")   # the grading phase is where the injection/browser cost + the timeout tail live
+        if gs:
+            print(f"\n    grade_s distribution (seconds):")
+            for line in _histogram(gs):
+                print(line)
+            killed = [r for r in timed if r.get("grade_timeout")]   # grader-flagged, robust to the timeout value
+            if killed:
+                print(f"    {len(killed)} app(s) ({100 * len(killed) / len(gs):.0f}%) hit the grade-timeout "
+                      f"ceiling — externally killed (a wedged render or a pathological fan-out), near-zero yield")
         slow = sorted((r for r in timed if r["timings"].get("total_s")),
                       key=lambda r: -r["timings"]["total_s"])[:5]
         if slow:
