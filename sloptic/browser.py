@@ -12,6 +12,7 @@ IP across every Vercel host; the real installed Chrome the dev box and laptop dr
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import os
 import pathlib
@@ -110,6 +111,24 @@ def _kill_browser_on_stall(deadline_s: float):
         yield fired
     finally:
         timer.cancel()
+
+
+_BROWSER_LANE_DEADLINE = 180.0   # any single browser lane finishes well under this; a longer run is a wedged
+#                                  renderer -> kill the browser so the lane returns its safe default instead of
+#                                  hanging to the 900s external grade SIGKILL (measured: the v23 register-lane
+#                                  runaways). Generous vs the lanes' own ~45-60s budgets, so no false kill.
+
+
+def _browser_guarded(fn):
+    """Arm the wedge-watchdog around a whole browser lane. A Playwright sync call on a CPU-spun renderer doesn't
+    honor its own timeout (the driver can't talk to a wedged renderer), so ONLY killing the browser process makes
+    it raise -- which the lane's own `except` then turns into its safe default. Kills descendants of THIS process
+    only (never a group), and lanes run sequentially per grade, so one lane's watchdog never touches another's."""
+    @functools.wraps(fn)
+    def _wrap(*args, **kwargs):
+        with _kill_browser_on_stall(_BROWSER_LANE_DEADLINE):
+            return fn(*args, **kwargs)
+    return _wrap
 
 
 def _launch(p):
@@ -1056,6 +1075,7 @@ def _dom_text(page) -> str:
     return ""
 
 
+@_browser_guarded
 def _drive_create_and_observe(base_url, submit_value, headers, timeout, observe):
     """Core browser write round trip: fill a content form with `submit_value` (carrying `headers` -- the
     register-lane session, so auth-gated creates work), submit via the app's OWN JS, RE-RENDER (in place, then one
@@ -1144,6 +1164,7 @@ def _render_and_find(browser_obj, base_url, headers, locate, timeout):
             ctxt.close()
 
 
+@_browser_guarded
 def cross_user_read_back(base_url: str, submit_value: str, locate: str,
                          a_headers, b_headers, timeout: float = 12.0):
     """Two-session cross-user read-back for IDOR/BOLA on the SPA data plane. CREATE as identity A (a_headers) in a
@@ -1202,6 +1223,7 @@ def cross_user_read_back(base_url: str, submit_value: str, locate: str,
         return None
 
 
+@_browser_guarded
 def register_in_browser(base_url: str, headers=None, timeout: float = 12.0, total_timeout: float = 45.0,
                         email: str | None = None, code_getter=None):
     """SPA self-registration THROUGH the browser (the auth self-oracle's client-rendered path): open the signup
@@ -1314,6 +1336,7 @@ def register_in_browser(base_url: str, headers=None, timeout: float = 12.0, tota
     return out
 
 
+@_browser_guarded
 def verify_in_browser(link: str, base_url: str = "", headers=None, timeout: float = 12.0):
     """Complete a SPA e-mail verification: open the emailed confirmation LINK in a fresh browser so the app's OWN
     JS reads the token out of the URL and establishes the session — an httpx GET can't run that JS, so a
@@ -1413,6 +1436,7 @@ def _fill_create_form(page, marker) -> bool:
     return False
 
 
+@_browser_guarded
 def check_create_reflection(base_url, marker, headers=None, timeout: float = 12.0):
     """Submit a create form (a text field filled with `marker`), then check whether the app reflects the new
     item in the DOM WITHOUT a reload. Returns 'stale' (absent live, present after reload -> the bug),
@@ -1522,6 +1546,7 @@ def _quiet_close(popup):
         popup.close()
 
 
+@_browser_guarded
 def inert_controls(url: str, headers=None, timeout: float = 12.0, max_controls: int = 10,
                    per_wait_ms: int = 400, total_timeout: float = 40.0) -> list | None:
     """Click each reveal-safe control on the page and return the labels of the ones that produced NO
@@ -1651,6 +1676,7 @@ _CONTRAST_JS = r"""() => {
 }"""
 
 
+@_browser_guarded
 def _eval_page(url, headers, timeout, js_list):
     """Render url once and return the summed result of each JS expression, or None if no browser/render."""
     try:
@@ -1703,6 +1729,7 @@ def _contrast_data(violation) -> list:
     return out
 
 
+@_browser_guarded
 def a11y_violations(url: str, headers=None, timeout: float = 12.0) -> list | None:
     """Render url, inject axe-core, and return its violations as [{id, impact, tags}] — the WCAG 2 A/AA SCORED
     ruleset (~100 rules incl. contrast, ARIA, structure) PLUS the Family-2 advisory candidates (WCAG 2.2 AA +
@@ -1814,6 +1841,7 @@ def _tally_console(pageerrors: list, console_errors_text: list, origin: str) -> 
             "total": len(pageerrors) + c_fp + c_tp, "sources": {"pageerror": pe_fp, "console": c_fp}}
 
 
+@_browser_guarded
 def console_errors(url: str, headers=None, timeout: float = 12.0) -> dict | None:
     """Render url and capture the app's OWN load-time JavaScript failures: uncaught throws (pageerror) PLUS the
     curated console.error classes a throw hook misses -- a self-blocking CSP and a React hydration mismatch
@@ -1891,6 +1919,7 @@ _CWV_THROTTLE = {"offline": False, "latency": 150, "downloadThroughput": 200_000
 
 
 
+@_browser_guarded
 def dom_xss_executes(base_url: str, paths, params=("q",), max_attempts: int = 24,
                      total_timeout: float = 45.0, headers=None, payloads=None) -> bool:
     """Inject an executing payload into candidate query params of each path, render, and return True
@@ -1942,6 +1971,7 @@ def _view_fp(page) -> frozenset:
     return frozenset()
 
 
+@_browser_guarded
 def back_button_broken(base_url: str, headers=None, timeout: float = 12.0):
     """Navigate IN-APP from the entry view to another route (click a same-origin router link — NOT a fresh
     goto, which the browser's own history would always restore), fire the browser BACK button, and check the
@@ -2045,6 +2075,7 @@ _LOGIN_SCREEN_JS = """() => {
 _AUTH_URL = re.compile(r"/(?:login|log-?in|signin|sign-?in|sign_in|auth|register|signup|sign-?up)\b", re.I)
 
 
+@_browser_guarded
 def deep_link_broken(base_url: str, routes, headers=None, timeout: float = 12.0, max_routes: int = 8):
     """FRESH-navigate (goto, not in-app) to a guaranteed-nonexistent route to capture the app's FALLBACK render
     (home / 404 / blank), then fresh-navigate to each discovered route; return ('broken', route) for the first
@@ -2109,6 +2140,7 @@ _ERROR_DOM_JS = """() => {
 }"""
 
 
+@_browser_guarded
 def silent_failure_on_action(base_url: str, headers=None, timeout: float = 12.0) -> str:
     """Fill a create/save form, FORCE its submit request to fail (fulfill the same-origin POST/PUT/PATCH with
     500), and check the app shows a failure indication. Returns 'silent' (the action's request failed but NO
@@ -2160,6 +2192,7 @@ def silent_failure_on_action(base_url: str, headers=None, timeout: float = 12.0)
         return "inconclusive"
 
 
+@_browser_guarded
 def stored_xss_executes(base_url: str, paths, headers=None, total_timeout: float = 45.0, max_pages: int = 20) -> bool:
     """Render each path PLAIN — NO injection, because an XSS payload was already STORED server-side via an API
     write — and return True if it EXECUTES: the app reflected the stored value unescaped into the DOM and it

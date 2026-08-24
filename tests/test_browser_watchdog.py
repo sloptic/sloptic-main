@@ -50,3 +50,29 @@ def test_kill_browser_on_stall_does_not_fire_when_the_block_is_fast():
     finally:
         p.kill()
         p.wait()
+
+
+def test_browser_guarded_decorator_kills_a_wedged_lane(monkeypatch):
+    # _browser_guarded arms the watchdog around a whole browser lane: if it runs past the deadline (a wedged
+    # renderer), the browser descendants are killed so the blocked call raises. Here a sleep stands in for the
+    # wedged chromium; the decorated lane must not outlast the (shortened) deadline.
+    monkeypatch.setattr(browser, "_BROWSER_LANE_DEADLINE", 0.3)
+    holder = {}
+
+    @browser._browser_guarded
+    def _fake_lane():
+        p = subprocess.Popen(["sleep", "60"])          # stands in for a wedged chromium descendant
+        holder["p"] = p
+        end = time.monotonic() + 5
+        while p.poll() is None and time.monotonic() < end:
+            time.sleep(0.05)                            # 'blocked in the wedged browser call'
+        return "returned"
+
+    assert _fake_lane() == "returned"                   # the lane returns (its call unblocked by the kill)
+    p = holder["p"]
+    try:
+        assert p.poll() is not None                     # the decorator's watchdog killed the descendant
+    finally:
+        if p.poll() is None:
+            p.kill()
+        p.wait()
