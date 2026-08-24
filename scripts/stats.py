@@ -88,7 +88,7 @@ def _source(r):
 def _scored(f):
     """A finding that CONTRIBUTES to the score. report_only / off score diagnostics (the per-audit Lighthouse
     probes) must stay out of the concentration + fire frequency views or they read as if they scored. Key on
-    the explicit `report_only` flag FIRST (robust to pre-leak-fix corpora where these leaked at penalty 1, not
+    the explicit `report_only` flag FIRST (correct on pre-leak-fix corpora where these leaked at penalty 1, not
     0), then fall back to penalty>0 for any other zero-cost fire."""
     if (f.get("evidence") or {}).get("report_only"):
         return False
@@ -193,8 +193,8 @@ def audit(recs, probe_id):
                         print(f"        -> {' | '.join(resp)}")
                 if ev:   # measurements (cwv/dos timings, a11y rules, ...), the observational-probe "repro"
                     print(f"      evidence={json.dumps(ev)[:400]}")
-    # --trace runs carry a per probe request log (fired OR clean OR n/a), show what this probe actually SENT,
-    # not just the finding that fired. Every request as a copy-pasteable curl + its status.
+    # --trace runs carry a per probe request log (fired OR clean OR n/a), show what this probe actually SENT
+    # for each finding, as a copy-pasteable curl + its status.
     traced = [(r, t) for r in recs for t in (r.get("trace") or []) if t.get("probe") == probe_id]
     if traced:
         # per probe cap (net._TRACE_PER_PROBE_CAP): a big fan out is sampled, not shown in full, say so
@@ -607,7 +607,7 @@ _VENDOR_FIELDS = ("cf-turnstile-response", "g-recaptcha-response", "h-captcha-re
 # a shared backend leaks 500s, so precision.py CANNOT vouch for these from the record alone: it reports them
 # UNCONFIRMED (neither clean nor FP) -> re-fire in isolation to resolve. This is the anti-"0 FP is a lie" fix,
 # the audit never again counts a concurrency-sensitive fire as verified-clean. (sqli-004's TIME technique is now
-# dose-response-hardened and load-robust, but its error technique and crash can still ride a load-induced 500.)
+# dose-response-hardened and stable under load, but its error technique and crash can still ride a load-induced 500.)
 _SIGNAL_SENSITIVE = {"perf-lighthouse-001",   # scored off the Lighthouse headline, which shifts with grader-side load
                      "perf-cwv-001", "perf-cwv-002", "perf-loadtime-001", "perf-ttfb-001",
                      "perf-load-001",   # a 12-connection concurrent BURST -> under a --concurrency batch the
@@ -1581,7 +1581,7 @@ def main():
             print("      (none)")
     print(f"\n    → audit any probe: scripts/stats.py {args.results} --audit <probe id>\n")
 
-    # (f) TIMING, measurement, not just gates: where the wall clock goes, and the slowest apps
+    # (f) TIMING, the wall clock as its own signal: where time goes, and the slowest apps
     if timed:
         sec(f"TIMING  (wall clock seconds per phase, across {len(timed)} apps)")
         for key, label in _PHASES:
