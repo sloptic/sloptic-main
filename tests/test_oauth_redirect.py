@@ -105,3 +105,40 @@ def test_clean_when_redirect_uri_matches_the_local_origin(app):
 def test_na_when_no_oauth_flow(app):
     _CFG.update(oauth=False, redirect_uri="")
     assert oauth_redirect_localhost(_ctx(app), _Probe()) is None
+
+
+def _sso_ctx(url="https://real-app.invalid"):
+    # a ctx whose caps say browser + SSO present, so the browser lane runs (the static lane finds nothing on the
+    # unresolvable host and falls through). capture_sso_authorize is monkeypatched per test.
+    prof = Profile(base_url=url)
+    prof.capabilities = {"browser": True, "sso_providers": ["google"]}
+    return type("C", (), {"base_url": url, "profile": prof, "headers": None, "client": None, "evidence": {}})()
+
+
+def test_browser_lane_reveals_a_client_side_sdk_localhost_redirect(monkeypatch):
+    # SDK SSO: nothing server-side, but a driven click captures an authorize request whose redirect_uri is
+    # localhost -> the probe fires via the browser lane where the static lane read N/A.
+    from sloptic import browser as _b
+    monkeypatch.setattr(_b, "capture_sso_authorize", lambda *a, **k: [
+        "https://accounts.google.com/o/oauth2/auth?client_id=x&response_type=code&redirect_uri=http://localhost:3000/cb"])
+    ctx = _sso_ctx()
+    assert oauth_redirect_localhost(ctx, _Probe()) is True
+    assert "localhost" in ctx.evidence.get("oauth_redirect_uri", "")
+    assert ctx.evidence.get("via") == "browser sso click"
+
+
+def test_browser_lane_clean_redirect_is_false_not_a_finding(monkeypatch):
+    # the driven click captures a correctly-configured prod redirect_uri -> observed, clean -> False (not N/A).
+    from sloptic import browser as _b
+    monkeypatch.setattr(_b, "capture_sso_authorize", lambda *a, **k: [
+        "https://accounts.google.com/o/oauth2/auth?client_id=x&response_type=code&redirect_uri=https://real-app.invalid/cb"])
+    assert oauth_redirect_localhost(_sso_ctx(), _Probe()) is False
+
+
+def test_browser_lane_skipped_without_an_sso_signal(monkeypatch):
+    # no SSO capability -> never spend a launch; stays N/A (the static-lane result) with an explanatory reason.
+    from sloptic import browser as _b
+    monkeypatch.setattr(_b, "capture_sso_authorize", lambda *a, **k: (_ for _ in ()).throw(AssertionError("launched!")))
+    ctx = _ctx("https://real-app.invalid")   # default caps: no browser/sso
+    assert oauth_redirect_localhost(ctx, _Probe()) is None
+    assert "na_reason" in ctx.evidence

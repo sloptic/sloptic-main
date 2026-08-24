@@ -416,6 +416,99 @@ def render_routes(base_url: str, paths, headers=None, timeout: float = 12.0,
     return out
 
 
+# ---- browser-driven OAuth capture: reveal an SDK-initiated authorize URL a static crawl can't see ---------
+_SSO_TRIGGER = re.compile(
+    r"(?:sign|log|continue)\s*(?:in|up)?\s*with\s+"
+    r"(?:google|github|microsoft|apple|facebook|discord|gitlab|slack|linkedin|twitter|okta|auth0)"
+    r"|continue with|single sign[- ]?on|\bsso\b", re.I)
+# oauth-ish URLs to intercept (narrow, so non-oauth traffic isn't routed through Python); the authorize hop
+# leaves the app's own origin, which is how we tell a real provider redirect from a same-origin /auth?redirect_uri.
+_OAUTH_NAV = re.compile(r"/oauth2?/(?:v\d/)?authorize|/o/oauth2|accounts\.google\.com|github\.com/login/oauth|"
+                        r"login\.microsoftonline\.com|appleid\.apple\.com|dialog/oauth|\.auth0\.com/authorize", re.I)
+_SSO_ROUTES = ("/login", "/signin", "/sign-in", "/auth", "/account/login")
+
+
+def _find_sso_triggers(page):
+    """Clickable elements likely to START an OAuth flow: a 'Sign in with <provider>' button, or a link to an
+    oauth route/provider. Best-effort and bounded -- a false match just wastes one click (aborted)."""
+    out = []
+    with contextlib.suppress(Exception):
+        for el in page.query_selector_all("a[href], button, [role='button'], input[type='submit'], [onclick]"):
+            with contextlib.suppress(Exception):
+                href = el.get_attribute("href") or ""
+                blob = ((el.inner_text() or "")[:120] + " " + (el.get_attribute("aria-label") or ""))
+                if _SSO_TRIGGER.search(blob) or _OAUTH_NAV.search(href):
+                    out.append(el)
+    return out
+
+
+def capture_sso_authorize(base_url, headers=None, timeout: float = 12.0, total_timeout: float = 45.0,
+                          max_clicks: int = 6) -> list[str]:
+    """Drive the app's OWN 'Sign in with <provider>' control and capture the outgoing OAuth authorize request
+    (redirect_uri and all) WITHOUT completing the flow. SDK-initiated SSO (Supabase/Firebase/NextAuth/Auth0/
+    Clerk) builds the authorize URL in JS at click time, so it never appears server-side -- only a click reveals
+    it. Provider navigations are ABORTED (the request event still fires first, so we capture the URL) so one
+    click can't strand us before the next. Returns the captured authorize URLs, deduped; []. NEVER submits
+    credentials -- it stops at the redirect to the provider."""
+    out: list[str] = []
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return out
+    origin = urllib.parse.urlparse(base_url).netloc.lower()
+    seen: set[str] = set()
+    try:
+        with _kill_browser_on_stall(total_timeout + _RENDER_HANG_GRACE), sync_playwright() as pw:
+            b = _launch(pw)
+            if b is None:
+                return out
+            try:
+                page = b.new_page()
+                _apply_auth(page, base_url, headers)
+
+                def _cap(req):
+                    with contextlib.suppress(Exception):
+                        u = req.url
+                        if u not in seen and _OAUTH_NAV.search(u) \
+                                and urllib.parse.urlparse(u).netloc.lower() not in ("", origin):
+                            seen.add(u)
+                            out.append(u)      # a real authorize hop: oauth-shaped AND left our origin
+                page.on("request", _cap)
+
+                def _route(route):             # abort only the cross-origin provider nav; let the app run
+                    with contextlib.suppress(Exception):
+                        u = route.request.url
+                        if _OAUTH_NAV.search(u) and urllib.parse.urlparse(u).netloc.lower() not in ("", origin):
+                            route.abort()
+                            return
+                    with contextlib.suppress(Exception):
+                        route.continue_()
+                page.route(_OAUTH_NAV, _route)
+
+                page.goto(base_url.rstrip("/") + "/", timeout=int(timeout * 1000), wait_until="load")
+                page.wait_for_timeout(400)
+                triggers = _find_sso_triggers(page)
+                for route in _SSO_ROUTES:      # entry page had no SSO control -> try the login routes
+                    if triggers:
+                        break
+                    with contextlib.suppress(Exception):
+                        page.goto(base_url.rstrip("/") + route, timeout=int(timeout * 1000), wait_until="load")
+                        page.wait_for_timeout(300)
+                        triggers = _find_sso_triggers(page)
+                for el in triggers[:max_clicks]:
+                    if out:
+                        break                  # one captured authorize URL is enough to inspect the redirect_uri
+                    with contextlib.suppress(Exception):
+                        el.click(timeout=2500)
+                        page.wait_for_timeout(700)   # let the SDK build + fire the authorize navigation
+            finally:
+                with contextlib.suppress(Exception):
+                    b.close()
+    except Exception:
+        pass
+    return list(dict.fromkeys(out))
+
+
 # ---- browser-driven SPA registration (auth self-oracle, client-rendered path) --------------------
 _SIGNUP_SUBMIT = re.compile(r"sign ?up|register|create account|create your account|get started|join now|"
                             r"\bjoin\b|continue|submit|create", re.I)

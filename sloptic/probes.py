@@ -3383,12 +3383,29 @@ def oauth_redirect_localhost(ctx, probe) -> bool | None:
             ctx.evidence.update(oauth_redirect_uri=ru, authorize_url=url[:160], origin=ctx.base_url)
             return True
     if not found:
-        # No server-emitted OAuth authorization URL (in the homepage HTML or a one-hop auth-route redirect). An
-        # app CAN show a 'Sign in with Google' button and still land here: modern SSO (Supabase/Firebase/NextAuth/
-        # Auth0/Clerk SDKs) builds the authorize URL -- redirect_uri and all -- CLIENT-SIDE at click time, so it
-        # never appears server-side. So has_sso=true but redirect_uri unobservable without DRIVING the click.
-        ctx.evidence["na_reason"] = ("no server-emitted OAuth authorization URL found (homepage + one auth-route "
-                                     "hop); SSO here is SDK-initiated client-side, so redirect_uri needs a browser click")
+        # No SERVER-emitted authorize URL. On the SPA/BaaS corpus SSO is SDK-initiated (Supabase/Firebase/NextAuth/
+        # Auth0/Clerk build the authorize URL -- redirect_uri and all -- in JS at click time), so it never appears
+        # server-side. DRIVE the app's own 'Sign in with <provider>' click to reveal it. Gated on browser + an SSO
+        # signal, so only the ~SSO apps pay a launch (never the no-auth majority).
+        caps = getattr(getattr(ctx, "profile", None), "capabilities", None) or {}
+        if caps.get("browser") and caps.get("sso_providers"):
+            for url in browser.capture_sso_authorize(ctx.base_url, headers=ctx.headers):
+                ru = _oauth_redirect_uri(url)
+                if not ru:
+                    continue
+                found = True
+                if (_PRIVATE_HOST.search(ru) or _UNSET_ENV_HOST.search(ru)) \
+                        and urllib.parse.urlparse(ru).netloc.lower() != origin_netloc:
+                    ctx.evidence.update(oauth_redirect_uri=ru, authorize_url=url[:160], origin=ctx.base_url,
+                                        via="browser sso click")
+                    return True
+    if not found:
+        # still nothing after the click (or no browser / no SSO signal): an app CAN show a 'Sign in with Google'
+        # button and land here -- the redirect_uri is unobservable without driving the SDK-built authorize request.
+        ctx.evidence["na_reason"] = ("no OAuth authorization URL found (homepage + one auth-route hop"
+                                     + (" + driven SSO click" if caps.get("browser") and caps.get("sso_providers")
+                                        else "; SSO is SDK-initiated client-side, needs --browser + an SSO signal")
+                                     + ")")
         return None
     return False
 
