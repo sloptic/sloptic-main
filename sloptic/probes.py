@@ -1371,8 +1371,12 @@ def no_error_state(ctx, probe) -> bool | None:
     ANY indication (message / red field / toast) counts as handled — we grade that an apology exists, not its
     quality. N/A without a browser or a create form whose submit fires a mutating request."""
     form = auth.create_form(ctx.profile.forms)
-    if form is None:
-        ctx.evidence["na_reason"] = "no create/save form to submit-and-fail"
+    caps = getattr(getattr(ctx, "profile", None), "capabilities", None) or {}
+    # No discovered <form> create: a FORMLESS SPA create (bare input + button) never lands in the form list, but
+    # the browser lane's _fill_create_form drives it anyway. Only bother when an auth surface exists -- a create
+    # almost always lives behind login -- so we don't launch a browser on every static no-form page.
+    if form is None and not caps.get("has_auth_entrypoint"):
+        ctx.evidence["na_reason"] = "no create/save form to submit-and-fail (and no auth surface hiding a formless one)"
         return None
     hdrs = dict(ctx.headers or {})   # authenticate the page if we hold a session (the form is usually gated)
     account = ctx.register(suffix="_noerr")
@@ -1388,14 +1392,17 @@ def no_error_state(ctx, probe) -> bool | None:
     finally:
         if account is not None:
             account.client.close()
-    ctx.evidence.update(verdict=verdict, action=form.action)
+    action = form.action if form else "a browser-discovered create"
+    ctx.evidence.update(verdict=verdict, action=action)
     if verdict == "silent":
         ctx.evidence["matched"] = ("forced the submit of %s to fail; the app showed no error/failure "
-                                   "indication (silent data loss)" % form.action)
+                                   "indication (silent data loss)" % action)
         return True   # the action's request failed and the app showed the user nothing -> silent data loss
     if verdict == "handled":
         return False
-    ctx.evidence["na_reason"] = "no create form submitted a mutating request to fail (client-only / no browser)"
+    ctx.evidence["na_reason"] = ("no create form the browser could submit-and-fail (formless lane found none)"
+                                 if form is None else
+                                 "no create form submitted a mutating request to fail (client-only / no browser)")
     return None
 
 
@@ -2991,8 +2998,11 @@ def stale_ui_after_create(ctx, probe) -> bool | None:
     but a refresh shows it saved' — the UI lied). N/A without a create form or a browser; clean when the item
     showed live (reflected) or never persisted (not_saved -> that's data-integrity's finding, not this one)."""
     form = auth.create_form(ctx.profile.forms)
-    if form is None:
-        ctx.evidence["na_reason"] = "no create form to submit-and-observe"
+    caps = getattr(getattr(ctx, "profile", None), "capabilities", None) or {}
+    # formless SPA create: not in the form list, but check_create_reflection's _fill_create_form drives it. Gate
+    # the no-form case on an auth surface (a create lives behind login), so no launch on a static no-form page.
+    if form is None and not caps.get("has_auth_entrypoint"):
+        ctx.evidence["na_reason"] = "no create form to submit-and-observe (and no auth surface hiding a formless one)"
         return None
     account = ctx.register(suffix="_sui")   # the create form usually lives behind login -> authenticate the page
     hdrs = dict(ctx.headers or {})
@@ -3009,7 +3019,7 @@ def stale_ui_after_create(ctx, probe) -> bool | None:
     finally:
         if account is not None:
             account.client.close()
-    ctx.evidence.update(verdict=verdict, marker=marker, form=form.action)
+    ctx.evidence.update(verdict=verdict, marker=marker, form=(form.action if form else "browser-discovered create"))
     if verdict == "stale":
         return True
     if verdict in ("reflected", "not_saved"):

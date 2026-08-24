@@ -97,3 +97,34 @@ def test_silent_fire_records_which_form_and_what_happened(monkeypatch):
     assert probes.no_error_state(ctx, type("P", (), {"probe": {}})()) is True
     assert ctx.evidence["action"] == "/api/items"
     assert "silent data loss" in ctx.evidence["matched"]
+
+
+def test_no_form_but_auth_surface_drives_the_formless_lane(monkeypatch):
+    # a FORMLESS SPA create isn't in profile.forms, but with an auth surface the browser lane (which drives a
+    # bare input+button) still runs -- so a silent failure fires instead of a premature N/A.
+    from sloptic import probes
+    monkeypatch.setattr(browser, "silent_failure_on_action", lambda *a, **k: "silent")
+    ctx = type("C", (), {})()
+    ctx.profile = Profile(base_url="http://x")                    # NO discovered forms
+    ctx.profile.capabilities = {"has_auth_entrypoint": True, "browser": True}
+    ctx.base_url = "http://x"
+    ctx.headers = None
+    ctx.evidence = {}
+    ctx.register = lambda suffix="": None
+    assert probes.no_error_state(ctx, type("P", (), {"probe": {}})()) is True
+    assert ctx.evidence["action"] == "a browser-discovered create"
+
+
+def test_no_form_and_no_auth_stays_na_without_launching(monkeypatch):
+    # no discovered form AND no auth surface -> a static no-form page: N/A, and the browser lane is NEVER launched.
+    from sloptic import probes
+    monkeypatch.setattr(browser, "silent_failure_on_action",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not launch")))
+    ctx = type("C", (), {})()
+    ctx.profile = Profile(base_url="http://x")                    # no forms, empty capabilities
+    ctx.base_url = "http://x"
+    ctx.headers = None
+    ctx.evidence = {}
+    ctx.register = lambda suffix="": None
+    assert probes.no_error_state(ctx, type("P", (), {"probe": {}})()) is None
+    assert "no auth surface" in ctx.evidence["na_reason"]
