@@ -146,3 +146,21 @@ def test_per_slug_budget_balances_a_multi_hackathon_pull():
     assert _per_slug_budget(30, 3) == 10       # 3 slugs -> 10 each, balanced for diversity (not 30/0/0)
     assert _per_slug_budget(25, 5) == 5        # --search's default shape, now balanced too
     assert _per_slug_budget(10, 3) == 4        # ceil so the total still reaches ~the limit (4*3=12 >= 10)
+
+
+def test_waf_block_warns_and_is_not_read_as_empty(monkeypatch, capsys):
+    # a 403 (Devpost AWS-WAF block) must NOT be silently read as an empty gallery: page_projects retries, then
+    # warns loudly and returns [] UNCACHED, so a re-run retries instead of memoizing 'no projects'.
+    import devpost_repos
+    monkeypatch.setattr(devpost_repos.time, "sleep", lambda *_a: None)   # skip the backoff waits
+    out = page_projects(_Stub("blocked", status=403), "waf-slug", 1)
+    assert out == []
+    err = capsys.readouterr().err
+    assert "WAF-blocked" in err and "waf-slug" in err
+
+
+def test_empty_gallery_200_is_cacheable_not_a_block(tmp_path):
+    # a genuine 200 with no gallery items is an empty gallery (cacheable 'end'), distinct from a 403 block.
+    cache = IngestCache(str(tmp_path / "c.jsonl"))
+    assert page_projects(_Stub("<html>no items</html>", status=200), "empty-slug", 9, cache) == []
+    assert cache.has("page:empty-slug:9")            # empty 200 IS cached; a 403 would not be
