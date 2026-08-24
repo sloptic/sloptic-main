@@ -7,7 +7,7 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
-from stats import _is_graded, _modalities, by_hackathon, lighthouse_scores  # noqa: E402
+from stats import _dnf_reason, _is_graded, _modalities, auth_surface, by_hackathon, lighthouse_scores  # noqa: E402
 
 from sloptic.eligibility import is_ungradeable_challenge  # noqa: E402
 
@@ -118,3 +118,38 @@ def test_modalities_reports_spread_and_clumps():
 def test_modalities_none_when_every_score_is_distinct():
     out = _modalities([12.5, 13.7, 45.6])
     assert "100% unique" in out[0] and "none — every score is distinct" in out[1]
+
+
+def test_dnf_reason_buckets_each_failure_most_specific_first():
+    # the (a) attrition breakdown: one bucket per DNF record, most specific first, so it sums to the DNF total.
+    assert _dnf_reason({"dead_url": True}).startswith("dead URL")
+    assert _dnf_reason({"challenge_stage": "entry", "bot_challenge": True}).startswith("entry challenge")
+    assert _dnf_reason({"functional": False}).startswith("non functional")
+    assert _dnf_reason({"source": "repo", "deployed": False}).startswith("deploy failed")
+    assert _dnf_reason({"source": "repo", "deployed": True}).startswith("ungraded")   # deployed, no slop_score
+    # most specific wins: a dead URL that also did not deploy reads as dead URL, not deploy failed
+    assert _dnf_reason({"dead_url": True, "deployed": False}).startswith("dead URL")
+
+
+def test_auth_surface_sizes_registerable_hard_blocked_and_no_auth_slices():
+    def app(**kw):
+        s = {"has_login": False, "has_signup": False, "has_password_form": False, "has_sso": False,
+             "sso_only": False, "sso_providers": [], "captcha": None}
+        s.update(kw)
+        return _rec(observed_surface=s)
+    graded = [
+        app(has_login=True, has_signup=True, has_password_form=True),                 # self registerable
+        app(has_login=True, has_sso=True, sso_only=True, sso_providers=["google"]),   # SSO only, hard blocked
+        app(has_login=True, captcha="hcaptcha"),                                      # captcha gated (not password)
+        app(),                                                                        # no auth at all
+        {"deployed": True, "slop_score": 40},                                         # no observed_surface -> excluded
+    ]
+    a = auth_surface(graded)
+    assert a["n"] == 4                                          # the surface-less record drops out
+    assert a["self_registerable"] == 1 and a["sso_only"] == 1 and a["no_auth"] == 1
+    assert a["has_sso"] == 1 and a["sso_providers"]["google"] == 1 and a["captcha"]["hcaptcha"] == 1
+
+
+def test_auth_surface_empty_on_a_pre_field_corpus():
+    a = auth_surface([{"deployed": True, "slop_score": 40}, {"deployed": True, "slop_score": 10}])
+    assert a["n"] == 0 and a["self_registerable"] == 0 and dict(a["sso_providers"]) == {}
