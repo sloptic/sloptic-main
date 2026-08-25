@@ -984,7 +984,12 @@ def international_input_breaks(ctx, probe) -> bool | None:
     OR a READ-BACK GET (a JSON create that doesn't echo but whose listing shows the value -- the SPA sink).
     Uses the register-lane session (reach fields behind login). N/A when there's no writable text surface."""
     targets = _injectable_targets(ctx.profile) + _json_body_targets(ctx.profile)
-    if not targets:
+    caps = getattr(getattr(ctx, "profile", None), "capabilities", None) or {}
+    # No discovered httpx text target: on an SPA the text input is client-rendered, so fall THROUGH to the browser
+    # read-back lane below (a create almost always lives behind login, so gate on browser + auth). A hard N/A here
+    # pre-empted that lane -- the reason 68 apps read 'requires unmet' / 'no writable text surface' on the corpus.
+    if not targets and not (caps.get("browser") and caps.get("has_auth_entrypoint")):
+        ctx.evidence["na_reason"] = "no writable text surface (no discovered text endpoint, no auth-gated create)"
         return None
     budget = probe.probe.get("max_attempts", 60)
     tested = False

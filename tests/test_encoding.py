@@ -206,3 +206,23 @@ def test_browser_readback_skipped_without_a_browser(app, monkeypatch):
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not launch a browser")))
     ctx = _ctx(app, endpoints=[_ep("/noecho")])                           # no browser capability
     assert probes.international_input_breaks(ctx, _Probe()) is None        # httpx-blind -> honest N/A, no browser
+
+
+def test_no_httpx_target_spa_falls_through_to_the_browser_readback(monkeypatch):
+    # the relaxation: no DISCOVERED text endpoint (SPA client-rendered input), but with browser + auth the probe
+    # drives the create in a browser and reads the value back -- instead of the old hard N/A that pre-empted it.
+    from sloptic import browser
+    monkeypatch.setattr(browser, "create_and_read_back", lambda base, val, loc, **k: "<li>%s</li>" % val)
+    ctx = _ctx("http://x")                                  # NO endpoints/forms -> no httpx targets
+    ctx.profile.capabilities = {"browser": True, "has_auth_entrypoint": True}
+    assert international_input_breaks(ctx, _Probe()) is False   # browser round-trip observed the value intact
+    assert ctx.evidence.get("via") == "browser"
+
+
+def test_no_target_no_auth_is_na_without_launching_a_browser(monkeypatch):
+    from sloptic import browser
+    monkeypatch.setattr(browser, "create_and_read_back",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not launch")))
+    ctx = _ctx("http://x")                                  # no targets, no auth surface
+    assert international_input_breaks(ctx, _Probe()) is None
+    assert "no writable text surface" in ctx.evidence["na_reason"]

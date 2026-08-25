@@ -21,7 +21,11 @@ severity:
   escalators:
     - {evidence: server_error, point: 72, vrt_variant: "the app 500s on international/multibyte input (emoji/CJK/Arabic) -- crashes on real user data"}
 applicability:
-  requires: [any_endpoint_accepts_text_input]
+  # was requires: [any_endpoint_accepts_text_input] -- that hard-skipped every SPA whose text input is
+  # client-rendered (no DISCOVERED endpoint), the exact case the browser read-back lane exists for. Gate on
+  # [browser] instead (grading is browser-on); the probe self-N/As internally when there's neither a discovered
+  # text target NOR an auth-gated create to drive.
+  requires: [browser]
 probe:
   predicate: international_input_breaks
 tp_definition: |
