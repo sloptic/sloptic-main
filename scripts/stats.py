@@ -319,7 +319,7 @@ def auth_surface(graded):
         # ONE auth type per app, keyed on what we can DRIVE, so the buckets are mutually exclusive and sum to n
         # (the old flat has_signup / self_registerable / sso_only counts OVERLAP -> can't reconcile, and the
         # password+SSO app is invisible: counted in self_registerable, excluded from sso_only). has_password_form
-        # is the drivable-signup signal; has_signup can be True with no drivable form (SDK/SSO-signup/wizard).
+        # says we can drive the signup; has_signup can be True with no form we can drive (SDK, SSO signup, wizard).
         pw, sso = s.get("has_password_form"), s.get("has_sso")
         if pw and sso:        return "password_and_sso"        # self-serve password AND SSO offered (BOTH)
         if pw:                return "password_only"           # self-serve password, no SSO
@@ -1363,7 +1363,7 @@ def main():
                           "high_outliers": [(r["repo"], r["slop_score"]) for r in highs]},
             "timing_s": {label: {"avg": round(statistics.mean(xs), 1), "median": round(statistics.median(xs), 1),
                                  "max": max(xs)} for key, label in _PHASES for xs in [_phase(key)] if xs},
-            "grade_timeout_ceiling": sum(1 for r in timed if r.get("grade_timeout")),
+            "grade_timeouts": sum(1 for r in timed if r.get("grade_timeout")),
             "pointer": {"apps": len(ptr_active), "endpoints_seeded": ptr_seeded, "reachable": ptr_reach,
                         "hallucinated": ptr_halluc, "params_seeded": ptr_params, "precision_pct": ptr_prec},
             "perception": {"apps": len(pcv_active), "endpoints_seeded": pcv_eps, "reachable": pcv_reach,
@@ -1451,15 +1451,15 @@ def main():
         sec(f"AUTH SURFACE  ({n_sf} graded apps carry the surface fields)")
         print(f"     has login {sf_login} ({100*sf_login/n_sf:.0f}%)   |   has signup {sf_signup} "
               f"({100*sf_signup/n_sf:.0f}%)   |   SSO present {sf_sso} ({100*sf_sso/n_sf:.0f}%)")
-        # auth TYPE as a mutually-exclusive partition (sums to n_sf) so the password+SSO app is visible and the
+        # auth TYPE as a mutually exclusive partition (sums to n_sf) so the password+SSO app is visible and the
         # 'has_signup but not drivable' gap is named, instead of overlapping counts that can't be reconciled.
         part = A["partition"]
         print(f"     auth type (partition of {n_sf}, one per app):")
-        for key, label in (("password_only", "password self-serve only (drivable)"),
-                           ("password_and_sso", "password self-serve + SSO (both, drivable)"),
-                           ("sso_only", "SSO only, no self-serve (hard blocked)"),
-                           ("signup_undrivable", "signup present but NOT drivable (SDK/SSO-signup/wizard)"),
-                           ("login_only", "login wall, no self-serve way in"),
+        for key, label in (("password_only", "password signup, drivable"),
+                           ("password_and_sso", "password signup + SSO, both drivable"),
+                           ("sso_only", "SSO only, no drivable signup (blocked)"),
+                           ("signup_undrivable", "signup present but not drivable (SDK/SSO/wizard)"),
+                           ("login_only", "login wall, no signup to drive"),
                            ("no_auth", "no auth at all")):
             v = part.get(key, 0)
             if v:
@@ -1622,10 +1622,10 @@ def main():
             print(f"\n    grade_s distribution (seconds):")
             for line in _histogram(gs):
                 print(line)
-            killed = [r for r in timed if r.get("grade_timeout")]   # grader-flagged, robust to the timeout value
+            killed = [r for r in timed if r.get("grade_timeout")]   # the grader flagged these, robust to the timeout value
             if killed:
-                print(f"    {len(killed)} app(s) ({100 * len(killed) / len(gs):.0f}%) hit the grade-timeout "
-                      f"ceiling — externally killed (a wedged render or a pathological fan-out), near-zero yield")
+                print(f"    {len(killed)} app(s) ({100 * len(killed) / len(gs):.0f}%) timed out and were killed "
+                      f"(a render wedged, or the probes ran away); they scored almost nothing")
         slow = sorted((r for r in timed if r["timings"].get("total_s")),
                       key=lambda r: -r["timings"]["total_s"])[:5]
         if slow:
