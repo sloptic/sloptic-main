@@ -5,16 +5,16 @@ produced it (not a black-box figure). One tool, three complementary lenses on on
   * default          RECALL, where does slop concentrate + the yield / auth / axis / severity picture.
   * --parity         VISIBILITY, did we SEE the app's surface? observed vs expected per stack -> blind spots.
                      (a low slop is only meaningful if discovery saw the surface; blindness clusters by stack.)
-  * --precision      the FALSE POSITIVE audit, are the fires REAL? + a hand-audit worksheet with a Wilson CI.
+  * --precision      the FALSE POSITIVE audit, are the fires REAL? + a worksheet you audit by hand, with a Wilson CI.
 
 Input is the JSONL that `deploy_and_grade.py --record FILE` appends (one line per app).
 
     uv run python scripts/stats.py results.jsonl                        # the recall report (default)
     uv run python scripts/stats.py results.jsonl --audit sec-sqli-004   # every app + evidence for one probe
-    uv run python scripts/stats.py results.jsonl --json                 # machine-readable summary
+    uv run python scripts/stats.py results.jsonl --json                 # machine readable summary
     uv run python scripts/stats.py results.jsonl --parity [--by X] [--csv F]   # cross stack visibility
     uv run python scripts/stats.py results.jsonl --precision [--show N]         # false positive audit
-    uv run python scripts/stats.py results.jsonl --precision --sample 30 > w.tsv  # hand-audit worksheet
+    uv run python scripts/stats.py results.jsonl --precision --sample 30 > w.tsv  # a worksheet you audit by hand
     uv run python scripts/stats.py w.tsv --tally                        # -> FP rate + 95% Wilson CI
     uv run python scripts/stats.py cur.jsonl --diff prev.jsonl          # run to run regression (what moved)
 
@@ -62,9 +62,9 @@ def _severity_tier(penalty):
 
 
 def load(path):
-    """Records, deduped by repo (latest ts wins) so re-runs don't double-count. The dedup key is the
+    """Records, deduped by repo (latest ts wins) so reruns don't get counted twice. The dedup key is the
     record's "repo" field = its TARGET (a github URL for repo grades, a live URL for url grades), so a
-    submission graded BOTH ways keeps both rows (distinct targets), they're separate lenses."""
+    submission graded BOTH ways keeps both rows (the targets are distinct), they're separate lenses."""
     recs = {}
     for line in pathlib.Path(path).read_text().splitlines():
         if not line.strip():
@@ -72,7 +72,7 @@ def load(path):
         try:
             r = json.loads(line)
         except json.JSONDecodeError:
-            continue   # tolerate a concurrent-append-corrupted line instead of crashing the whole report
+            continue   # tolerate a line that a concurrent append corrupted, instead of crashing the whole report
         key = r.get("repo")
         if key not in recs or r.get("ts", 0) >= recs[key].get("ts", 0):
             recs[key] = r
@@ -86,24 +86,24 @@ def _source(r):
 
 
 def _scored(f):
-    """A finding that CONTRIBUTES to the score. report_only / off score diagnostics (the per-audit Lighthouse
-    probes) must stay out of the concentration + fire frequency views or they read as if they scored. Key on
-    the explicit `report_only` flag FIRST (correct on pre-leak-fix corpora where these leaked at penalty 1, not
-    0), then fall back to penalty>0 for any other zero-cost fire."""
+    """A finding that CONTRIBUTES to the score. report_only / off score diagnostics (the Lighthouse probes that
+    run once per audit) must stay out of the concentration + fire frequency views or they read as if they scored.
+    Key on the explicit `report_only` flag FIRST (correct on corpora collected before the leak was fixed, where
+    these leaked at penalty 1, not 0), then fall back to penalty>0 for any other fire that costs nothing."""
     if (f.get("evidence") or {}).get("report_only"):
         return False
     return f.get("penalty", 0) > 0
 
 
 def cat_subtotals(rec):
-    """Per-category DAMPED subtotal for one app, rebuilt from its SCORED findings, faithful to the live scorer
-    (variant-group collapse + within-category decay). Off-score diagnostics (penalty 0) are excluded."""
+    """The damped subtotal per category for one app, rebuilt from its SCORED findings to match the live scorer
+    (collapsing variant groups, then decaying within each category). Off score diagnostics (penalty 0) are excluded."""
     by_cat = defaultdict(list)
     for f in rec.get("findings", []):
         if not _scored(f):   # off score diagnostics add 0 to the damper anyway; drop them so a category that is
-            continue         # ALL diagnostics (the report_only Lighthouse audits) doesn't show as a 0-value row
-        # findings are deduped-with-count (one row per probe+reason); expand so the fan out fired
-        # instances are all present for the variant-group / decay dampers to reproduce the live score.
+            continue         # ALL diagnostics (the report_only Lighthouse audits) doesn't show up as a row worth zero
+        # findings arrive deduplicated with a count attached (one row per probe+reason); expand each row back out
+        # so every fired instance is present, letting the variant group / decay dampers reproduce the live score.
         for _ in range(f.get("count", 1)):
             by_cat[(f["bundle"], f["category"])].append(
                 Outcome(f["probe_id"], f["bundle"], f["category"], "slop_detected", f["penalty"],
@@ -160,8 +160,8 @@ def _modalities(scores, top=8):
 
 
 def _curl(repro):
-    """Render a repro record as a copy-pasteable curl command (Burp Repeater: 'Paste from curl'). Every
-    single-quoted field is shell-escaped so a payload's own quote can't break the command."""
+    """Render a repro record as a curl command you can paste straight into Burp Repeater ('Paste from curl'). Every
+    single-quoted field is escaped for the shell so a payload's own quote can't break the command."""
     esc = lambda s: str(s).replace("'", "'\\''")   # noqa: E731
     parts = ["curl -sS -i -X %s '%s'" % (repro.get("method", "GET"), esc(repro.get("url", "")))]
     for k, v in (repro.get("headers") or {}).items():
@@ -191,10 +191,10 @@ def audit(recs, probe_id):
                         resp.append(f"matched={repro['matched']!r}")
                     if resp:
                         print(f"        -> {' | '.join(resp)}")
-                if ev:   # measurements (cwv/dos timings, a11y rules, ...), the observational-probe "repro"
+                if ev:   # measurements (cwv/dos timings, a11y rules, ...): for an observational probe, evidence stands in as the "repro"
                     print(f"      evidence={json.dumps(ev)[:400]}")
-    # --trace runs carry a per probe request log (fired OR clean OR n/a), show what this probe actually SENT
-    # for each finding, as a copy-pasteable curl + its status.
+    # --trace runs carry a per probe request log (fired OR clean OR n/a); show what this probe actually SENT
+    # for each finding, as a curl command you can paste straight in, plus its status.
     traced = [(r, t) for r in recs for t in (r.get("trace") or []) if t.get("probe") == probe_id]
     if traced:
         # per probe cap (net._TRACE_PER_PROBE_CAP): a big fan out is sampled, not shown in full, say so
@@ -207,13 +207,14 @@ def audit(recs, probe_id):
 
 
 def _is_graded(r):
-    """A real, distribution-eligible grade: came up, scored, not DNF/recon, and not withheld at an ENTRY
-    challenge (which scores 0). The (b) distribution, (c) fire-freq, (d) winner split and (e) anomalies all
-    share this ONE predicate so they can't drift, (d) once omitted the entry-challenge clause and reported
-    min=0 while (b) reported min=8, because the 6 entry-withheld apps (5 scoring 0) leaked into (d) alone.
-    The entry-challenge rule lives in sloptic.eligibility, shared with the curve (benchmark.py), as does the
-    shell-only rule (a canvas-shell Streamlit graded 0 by the short-circuit is excluded here too, so it doesn't
-    show as a spurious '0' in the descriptive distribution; a RENDERED Streamlit is a real grade and stays)."""
+    """A real grade that belongs in the distribution: came up, scored, not DNF/recon, and not withheld at an ENTRY
+    challenge (which scores 0). The (b) distribution, (c) fire frequency, (d) winner split and (e) anomalies all
+    share this ONE predicate so they can't drift; (d) once omitted the entry challenge clause and reported
+    min=0 while (b) reported min=8, because the 6 apps withheld at entry (5 scoring 0) leaked into (d) alone.
+    The entry challenge rule lives in sloptic.eligibility, shared with the curve (benchmark.py), and so does the
+    rule for apps that are just an empty shell (a Streamlit app that's just a canvas shell and returns early with
+    a 0 is excluded here too, so it doesn't show as a spurious '0' in the descriptive distribution; a RENDERED
+    Streamlit is a real grade and stays)."""
     return (r.get("deployed") and "slop_score" in r and r.get("functional") is not False
             and not r.get("recon")   # recon records carry host_tiers only (no probes) -> not a real grade
             and not is_ungradeable_challenge(r) and not is_shell_only(r)
@@ -234,7 +235,7 @@ def lighthouse_scores(recs):
     """The Lighthouse performance score (0-100) across records that carry it -> {'performance': {n, min, q1,
     median, q3, max (the 5-number summary), mean, stdev}} (values None when none do). This is the score the perf
     axis already grades on, surfaced for the report. (Accessibility is NOT here on purpose: a11y is scored by the
-    qa-a11y axe probes, not Lighthouse.) Pre-Lighthouse-cutover records have no score, so the caller skips at n=0."""
+    qa-a11y axe probes, not Lighthouse.) Records from before the switch to Lighthouse have no score, so the caller skips at n=0."""
     xs = []
     for r in recs:
         lh = (r.get("observed_surface") or {}).get("lighthouse")
@@ -255,11 +256,11 @@ def lighthouse_scores(recs):
 
 
 def by_hackathon(recs):
-    """Roll the per-record Devpost hackathon slug up into per-hackathon stats: submissions, deploy% (REPO apps
-    only -- URL apps aren't deploy tested), graded count, slop median/mean/stdev, winner count, and the winners'
-    own median/mean. Sorted by submission count. The slug is already on every record (run_batch threads it via
-    --meta); this is the breakdown over it. Winner stats are over the GRADED winners (a DNF winner has no score),
-    while `winners` is the full winner-flagged count of the cohort."""
+    """Roll the Devpost hackathon slug on each record up into stats grouped by hackathon: submissions, deploy%
+    (REPO apps only -- URL apps aren't deploy tested), graded count, slop median/mean/stdev, winner count, and the
+    winners' own median/mean. Sorted by submission count. The slug is already on every record (run_batch threads it
+    via --meta); this is the breakdown over it. Winner stats are over the GRADED winners (a DNF winner has no
+    score), while `winners` is however many of the whole cohort are flagged as winners."""
     agg = defaultdict(lambda: {"subs": 0, "repo": 0, "deployed": 0, "graded": [], "winners": 0, "win_scores": []})
     for r in recs:
         d = agg[r.get("hackathon") or "(unlabeled)"]
@@ -321,11 +322,11 @@ def auth_surface(graded):
         # password+SSO app is invisible: counted in self_registerable, excluded from sso_only). has_password_form
         # says we can drive the signup; has_signup can be True with no form we can drive (SDK, SSO signup, wizard).
         pw, sso = s.get("has_password_form"), s.get("has_sso")
-        if pw and sso:        return "password_and_sso"        # self-serve password AND SSO offered (BOTH)
-        if pw:                return "password_only"           # self-serve password, no SSO
+        if pw and sso:        return "password_and_sso"        # self serve password AND SSO offered (BOTH)
+        if pw:                return "password_only"           # self serve password, no SSO
         if sso:               return "sso_only"                # SSO present, no drivable password form
         if s.get("has_signup"): return "signup_undrivable"     # signup detected but no form we can drive, no SSO
-        if s.get("has_login"):  return "login_only"            # a login wall, no self-serve way in
+        if s.get("has_login"):  return "login_only"            # a login wall, no self serve way in
         return "no_auth"                                       # no login / signup / sso at all
     partition = Counter(bucket(r["observed_surface"]) for r in surfaced)   # sums to len(surfaced) by construction
     return {"n": len(surfaced), "has_login": sf("has_login"), "has_signup": sf("has_signup"),
@@ -348,7 +349,7 @@ _TYPES = ("login", "signup", "upload", "api")   # signup added after discovery e
 
 
 def _row(rec: dict) -> dict:
-    """Flatten one record to a per-app parity row (stack + observed + expected + slop + ratio)."""
+    """Flatten one record to a parity row per app (stack + observed + expected + slop + ratio)."""
     sp = rec.get("stack_profile") or {}
     obs = rec.get("observed_surface") or {}
     exp = rec.get("expected_surface") or {}
@@ -369,7 +370,7 @@ def _row(rec: dict) -> dict:
         "stack": rec.get("stack") or "?",
         "obs_routes": obs.get("routes"), "obs_forms": obs.get("forms"),
         "obs_inputs": obs.get("inputs"), "obs_endpoints": obs.get("endpoints"),
-        # endpoints reached vs healthy: many-reached-few-healthy = env-var-dead surface (dummy keys)
+        # endpoints reached vs healthy: many reached but few healthy means the env vars behind them are dead (dummy keys)
         "obs_endpoints_reached": obs.get("endpoints_reached"), "obs_endpoints_dead": obs.get("endpoints_dead"),
         "obs_surface_size": size,
         "obs_login": obs.get("has_login"), "obs_signup": obs.get("has_signup"),
@@ -377,12 +378,12 @@ def _row(rec: dict) -> dict:
         "exp_login": exp.get("login"), "exp_signup": exp.get("signup"), "exp_upload": exp.get("upload"),
         "exp_search": exp.get("search"), "exp_api": exp.get("api"), "exp_views": exp.get("views"),
         "slop_score": slop, "findings": len(rec.get("findings", [])),
-        # how much of the battery APPLIED, the fuzzer's-eye coverage. Low pct or many n/a kinds = we
+        # how much of the battery APPLIED: coverage as the fuzzer sees it. Low pct or many n/a kinds means we
         # tested little here (blind, or a genuinely tiny app); a low slop score then means little.
         "pct_applicable": cov.get("pct_applicable"),
         "probes_applicable": cov.get("probes_applicable"),
         "na_kinds": len(cov.get("na_kinds") or []),
-        # wall-clock per phase (measurement): which stacks are expensive to deploy vs grade
+        # wall clock per phase (measurement): which stacks are expensive to deploy vs grade
         "deploy_s": tm.get("deploy_s"), "grade_s": tm.get("grade_s"), "total_s": tm.get("total_s"),
         # slop normalized by how much we SAW: high surface + low ratio = clean; low surface = suspect
         "slop_per_surface": round(slop / size, 2) if (slop is not None and size) else None,
@@ -395,7 +396,7 @@ def _avg(xs):
 
 
 def _dist(xs) -> dict | None:
-    """avg/median/stdev/min/max + quartiles over the non-None values (None if empty)."""
+    """avg/median/stdev/min/max + quartiles over the values that aren't None (None if empty)."""
     xs = [x for x in xs if x is not None]
     if not xs:
         return None
@@ -407,7 +408,7 @@ def _dist(xs) -> dict | None:
 
 
 def group_parity(rows: list, key: str) -> dict:
-    """Per-stack aggregates + TYPE parity. Parity for a surface type = of the DEPLOYED apps whose source
+    """Per stack aggregates + TYPE parity. Parity for a surface type = of the DEPLOYED apps whose source
     says they HAVE it (expected), on how many did discovery actually OBSERVE it, i.e. the recall of that
     surface type for this stack. Low + clustered = a blind spot."""
     groups = defaultdict(list)
@@ -420,7 +421,7 @@ def group_parity(rows: list, key: str) -> dict:
         for t in _TYPES:
             expected = [r for r in dep if r.get(f"exp_{t}")]                 # source says the surface exists
             observed = [r for r in expected if r.get(f"obs_{t}")]            # ...and discovery saw it
-            parity[t] = (len(observed), len(expected))                       # (saw, should-have-seen)
+            parity[t] = (len(observed), len(expected))                       # (saw, what we should have seen)
         out[g] = {
             "n": len(rs), "deployed": sum(r["deployed"] for r in rs),
             "surface_avg": _avg([r["obs_surface_size"] for r in dep]),
@@ -436,7 +437,7 @@ def group_parity(rows: list, key: str) -> dict:
 def blind_spots(rows: list, key: str) -> list:
     """Ranked (stack, type, missed, observed, expected), missed = expected−observed = the number of apps
     where the source says a surface exists but we didn't see it. This IS prevalence × brokenness (how many
-    apps of the stack have it × the fraction we miss), so the ranking is the fix-order."""
+    apps of the stack have it × the fraction we miss), so the ranking tells you what to fix first."""
     gp = group_parity(rows, key)
     spots = []
     for g, agg in gp.items():
@@ -467,18 +468,18 @@ def parity_report(recs, args):
         print(f"wrote {len(rows)} rows -> {args.csv}")
         return
 
-    # parity/blind-spots are only meaningful for apps the black-box HTTP grader can actually assess,
+    # parity/blind spots are only meaningful for apps the black-box HTTP grader can actually assess,
     # a mobile/CLI/notebook scoring low isn't a blind spot, it's out of scope. Split them out.
     web = [r for r in rows if r["web_gradeable"]]
     nonweb = [r for r in rows if not r["web_gradeable"]]
     gp = group_parity(web, args.by)
     spots = blind_spots(web, args.by)
 
-    # ASSESSABILITY: parity CONTRASTS stacks against source-derived expected-surface labels. The url-ingest
+    # ASSESSABILITY: parity CONTRASTS stacks against the expected surface the source implies. The URL ingest
     # path grades a bare URL with no source, so it emits no expected_surface and one flat stack -> there is
     # nothing to contrast. Report that honestly instead of a silent one-row "clean" (an unassessable file is
-    # NOT a clean bill). The SPA-vs-server-rendered false-negative comparison is the group-by-routing columns
-    # below; it needs >1 routing class AND expected labels, i.e. deploy_and_grade records, to appear.
+    # NOT a clean bill). The false negative comparison between SPA and server-rendered stacks is the columns
+    # grouped by routing below; it needs >1 routing class AND expected labels, i.e. deploy_and_grade records, to appear.
     has_expected = any(r[f"exp_{t}"] is not None for r in web for t in _TYPES)
     single_stack = len(gp) <= 1
     assessable = has_expected and not single_stack
@@ -492,25 +493,25 @@ def parity_report(recs, args):
                           "groups": gp, "blind_spots": spots}, indent=2))
         return
 
-    print(f"\n═══ cross-stack parity, {len(rows)} apps ({len(web)} web-gradeable), grouped by {args.by} ═══")
+    print(f"\n═══ cross stack parity, {len(rows)} apps ({len(web)} web gradeable), grouped by {args.by} ═══")
 
     if not assessable:
-        print("\n⚠ CANNOT ASSESS CROSS-STACK PARITY on this results file (this is not a clean bill):")
+        print("\n⚠ CANNOT ASSESS CROSS STACK PARITY on this results file (this is not a clean bill):")
         if single_stack:
             only = repr(next(iter(gp))) if gp else "?"
-            print(f"    all {len(web)} web-gradeable apps are a SINGLE stack ({only}), parity contrasts stacks,")
-            print("    so there is nothing to contrast. The SPA-vs-server-rendered false-negative comparison is")
-            print(f"    the group-by-{args.by} columns below and needs >1 class to appear.")
+            print(f"    all {len(web)} web gradeable apps are a SINGLE stack ({only}), parity contrasts stacks,")
+            print("    so there is nothing to contrast. The false negative comparison between SPA and")
+            print(f"    server-rendered stacks is the columns grouped by {args.by} below and needs >1 class to appear.")
         if not has_expected:
-            print("    NO source-derived expected-surface labels are present (the url-ingest path grades a bare")
-            print("    URL with no source, so it emits none), observed-vs-expected parity and blind spots are")
-            print("    undefined without them.")
-        print("    → re-run via deploy_and_grade with --submission <source> to produce assessable records.")
+            print("    NO expected surface is present for the source to imply (the URL ingest path grades a bare")
+            print("    URL with no source, so it emits none); parity between observed and expected, and blind")
+            print("    spots, are undefined without them.")
+        print("    → run deploy_and_grade again with --submission <source> to produce assessable records.")
 
-    # APP-KIND distribution, how much of the field is even a web app? (out-of-scope ≠ blind spot)
-    print("\nAPP-KIND DISTRIBUTION  (only web apps are gradeable; the rest are out of scope, not blind spots)")
+    # APP KIND distribution, how much of the field is even a web app? (out of scope isn't a blind spot)
+    print("\nAPP KIND DISTRIBUTION  (only web apps are gradeable; the rest are out of scope, not blind spots)")
     for kind, n in Counter(r["app_kind"] for r in rows).most_common():
-        tag = "" if kind in ("web-app", "web-api", "static-site", "?") else "   ← not web-gradeable"
+        tag = "" if kind in ("web-app", "web-api", "static-site", "?") else "   ← not web gradeable"
         print(f"  {kind:14} {n:>3}{tag}")
     if nonweb:
         print(f"  → {len(nonweb)}/{len(rows)} ({len(nonweb)/len(rows)*100:.0f}%) are NOT web apps, "
@@ -521,9 +522,9 @@ def parity_report(recs, args):
     for g, agg in sorted(gp.items(), key=lambda kv: -kv[1]["n"]):
         print(f"  {g:16} {agg['n']:>3} apps  ({agg['deployed']} deployed)")
 
-    # per-stack observed surface + test COVERAGE + TYPE parity. cov% = avg share of the battery that
+    # per stack observed surface + test COVERAGE + TYPE parity. cov% = avg share of the battery that
     # applied; a low cov% (lots of n/a) means a low slop score is uninformative, not necessarily clean.
-    print(f"\nOBSERVED SURFACE & TYPE PARITY  (per {args.by}; parity = saw / source-says-exists)")
+    print(f"\nOBSERVED SURFACE & TYPE PARITY  (per {args.by}; parity = saw / the source says it exists)")
     print(f"  {'stack':16} {'dep':>4} {'surf':>5} {'cov%':>5} {'find':>5} {'slop':>5}   "
           + "  ".join(f"{t:>9}" for t in _TYPES))
     for g, agg in sorted(gp.items(), key=lambda kv: -kv[1]["n"]):
@@ -534,7 +535,7 @@ def parity_report(recs, args):
               f"{str(agg['coverage_avg']):>5} {str(agg['findings_avg']):>5} "
               f"{str(agg['slop_avg']):>5}   {par}")
 
-    # COVERAGE % BAR per stack, the cov% column above drawn as a bar so a blind / barely-tested stack pops out
+    # COVERAGE % BAR per stack, the cov% column above drawn as a bar so a blind / barely tested stack pops out
     # (a short bar = we applied little of the battery there, so its low slop means little). Scaled to 100% = full.
     cov_rows = [(g, agg["coverage_avg"], agg["n"]) for g, agg in gp.items() if agg["coverage_avg"] is not None]
     if cov_rows:
@@ -542,10 +543,10 @@ def parity_report(recs, args):
         for g, cov, n in sorted(cov_rows, key=lambda x: -x[1]):
             print(f"  {g:16} {cov:5.1f}% │ {'█' * round(cov / 100 * 40)} (n{n})")
 
-    # TEST COVERAGE PER APP, the cross-app spread of how much of the battery APPLIED. The per-stack cov%
-    # above is only an average; this is the full distribution. A wide stdev = coverage swings hard app-to-app
+    # TEST COVERAGE PER APP, the cross app spread of how much of the battery APPLIED. The per stack cov%
+    # above is only an average; this is the full distribution. A wide stdev = coverage swings hard app to app
     # (some apps barely tested), which bounds how comparable their slop scores are, a low slop on a
-    # low-coverage app means little. Over web-gradeable apps.
+    # low coverage app means little. Over web gradeable apps.
     cov_pct = _dist([r["pct_applicable"] for r in web])
     cov_cnt = _dist([r["probes_applicable"] for r in web])
     print("\nTEST COVERAGE PER APP  (share of the probe battery that APPLIED, bounds slop comparability)")
@@ -557,25 +558,25 @@ def parity_report(recs, args):
         print(f"  probes applied   n={cov_cnt['n']}  avg={cov_cnt['avg']}  median={cov_cnt['median']}  "
               f"stdev={cov_cnt['stdev']}  min={cov_cnt['min']:.0f}  max={cov_cnt['max']:.0f}  "
               f"(q1={cov_cnt['q1']} q3={cov_cnt['q3']})")
-    if cov_pct:   # the app-level cov% spread as a histogram, a left-heavy shape = many barely-tested apps
+    if cov_pct:   # the app level cov% spread as a histogram, a left heavy shape = many barely tested apps
         print("  distribution (pct applicable across apps):")
         for line in _histogram([r["pct_applicable"] for r in web if r["pct_applicable"] is not None]):
             print(line)
     if not cov_pct:
         print("  (no coverage data on these records)")
 
-    # blind-spot ranking (prevalence × brokenness = # apps where we missed a surface the source implies)
+    # blind spot ranking (prevalence × brokenness = # apps where we missed a surface the source implies)
     print("\nBLIND SPOTS  (fix order, apps where the source says a surface exists but we didn't see it)")
     if not has_expected:
-        print("  CANNOT ASSESS, no source-derived expected-surface labels in this file (url-ingest emits")
+        print("  CANNOT ASSESS: no expected surface here for the source to imply (the URL ingest path emits")
         print("  none). This is an unassessable condition, NOT a clean bill; blind spots are undefined without")
-        print("  ground truth. Re-run deploy_and_grade with --submission <source> to assess.")
+        print("  ground truth. Run deploy_and_grade again with --submission <source> to assess.")
     elif not spots:
         print("  (none, observed surface matches expected across every assessed stack)")
     for s in spots[:12]:
         print(f"  {s['stack']:16} {s['type']:8} missed {s['missed']}/{s['expected']} apps "
               f"(saw {s['observed']})")
-    print(f"\n  → per-app ledger: scripts/stats.py {args.results} --parity --csv rows.csv\n")
+    print(f"\n  → per app ledger: scripts/stats.py {args.results} --parity --csv rows.csv\n")
 
 
 # ==========================================================================================================
@@ -583,8 +584,8 @@ def parity_report(recs, args):
 # ==========================================================================================================
 def _unvalidated_probes(recs, min_penalty: int = 25) -> list:
     """Catalog probes that fired 0x across `recs`, 0 fires is ABSENCE OF EVIDENCE, not precision (the corpus
-    is auth-dark for the authed-surface probes, so they never get to fire). Returns (id, penalty), high first,
-    so the report NEVER lets a never-fired high-penalty probe read as 'precise / 0 FP'."""
+    is auth-dark for the authed surface probes, so they never get to fire). Returns (id, penalty), high first,
+    so the report NEVER lets a probe with a high penalty that never fired read as 'precise / 0 FP'."""
     fired = {f["probe_id"] for r in recs for f in (r.get("findings") or [])}
     try:
         catalog = load_catalog(str(pathlib.Path(__file__).resolve().parent.parent / "catalog"))
@@ -593,37 +594,38 @@ def _unvalidated_probes(recs, min_penalty: int = 25) -> list:
     return sorted([(p.id, p.penalty) for p in catalog if p.id not in fired and p.penalty >= min_penalty],
                   key=lambda x: -x[1])
 
-# Probes that require a REAL server-side endpoint or state change, hallucinated on a catch-all/broken shell.
+# Probes that require a REAL server side endpoint or state change, hallucinated on a catch-all/broken shell.
 _PHANTOM_SENSITIVE = ("sec-sqli", "sec-csrf", "sec-cmdi", "sec-ssti", "sec-lfi", "sec-hosthdr",
                       "sec-split", "sec-ratelimit", "sec-idor", "sec-redirect", "sec-dos", "sec-xss",
                       "sec-ssrf", "qa-crash", "qa-race")
-# These probes now route through the endpoint-level LIVENESS GATE (_endpoint_is_live in probes.py): they
+# These probes now route through the endpoint level LIVENESS GATE (_endpoint_is_live in probes.py): they
 # only fire on an endpoint proven distinct from a nonexistent sibling under its own prefix. So a SURVIVING
-# fire is on a REAL server endpoint, and the host-level catch-all flag no longer implies a phantom, a modern
+# fire is on a REAL server endpoint, and the host level catch-all flag no longer implies a phantom: a modern
 # app routinely pairs a catch-all SPA FRONTEND with a real API BACKEND (roadio's /api/locations/search, a real
-# SQLi, was firing correctly but getting false-flagged here just because the frontend is a catch-all). We
+# SQLi, was firing correctly but got falsely flagged here just because the frontend is a catch-all). We
 # TRUST the gate for these and never call their fires catch-all phantoms.
 _GATE_VETTED = ("sec-sqli-004", "sec-ratelimit-001", "sec-csrf-001", "qa-crash-010", "sec-dos-001",
                 "sec-hosthdr-001")
-# EFFECT-CONFIRMED probes (added after the browser data-plane + integrity/IDOR lanes shipped; precision predates
+# EFFECT CONFIRMED probes (added after the browser data plane + integrity/IDOR lanes shipped; precision predates
 # them): they fire ONLY on an OBSERVED effect a catch-all shell cannot fake, stored XSS that EXECUTES in the DOM,
-# a create that READS BACK, a cross-user READ of a real owned object, an international round-trip. A catch-all
-# serves the same inert shell to everyone, so these self-gate there, a SURVIVING fire is real, never a phantom.
+# a create that READS BACK, a cross user READ of a real owned object, an international round trip. A catch-all
+# serves the same inert shell to everyone, so these gate themselves there, and a SURVIVING fire is real, never a phantom.
 # Without this they matched _PHANTOM_SENSITIVE ("sec-xss" / "sec-idor") and were falsely flagged on a catch-all.
 _EFFECT_CONFIRMED = ("sec-xss-002", "sec-idor-002", "sec-idor-003", "sec-idor-004", "sec-idor-005",
                      "qa-integrity-001", "qa-integrity-002", "qa-input-002", "qa-race-002")
-# Everything else (headers/a11y/seo/perf/compression/dead-controls/...) measures the ACTUAL served
+# Everything else (headers/a11y/seo/perf/compression/dead controls/...) measures the ACTUAL served
 # response and stays real even on a catch-all, a missing CSP header is missing regardless.
 _NON_WORKING = {"broken", "not-an-app", "placeholder"}   # page states where the WHOLE surface is untrustworthy
 # Third-party fields that reflect by design (anti-bot tokens), an XSS "reflection" here is the vendor's, not the app's.
 _VENDOR_FIELDS = ("cf-turnstile-response", "g-recaptcha-response", "h-captcha-response", "__requestverificationtoken")
-# Fires whose SIGNAL is timing (perf) or a load-induced error (crash / sqli-error), trustworthy only when the
+# Fires whose SIGNAL is timing (perf) or an error caused by load (crash / sqli-error), trustworthy only when the
 # app was graded in ISOLATION at stable latency. Under a concurrent batch a saturated grader inflates timing and
 # a shared backend leaks 500s, so precision.py CANNOT vouch for these from the record alone: it reports them
-# UNCONFIRMED (neither clean nor FP) -> re-fire in isolation to resolve. This is the anti-"0 FP is a lie" fix,
-# the audit never again counts a concurrency-sensitive fire as verified-clean. (sqli-004's TIME technique is now
-# dose-response-hardened and stable under load, but its error technique and crash can still ride a load-induced 500.)
-_SIGNAL_SENSITIVE = {"perf-lighthouse-001",   # scored off the Lighthouse headline, which shifts with grader-side load
+# UNCONFIRMED (neither clean nor FP) -> fire them again in isolation to resolve. This exists so the audit can't
+# lie about 0 FP again: it never counts a fire that's sensitive to concurrency as verified clean. (sqli-004's
+# TIME technique is now hardened with a dose-response check and stays stable under load, but its error technique
+# and crash can still ride a 500 caused by load.)
+_SIGNAL_SENSITIVE = {"perf-lighthouse-001",   # scored off the Lighthouse headline, which shifts with grader side load
                      "perf-cwv-001", "perf-cwv-002", "perf-loadtime-001", "perf-ttfb-001",
                      "perf-load-001",   # a 12-connection concurrent BURST -> under a --concurrency batch the
                                         # grader's own ~96 simultaneous conns can DROP (counted as failure);
@@ -636,29 +638,29 @@ def _phantom_sensitive(pid):
 
 
 def _audited(pid):
-    """True iff precision.py has an ACTUAL rule that inspects this probe (phantom/catch-all, signal-
+    """True iff precision.py has an ACTUAL rule that inspects this probe (phantom/catch-all, signal
     instability, or the exposure/secret guard). When False, a `_suspect()==None` verdict means NO OPINION
    , the finding is UNAUDITED, not verified. The unaudited surface (a11y / headers / seo / perf-requests /
     web-vitals-count / …) is the MAJORITY of the score and exactly where scope & attribution FPs hide (the
     asi1 perf-requests fire is here: real signal, correct probe, live endpoint, wrong owner, every rule
-    the audit owns says 'real'). Only a hand-sample (--sample) can vouch for it. See [[fuzz-runner]]."""
+    the audit owns says 'real'). Only auditing by hand (--sample) can vouch for it. See [[fuzz-runner]]."""
     return _phantom_sensitive(pid) or pid in _SIGNAL_SENSITIVE or pid.startswith("sec-secret")
 
 
 def _damped_by_probe(findings, decay=CATEGORY_DECAY):
-    """Per-probe DAMPED penalty for one app, what each fire actually COSTS in the score, not the raw
+    """Per probe DAMPED penalty for one app, what each fire actually COSTS in the score, not the raw
     `penalty x count` this tool used to report. Mirrors aggregate._damped_total: a variant group counts once
-    (its highest-penalty member), then per-category diminishing returns (sorted desc, penalty * decay**i).
-    Raw sums badly over-state a fan-out probe: sec-headers-001 fires per-ROUTE, so its raw mass looked like
-    ~25k on the corpus while its damped cost collapses to near-zero behind the higher-penalty header fires."""
-    items = []                                    # expand a fan-out finding back into its per-target outcomes
+    (its highest penalty member), then per category diminishing returns (sorted desc, penalty * decay**i).
+    Raw sums badly overstate a fan out probe: sec-headers-001 fires per ROUTE, so its raw mass looked like
+    ~25k on the corpus while its damped cost collapses to near zero behind the higher penalty header fires."""
+    items = []                                    # expand a fan out finding back into its per target outcomes
     for f in findings:
         pid, grp = f.get("probe_id", ""), f.get("group")
         cat, pen = (f.get("category") or ""), f.get("penalty", 0)
         items.extend([(pid, cat, grp, pen)] * max(1, f.get("count", 1)))
     groups, singles = {}, []
     for it in items:
-        if it[2]:                                 # variant group -> only its highest-penalty member counts
+        if it[2]:                                 # variant group -> only its highest penalty member counts
             cur = groups.get(it[2])
             if cur is None or it[3] > cur[3]:
                 groups[it[2]] = it
@@ -687,46 +689,47 @@ def _suspect(f, catch_all):
       - ("fp", reason)        a likely FALSE POSITIVE (counts toward the precision gap)
       - ("advisory", reason)  a REAL finding flagged for review (NOT an FP), e.g. a third-party platform login
       - None                  looks real
-    Gate-aware: sec-sqli-004 / sec-ratelimit-001 / sec-csrf-001 / qa-crash-010 route through the liveness gate,
-    so a surviving fire is on a real endpoint, never a catch-all phantom. Rate-limit on a catch-all-frontend
+    Gate aware: sec-sqli-004 / sec-ratelimit-001 / sec-csrf-001 / qa-crash-010 route through the liveness gate,
+    so a surviving fire is on a real endpoint, never a catch-all phantom. Rate limit on a catch-all frontend
     host is the one nuance: the login is live but is often a THIRD-PARTY platform login (real endpoint, wrong
     OWNER), so it is an advisory, not an FP, it dissolves when teams submit their own URLs."""
     pid = f.get("probe_id", "")
     ev = f.get("evidence") or {}
     if pid.startswith("sec-xss") and (ev.get("field") or "").lower() in _VENDOR_FIELDS:
-        return ("fp", f"reflection is a vendor anti-bot field ({ev.get('field')}), not app-controlled XSS")
+        return ("fp", f"reflection is a vendor anti-bot field ({ev.get('field')}), not app controlled XSS")
     if pid == "sec-ratelimit-001" and catch_all:
-        return ("advisory", "rate-limit on a live login on a catch-all-frontend host, likely a third-party "
+        return ("advisory", "rate limit on a live login on a catch-all frontend host, likely a third-party "
                             "platform login (real endpoint, verify it is the team's own app)")
-    if pid in _SIGNAL_SENSITIVE:   # timing / load-induced-error signal: reliable only if graded in isolation.
-        return ("unconfirmed", "timing / load-induced-error signal, not verifiable from batch data; clean if "
-                               "graded in isolation, else re-fire isolated to confirm (not counted clean or FP)")
+    if pid in _SIGNAL_SENSITIVE:   # timing, or an error caused by load: reliable only if graded in isolation.
+        return ("unconfirmed", "a timing signal, or an error caused by load, not verifiable from batch data; "
+                               "clean if graded in isolation, else fire it again in isolation to confirm "
+                               "(not counted clean or FP)")
     if pid in _GATE_VETTED or pid in _EFFECT_CONFIRMED:
-        return None   # liveness-gated OR effect-confirmed: a surviving fire is real, not a catch-all phantom
+        return None   # liveness gated OR effect confirmed: a surviving fire is real, not a catch-all phantom
     if _phantom_sensitive(pid) and catch_all:
-        return ("fp", "catch-all / soft-404 host, the targeted endpoint likely doesn't exist server-side "
-                      "(un-gated phantom-sensitive probe)")
+        return ("fp", "catch-all / soft 404 host, the targeted endpoint likely doesn't exist server side "
+                      "(an ungated phantom sensitive probe)")
     # Exposure fires on a catch-all host are deliberately NOT flagged. The shell guard now lives at the PROBE
-    # level (response_is_dotenv rejects an HTML-shell body/content-type; .git/.aws use signatures HTML can't
+    # level (response_is_dotenv rejects an HTML shell body/content-type; .git/.aws use signatures HTML can't
     # satisfy; 006 validates the .map parses), so a SURVIVING exposure fire has already cleared it and is REAL.
-    # Verified live: 8yhjs2.csb.app is a soft-404 SPA that ALSO serves a genuine /.env (application/octet-stream,
-    # real Amplitude/Sentry keys). A host-level catch-all heuristic here DISMISSES real leaks, a false negative
+    # Verified live: 8yhjs2.csb.app is a soft 404 SPA that ALSO serves a genuine /.env (application/octet-stream,
+    # real Amplitude/Sentry keys). A host level catch-all heuristic here DISMISSES real leaks, a false negative
     # on the most severe finding class, strictly worse than the false positive it was meant to catch.
     if pid.startswith("sec-secret") and catch_all:
-        return ("advisory", "secret-pattern match in the bundle of a catch-all-frontend host, verify it's a "
+        return ("advisory", "secret pattern match in the bundle of a catch-all frontend host, verify it's a "
                             "real embedded key (sk-ant / sk-live / AKIA…), not a library constant or the shell")
-    # NOTE: a login-wall is NOT flagged, its login form + rate-limiting ARE real, testable surface.
+    # NOTE: a login wall is NOT flagged, its login form + rate limiting ARE real, testable surface.
     return None
 
 
 def _gated(r):
-    """DNF-class: excluded from scoring. functional=False is the grader's authoritative verdict (set with
+    """DNF class: excluded from scoring. functional=False is the grader's authoritative verdict (set with
     corroboration, a deterministic broken signal, or no real surface); the page_state fallback covers records
     graded before the veto. A `disputed_broken` record is the veto's product, the LLM called it broken but
     real surface was captured, so it's SCORED, never gated (and its fires ARE audited like any scored app)."""
     if r.get("disputed_broken"):
         return False
-    # entry-challenge withholds (bot_challenge from the first fetch) score 0 but are NOT real grades, gate them
+    # entry challenge withholds (bot_challenge from the first fetch) score 0 but are NOT real grades, gate them
     # too so they don't inflate the SCORED count (precision predates the challenge_stage field).
     return (r.get("functional") is False or _page_state(r) in _NON_WORKING
             or is_ungradeable_challenge(r))
@@ -736,7 +739,7 @@ def analyze(recs):
     have_score = [r for r in recs if isinstance(r.get("slop_score"), (int, float))]
     gated = [r for r in have_score if _gated(r)]          # correctly DNF'd by the gate -> not a precision problem
     scored = [r for r in have_score if not _gated(r)]     # the apps that ACTUALLY count toward the score
-    per_probe = defaultdict(lambda: [0, 0])              # pid -> [fires, FALSE-positives]
+    per_probe = defaultdict(lambda: [0, 0])              # pid -> [fires, FALSE positives]
     unaudited = defaultdict(lambda: [0, 0])              # pid -> [fires, penalty] the audit has NO rule for
     vouched = 0                                          # fires where a real precision rule ran and passed
     scored_penalty = 0                                   # total penalty across scored fires (for the share)
@@ -746,7 +749,7 @@ def analyze(recs):
     for r in scored:                                     # measure precision ONLY on what's actually scored
         catch_all = _soft404(r) or bool((r.get("observed_surface") or {}).get("catch_all"))
         catchall_apps += bool(catch_all)
-        damped = _damped_by_probe(r.get("findings") or [])   # REAL in-score cost, not raw penalty*count
+        damped = _damped_by_probe(r.get("findings") or [])   # the real cost inside the score, not raw penalty*count
         for f in r.get("findings", []):
             pid = f["probe_id"]
             pen = damped.get(pid, 0.0)
@@ -766,7 +769,7 @@ def analyze(recs):
                 per_probe[pid][1] += 1
                 fp_reasons[why.split(", ")[0].split(" (")[0]] += 1
                 flagged.append(row)
-            elif klass == "unconfirmed":                 # concurrency/latency-sensitive, NOT counted clean or FP
+            elif klass == "unconfirmed":                 # concurrency/latency sensitive, NOT counted clean or FP
                 unconf_reasons[why.split(", ")[0].split(" (")[0]] += 1
                 unconfirmed.append(row)
             else:                                        # advisory: a REAL finding flagged for review, not an FP
@@ -781,7 +784,7 @@ def analyze(recs):
 
 def _wilson(k, n, z=1.96):
     """95% Wilson score interval for a binomial proportion. Unlike the normal approximation it stays inside
-    [0,1] and does not collapse to a fake-tight band at k=0 (0/30 hand-audited is NOT '0% FP, done', Wilson
+    [0,1] and does not collapse to a fake tight band at k=0 (0/30 audited by hand is NOT '0% FP, done', Wilson
     reports it as ~0–11%, which is the honest read on a small sample). This is the whole point of the CI."""
     if n == 0:
         return (0.0, 0.0)
@@ -798,14 +801,14 @@ def _fire_target(f):
 
 
 def _sample_worksheet(recs, n, seed):
-    """Emit N random SCORED fires as a hand-audit worksheet (TSV). The human fills the `verdict` column
-    (fp | ok), then `precision.py --tally FILE` turns it into a real FP rate + 95% CI, the ground-truth
+    """Emit N random SCORED fires as a worksheet you audit by hand (TSV). The human fills the `verdict` column
+    (fp | ok), then `precision.py --tally FILE` turns it into a real FP rate + 95% CI, the ground truth
     number the heuristic audit structurally cannot produce (it has no oracle; this IS the oracle)."""
     a = analyze(recs)
     fires = [(r.get("repo", ""), f) for r in a["scored"] for f in r.get("findings", [])]
     random.Random(seed).shuffle(fires)                   # seeded -> the draw is reproducible / auditable
     pick = fires[: min(n, len(fires))]
-    print(f"# hand-audit worksheet, {len(pick)} of {len(fires)} scored fires (seed={seed}). Reproduce each")
+    print(f"# a worksheet you audit by hand, {len(pick)} of {len(fires)} scored fires (seed={seed}). Reproduce each")
     print(f"# and set VERDICT = fp (false positive) | ok (real) | blank to skip. Then:")
     print(f"#   uv run python scripts/stats.py THIS_FILE --tally")
     print("verdict\trepo\tprobe_id\tpenalty\ttarget\trepro")
@@ -815,7 +818,7 @@ def _sample_worksheet(recs, n, seed):
 
 
 def _tally(path):
-    """Read a filled worksheet and print the hand-audited FP rate + 95% Wilson CI over the resolved verdicts."""
+    """Read a filled worksheet and print the FP rate audited by hand, + 95% Wilson CI over the resolved verdicts."""
     k = n = 0
     per_probe = defaultdict(lambda: [0, 0])              # pid -> [audited, fp]
     for line in open(path):
@@ -831,10 +834,10 @@ def _tally(path):
         per_probe[pid][0] += 1
         per_probe[pid][1] += (v == "fp")
     if not n:
-        print("no resolved verdicts (fill the `verdict` column with fp/ok, then re-run --tally)")
+        print("no resolved verdicts (fill the `verdict` column with fp/ok, then run --tally again)")
         return
     lo, hi = _wilson(k, n)
-    print(f"\n═══ hand-audited precision, {n} fires resolved, {k} false positive(s) ═══")
+    print(f"\n═══ precision audited by hand, {n} fires resolved, {k} false positive(s) ═══")
     print(f"    FP rate    {k / n * 100:5.1f}%     95% CI  {lo * 100:4.1f}% – {hi * 100:4.1f}%")
     print(f"    precision  {(1 - k / n) * 100:5.1f}%     95% CI  {(1 - hi) * 100:4.1f}% – {(1 - lo) * 100:4.1f}%")
     print(f"    -> at n={n}, the TRUE FP rate is plausibly as high as {hi * 100:.1f}%. Widen the draw to tighten it.")
@@ -881,21 +884,21 @@ def precision_report(recs, args):
         return
 
     print(f"\n═══ precision audit, {len(scored)} SCORED apps  ({len(a['gated'])} DNF'd by the gate, excluded) ═══")
-    print(f"\n⚠  NOT a true-precision number. This audit recognizes a FIXED list of FP classes (catch-all")
-    print(f"   phantom | vendor-reflection | signal-instability) and has NO ground-truth oracle. It is blind")
+    print(f"\n⚠  NOT a true precision number. This audit recognizes a FIXED list of FP classes (catch-all")
+    print(f"   phantom | vendor reflection | signal instability) and has NO ground truth oracle. It is blind")
     print(f"   to scope/attribution FPs, a REAL finding on the wrong owner's page (the asi1 perf case). For")
-    print(f"   the real number, hand-sample:  python scripts/stats.py {args.results} --precision --sample 30 > w.tsv")
+    print(f"   the real number, audit by hand:  python scripts/stats.py {args.results} --precision --sample 30 > w.tsv")
 
-    print(f"\n(0) DNF GATE, {len(a['gated'])} apps broken/not-an-app -> DNF-class, EXCLUDED "
+    print(f"\n(0) DNF GATE, {len(a['gated'])} apps broken/not-an-app -> DNF class, EXCLUDED "
           f"({a['gated_slop']} slop correctly kept out of the distribution; not a precision gap).")
 
     print(f"\n(1) WHAT THE AUDIT CAN / CANNOT VOUCH FOR")
-    print(f"    {vouched:>5} / {total_fires} VOUCHED    , a precision rule ran and passed (liveness-gate / "
-          f"catch-all / vendor-field).")
+    print(f"    {vouched:>5} / {total_fires} VOUCHED    , a precision rule ran and passed (liveness gate / "
+          f"catch-all / vendor field).")
     print(f"    {unaudited_fires:>5} / {total_fires} UNAUDITED  , NO rule exists; neither confirmed nor suspect. "
-          f"{pen_share:.0f}% of DAMPED in-score penalty. Hand-sample these:")
+          f"{pen_share:.0f}% of the DAMPED penalty inside the score. Audit these by hand:")
     for pid, (fires, pen) in sorted(unaudited.items(), key=lambda x: -x[1][1])[:12]:
-        print(f"            {fires:>5} fires | {pen:>7.0f} in-score pen   {pid}")
+        print(f"            {fires:>5} fires | {pen:>7.0f} pen inside the score   {pid}")
     unval = _unvalidated_probes(recs)
     if unval:
         print(f"\n(1b) UNVALIDATED, {len(unval)} high-penalty probe(s) fired 0× on this corpus.")
@@ -904,32 +907,32 @@ def precision_report(recs, args):
         for pid, pen in unval[:15]:
             print(f"            pen {pen:>3}   {pid}")
     if total_unconf:
-        print(f"    {total_unconf:>5} / {total_fires} UNCONFIRMED, timing / load-induced-error ({unconf_apps} apps); "
-              f"re-fire in isolation to resolve:")
+        print(f"    {total_unconf:>5} / {total_fires} UNCONFIRMED, timing, or an error caused by load ({unconf_apps} apps); "
+              f"fire them again in isolation to resolve:")
         for why, n in a["unconf_reasons"].most_common():
             print(f"            {n:>5}  {why}")
-    print(f"    {total_fp:>5} / {total_fires} KNOWN-CLASS FP ({fp_apps} apps), only the classes this audit can see:")
+    print(f"    {total_fp:>5} / {total_fires} KNOWN CLASS FP ({fp_apps} apps), only the classes this audit can see:")
     for why, n in a["fp_reasons"].most_common():
         print(f"            {n:>5}  {why}")
     if not a["fp_reasons"]:
         print(f"            (none of the KNOWN classes survived, this says NOTHING about the unaudited surface above)")
 
     if a["advisories"]:
-        print(f"\n(1b) OWNERSHIP-FLAGGED, REAL findings on live endpoints, NOT false positives")
+        print(f"\n(1b) OWNERSHIP FLAGGED, REAL findings on live endpoints, NOT false positives")
         print(f"    {len(a['advisories'])} fires across {adv_apps} apps. These dissolve when teams submit their OWN URLs:")
         for why, n in a["adv_reasons"].most_common():
             print(f"      {n:>4}  {why}")
 
-    print(f"\n(2) PER-PROBE CATCH-ALL/PHANTOM PRECISION  (audited probes only, NOT the whole surface; "
-          f"[gated] = liveness-vetted)")
+    print(f"\n(2) PER PROBE CATCH-ALL/PHANTOM PRECISION  (audited probes only, NOT the whole surface; "
+          f"[gated] = vetted by the liveness gate)")
     rows = [(pid, v[0], v[1]) for pid, v in a["per_probe"].items() if _phantom_sensitive(pid) and v[0]]
     for pid, fires, fp in sorted(rows, key=lambda x: -x[2]) or [(None, 0, 0)]:
         if pid is None:
-            print("    (no phantom-sensitive probes fired on scored apps)")
+            print("    (no phantom sensitive probes fired on scored apps)")
             break
         prec = (fires - fp) / fires * 100
         tag = " [gated]" if pid in _GATE_VETTED else " [effect]" if pid in _EFFECT_CONFIRMED else ""
-        print(f"    {pid:20} {fires:>4} fires | {fp:>4} FP | {prec:5.0f}% not-phantom {'█' * int(round(prec / 5))}{tag}")
+        print(f"    {pid:20} {fires:>4} fires | {fp:>4} FP | {prec:5.0f}% not phantom {'█' * int(round(prec / 5))}{tag}")
 
     combined = [("   ", *x) for x in a["flagged"]] + [("[A]", *x) for x in a["advisories"]]
     if combined:
@@ -939,7 +942,7 @@ def precision_report(recs, args):
 
     # SCORE TRUST (parity x precision join), per scored app: is its slop trustworthy? Two ways it is not, we were
     # BLIND (coverage <= Q1 -> a low score is uninformative, not clean, parity's concern) OR the score is INFLATED
-    # (a known-class FP fire, precision's concern). Everything else is a trustworthy score.
+    # (a fire from a known FP class, precision's concern). Everything else is a trustworthy score.
     flagged_repos = {x[0] for x in a["flagged"]}
     covs = [c for r in a["scored"] if (c := (r.get("coverage") or {}).get("pct_applicable")) is not None]
     q1 = (statistics.quantiles(covs, n=4)[0] if len(covs) >= 4 else min(covs)) if covs else 0
@@ -956,9 +959,9 @@ def precision_report(recs, args):
             trust += 1
     if a["scored"]:
         print(f"\n(4) SCORE TRUST  (parity x precision join, over {len(a['scored'])} scored apps)")
-        print(f"    {trust:>4} trustworthy   |   {len(blind):>4} UNDER-OBSERVED (cov <= Q1 {q1:.0f}%, score "
-              f"uninformative)   |   {len(inflated):>4} INFLATED (>=1 known-class FP fire)")
-        # INFLATED: highest slop first (most FP-affected). BLIND: LOWEST slop first, a low score on low coverage
+        print(f"    {trust:>4} trustworthy   |   {len(blind):>4} UNDER OBSERVED (cov <= Q1 {q1:.0f}%, score "
+              f"uninformative)   |   {len(inflated):>4} INFLATED (>=1 fire from a known FP class)")
+        # INFLATED: highest slop first (most affected by FP). BLIND: LOWEST slop first, a low score on low coverage
         # is the suspect case (looks clean but we barely tested it, not the same as genuinely clean).
         for r in sorted(inflated, key=lambda r: -(r.get("slop_score") or 0))[:6]:
             label = (r.get("repo") or "").rstrip("/").rsplit("/", 1)[-1][:32] or "?"
@@ -975,7 +978,7 @@ def precision_report(recs, args):
 # regrade loop's answer to "did my change help, and what moved?"
 # ==========================================================================================================
 def diff_report(cur, prev, args):
-    """Join CURRENT vs a PREVIOUS run by app (repo) and report what moved, score deltas, per-probe fire gains /
+    """Join CURRENT vs a PREVIOUS run by app (repo) and report what moved, score deltas, per probe fire gains /
     losses, coverage / challenge / DNF shifts. Apps present in only one run are counted but never differenced."""
     cg = {r.get("repo"): r for r in cur if _is_graded(r)}
     pg = {r.get("repo"): r for r in prev if _is_graded(r)}
@@ -985,7 +988,7 @@ def diff_report(cur, prev, args):
 
     def fired(r):
         return {f["probe_id"] for f in r.get("findings", []) if _scored(f)}
-    probe_delta, new_pairs, gone_pairs = Counter(), 0, 0     # per-probe app-fire gain/loss over common apps
+    probe_delta, new_pairs, gone_pairs = Counter(), 0, 0     # per probe app fire gain/loss over common apps
     for k in common:
         cf, pf = fired(cg[k]), fired(pg[k])
         new_pairs += len(cf - pf)
@@ -1042,7 +1045,7 @@ def diff_report(cur, prev, args):
             if d > 0:
                 print(f"      {((k or '').rstrip('/').rsplit('/', 1)[-1] or '?')[:34]:34} {pg[k]['slop_score']:>6.1f} -> {cg[k]['slop_score']:<6.1f} ({d:+.1f})")
 
-    print(f"\n(3) FIRES  ({new_pairs} new app-fires | {gone_pairs} gone | per-probe net over common apps)")
+    print(f"\n(3) FIRES  ({new_pairs} new app fires | {gone_pairs} gone | per probe net over common apps)")
     gained = [(p, n) for p, n in probe_delta.most_common() if n > 0]
     lost = [(p, n) for p, n in sorted(probe_delta.items(), key=lambda x: x[1]) if n < 0]
     if gained:
@@ -1050,7 +1053,7 @@ def diff_report(cur, prev, args):
     if lost:
         print("    firing LESS now:  " + "  ".join(f"{p} {n:+d}" for p, n in lost[:8]))
     if not gained and not lost:
-        print("    (no per-probe fire changes over the common apps)")
+        print("    (no per probe fire changes over the common apps)")
 
     print(f"\n(4) COVERAGE / TAINT")
     if covc and covp:
@@ -1058,7 +1061,7 @@ def diff_report(cur, prev, args):
               f"({statistics.mean(covc)-statistics.mean(covp):+.1f})")
     print(f"    bot challenged   prev {chal(prev)}  ->  cur {chal(cur)}   |   "
           f"DNF   prev {ndnf(prev)}  ->  cur {ndnf(cur)}")
-    print(f"\n    → per-probe / per-app detail: --json, or --audit <probe id> on either run\n")
+    print(f"\n    → per probe / per app detail: --json, or --audit <probe id> on either run\n")
 
 
 def main():
@@ -1067,21 +1070,21 @@ def main():
                     "visibility) and --precision (false positive audit). One tool, three lenses on one file.")
     ap.add_argument("results", help="the JSONL from deploy_and_grade --record (or a filled worksheet, with --tally)")
     ap.add_argument("--audit", metavar="PROBE", help="list every app + evidence where PROBE fired, then exit")
-    ap.add_argument("--json", action="store_true", help="emit a machine-readable summary instead of the report")
+    ap.add_argument("--json", action="store_true", help="emit a machine readable summary instead of the report")
     ap.add_argument("--sigma", type=float, default=2.0, help="high outlier threshold in stdevs (default 2)")
     ap.add_argument("--charts", action="store_true",
-                    help="render the corpus-writeup PNG charts (+ sibling CSVs) to docs/charts/, then exit "
+                    help="render the corpus writeup PNG charts (+ sibling CSVs) to docs/charts/, then exit "
                          "(needs matplotlib: run via `uv run --with matplotlib`)")
     # --- PARITY mode (cross stack visibility): observed vs expected surface, blind spots ---
     ap.add_argument("--parity", action="store_true", help="run the cross stack PARITY dashboard instead of the report")
     ap.add_argument("--by", default="routing", choices=["routing", "framework", "api_style"],
-                    help="parity group key (default routing, the discovery-relevant axis)")
-    ap.add_argument("--csv", metavar="FILE", help="parity: write the per-app rows to FILE (the ledger) and exit")
+                    help="parity group key (default routing, the discovery relevant axis)")
+    ap.add_argument("--csv", metavar="FILE", help="parity: write the per app rows to FILE (the ledger) and exit")
     # --- PRECISION mode (false positive audit) ---
     ap.add_argument("--precision", action="store_true", help="run the PRECISION (false positive) audit instead")
     ap.add_argument("--show", type=int, default=20, help="precision: how many flagged findings to list")
     ap.add_argument("--sample", type=int, metavar="N",
-                    help="precision: emit N random fires as a hand-audit worksheet (TSV), then exit")
+                    help="precision: emit N random fires as a worksheet you audit by hand (TSV), then exit")
     ap.add_argument("--tally", action="store_true",
                     help="precision: treat `results` as a filled worksheet -> FP rate + 95%% Wilson CI")
     ap.add_argument("--seed", type=int, default=0, help="precision: RNG seed for --sample (reproducible draw)")
@@ -1120,13 +1123,13 @@ def main():
         return
 
     # cohorts: REPO apps are cloned + deploy tested from source (the reproducibility metric applies to
-    # them). URL-INGEST apps were already live and graded raw over HTTP(S), NOT deployed by us, and graded
-    # with a different applicable-probe set (the HTTPS-only probes apply). Keep them distinct so neither the
-    # deploy-rate nor the score cohorts get silently conflated.
+    # them). URL INGEST apps were already live and graded raw over HTTP(S), NOT deployed by us, and only
+    # the HTTPS-only probes apply to them. Keep them distinct so neither the deploy rate nor the score
+    # cohorts get silently conflated.
     url_apps = [r for r in recs if _source(r) == "url"]
     repo_recs = [r for r in recs if _source(r) == "repo"]
-    deployed = [r for r in repo_recs if r.get("deployed")]      # deploy success is a REPO-only concept
-    # non functional = the audit judged it broken/not-an-app/placeholder -> DNF-CLASS: ranks below every
+    deployed = [r for r in repo_recs if r.get("deployed")]      # deploy success is a REPO only concept
+    # non functional = the audit judged it broken/not-an-app/placeholder -> DNF CLASS: ranks below every
     # working submission, so it's EXCLUDED from the score distribution (never rescued to a low slop score).
     nonfunctional = [r for r in recs if r.get("functional") is False]
     disputed = [r for r in recs if r.get("disputed_broken") and r.get("functional") is not False]  # veto: scored, flagged
@@ -1139,20 +1142,20 @@ def main():
         if r.get("project"):
             by_project[r["project"]][_source(r)] = r
     paired = {p: d for p, d in by_project.items() if "repo" in d and "url" in d}
-    timed = [r for r in recs if r.get("timings")]               # per-phase wall clock, as measurement
+    timed = [r for r in recs if r.get("timings")]               # per phase wall clock, as measurement
     _PHASES = [("clone_s", "clone"), ("plan_s", "plan(LLM)"), ("deploy_s", "deploy"),
                ("grade_s", "grade"), ("audit_s", "audit(LLM)"), ("total_s", "total")]
 
     def _phase(key):
         return [r["timings"][key] for r in timed if r["timings"].get(key)]
 
-    # ---- (a) deploy success rate (the hackathon-reproducibility finding) ----
+    # ---- (a) deploy success rate (the hackathon reproducibility finding) ----
     skipped = [r for r in repo_recs if r.get("skipped")]   # not a web app -> OUT OF SCOPE, not a failure
     fails = [r for r in repo_recs if not r.get("deployed") and not r.get("skipped")]
     err_kinds = Counter((r.get("deploy_error") or "unknown")[:60] for r in fails)
     timeouts = Counter(r["timeout"] for r in recs if r.get("timeout"))   # 'took forever', a signal itself
 
-    # ---- per-app category subtotals (rebuilt, faithful) ----
+    # ---- per app category subtotals (rebuilt, faithful) ----
     per_app_cats = {r["repo"]: cat_subtotals(r) for r in graded}
     cat_total = defaultdict(float)       # category -> damped slop summed across apps
     for cats in per_app_cats.values():
@@ -1160,7 +1163,7 @@ def main():
             cat_total[f"{bundle}/{cat}"] += v
     all_slop = sum(cat_total.values()) or 1.0
 
-    # ---- (c) per probe fire frequency (app-level) + most frequent findings ----
+    # ---- (c) per probe fire frequency (app level) + most frequent findings ----
     probe_apps = defaultdict(set)        # probe_id -> {repos}
     probe_meta = {}                      # probe_id -> (bundle, category)
     for r in graded:
@@ -1171,9 +1174,9 @@ def main():
             probe_meta[f["probe_id"]] = (f["bundle"], f["category"])
     freq = sorted(((pid, len(apps)) for pid, apps in probe_apps.items()), key=lambda x: -x[1])
 
-    # ---- email-verification family breakdown (now scoring): the qa-email-001 ladder + qa-email-002 inert.
+    # ---- email verification family breakdown (now scoring): the qa-email-001 ladder + qa-email-002 inert.
     # Read off the FIRED findings' evidence (email_gated apps that CLEANED leave no finding), so this sizes the
-    # lock-outs, not the whole email-gated subset. Self-suppresses when the family never fired. ----
+    # lockouts, not the whole email gated subset. Self suppresses when the family never fired. ----
     def _email_fires(pid):
         return [(r, f) for r in graded for f in r.get("findings", []) if f["probe_id"] == pid and _scored(f)]
 
@@ -1185,19 +1188,19 @@ def main():
                    "email_late_30s": _ev_count(email_001, "email_late_30s"),
                    "no_resend_button": _ev_count(email_001, "no_resend_button")}
 
-    # ---- (d) winners vs non-winners ----
+    # ---- (d) winners vs non winners ----
     def split(pred):
         return [r for r in recs if r.get("winner") is True and pred(r)], \
                [r for r in recs if r.get("winner") is False and pred(r)]
     win_all, non_all = split(lambda r: True)
     # SAME population as (b) graded, via the shared _is_graded, excludes non functional/DNF, recon, AND
-    # entry-challenge withholds, so the winner comparison isn't contaminated and its min can't disagree with (b).
+    # entry challenge withholds, so the winner comparison isn't contaminated and its min can't disagree with (b).
     win_scores = [r["slop_score"] for r in win_all if _is_graded(r)]
     non_scores = [r["slop_score"] for r in non_all if _is_graded(r)]
 
-    # ---- (a2) by hackathon: the source-hackathon attribution rolled up into per-hackathon stats ----
+    # ---- (a2) by hackathon: the source hackathon attribution rolled up into per hackathon stats ----
     hk_rows = by_hackathon(recs)
-    hk_ranked = [r for r in hk_rows if r["graded"] >= 10 and r["median_slop"] is not None]  # min-n so a 1-app slug can't top it
+    hk_ranked = [r for r in hk_rows if r["graded"] >= 10 and r["median_slop"] is not None]  # min n so a 1-app slug can't top it
 
     # ---- (e) anomalies ----
     mean = statistics.mean(scores) if scores else 0
@@ -1207,7 +1210,7 @@ def main():
     thin = [r for r in graded if r["slop_score"] > 0 and len(r.get("findings", [])) < 2]
     highs = [r for r in graded if sd > 0 and r["slop_score"] > hi_cut]
 
-    # ---- LLM-pointer precision (build #2, OFF-SCORE): of the endpoints the LLM UNIQUELY seeded from source
+    # ---- LLM pointer precision (build #2, OFF SCORE): of the endpoints the LLM UNIQUELY seeded from source
     # (the crawler missed them), how many were REAL vs hallucinated 404s. Measures the pointer, never scores it.
     def _ptr(r):
         s = r.get("observed_surface")
@@ -1220,10 +1223,10 @@ def main():
     ptr_judged = ptr_reach + ptr_halluc
     ptr_prec = round(ptr_reach / ptr_judged * 100, 1) if ptr_judged else None
 
-    # rendered-PERCEPTION pointer (proactive discovery, --proactive), the same honesty measure on surface an
-    # LLM read off the RENDERED page (client-side logins/uploads/actions). Kept SEPARATE from the source pointer
-    # above so a --proactive A/B is legible. Forms are counted (they survived phantom-suppression to be probed);
-    # endpoint reachable/hallucinated via the frozen baseline. Off-score: measures perception, never scores it.
+    # rendered PERCEPTION pointer (proactive discovery, --proactive), the same honesty measure on surface an
+    # LLM read off the RENDERED page (client side logins/uploads/actions). Kept SEPARATE from the source pointer
+    # above so a --proactive A/B is legible. Forms are counted (they survived phantom suppression to be probed);
+    # endpoint reachable/hallucinated via the frozen baseline. Off score: measures perception, never scores it.
     pcv_active = [p for r in recs for p in [_ptr(r)]
                   if p and (p.get("perceived_endpoints_seeded") or p.get("perceived_forms_seeded"))]
     pcv_eps = sum(p.get("perceived_endpoints_seeded", 0) for p in pcv_active)
@@ -1233,10 +1236,10 @@ def main():
     pcv_judged = pcv_reach + pcv_halluc
     pcv_prec = round(pcv_reach / pcv_judged * 100, 1) if pcv_judged else None
 
-    # BACKEND TIER distribution (OFF-SCORE): WHOSE is each host the app's traffic hits (classify-hosts). Sizes the
-    # Move-2 gap = how many apps have an ATTRIBUTED own off-origin backend (same domain / self-host PaaS) we could
+    # BACKEND TIER distribution (OFF SCORE): WHOSE is each host the app's traffic hits (classify hosts). Sizes the
+    # Move-2 gap = how many apps have an ATTRIBUTED own off origin backend (same domain / self hosted PaaS) we could
     # safely probe. Tiers OVERLAP (an app can have a same origin API + a BaaS + a custom backend) -> each count is
-    # "how many apps have ANY host of this tier". opaque = unattributable off-origin (not probed; flagged instead).
+    # "how many apps have ANY host of this tier". opaque = unattributable off origin (not probed; flagged instead).
     def _tiers(r):
         s = r.get("observed_surface")
         t = s.get("host_tiers") if isinstance(s, dict) else None
@@ -1252,8 +1255,8 @@ def main():
     opaque_hosts = Counter(h for t in tiered for h in (t.get("opaque_hosts") or []))
 
     # PLATFORM + BUILDER (off score, platform_id): host platform (headers+suffix), AI builder (served markup),
-    # and the payoff -- slop BY builder (are AI-built apps sloppier than hand-deployed ones?). Empty on records
-    # graded before the field existed (old runs) -> the section self-suppresses.
+    # and the payoff -- slop BY builder (are AI-built apps sloppier than ones deployed by hand?). Empty on records
+    # graded before the field existed (old runs) -> the section self suppresses.
     platted = [(r, r["platform"]) for r in recs if isinstance(r.get("platform"), dict) and r["platform"]]
     host_dist = Counter((p.get("host_platform") or "unknown") for _, p in platted)
     edge_dist = Counter(p["edge"] for _, p in platted if p.get("edge"))
@@ -1271,7 +1274,7 @@ def main():
     models = Counter(r.get("model") for r in recs if r.get("model"))   # LLM(s) used (a file may mix runs)
 
     # BOT CHALLENGE / TAINT (net.is_bot_challenge): apps that answered with a WAF/challenge/sleep interstitial
-    # instead of the app. Excluded from `graded`, but COUNTED here per host platform so a disproportionately-
+    # instead of the app. Excluded from `graded`, but COUNTED here per host platform so a disproportionately
     # challenged platform (e.g. Vercel Attack Challenge Mode) is visible as a taint signal -- rather than
     # inferred from the compression proxy. Rate = challenged / (all records on that platform).
     def _host_of(r):
@@ -1283,7 +1286,7 @@ def main():
     chal_by_host = Counter(_host_of(r) for r in challenged)
     # WHICH probe's traffic first tripped the WAF (net.challenge_onset) -> the gate/reorder candidates
     onset_by_probe = Counter(r["challenge_onset"] for r in challenged if r.get("challenge_onset"))
-    # per probe REQUEST VOLUME (net.request_counts): which probes send abnormally many requests (the WAF-trip /
+    # per probe REQUEST VOLUME (net.request_counts): which probes send abnormally many requests (the WAF trip /
     # pacing / trim candidates). Median across apps that ran the probe, + the worst single app.
     probe_reqs: dict = defaultdict(list)
     for r in recs:
@@ -1298,7 +1301,7 @@ def main():
 
     # ---- ATTRITION (the DNF rate) + AUTH SURFACE: the headline yield the deploy rate alone hides (a repo can
     # deploy yet still DNF on a broken app or an entry challenge), and the login/signup/SSO reach. Both computed
-    # by module-level functions (unit tested); unpacked to locals so the JSON + print blocks stay unchanged. ----
+    # by module level functions (unit tested); unpacked to locals so the JSON + print blocks stay unchanged. ----
     attempted = [r for r in recs if not r.get("skipped")]
     dnf = [r for r in attempted if not _is_graded(r)]
     dnf_reasons = Counter(_dnf_reason(r) for r in dnf)
@@ -1306,8 +1309,8 @@ def main():
     n_sf, sf_login, sf_signup, sf_pw = A["n"], A["has_login"], A["has_signup"], A["self_registerable"]
     sf_sso, sf_ssoonly, no_auth = A["has_sso"], A["sso_only"], A["no_auth"]
     sso_providers, captcha_kinds = A["sso_providers"], A["captcha"]
-    # reach x yield: of the self-registerable apps (a password signup we can drive), how many actually got an
-    # authed-cluster finding, i.e. did establishing a session surface a defect. Ties the reach to real coverage.
+    # reach x yield: of the self registerable apps (a password signup we can drive), how many actually got an
+    # authed cluster finding, i.e. did establishing a session surface a defect. Ties the reach to real coverage.
     reg_apps = [r for r in graded if isinstance(r.get("observed_surface"), dict)
                 and r["observed_surface"].get("has_password_form")]
     reg_fired = [r for r in reg_apps if any(_scored(f) and f["probe_id"] in _AUTHED_PROBES
@@ -1426,7 +1429,7 @@ def main():
               f"surface, SCORED (not DNF'd on the LLM alone), FLAGGED for human review")
 
     # (a2)
-    def _f(v):   # a stat cell: em-dash when undefined (too small a sample), else one decimal
+    def _f(v):   # a stat cell: em dash when undefined (too small a sample), else one decimal
         return "-" if v is None else f"{v:.1f}"
     sec(f"BY HACKATHON  ({len(hk_rows)} hackathons, source attribution)   [slop = whole cohort | w.* = winners only]")
     print(f"     {'hackathon':<28}{'subs':>5}{'grd':>4}{'min':>6}{'med':>6}{'mean':>6}{'max':>6}{'sd':>5}"
@@ -1479,7 +1482,7 @@ def main():
     # (b)
     sec(f"SLOP SCORE DISTRIBUTION  (all graded apps)")
     print(f"    {_stat_line(scores)}")
-    if url_apps:   # don't conflate cohorts, live apps grade over HTTPS with a different applicable-probe set
+    if url_apps:   # don't conflate cohorts, live apps grade over HTTPS with only the HTTPS-only probes applying
         print(f"      ├─ repo deployed  {_stat_line([r['slop_score'] for r in graded if _source(r) == 'repo'])}")
         print(f"      └─ live URL       {_stat_line([r['slop_score'] for r in graded if _source(r) == 'url'])}")
     for line in _histogram(scores):
@@ -1495,9 +1498,9 @@ def main():
         b, c = probe_meta[pid]
         print(f"      {pid:20} {n:>3}/{len(graded)} apps   {b}/{c}")
 
-    # SLOP BY AXIS, the score's top-level split: security / qa / performance. The per-axis damped subtotals
+    # SLOP BY AXIS, the score's top level split: security / qa / performance. The per axis damped subtotals
     # (axis_slop) summed + median across graded apps, and each axis's share of all slop, so you see WHICH axis
-    # drives the corpus before drilling into categories. Self-suppresses on a corpus that predates axis_slop.
+    # drives the corpus before drilling into categories. Self suppresses on a corpus that predates axis_slop.
     axis_vals = defaultdict(list)
     for r in graded:
         for ax, v in (r.get("axis_slop") or {}).items():
@@ -1511,7 +1514,7 @@ def main():
             print(f"    {ax:12} {axis_total[ax]/all_axis*100:4.0f}% of all slop   "
                   f"median {statistics.median(xs):5.1f}   mean {statistics.mean(xs):5.1f}   (n {len(xs)} apps)")
 
-    # FINDING SEVERITY, the scored findings bucketed by risk-priced penalty into tiers, with the # of apps carrying
+    # FINDING SEVERITY, the scored findings bucketed by risk priced penalty into tiers, with the # of apps carrying
     # at least one at that tier. Shows the SHAPE of the harm (are the fires a few critical breaches or a long tail
     # of minor ones), which the summed score alone hides.
     sev_findings, sev_apps = Counter(), defaultdict(set)
@@ -1522,13 +1525,13 @@ def main():
                 sev_findings[t] += 1
                 sev_apps[t].add(r["repo"])
     if sev_findings:
-        sec("FINDING SEVERITY  (scored findings by risk-priced penalty tier; apps = # with >=1 at that tier)")
+        sec("FINDING SEVERITY  (scored findings by risk priced penalty tier; apps = # with >=1 at that tier)")
         for tier in ("critical", "serious", "moderate", "minor"):
             print(f"    {tier:9} (pen {'>=30' if tier=='critical' else '16-29' if tier=='serious' else '8-15' if tier=='moderate' else '1-7':>5})"
                   f"   {sev_findings.get(tier, 0):>4} findings   across {len(sev_apps.get(tier, set())):>3} apps")
 
     # (b2) Lighthouse PERFORMANCE score, 0-100, the number the perf axis grades on, surfaced here. Absent on a
-    # pre-Lighthouse-cutover corpus, so the section self-skips. (a11y is scored by qa-a11y, not shown here.)
+    # corpus from before the switch to Lighthouse, so the section self skips. (a11y is scored by qa-a11y, not shown here.)
     s = lighthouse_scores(graded)["performance"]
     if s["n"]:
         sec(f"LIGHTHOUSE PERFORMANCE (0-100)   higher is better")
@@ -1539,7 +1542,7 @@ def main():
         non = lighthouse_scores([r for r in graded if r.get("winner") is False])["performance"]
         if win["n"] and non["n"]:
             print(f"     winners     (n {win['n']:>4}):  median {win['median']:>3}  mean {win['mean']:>5}  green {win['pct_green']}%")
-            print(f"     non-winners (n {non['n']:>4}):  median {non['median']:>3}  mean {non['mean']:>5}  green {non['pct_green']}%")
+            print(f"     non winners (n {non['n']:>4}):  median {non['median']:>3}  mean {non['mean']:>5}  green {non['pct_green']}%")
 
     # (c)
     sec(f"PER PROBE FIRE FREQUENCY  (# of the {len(graded)} graded apps each probe fired on)")
@@ -1550,9 +1553,9 @@ def main():
 
     # (c2) NEVER APPLIED, probes that were N/A on EVERY graded app: the intersection of the n/a sets.
     # They never reached a target, either the surface they need is absent from every app, or the probe is
-    # mis-gated / broken. This is DISTINCT from a probe that applied and found nothing (working, just rare);
+    # gated wrong or broken. This is DISTINCT from a probe that applied and found nothing (working, just rare);
     # that split is shown for contrast. Exact per probe when records carry coverage.applied; else the
-    # coarser kind-level intersection (older records predate the per probe field).
+    # coarser kind level intersection (older records predate the per probe field).
     try:
         cat = {p.id: p.bundle for p in load_catalog(str(_ROOT / "catalog"))}
     except Exception:                          # never let a catalog hiccup break the whole report
@@ -1571,11 +1574,11 @@ def main():
                 grp[cat[pid]].append(pid)
             for b in sorted(grp):
                 print(f"      [{b}]  " + ", ".join(sorted(grp[b])))
-            print(f"      ↳ surface absent everywhere, OR the probe is mis-gated/broken, audit any that SHOULD apply")
+            print(f"      ↳ surface absent everywhere, OR the probe is gated wrong or broken, audit any that SHOULD apply")
         else:
             print("      (every probe applied to at least one app)")
         print(f"      (for contrast: {ran_clean} probes DID apply somewhere but never fired, working, just rare)")
-    elif cov:                                  # legacy records: only kind-level n/a survives
+    elif cov:                                  # legacy records: only kind level n/a survives
         na = [set(r["coverage"].get("na_kinds", [])) for r in cov]
         ran = [set(r["coverage"].get("ran_kinds", [])) for r in cov]
         na_all = sorted(set.intersection(*na) - set().union(*ran)) if na else []
@@ -1590,7 +1593,7 @@ def main():
     else:
         print(f"    winners      deploy {sum(r.get('deployed', False) for r in win_all)}/{len(win_all)}   "
               f"slop {_stat_line(win_scores)}")
-        print(f"    non-winners  deploy {sum(r.get('deployed', False) for r in non_all)}/{len(non_all)}   "
+        print(f"    non winners  deploy {sum(r.get('deployed', False) for r in non_all)}/{len(non_all)}   "
               f"slop {_stat_line(non_scores)}")
 
     # (e)
@@ -1601,7 +1604,7 @@ def main():
     print(f"    thin  (deployed, scored >0 but <2 findings, possible discovery blind spot):")
     for r in thin or [None]:
         print("      " + (f"{r['repo']}   score {r['slop_score']}, {len(r['findings'])} finding(s)" if r else "(none)"))
-    print(f"    high outliers  (> mean+{args.sigma:g}σ = {hi_cut:.0f}, terrible app OR over-firing bug):")
+    print(f"    high outliers  (> mean+{args.sigma:g}σ = {hi_cut:.0f}, terrible app OR a bug firing too much):")
     for r in sorted(highs, key=lambda r: -r["slop_score"]) or [None]:
         if r:
             top = sorted(cat_subtotals(r).items(), key=lambda x: -x[1])[:3]
@@ -1636,7 +1639,7 @@ def main():
                       f"(deploy {t.get('deploy_s', 0):.0f} | grade {t.get('grade_s', 0):.0f})")
 
     # (g) PAIRED, same submission graded BOTH ways (repo deploy vs live URL). The DELTA is the signal:
-    # repo-failed-but-URL-works = pure reproducibility failure; URL much cleaner = their infra hardens or
+    # the repo failed but the URL works = pure reproducibility failure; URL much cleaner = their infra hardens or
     # the repo is missing config; similar = genuinely clean AND reproducible. Never a blended average.
     if paired:
         repro_fail = [(p, d) for p, d in paired.items()
@@ -1644,7 +1647,7 @@ def main():
         both = [(p, d["repo"]["slop_score"], d["url"]["slop_score"]) for p, d in paired.items()
                 if "slop_score" in d["repo"] and "slop_score" in d["url"]]
         sec(f"PAIRED repo vs URL  ({len(paired)} submissions graded both ways, the delta is signal)")
-        print(f"    {len(both)} scored on both | {len(repro_fail)} repo-FAILED-but-URL-works "
+        print(f"    {len(both)} scored on both | {len(repro_fail)} where the repo FAILED but the URL works "
               f"(pure reproducibility failures)")
         for p, rs, us in sorted(both, key=lambda x: -(x[1] - x[2]))[:12]:
             tag = ("URL cleaner, their infra hardens / repo missing config" if rs - us >= 20 else
@@ -1656,7 +1659,7 @@ def main():
                   f"→ live only (not reproducible from source)")
 
     # (h) COVERAGE AUDIT (LLM), surface the fuzzer's discovery MISSED, per the LLM critic, aggregated into
-    # a fixable backlog (the AfroSecured-style incidents), plus page-state classification (placeholder/broken).
+    # a fixable backlog (the AfroSecured-style incidents), plus page state classification (placeholder/broken).
     audited = [r for r in recs if r.get("coverage_audit")]
     if audited:
         misses = [(r["repo"], m) for r in audited for m in (r["coverage_audit"].get("missed") or [])]
@@ -1675,7 +1678,8 @@ def main():
 
     # (i) LLM POINTER PRECISION (build #2, off score), of the endpoints the LLM UNIQUELY seeded from source
     # (the crawler missed them), how many were REAL on the deployed app vs hallucinated 404s. Measures the
-    # pointer's accuracy without EVER letting it touch the score, the pointer/never-judge separation, quantified.
+    # pointer's accuracy without EVER letting it touch the score: the separation that keeps the pointer from
+    # ever judging, quantified.
     if ptr_active:
         sec(f"LLM POINTER PRECISION (build #2, off score), {len(ptr_active)} apps where the LLM seeded "
               f"endpoints the crawler missed")
@@ -1694,7 +1698,7 @@ def main():
                       f"/ {pp['endpoints_seeded']} seeded")
 
     # (i2) PERCEPTION POINTER (proactive discovery, off score), of the surface an LLM perceived off the
-    # RENDERED page (the client-side logins/uploads/actions the crawl missed), how much turned out REAL. The
+    # RENDERED page (the client side logins/uploads/actions the crawl missed), how much turned out REAL. The
     # recall counterpart to (h) DISCOVERY GAPS: (h) says what's still missed, this says how good the fix is.
     if pcv_active:
         pcv_pw = sum(p.get("perceived_password_forms", 0) for p in pcv_active)   # perceived forms w/ a password field
@@ -1722,29 +1726,29 @@ def main():
                 label = (r.get("repo") or "").rstrip("/").rsplit("/", 1)[-1][:28] or "?"   # trailing '/' -> host, not ''
                 print(f"      {label:28} {' | '.join(bits)}")
             if len(rows) > 15:
-                print(f"      ... and {len(rows) - 15} more (jq the per-app records for the rest)")
+                print(f"      ... and {len(rows) - 15} more (jq the per app records for the rest)")
         ghosts = [(r.get("repo", ""), p) for r in recs for p in ((_ptr(r) or {}).get("perceived_ghost_paths") or [])]
         if ghosts:
             print(f"    ghost paths perception INVENTED (404, eyeball these when endpoint precision dips):")
             for repo, path in ghosts[:8]:
                 print(f"      {repo.rsplit('/', 1)[-1][:30]:30} {path}")
 
-    # (i3) BACKEND TIER DISTRIBUTION (off score), WHERE each app's runtime traffic goes (classify-hosts). Sizes
-    # the SPA off-origin gap: same origin = probe-able now, managed BaaS = config test lane, OWN off-origin = the
+    # (i3) BACKEND TIER DISTRIBUTION (off score), WHERE each app's runtime traffic goes (classify hosts). Sizes
+    # the SPA off origin gap: same origin = testable now, managed BaaS = config test lane, OWN off origin = the
     # Move-2 recall frontier we can't yet reach. Tiers OVERLAP (an app can span all three).
     if n_tier:
         sec(f"BACKEND TIER DISTRIBUTION (off score), {n_tier} apps with observed runtime traffic")
-        print(f"    same origin (probe-able now):        {tier_same:>4} ({tier_same/n_tier*100:.0f}%)")
-        print(f"    OWN off-origin backend (attributed): {tier_own:>4} ({tier_own/n_tier*100:.0f}%)   <- Move-2 target (same domain / self-host PaaS)")
+        print(f"    same origin (testable now):          {tier_same:>4} ({tier_same/n_tier*100:.0f}%)")
+        print(f"    OWN off origin backend (attributed): {tier_own:>4} ({tier_own/n_tier*100:.0f}%)   <- Move-2 target (same domain / self hosted PaaS)")
         print(f"    managed BaaS (config test lane):     {tier_baas:>4} ({tier_baas/n_tier*100:.0f}%)")
         print(f"    vendor (consumed, not graded):       {tier_vendor:>4} ({tier_vendor/n_tier*100:.0f}%)")
-        print(f"    opaque off-origin (unattributable):  {tier_opaque:>4} ({tier_opaque/n_tier*100:.0f}%)   <- not probed (safety); no clean-bill credit")
+        print(f"    opaque off origin (unattributable):  {tier_opaque:>4} ({tier_opaque/n_tier*100:.0f}%)   <- not probed (safety); no clean bill credit")
         if own_hosts:
-            print("    top own-backend hosts: " + ", ".join(f"{h}({c})" for h, c in own_hosts.most_common(6)))
+            print("    top own backend hosts: " + ", ".join(f"{h}({c})" for h, c in own_hosts.most_common(6)))
         if opaque_hosts:
             print("    top opaque hosts:      " + ", ".join(f"{h}({c})" for h, c in opaque_hosts.most_common(6)))
 
-    # (i4) PLATFORM + AI BUILDER (off score), WHERE it is served and WHAT built it, plus slop-by-builder
+    # (i4) PLATFORM + AI BUILDER (off score), WHERE it is served and WHAT built it, plus slop by builder
     if platted:
         n_pl = len(platted)
         sec(f"PLATFORM + AI BUILDER (off score), {n_pl} apps classified")
@@ -1756,7 +1760,7 @@ def main():
         print("    slop by host   (median|n): " + "  ".join(f"{k}={med}(n{n})" for k, n, med in slop_by_host[:8]))
 
     # (i5) BOT CHALLENGE / TAINT, how many apps served a WAF/challenge/sleep page (excluded from the grade),
-    # broken down by host platform so a disproportionately-challenged platform is visible as a taint signal.
+    # broken down by host platform so a disproportionately challenged platform is visible as a taint signal.
     if challenged:
         sec(f"BOT CHALLENGE / TAINT, {len(challenged)} of {len(recs)} records "
               f"({100 * len(challenged) / (len(recs) or 1):.1f}%) served a challenge/interstitial")
@@ -1764,34 +1768,34 @@ def main():
               f"   |   ENTRY (challenged from the start -> withheld): {len(entry_ch)}")
         print("    by host (challenged / total on platform): "
               + "  ".join(f"{h}={n}/{t}({pct:.0f}%)" for h, n, t, pct in challenge_by_host))
-        inc_axis = [r for r in recs if r.get("incomplete_axes")]   # KEPT grades whose severe tail was edge-blocked
+        inc_axis = [r for r in recs if r.get("incomplete_axes")]   # KEPT grades whose severe tail was edge blocked
         if inc_axis:
             axc = Counter(a for r in inc_axis for a in (r.get("incomplete_axes") or []))
-            print(f"    INCOMPLETE axes (grade KEPT but that axis NOT clean-tested, severe edge-blocked): "
+            print(f"    INCOMPLETE axes (grade KEPT but that axis NOT clean tested, severe edge blocked): "
                   f"{len(inc_axis)} apps  |  " + "  ".join(f"{a}={n}" for a, n in axc.most_common()))
         if onset_by_probe:   # which probe's traffic first tripped the WAF -> the gate/reorder candidates
             print("    tripped BY probe (first challenge status): "
                   + "  ".join(f"{p}={n}" for p, n in onset_by_probe.most_common(8)))
 
-    if req_rank:   # (i6) which probes send the most requests -> WAF-trip / pacing / trim candidates
+    if req_rank:   # (i6) which probes send the most requests -> WAF trip / pacing / trim candidates
         sec("REQUEST VOLUME per probe (median across apps | worst single app), the high fan out probes")
         for pid, med, mx, n in req_rank[:12]:
             print(f"    {pid:<22} median {med:>5.0f}   worst {mx:>5}   (n={n} apps)")
 
-        # PROBE COST vs VALUE, the request volume (cost) joined to the fire rate (value). A high-cost, low/zero
-        # yield probe is a WAF-trip / pacing / trim candidate (the sec-dos / sec-cmdi fan out that trips Vercel).
-        sec("PROBE COST vs VALUE  (median requests = cost | apps fired on = value | worst cost-per-fire first)")
+        # PROBE COST vs VALUE, the request volume (cost) joined to the fire rate (value). A high cost, low/zero
+        # yield probe is a WAF trip / pacing / trim candidate (the sec-dos / sec-cmdi fan out that trips Vercel).
+        sec("PROBE COST vs VALUE  (median requests = cost | apps fired on = value | worst cost per fire first)")
         cv = [(pid, med, len(probe_apps.get(pid, set()))) for pid, med, mx, n in req_rank]
-        cv = [(pid, med, fires, med / fires if fires else med * 2) for pid, med, fires in cv]   # never-fired ranks worst
+        cv = [(pid, med, fires, med / fires if fires else med * 2) for pid, med, fires in cv]   # never fired ranks worst
         for pid, med, fires, ratio in sorted(cv, key=lambda x: -x[3])[:12]:
             flag = ("   <- expensive, ZERO yield (trim / pace)" if fires == 0 and med >= 30
                     else "   <- high cost per fire" if ratio >= 100 else "")
             print(f"    {pid:<22} cost {med:>5.0f} req | value {fires:>3} apps | {ratio:>6.0f} req/fire{flag}")
 
-    # (i7) EMAIL VERIFICATION (qa-email, now scoring), of the email-gated signups, which locked a user out. The
+    # (i7) EMAIL VERIFICATION (qa-email, now scoring), of the email gated signups, which locked a user out. The
     # qa-email-001 ladder (no mail in 60s = locked out | only after the 30s checkpoint = unreliable | no resend
-    # control = resilience gap) + qa-email-002's inert link. Counts are over FIRED findings, so an email-gated app
-    # whose flow WORKED leaves no row here (it cleaned). Self-suppresses on a corpus where the family never fired.
+    # control = resilience gap) + qa-email-002's inert link. Counts are over FIRED findings, so an email gated app
+    # whose flow WORKED leaves no row here (it cleaned). Self suppresses on a corpus where the family never fired.
     if email_001 or email_002:
         sec(f"EMAIL VERIFICATION (qa-email, scoring), {len(email_001)} app(s) with an unreliable "
               f"confirmation flow (qa-email-001) | {len(email_002)} with an inert verification link (qa-email-002)")
