@@ -53,6 +53,14 @@ def _source_secret_outcome(source_dir) -> Outcome:
                    outcome="clean", penalty=0, variant_group_id="hardcoded-secrets", evidence=evidence)
 
 
+# The browser register (launch + fill + submit) is memoized once per identity, but it is TIMING-SENSITIVE on an
+# app that never settles to networkidle: a single slow/timed-out attempt used to be cached and then poison every
+# authed probe for that identity. Retry a hard failure (a None) up to this many times before caching it, so one
+# flaky launch no longer sends the whole session/idor/race suite to N/A; a genuinely session-less app still caps
+# here and stops relaunching. 2 = one retry (bounded ~+45s worst case on an app that truly can't self-register).
+_BROWSER_REG_MAX_TRIES = 2
+
+
 @dataclass
 class _Ctx:
     base_url: str
@@ -87,21 +95,29 @@ class _Ctx:
         """ONE browser registration per identity (launch + fill + submit is 20-40s), memoized and SHARED between
         the auth self-oracle (here) and the email flow, so an email-gated SPA is browser-registered exactly once.
         Signs up with this identity's controlled address when a receiver is configured, so the SPA mails the
-        confirmation to us; None/dummy otherwise (unchanged)."""
+        confirmation to us; None/dummy otherwise (unchanged).
+
+        A hard FAILURE (a None -- no session) is RETRIED up to _BROWSER_REG_MAX_TRIES before being memoized: only a
+        SUCCESS (a session, or an email_pending handoff the email flow completes) short-circuits the retry. See the
+        constant -- one flaky launch on a never-settling app must not memoize-poison the whole authed suite."""
         if self.browser_register is None:
             return None
         store = self._browser_cache
         if suffix not in store:
             addr = self.email_address(suffix)
-            if not addr:
-                store[suffix] = self.browser_register(base_url)
-            else:
-                kwargs = {"email": addr}
+            kwargs = {}
+            if addr:
+                kwargs["email"] = addr
                 # LANE B: hand the browser lane a CODE fetcher for the email-first wizard, but ONLY if it accepts
                 # one (the real browser.register_in_browser does; a 2-arg test stub does not -> don't break it).
                 if self.email is not None and _accepts_kwarg(self.browser_register, "code_getter"):
                     kwargs["code_getter"] = lambda _s=suffix: self._poll_email_code(_s)
-                store[suffix] = self.browser_register(base_url, **kwargs)
+            result = None
+            for _ in range(_BROWSER_REG_MAX_TRIES):
+                result = self.browser_register(base_url, **kwargs)
+                if result:                       # a session or an email_pending handoff -> done, don't relaunch
+                    break
+            store[suffix] = result               # cache the success, or the last failure once the budget is spent
         return store[suffix]
 
     def _poll_email_code(self, suffix: str = ""):
@@ -455,7 +471,7 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
             _t_disc = time.monotonic()
             profile = discover(handle.base_url, render=render, headers=headers, seed_features=seed_features,
                                perceive=perceive, auth_crawl=auth_crawl, browser_register=browser_register,
-                               crawl_session_sink=crawl_session_sink)
+                               crawl_session_sink=crawl_session_sink, email_receiver=email_receiver)
             _phase("discovered", f"surface: {len(profile.routes)} routes, {len(profile.forms)} forms, "
                    f"{len(profile.endpoints)} endpoints"
                    + (", auth entrypoint" if profile.capabilities.get("has_auth_entrypoint") else "")

@@ -1052,7 +1052,8 @@ def _drop_phantom_surface(base_url, headers, endpoints, forms):
         return False, endpoints, forms
 
 
-def _crawl_auth_headers(base_url: str, forms, auth=(False, False), browser_register=None, session_sink=None) -> dict:
+def _crawl_auth_headers(base_url: str, forms, auth=(False, False), browser_register=None, session_sink=None,
+                        email_receiver=None) -> dict:
     """Register a THROWAWAY crawl account and return its session as request headers a browser render can carry (a
     Cookie, or a Bearer Authorization) — so the crawl reaches the surface an SPA hides behind login (upload, item
     CRUD) instead of only mapping the login page. Uses the SAME lanes the probes do: httpx form/JSON, and — when
@@ -1066,6 +1067,19 @@ def _crawl_auth_headers(base_url: str, forms, auth=(False, False), browser_regis
     # <form> (has_auth_surface = password form OR login/signup trigger).
     prof = Profile(base_url=base_url, forms=list(forms),
                    capabilities={"login_trigger": bool(auth[0]), "signup_trigger": bool(auth[1])})
+    # AUTH-CRAWL EMAIL: with a receiver configured, register the crawl account through a DELIVERABLE address WE own
+    # rather than the browser lane's default hl_*@example.com. An app that validates the domain -- or, like a
+    # django-allauth signup, 500s when the confirmation mail can't be delivered to example.com -- would otherwise
+    # fail the crawl register and never authenticate the crawl (mapping only the logged-out surface). Mirrors
+    # ctx._browser_register_once for the probe-time identity; a fresh throwaway address is fine (the session
+    # unifies to the probes via session_sink, so it need not match the probes' inbox).
+    if email_receiver is not None and browser_register is not None:
+        import secrets
+        _crawl_addr = email_receiver.address(secrets.token_hex(6))
+        _raw_reg = browser_register
+
+        def browser_register(_bu, _raw=_raw_reg, _addr=_crawl_addr):
+            return _raw(_bu, email=_addr)
     acct = register_account(base_url, prof, browser_register=browser_register)
     if not _has_session(acct):
         if acct is not None:
@@ -1093,7 +1107,7 @@ def _crawl_auth_headers(base_url: str, forms, auth=(False, False), browser_regis
 
 def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: int = MAX_DEPTH,
              headers=None, seed_features=None, perceive=None, auth_crawl=False, browser_register=None,
-             crawl_session_sink=None) -> Profile:
+             crawl_session_sink=None, email_receiver=None) -> Profile:
     """`perceive(rendered_doms, observed)` (optional) — PROACTIVE discovery: an injected LLM reads the rendered
     pages and returns the probeable surface the crawl missed (perceive_surface output), merged in below via
     merge_perceived. LLM-agnostic here: the callback owns the model call; a None/failing one degrades to the
@@ -1218,7 +1232,7 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
             # a target. Register a throwaway account and carry its session into the browser context (SEPARATE
             # from the probes' session_headers, which stay fresh so IDOR still gets two distinct identities).
             _auth = _crawl_auth_headers(base_url, forms, auth=tuple(auth), browser_register=browser_register,
-                                        session_sink=crawl_session_sink)
+                                        session_sink=crawl_session_sink, email_receiver=email_receiver)
             if _auth:
                 render_headers = {**(headers or {}), **_auth}
         render_meta: dict = {}
