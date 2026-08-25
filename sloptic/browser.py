@@ -494,6 +494,23 @@ def _find_sso_triggers(page):
     return out
 
 
+_SSO_PROVIDER_WORDS = ("google", "github", "gitlab", "microsoft", "azure", "facebook", "apple",
+                       "discord", "twitter", "linkedin", "slack", "spotify", "twitch", "okta", "auth0")
+
+
+def _sso_provider_slugs(triggers) -> list[str]:
+    """Provider slugs inferred from the 'Continue with <provider>' trigger text, so the server-mediated SSO replay
+    below POSTs the right provider(s) to the allauth endpoint (default google when none is recognisable)."""
+    slugs: list[str] = []
+    for el in triggers:
+        with contextlib.suppress(Exception):
+            t = (el.inner_text() or "").lower()
+            for w in _SSO_PROVIDER_WORDS:
+                if w in t and w not in slugs:
+                    slugs.append(w)
+    return slugs
+
+
 def capture_sso_authorize(base_url, headers=None, timeout: float = 12.0, total_timeout: float = 45.0,
                           max_clicks: int = 6) -> list[str]:
     """Drive the app's OWN 'Sign in with <provider>' control and capture the outgoing OAuth authorize request
@@ -547,12 +564,37 @@ def capture_sso_authorize(base_url, headers=None, timeout: float = 12.0, total_t
                         page.goto(base_url.rstrip("/") + route, timeout=int(timeout * 1000), wait_until="load")
                         page.wait_for_timeout(300)
                         triggers = _find_sso_triggers(page)
+                prov_slugs = _sso_provider_slugs(triggers)   # captured before any click navigation detaches them
                 for el in triggers[:max_clicks]:
                     if out:
                         break                  # one captured authorize URL is enough to inspect the redirect_uri
                     with contextlib.suppress(Exception):
                         el.click(timeout=2500)
                         page.wait_for_timeout(700)   # let the SDK build + fire the authorize navigation
+                # SERVER-MEDIATED SSO (django-allauth headless & similar): 'Continue with <provider>' is a
+                # SAME-ORIGIN, CSRF-protected POST that 302s to the provider -- nothing cross-origin fires for the
+                # click-capture above, and a driven click can't reproduce the app's own CSRF header (a 403). The
+                # login page did set a csrftoken cookie, so REPLAY the standard allauth provider-redirect POST with
+                # it and read the 302 Location. Read-only (max_redirects=0, never follows to the provider), and
+                # naturally scoped: no csrftoken cookie -> skipped, and a non-allauth app 404s the path harmlessly.
+                if not out:
+                    with contextlib.suppress(Exception):
+                        csrf = next((c["value"] for c in page.context.cookies()
+                                     if c["name"] == "csrftoken"), "")
+                        if csrf:
+                            for prov in (prov_slugs or ["google"]):
+                                if out:
+                                    break
+                                with contextlib.suppress(Exception):
+                                    r = page.context.request.post(
+                                        base_url.rstrip("/") + "/_allauth/browser/v1/auth/provider/redirect",
+                                        headers={"X-CSRFToken": csrf, "Referer": base_url},
+                                        form={"provider": prov, "callback_url": base_url, "process": "login"},
+                                        max_redirects=0)
+                                    loc = r.headers.get("location", "")
+                                    if loc and _OAUTH_NAV.search(loc) \
+                                            and urllib.parse.urlparse(loc).netloc.lower() not in ("", origin):
+                                        out.append(loc)
             finally:
                 with contextlib.suppress(Exception):
                     b.close()

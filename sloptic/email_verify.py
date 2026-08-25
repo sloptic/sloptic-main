@@ -336,8 +336,18 @@ def verify_email_flow(
                                  na_reason="could not submit a signup with a controlled address "
                                            "(no reachable signup form/API, or a CAPTCHA/SSO gate)")
     if reg.has_session:
-        return EmailVerifyResult(attempted=True, email_gated=False,
-                                 na_reason="signup established a session immediately (not email-gated)")
+        # A session at signup means ACCESS is NOT gated on email verification, so the lockout (qa-email-001) and
+        # inert-link (qa-email-002) failures these probes test cannot occur -- you are already in. Firing them here
+        # is a false positive: django-allauth's default logs you in AND sends a "confirm your email" mail, and its
+        # confirmation link (opened cold) verifies the address without minting a NEW session, which is correct, not
+        # broken. So this is N/A either way, never a penalty. Poll once (the eager prime usually has it waiting) so
+        # the reason can distinguish a genuine non-blocking confirmation email from no verification at all.
+        msg = receiver.poll(tag, unannounced_timeout)
+        return EmailVerifyResult(
+            attempted=True, email_gated=False, email_arrived=msg is not None, message=msg,
+            na_reason=("signup logs you in immediately AND sends a confirmation email -- non-blocking email "
+                       "verification, not the email-as-a-gate lockout these probes test") if msg is not None else
+                      "signup establishes a session immediately (not email-gated)")
     resent = first_leg_empty = False
     if reg.announces_email:
         first_leg = min(resend_at, announced_timeout)

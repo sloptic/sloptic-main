@@ -128,6 +128,17 @@ def test_flow_na_when_signup_logs_straight_in_not_email_gated():
     assert res.attempted is True and res.email_gated is False and "not email-gated" in res.na_reason
 
 
+def test_flow_na_when_session_at_signup_and_nonblocking_confirmation_email():
+    # django-allauth's default: a session at signup AND a "confirm your email" mail. ACCESS is not gated on
+    # verification (you are already in), so this must read N/A (email_gated False) and NEVER fire qa-email-001/002
+    # -- firing the lockout/inert-link penalties on a not-gated signup is a false positive. The poll still surfaces
+    # email_arrived so the reason can say a non-blocking confirmation mail was sent (what the user actually has).
+    msg = EmailMessage.parse("hl-tag@grader.test", "Confirm your email", "https://grader.test/verify?t=1")
+    res = _run(RegistrationOutcome(submitted=True, has_session=True, announces_email=False), arrived=msg)
+    assert res.email_gated is False and res.email_arrived is True
+    assert "non-blocking" in res.na_reason
+
+
 def test_flow_na_when_no_announcement_and_no_email_the_false_positive_guard():
     # a signup that just wants a SEPARATE login: no session, no confirm-email language, no mail. Must NOT read
     # as a lock-out. This is the single false positive the whole disambiguation exists to prevent.
