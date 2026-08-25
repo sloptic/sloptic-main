@@ -276,6 +276,20 @@ def _clear_bar(args) -> None:
         sys.stderr.flush()
 
 
+def _make_phase(args):
+    """An on_phase callback for run() (stderr, so --json/--failed on stdout stay clean). Surfaces the LONG,
+    otherwise-silent phases (crawl, Lighthouse) even in the DEFAULT view so a watched grade never looks frozen;
+    --verbose adds every phase boundary (surface summary, per-phase timings); --quiet shows none."""
+    if args.quiet:
+        return None
+
+    def cb(name, label, important):
+        if args.verbose or important:
+            sys.stderr.write(f"\r\033[K  · {label}\n")   # \r\033[K wipes any live bar first, then a clean line
+            sys.stderr.flush()
+    return cb
+
+
 # ---- entry point ----------------------------------------------------------------------------
 
 def main() -> None:
@@ -386,6 +400,7 @@ def main() -> None:
             _fail(args, "bad-arg", f"--header must be 'Name: Value', got: {h!r}")
         auth_headers[name.strip()] = value.strip()
     progress = _make_progress(args)
+    phase = _make_phase(args)
 
     if args.source and not pathlib.Path(args.source).exists():
         _fail(args, "bad-arg", f"--source path does not exist: {args.source}")
@@ -402,7 +417,7 @@ def main() -> None:
             report, age = hit
             sys.stderr.write(f"  ✓ cached grade ({runcache.human_age(age)} old) — --refresh to re-grade\n")
     if report is None:
-        report = _grade(args, source, catalog, render, auth_headers, progress)
+        report = _grade(args, source, catalog, render, auth_headers, progress, phase)
         if key:
             runcache.save(key, report, source)
     _clear_bar(args)
@@ -418,7 +433,7 @@ def _build_email_receiver(args):
     return HttpReceiver(domain=args.email_domain, endpoint=args.email_endpoint, token=args.email_token or "")
 
 
-def _grade(args, source, catalog, render, auth_headers, progress):
+def _grade(args, source, catalog, render, auth_headers, progress, phase=None):
     """Deploy the source (subprocess / remote URL / sandboxed submission) and run the battery, returning the
     Report. Deploy/build/health failure -> _fail (SystemExit). Factored out so main() can short-circuit to the
     run cache before this ever executes."""
@@ -431,14 +446,14 @@ def _grade(args, source, catalog, render, auth_headers, progress):
     # Trusted reference app: subprocess, no Docker.
     if args.app:
         return run(SubprocessDeployer(args.app), catalog, render=render, headers=auth_headers,
-                   on_progress=progress, source_dir=args.source, email_receiver=email_receiver,
+                   on_progress=progress, on_phase=phase, source_dir=args.source, email_receiver=email_receiver,
                    browser_register=browser_register, auth_crawl=auth_crawl)
 
     # Already-running URL: dogfooding, no Docker, no teardown of the target.
     if args.target:
         try:
             return run(RemoteDeployer(args.target), catalog, render=render, headers=auth_headers,
-                       on_progress=progress, source_dir=args.source, email_receiver=email_receiver,
+                       on_progress=progress, on_phase=phase, source_dir=args.source, email_receiver=email_receiver,
                        browser_register=browser_register, auth_crawl=auth_crawl)
         except _DEPLOY_FAILURES as e:
             _fail(args, "unreachable", str(e)[:500])
@@ -455,7 +470,7 @@ def _grade(args, source, catalog, render, auth_headers, progress):
             network=args.network if args.harden else None,
         )
         return run(deployer, catalog, render=render, headers=auth_headers, on_progress=progress,
-                   browser_register=browser_register, auth_crawl=auth_crawl,
+                   on_phase=phase, browser_register=browser_register, auth_crawl=auth_crawl,
                    source_dir=args.source or str(sub.context_dir),  # scan the submission's own source
                    email_receiver=email_receiver)
     except _DEPLOY_FAILURES as e:

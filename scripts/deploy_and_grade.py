@@ -865,6 +865,14 @@ def _build_email_receiver(cfg):
     return HttpReceiver(domain=domain, endpoint=endpoint, token=token or "")
 
 
+def _grade_phase_line(name, label, important):
+    """on_phase sink for a direct/standalone grade: surface the LONG, otherwise-silent phases -- chiefly the
+    ~2-3min Lighthouse trace -- so a watched run shows it's alive instead of looking frozen. Discovery already
+    prints its own banner just above, so skip that one here to avoid a duplicate line."""
+    if name in ("lighthouse", "lighthouse_done"):
+        print(f"  {label}", flush=True)
+
+
 def _grade_worker(url, use_browser, features, q, cached_profile=None, cache_key=None, repo_url=None,
                   proactive=False, model=DEFAULT_MODEL, browser_auth=False, session_headers=None,
                   llm_reasoning=False, recon=False, controlled_deploy=False, trace=False, login_creds=None,
@@ -897,7 +905,8 @@ def _grade_worker(url, use_browser, features, q, cached_profile=None, cache_key=
             print(f"  discovering surface ({_kinds}) — this runs before the first probe ...", flush=True)
         report = run(RemoteDeployer(url, health_timeout=20),
                      select_probes(load_catalog(str(_ROOT / "catalog")), probe_filter),
-                     render=render, on_progress=_grade_heartbeat, seed_features=features, headers=session_headers,
+                     render=render, on_progress=_grade_heartbeat, on_phase=_grade_phase_line,
+                     seed_features=features, headers=session_headers,
                      cached_profile=cached_profile, on_profile=on_profile, perceive=perceive,
                      browser_register=browser_register, recon=recon,
                      # authenticate the CRAWL (not just the probes): an SPA hides upload/item-CRUD behind login,
@@ -1296,12 +1305,13 @@ def main():
     ap.add_argument("--build-timeout", type=int, default=480, dest="build_timeout",
                     help="kill a docker build after N seconds (default 480). Lower = better batch "
                          "throughput but risks false-killing a genuinely heavy build; 300 is aggressive")
-    ap.add_argument("--grade-timeout", type=int, default=None, dest="grade_timeout",
+    ap.add_argument("--grade-timeout", type=int, default=600, dest="grade_timeout",
                     help="wall-clock cap (seconds) on the grading phase, externally enforced by killing the "
-                         "grade subprocess (even a Playwright CPU-spin, which a signal can't touch). Default "
-                         "NONE for a DIRECT run — you're watching it, so it runs to completion; Ctrl-C kills "
-                         "the child + its chrome cleanly. run_batch ALWAYS passes an explicit value, so a "
-                         "BATCH stays bounded — one pathological app can't stall an overnight run.")
+                         "grade subprocess + its process group (even a Playwright CPU-spin OR a wedged Lighthouse "
+                         "Chrome, which a signal / subprocess timeout can't reach). Default 600 so a DIRECT run "
+                         "can't hang indefinitely on the silent ~2-3min Lighthouse phase (productive apps p95 "
+                         "~510s, so 600 rarely false-kills). Pass 0 to disable the cap — watch it to completion, "
+                         "Ctrl-C kills the child + its chrome cleanly. run_batch passes its own value (480).")
     ap.add_argument("--clone-timeout", type=int, default=300, dest="clone_timeout",
                     help="git clone timeout in seconds (default 300; a timeout is recorded, not a crash)")
     ap.add_argument("--max-repo-mb", type=int, default=0, dest="max_repo_mb",
@@ -1490,7 +1500,8 @@ def main():
         _t = time.monotonic()
         try:
             report = grade(url, args.browser or args.recon or args.controlled_deploy,  # recon/controlled NEED the render
-                           timeout=args.grade_timeout,
+                           timeout=(args.grade_timeout or None),   # 0 -> None: no cap (watch a direct run to the end)
+
                            features=(plan.get("features") if plan else None),   # url-ingest has no plan
                            cached_profile=cached_profile,
                            cache_key=(None if args.no_cache else _sha), repo_url=args.repo,

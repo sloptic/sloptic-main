@@ -410,14 +410,25 @@ def _captured_session(ctx) -> dict | None:
 def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_progress=None,
         source_dir=None, seed_features=None, cached_profile=None, on_profile=None, perceive=None,
         browser_register=None, recon: bool = False, auth_crawl: bool = False, trace: bool = False,
-        login_creds=None, email_receiver=None) -> Report:
+        login_creds=None, email_receiver=None, on_phase=None) -> Report:
     """on_progress(done, total, probe, outcomes): called twice per probe — before it runs with
     outcomes=None (so a caller can show what's currently testing), and after with its outcomes.
 
     cached_profile: a FROZEN discovered surface (the per-commit cache, build 1b) reused VERBATIM instead
     of crawling — only its base_url is re-bound to this deployment. on_profile(profile): called once with
     a freshly-discovered surface (cache MISS) so the caller can persist it. Mutually exclusive: a HIT
-    skips discovery entirely (no crawl, no browser, no on_profile); a MISS discovers then hands it back."""
+    skips discovery entirely (no crawl, no browser, no on_profile); a MISS discovers then hands it back.
+
+    on_phase(name, label, important): OPTIONAL phase-boundary hook (crawl / lighthouse / probes). important=True
+    flags a LONG, otherwise-silent phase a watched grade should see even when not verbose (chiefly the ~2-3min
+    Lighthouse trace). Formatting + verbosity are the caller's; best-effort — a callback error never touches the
+    grade."""
+    def _phase(name, label, important=False):
+        if on_phase:
+            try:
+                on_phase(name, label, important)
+            except Exception:
+                pass
     try:
         handle = deployer.deploy()  # inside try so teardown runs even if deploy/health fails
         # --login: authenticate with team-provided demo/test creds BEFORE the crawl, so BOTH discovery and the
@@ -438,9 +449,17 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
             # Skips the crawl + interaction clicking entirely -> their timing non-determinism leaves the score.
             profile = replace(cached_profile, base_url=handle.base_url)
         else:
+            _phase("discover", "crawling the surface"
+                   + (" (browser render)" if render else "")
+                   + (" + auth register" if auth_crawl else "") + " ...", important=bool(render))
+            _t_disc = time.monotonic()
             profile = discover(handle.base_url, render=render, headers=headers, seed_features=seed_features,
                                perceive=perceive, auth_crawl=auth_crawl, browser_register=browser_register,
                                crawl_session_sink=crawl_session_sink)
+            _phase("discovered", f"surface: {len(profile.routes)} routes, {len(profile.forms)} forms, "
+                   f"{len(profile.endpoints)} endpoints"
+                   + (", auth entrypoint" if profile.capabilities.get("has_auth_entrypoint") else "")
+                   + f", render={profile.render_state or 'n/a'}  ({time.monotonic() - _t_disc:.0f}s)")
             if on_profile is not None:
                 on_profile(profile)   # cache MISS -> hand the freshly-minted canonical surface to the caller
         if recon:   # deploy -> discover(render + classify) -> STOP, skipping the probe gauntlet. Recon only needs
@@ -502,12 +521,23 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
             # ctx.lighthouse stays None -> those probes read N/A, never DNF the grade. Grade the LANDING page (a
             # sub-path deploy's real app), not the bare origin. Sets the `lighthouse` capability so the YAMLs gate.
             if _needs_lighthouse(catalog):
+                _phase("lighthouse",
+                       f"running Lighthouse perf trace ({lighthouse.DEFAULT_RUNS} run(s), up to ~2-3 min) ...",
+                       important=True)
+                _t_lh = time.monotonic()
                 try:
                     with _lighthouse_lock():   # host-wide: one Chrome perf trace at a time under --concurrency
                         ctx.lighthouse = lighthouse.measure(origin.rstrip("/") + (profile.landing_path or "/"))
                     profile.capabilities["lighthouse"] = True
-                except lighthouse.PSIError:
-                    pass
+                    _lh_sc = lighthouse.perf_score(ctx.lighthouse)
+                    _phase("lighthouse_done",
+                           (f"Lighthouse perf score {_lh_sc:.2f}" if _lh_sc is not None
+                            else "Lighthouse done, no score")
+                           + f"  ({time.monotonic() - _t_lh:.0f}s)")
+                except lighthouse.PSIError as e:
+                    _phase("lighthouse_done",
+                           f"Lighthouse unavailable ({time.monotonic() - _t_lh:.0f}s): {str(e)[:70]}")
+            _phase("probes", f"running {total} probes ...")
             # Run low-volume probes FIRST, the high-volume injection/stress tail LAST: on an adaptive-WAF host a
             # challenge then trips late (during the tail), so the recovery keeps the already-collected outcomes
             # (it scores only PRE-onset). Stable sort -> catalog order preserved within each tier; a completed
