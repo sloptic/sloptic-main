@@ -215,7 +215,16 @@ _MAX_REVEALED = 120   # bound the appended fragment: with a[href] in the harvest
 #                       otherwise paste hundreds of elements onto every route's dom
 
 
-def _reveal_hidden_controls(page, max_clicks: int = 6, per_wait_ms: int = 350) -> str:
+# Bound the DOM harvest IN JS so a pathological page (thousands of nested controls) can't return a multi-MB
+# payload whose Python-side DESERIALIZE holds the GIL -- which stalls the whole grade past the timeout AND
+# blocks the (thread-based) hang-watchdog from ever firing (measured on foodbridge.me: render wedged >900s while
+# the watchdog Timer never ran). Slice the element count and truncate each outerHTML; near-lossless for real apps.
+_CONTROLS_JS = "els => els.slice(0, 400).map(e => (e.outerHTML || '').slice(0, 4000))"
+_TRIGGER_CAP = 150   # examine at most this many reveal candidates -- inner_text()/evaluate() per element is a
+#                      round trip, so an unbounded trigger set on a huge DOM is itself minutes of wall clock
+
+
+def _reveal_hidden_controls(page, max_clicks: int = 6, per_wait_ms: int = 350, deadline: float | None = None) -> str:
     """Click reveal-intent controls (login / upload / menu triggers) to surface INTERACTION-GATED forms
     and inputs a static render misses, and return the revealed <form>/modal HTML (appended to the route's
     dom for discovery to scan). Reveal-ONLY: never clicks a submit / pay / delete / logout / external
@@ -229,14 +238,15 @@ def _reveal_hidden_controls(page, max_clicks: int = 6, per_wait_ms: int = 350) -
     # no target and reports clean. Route discovery gates chunk discovery gates endpoint discovery.
     _controls = "input, textarea, select, form, a[href]"
     with contextlib.suppress(Exception):   # baseline: controls already present -> append only NEWLY revealed
-        for h in (page.eval_on_selector_all(_controls, "els => els.map(e => e.outerHTML)") or []):
+        for h in (page.eval_on_selector_all(_controls, _CONTROLS_JS) or []):
             seen.add(h[:160])
     triggers = []
     with contextlib.suppress(Exception):
-        triggers = page.query_selector_all("button, a, [role=button], [role=tab], summary, [onclick]")
+        triggers = page.query_selector_all("button, a, [role=button], [role=tab], summary, [onclick]")[:_TRIGGER_CAP]
     for el in triggers:
-        if clicked >= max_clicks:
-            break
+        if clicked >= max_clicks or (deadline is not None and time.monotonic() > deadline):
+            break                          # wall-clock deadline is GIL-cooperative (checked between elements),
+            #                                the one guard that works when a thread-watchdog can't (GIL held)
         try:
             label = ((el.inner_text() or "") + " " + (el.get_attribute("aria-label") or "")).strip().lower()[:80]
         except Exception:
@@ -256,7 +266,7 @@ def _reveal_hidden_controls(page, max_clicks: int = 6, per_wait_ms: int = 350) -
         except Exception:
             continue
         with contextlib.suppress(Exception):   # controls that APPEARED since baseline (a revealed login/upload)
-            for frag in (page.eval_on_selector_all(_controls, "els => els.map(e => e.outerHTML)") or []):
+            for frag in (page.eval_on_selector_all(_controls, _CONTROLS_JS) or []):
                 key = frag[:160]
                 if key not in seen and len(revealed) < _MAX_REVEALED:
                     seen.add(key)
@@ -270,7 +280,7 @@ def _reveal_hidden_controls(page, max_clicks: int = 6, per_wait_ms: int = 350) -
 _DRIVE_ROUTES = 3   # drive actions on only the first few routes (submit+wait is costly + mutates) -> grade budget
 
 
-def _drive_actions(page, max_actions: int = 5, per_wait_ms: int = 450) -> None:
+def _drive_actions(page, max_actions: int = 5, per_wait_ms: int = 450, deadline: float | None = None) -> None:
     """ACT on the page — fill visible forms with benign values and submit them, and click NON-destructive
     action buttons — so the app FIRES its OWN business API calls, which the net_sink harvest turns into real
     endpoints. This surfaces the INTERACTION-GATED runtime surface (a chat submit -> /api/chat) that no static
@@ -280,8 +290,8 @@ def _drive_actions(page, max_actions: int = 5, per_wait_ms: int = 450) -> None:
     (they submit discovered forms). Best-effort + isolated (suppress) so one hostile control never breaks the render."""
     acted = 0
     with contextlib.suppress(Exception):                     # 1. real <form>s: fill benign values + submit
-        for form in page.query_selector_all("form"):
-            if acted >= max_actions:
+        for form in page.query_selector_all("form")[:_TRIGGER_CAP]:
+            if acted >= max_actions or (deadline is not None and time.monotonic() > deadline):
                 break
             with contextlib.suppress(Exception):
                 if not form.is_visible() or _NO_CLICK.search((form.inner_text() or "")[:200]):
@@ -295,8 +305,8 @@ def _drive_actions(page, max_actions: int = 5, per_wait_ms: int = 450) -> None:
                 page.wait_for_timeout(per_wait_ms)           # let the fetch land so net_sink captures it
                 acted += 1
     with contextlib.suppress(Exception):                     # 2. action BUTTONS (SPA onclick->fetch, not a <form>)
-        for btn in page.query_selector_all("button, [role=button]"):
-            if acted >= max_actions:
+        for btn in page.query_selector_all("button, [role=button]")[:_TRIGGER_CAP]:
+            if acted >= max_actions or (deadline is not None and time.monotonic() > deadline):
                 break
             with contextlib.suppress(Exception):
                 lbl = ((btn.inner_text() or "") + " " + (btn.get_attribute("aria-label") or "")).strip().lower()[:80]
@@ -431,9 +441,9 @@ def render_routes(base_url: str, paths, headers=None, timeout: float = 12.0,
                             page.wait_for_timeout(300)  # let client JS paint the route's forms/inputs
                         dom = page.content()
                         if interact and idx < interact_routes:  # bound: reveal-clicking every route on a big
-                            dom += _reveal_hidden_controls(page)  # SPA is the grade-timeout — cap to the first N
+                            dom += _reveal_hidden_controls(page, deadline=deadline)  # SPA is the grade-timeout
                             if net_sink is not None and idx < _DRIVE_ROUTES:   # then ACT (submit/click) to fire
-                                _drive_actions(page)                            # the app's business API calls
+                                _drive_actions(page, deadline=deadline)         # the app's business API calls
                         out[path] = dom
             finally:
                 b.close()

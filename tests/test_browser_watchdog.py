@@ -76,3 +76,16 @@ def test_browser_guarded_decorator_kills_a_wedged_lane(monkeypatch):
         if p.poll() is None:
             p.kill()
         p.wait()
+
+
+def test_reveal_hidden_controls_breaks_on_a_passed_deadline():
+    # the GIL-cooperative guard: a wall-clock deadline checked BETWEEN elements exits the reveal loop even when a
+    # thread-watchdog can't fire (GIL held by a huge DOM deserialize). A past deadline -> break before any element.
+    class _P:
+        def eval_on_selector_all(self, sel, js):
+            return []                                    # no baseline controls
+
+        def query_selector_all(self, sel):
+            return [object(), object(), object()]        # non-empty triggers; must NOT be touched
+    out = browser._reveal_hidden_controls(_P(), deadline=time.monotonic() - 1)
+    assert out == ""                                     # broke immediately, clicked nothing
