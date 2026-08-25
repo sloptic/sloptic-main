@@ -1360,7 +1360,7 @@ def register_in_browser(base_url: str, headers=None, timeout: float = 12.0, tota
     import secrets
     uname = "hl_" + secrets.token_hex(5)
     creds = {"email": email or (uname + "@example.com"), "username": uname, "password": "Hl-Probe-Passw0rd!"}
-    captured, seen_bearer, reads, out = {}, {}, [], None
+    captured, seen_bearer, reads, out, signup_resp = {}, {}, [], None, {}
     LAST_STAGE.clear()
     try:
         with sync_playwright() as pw:
@@ -1386,6 +1386,14 @@ def register_in_browser(base_url: str, headers=None, timeout: float = 12.0, tota
                             if not any(r["url"] == req.url for r in reads):
                                 reads.append({"url": req.url, "apikey": apikey})
                 page.on("request", _on_request)
+
+                def _on_response(resp):   # the signup RESPONSE body -> lets the caller detect a verification
+                    with contextlib.suppress(Exception):   # 'promise' (announce language, or allauth's JSON
+                        rq = resp.request                  # `verify_email is_pending`) even when a session is granted
+                        if rq.method in ("POST", "PUT") and creds["password"] in (rq.post_data or "") \
+                                and "body" not in signup_resp:
+                            signup_resp["body"] = (resp.text() or "")[:2000]
+                page.on("response", _on_response)
 
                 if not _reach_and_submit_signup(page, base_url, creds, timeout, total_timeout):
                     # LANE B: EMAIL-FIRST wizard (email + emailed code, password on a later step) when we have an
@@ -1430,11 +1438,12 @@ def register_in_browser(base_url: str, headers=None, timeout: float = 12.0, tota
                         with contextlib.suppress(Exception):
                             page_text = (page.inner_text("body") or "")[:5000]
                         return {"email_pending": True, "creds": creds, "cookies": jar, "page_text": page_text,
-                                "request": captured or None, "backend_reads": reads}
+                                "request": captured or None, "backend_reads": reads,
+                                "signup_response": signup_resp.get("body", "")}
                     return None
                 out = {"creds": creds, "cookies": jar, "request": captured or None,
                        "bearer": bearer, "storage_exposed": bool(stored.get("token")),
-                       "backend_reads": reads}
+                       "backend_reads": reads, "signup_response": signup_resp.get("body", "")}
             finally:
                 b.close()
     except Exception as exc:

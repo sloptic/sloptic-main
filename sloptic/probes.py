@@ -6928,10 +6928,13 @@ def _email_register_once(ctx, suffix=""):
             live["lane"] = "browser"
             return _done(email_verify.RegistrationOutcome(
                 submitted=True, has_session=False,
-                announces_email=email_verify.announces_pending_email(bres.get("page_text") or ""), handle=None))
-        if bres.get("cookies") or bres.get("bearer"):            # the SPA logged us in at once -> not email-gated
+                announces_email=email_verify.signals_email_verification(
+                    (bres.get("signup_response") or "") + " " + (bres.get("page_text") or "")), handle=None))
+        if bres.get("cookies") or bres.get("bearer"):            # the SPA logged us in at once -> session at signup
             live.update(lane="browser_session", browser_session=bres)
-            return _done(email_verify.RegistrationOutcome(submitted=True, has_session=True, handle=None))
+            return _done(email_verify.RegistrationOutcome(
+                submitted=True, has_session=True, handle=None,
+                announces_email=email_verify.signals_email_verification(bres.get("signup_response") or "")))
     # 3) BaaS lane (Supabase gateway): confirmation ON -> accepts the signup, withholds a session, mails a confirm link
     gw = _baas_gateway(ctx)
     if gw is not None:
@@ -7121,15 +7124,27 @@ def _rebuild_account(base_url, sess) -> "auth.Account":
 
 def email_never_arrives(ctx, probe) -> bool | None:
     """qa-email-001: the email-verification signup flow is unreliable, on an evidence ladder (functional-
-    suitability, SCORING_V2_SPEC): no email within 60s even after a resend -> locked out (72); email only after
-    the 30s checkpoint -> unreliable send (24); a working-but-no-resend-control signup -> a resilience gap (5)."""
+    suitability, SCORING_V2_SPEC): no email within 60s even after a resend -> locked out (72); a NON-BLOCKING
+    signup that promises a confirmation email that never arrives -> dead verification (36); email only after the
+    30s checkpoint -> unreliable send (24); a working-but-no-resend-control signup -> a resilience gap (5)."""
     res = _email_verify_result(ctx)
-    if not res.attempted or not res.email_gated:
+    nonblocking_promise = res.session_at_signup and res.announces_email
+    if not res.attempted or not (res.email_gated or nonblocking_promise):
         ctx.evidence["na_reason"] = res.na_reason or "signup is not email-verification-gated"
         return None
-    ctx.evidence["email_gated"] = True
     if res.message is not None:
         ctx.evidence["subject"] = (res.message.subject or "")[:120]
+    if nonblocking_promise:
+        # NON-BLOCKING verification (a session was granted at signup): access is not gated, so a late email or a
+        # missing resend control is NOT a failure here -- only a BROKEN PROMISE fires: the signup committed to a
+        # confirmation email that never arrives. One rung BELOW a lockout (the user is duped for a time but can
+        # still use the app), scored via the verification_dead_nonblocking escalator (36).
+        if not res.email_arrived:
+            ctx.evidence["verification_dead_nonblocking"] = True    # escalator -> 36
+            ctx.evidence["detail"] = res.detail
+            return True
+        return False                                                # promised AND delivered -> a working flow
+    ctx.evidence["email_gated"] = True
     if not res.email_arrived:
         ctx.evidence["no_email_60s"] = True            # escalator -> 72
         ctx.evidence["detail"] = res.detail

@@ -91,6 +91,19 @@ def announces_pending_email(response_body: str) -> bool:
     return bool(_ANNOUNCE_RE.search(response_body or ""))
 
 
+# A MACHINE-readable pending-verification signal, for stacks whose signup response is JSON, not human prose:
+# django-allauth headless returns a flow `{"id":"verify_email","is_pending":true}`. Same meaning as the announce
+# language above (a confirmation is owed), just in a shape announces_pending_email's prose regex can't see.
+_VERIFY_PENDING_JSON = re.compile(r'verify[_-]?email.{0,40}?is[_-]?pending["\s:]*true', re.I | re.S)
+
+
+def signals_email_verification(response_body: str) -> bool:
+    """The signup response indicates a confirmation email is owed -- human announce language ('check your email to
+    confirm') OR a machine flag (allauth's `verify_email is_pending: true`). This is the intent-INDEPENDENT
+    'promise' the app made: whether it kept it (the mail arrives) is then observable, no design judgement needed."""
+    return announces_pending_email(response_body) or bool(_VERIFY_PENDING_JSON.search(response_body or ""))
+
+
 # --- receivers ---------------------------------------------------------------------------------------------
 
 class EmailReceiver(abc.ABC):
@@ -241,6 +254,9 @@ class EmailVerifyResult:
     twice would double the mutation and the wait."""
     attempted: bool                     # a signup with our address was submitted
     email_gated: bool = False           # signup is waiting on email verification (announced, or an email arrived)
+    session_at_signup: bool = False     # signup logged us in immediately -> NOT gated (access does not wait on email)
+    announces_email: bool = False       # the signup promised a confirmation email (announce language or an allauth
+    #                                     `verify_email is_pending` response) -- the intent-independent 'promise'
     email_arrived: bool = False
     first_leg_empty: bool = False       # no email by the resend_at checkpoint (even if it arrived later) -> slow send
     has_resend_control: bool = False    # the confirm page offers a 'resend' option
@@ -336,18 +352,27 @@ def verify_email_flow(
                                  na_reason="could not submit a signup with a controlled address "
                                            "(no reachable signup form/API, or a CAPTCHA/SSO gate)")
     if reg.has_session:
-        # A session at signup means ACCESS is NOT gated on email verification, so the lockout (qa-email-001) and
-        # inert-link (qa-email-002) failures these probes test cannot occur -- you are already in. Firing them here
-        # is a false positive: django-allauth's default logs you in AND sends a "confirm your email" mail, and its
-        # confirmation link (opened cold) verifies the address without minting a NEW session, which is correct, not
-        # broken. So this is N/A either way, never a penalty. Poll once (the eager prime usually has it waiting) so
-        # the reason can distinguish a genuine non-blocking confirmation email from no verification at all.
+        # A session at signup means ACCESS is not gated on email verification, so the gated ladder's lockout and
+        # inert-link (qa-email-002) failures cannot occur -- you are already in -- and firing them here would be a
+        # false positive (allauth's confirmation link, opened cold, verifies the address without minting a NEW
+        # session, which is correct, not broken). But a non-blocking flow can still BREAK ITS OWN PROMISE: if the
+        # signup committed to a confirmation email (announce language, or an allauth `verify_email is_pending`
+        # response) and none arrives, the user hunts a nonexistent mail and reasonably concludes the app is broken
+        # -> the qa-email-001 `verification_dead_nonblocking` rung (one below a lockout; graded via session_at_signup
+        # so the severity stays 36, not 72). No promise (and no mail) -> nothing was owed -> N/A.
         msg = receiver.poll(tag, unannounced_timeout)
+        promised = reg.announces_email or msg is not None   # announced verification, OR a confirmation actually came
+        if not promised:
+            return EmailVerifyResult(attempted=True, email_gated=False, session_at_signup=True,
+                                     na_reason="signup establishes a session immediately (not email-gated)")
         return EmailVerifyResult(
-            attempted=True, email_gated=False, email_arrived=msg is not None, message=msg,
-            na_reason=("signup logs you in immediately AND sends a confirmation email -- non-blocking email "
-                       "verification, not the email-as-a-gate lockout these probes test") if msg is not None else
-                      "signup establishes a session immediately (not email-gated)")
+            attempted=True, email_gated=False, session_at_signup=True, announces_email=True,
+            email_arrived=msg is not None, message=msg,
+            na_reason=("signup logs you in immediately AND delivers its confirmation email -- non-blocking email "
+                       "verification, working") if msg is not None else "",
+            detail=("" if msg is not None else
+                    "signup promised email verification (a confirmation email) but none arrived -- the user hunts a "
+                    "nonexistent mail and assumes the app is broken"))
     resent = first_leg_empty = False
     if reg.announces_email:
         first_leg = min(resend_at, announced_timeout)

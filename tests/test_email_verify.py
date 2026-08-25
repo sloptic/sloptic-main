@@ -8,7 +8,7 @@ import httpx
 
 from sloptic.email_verify import (
     EmailMessage, EmailReceiver, EmailVerifyResult, HttpReceiver, MailHogReceiver, MockReceiver,
-    RegistrationOutcome, Verification, announces_pending_email, verify_email_flow)
+    RegistrationOutcome, Verification, announces_pending_email, signals_email_verification, verify_email_flow)
 
 
 # ---- parsing ----------------------------------------------------------------------------------------------
@@ -43,6 +43,14 @@ def test_announces_pending_email_matches_confirmation_language_only():
     assert announces_pending_email("A confirmation email is on its way to your inbox.")
     assert not announces_pending_email("Welcome! You are now logged in.")
     assert not announces_pending_email("Update your email address in settings.")   # 'email' alone is not enough
+
+
+def test_signals_email_verification_catches_prose_and_allauth_pending_json():
+    # the 'promise' signal: human announce language OR a machine flag (allauth's verify_email is_pending)
+    assert signals_email_verification("Please check your email to confirm your account.")
+    assert signals_email_verification('{"data":{"flows":[{"id":"verify_email","is_pending":true}]}}')
+    assert not signals_email_verification('{"status":200,"data":{"user":{"id":1}},"meta":{"is_authenticated":true}}')
+    assert not signals_email_verification("")
 
 
 # ---- MockReceiver -----------------------------------------------------------------------------------------
@@ -128,15 +136,24 @@ def test_flow_na_when_signup_logs_straight_in_not_email_gated():
     assert res.attempted is True and res.email_gated is False and "not email-gated" in res.na_reason
 
 
-def test_flow_na_when_session_at_signup_and_nonblocking_confirmation_email():
-    # django-allauth's default: a session at signup AND a "confirm your email" mail. ACCESS is not gated on
-    # verification (you are already in), so this must read N/A (email_gated False) and NEVER fire qa-email-001/002
-    # -- firing the lockout/inert-link penalties on a not-gated signup is a false positive. The poll still surfaces
-    # email_arrived so the reason can say a non-blocking confirmation mail was sent (what the user actually has).
+def test_flow_nonblocking_promise_delivered_is_clean_not_a_penalty():
+    # session at signup + a confirmation email that ARRIVES: non-blocking verification that works. Must NOT fire
+    # the gated lockout/inert-link penalties (email_gated False); a delivered mail is itself the promise.
     msg = EmailMessage.parse("hl-tag@grader.test", "Confirm your email", "https://grader.test/verify?t=1")
     res = _run(RegistrationOutcome(submitted=True, has_session=True, announces_email=False), arrived=msg)
-    assert res.email_gated is False and res.email_arrived is True
+    assert res.email_gated is False and res.session_at_signup is True
+    assert res.announces_email is True and res.email_arrived is True
     assert "non-blocking" in res.na_reason
+
+
+def test_flow_nonblocking_promise_broken_no_email_fires_dead_verification():
+    # session at signup + the signup ANNOUNCED a confirmation email, but none arrives: not a lockout (you are in),
+    # but a broken promise -> the qa-email-001 verification_dead_nonblocking rung (36). Intent-independent -- the
+    # promise is the app's own announcement, its non-arrival is observable, no design judgement.
+    res = _run(RegistrationOutcome(submitted=True, has_session=True, announces_email=True), arrived=None)
+    assert res.email_gated is False and res.session_at_signup is True
+    assert res.announces_email is True and res.email_arrived is False
+    assert res.detail                                     # the "hunts a nonexistent mail" broken-promise detail is set
 
 
 def test_flow_na_when_no_announcement_and_no_email_the_false_positive_guard():

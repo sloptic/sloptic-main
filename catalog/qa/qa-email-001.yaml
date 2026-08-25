@@ -3,10 +3,12 @@ bundle: qa
 category: email-verification
 pool: public
 evidence_model: provable
-# REPORT_ONLY in v1 (the predicate forces off-score) until the corpus admission-test validates the family; the
-# severity below is what it takes once promoted. An EVIDENCE LADDER on the reliability of the signup email flow
-# (functional-suitability, Nielsen 4 -- account creation is a core feature many others depend on):
+# An EVIDENCE LADDER on the reliability of the signup email flow (functional-suitability, Nielsen 4 -- account
+# creation is a core feature many others depend on):
 #   72  no email within 60s even after a resend -> the user is locked out (the catastrophe)
+#   36  a NON-BLOCKING signup (logs you in at once) that PROMISES a confirmation email which never arrives -> the
+#       verification is dead: the user hunts a nonexistent mail and (falsely) concludes the app is broken. Not a
+#       lockout -- they can still use the app -- but they were duped for a time, which is also unacceptable.
 #   24  email arrived only after the 30s checkpoint (late / only after resend) -> an unreliable send
 #    5  a working signup that offers NO resend control -> a resilience gap (a good app lets you re-request)
 severity:
@@ -16,14 +18,19 @@ severity:
   default: 5
   escalators:
     - {evidence: email_late_30s, point: 24, vrt_variant: "email missed the 30s checkpoint (late / only after resend) -- unreliable send"}
+    - {evidence: verification_dead_nonblocking, point: 36, vrt_variant: "signup logs the user in immediately but the confirmation email it promised never arrives -- non-blocking verification that silently fails; the user hunts a nonexistent mail and assumes the app is broken"}
     - {evidence: no_email_60s, point: 72, vrt_variant: "no email within 60s even after a resend -> locked out"}
 applicability:
   requires: [has_auth_entrypoint]
 probe:
   predicate: email_never_arrives
 tp_definition: |
-  TP: an email-verification-gated signup whose flow is unreliable -- no email in 60s even after clicking resend
-  (locked out), OR the email only arrived after the 30s mark (unreliable send), OR a working signup that offers
-  no way to resend the confirmation (a resilience gap; users are expected to get several chances).
-  NOT (confounders): signup is not email-gated (logs in immediately, or wants a separate login with no
-  confirm-email language and no mail) -> N/A; a CAPTCHA/SSO blocks registration -> N/A.
+  TP: an email-verification signup whose flow is unreliable. Either -- email-GATED (no session until verified) --
+  no email in 60s even after clicking resend (locked out), OR the email only arrived after the 30s mark
+  (unreliable send), OR a working signup that offers no way to resend (a resilience gap); OR -- NON-BLOCKING (a
+  session IS granted at signup) -- the signup PROMISES a confirmation email (announce language, or an allauth
+  `verify_email is_pending` response) that never arrives, so verification is dead and the user chases a
+  nonexistent mail.
+  NOT (confounders): signup logs you in immediately AND neither promised nor delivered a confirmation email (a
+  plain no-verification signup) -> N/A; a signup that wants a separate login with no confirm-email language and no
+  mail -> N/A; a CAPTCHA/SSO blocks registration -> N/A.
