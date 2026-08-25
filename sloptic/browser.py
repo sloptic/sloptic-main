@@ -748,6 +748,26 @@ _SIGNUP_ROUTES = ("/register", "/signup", "/sign-up", "/join", "/auth/register",
 _SIGNUP_LINK = re.compile(r"sign[ _-]?up|regist|create[ _-]?account|get[ _-]?started|\bjoin\b", re.I)
 
 
+# A JS-router signup CTA: a <button>/[role=button] whose onClick pushes the signup route (no <a href>, so
+# _signup_hrefs can't see it). Narrower than _SIGNUP_SUBMIT (no bare continue/submit/create -- those match
+# random CTAs); it must name signup/register/join so clicking it navigates to the signup, never submits a login.
+_SIGNUP_TRIGGER = re.compile(r"sign ?up|register|create (?:your )?account|get started|join now|\bjoin\b", re.I)
+
+
+def _first_signup_trigger(page):
+    """The first visible JS-router signup CTA that is NOT an <a href> (those are _signup_hrefs' job). Element
+    handle or None; clicking it should navigate to the client-rendered signup view a route-guess/href walk misses."""
+    with contextlib.suppress(Exception):
+        for el in page.query_selector_all("button, [role='button'], [onclick]"):
+            with contextlib.suppress(Exception):
+                if not el.is_visible() or el.get_attribute("href"):
+                    continue
+                lbl = ((el.inner_text() or "") + " " + (el.get_attribute("aria-label") or "")).strip().lower()[:60]
+                if _SIGNUP_TRIGGER.search(lbl) and not _NO_CLICK.search(lbl):
+                    return el
+    return None
+
+
 def _signup_hrefs(page, base_url: str) -> list[str]:
     """Signup destinations the APP ITSELF advertises, resolved and same-origin only.
 
@@ -845,6 +865,19 @@ def _reach_and_submit_signup(page, base_url, creds, timeout, total_timeout: floa
             _reveal_hidden_controls(page, deadline=deadline)
             if _fill_and_submit_signup(page, creds):
                 return True
+    # JS-ROUTER signup CTA: a 'Sign up' <button> (onClick router push, no <a href>) is invisible to the href
+    # walk above -- click it to reach the client-rendered signup view, then reveal + fill. Guarded: the fill only
+    # proceeds if a password field actually appears, so a mis-click never submits a login. Measured: the residual
+    # auth-blocked apps that read 'no visible password field reached' on route-router SPAs.
+    if time.monotonic() < deadline:
+        trig = _first_signup_trigger(page)
+        if trig is not None:
+            with contextlib.suppress(Exception):
+                trig.click(timeout=2500)
+                page.wait_for_timeout(500)
+                _reveal_hidden_controls(page, deadline=deadline)
+                if _fill_and_submit_signup(page, creds):
+                    return True
     # GUESSED-ROUTE FISHING: 8 conventional /signup paths. Worth it only when the app SHOWS a self-serve auth
     # surface; on a no-auth page these 8 navigations are pure WAF antagonism (~zero yield -- a real signup is
     # linked, tried above) and were a chunk of the per-app-block trigger. Skip them when there's no auth tell.
