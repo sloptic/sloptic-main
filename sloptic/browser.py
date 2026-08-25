@@ -231,6 +231,20 @@ def _reveal_hidden_controls(page, max_clicks: int = 6, per_wait_ms: int = 350, d
     control (_NO_CLICK), so it opens UI without acting on the app; bounded by max_clicks + an Escape reset
     between clicks so one page can't loop or drift far from its initial state."""
     revealed, seen, clicked = [], set(), 0
+    # Bound EVERY element op (inner_text/evaluate/click/fill) to a few seconds: on a wedged renderer a single
+    # el.inner_text() blocks the Playwright DEFAULT (~30s), and the deadline check between elements can't interrupt
+    # a call stuck INSIDE it -- measured as the residual 900s discover-phase runaways (one 29s inner_text per app).
+    # Restored to the default in the finally so the rest of the lane's ops are unaffected.
+    with contextlib.suppress(Exception):
+        page.set_default_timeout(2500)
+    try:
+        return _reveal_hidden_controls_inner(page, max_clicks, per_wait_ms, deadline, revealed, seen, clicked)
+    finally:
+        with contextlib.suppress(Exception):
+            page.set_default_timeout(30000)
+
+
+def _reveal_hidden_controls_inner(page, max_clicks, per_wait_ms, deadline, revealed, seen, clicked) -> str:
     # `a[href]` is here for a reason worth spelling out: harvesting only form controls made this pass blind to
     # interaction-gated ROUTES. Measured on OopsSec, clicking the account menu reveals <a href="/wishlists">
     # and <a href="/cart"> — live 200 pages — and dropping them broke the whole chain downstream: no route
@@ -796,15 +810,19 @@ def _page_has_auth_entrypoint(page) -> bool:
     return False
 
 
-def _reach_and_submit_signup(page, base_url, creds, timeout) -> bool:
+def _reach_and_submit_signup(page, base_url, creds, timeout, total_timeout: float = 45.0) -> bool:
     """Get to a fillable signup and submit it. The homepage (reveal an inline modal) first; if the signup lives
     on its OWN route — a 'Get Started' <a> link the reveal can't open — walk conventional signup paths and try
-    each. True once a signup form was filled + submitted (the app's own JS then makes the real request)."""
+    each. True once a signup form was filled + submitted (the app's own JS then makes the real request).
+    Wall-clock bounded by `deadline`: the ~10-nav walk x an unbounded reveal per nav could otherwise run to the
+    900s grade kill on a slow app (measured: the 6 residual discover-phase runaways), and a thread-watchdog can't
+    interrupt a GIL-holding step -- so the deadline is checked BETWEEN navs and threaded into each reveal."""
+    deadline = time.monotonic() + total_timeout
     homepage_has_auth = False
     with contextlib.suppress(Exception):
         page.goto(base_url.rstrip("/") + "/", timeout=timeout * 1000, wait_until="load")
         page.wait_for_timeout(300)
-        _reveal_hidden_controls(page)
+        _reveal_hidden_controls(page, deadline=deadline)
         homepage_has_auth = _page_has_auth_entrypoint(page)   # gate the guessed-route fishing below
         # The homepage is the one place we have no route-name evidence, so require the form to LOOK like a
         # signup. Without this an app whose landing page is a login gets its login submitted and the walk to
@@ -815,6 +833,8 @@ def _reach_and_submit_signup(page, base_url, creds, timeout) -> bool:
     # a goto may not re-trigger from the same document, so click those instead; anything with a path or query
     # is navigable. High signal + low antagonism -> always tried, even on a page with no other auth tell.
     for href in _signup_hrefs(page, base_url):
+        if time.monotonic() > deadline:
+            return False
         with contextlib.suppress(Exception):
             if "#" in href and href.split("#", 1)[0].rstrip("/") in (page.url or "").rstrip("/"):
                 frag = "#" + href.split("#", 1)[1]
@@ -822,7 +842,7 @@ def _reach_and_submit_signup(page, base_url, creds, timeout) -> bool:
             else:
                 page.goto(href, timeout=timeout * 1000, wait_until="load")
             page.wait_for_timeout(400)
-            _reveal_hidden_controls(page)
+            _reveal_hidden_controls(page, deadline=deadline)
             if _fill_and_submit_signup(page, creds):
                 return True
     # GUESSED-ROUTE FISHING: 8 conventional /signup paths. Worth it only when the app SHOWS a self-serve auth
@@ -831,10 +851,12 @@ def _reach_and_submit_signup(page, base_url, creds, timeout) -> bool:
     if not homepage_has_auth:
         return False
     for route in _SIGNUP_ROUTES:
+        if time.monotonic() > deadline:
+            break
         with contextlib.suppress(Exception):
             page.goto(base_url.rstrip("/") + route, timeout=timeout * 1000, wait_until="load")
             page.wait_for_timeout(400)
-            _reveal_hidden_controls(page)
+            _reveal_hidden_controls(page, deadline=deadline)
             if _fill_and_submit_signup(page, creds):
                 return True
     return False
@@ -1290,7 +1312,7 @@ def register_in_browser(base_url: str, headers=None, timeout: float = 12.0, tota
                                 reads.append({"url": req.url, "apikey": apikey})
                 page.on("request", _on_request)
 
-                if not _reach_and_submit_signup(page, base_url, creds, timeout):
+                if not _reach_and_submit_signup(page, base_url, creds, timeout, total_timeout):
                     # LANE B: EMAIL-FIRST wizard (email + emailed code, password on a later step) when we have an
                     # inbox AND a code fetcher. LANE C: passwordless magic-link (email-only form). Ordered so the
                     # wizard, the more complete flow, is tried BEFORE the email-only magic submit -- else magic
