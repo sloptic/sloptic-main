@@ -615,10 +615,20 @@ def parity_report(recs, args):
         full = sum(1 for r in arows if r[2] == n_appl)
         never = sum(1 for r in arows if r[2] == 0)
         partial = len(arows) - full - never
+        total_probes = len(arows)                      # the catalog universe (every probe seen across the run)
+        per_app = _dist([len(r["coverage"]["applied"]) for r in recs
+                         if (r.get("coverage") or {}).get("applied") is not None])
         print(f"\nPROBE APPLICABILITY  (of {n_appl} graded apps, how many each probe could apply to, and why it "
               f"sat out; no cross stack ground truth needed)")
         print(f"  {full} applied on every app  |  {partial} applied on some  |  {never} never reached a target"
               f"   (probe id prefix carries the bundle: sec / qa / perf)")
+        if per_app:
+            # how much of the battery a typical app got: probes that APPLIED per app, across the graded apps
+            # (the same figure as TEST COVERAGE PER APP's 'probes applied', surfaced here beside the per probe view).
+            print(f"  probes per app   mean={per_app['avg']}  median={per_app['median']}  "
+                  f"stdev={per_app['stdev']}  min={per_app['min']:.0f}  max={per_app['max']:.0f}  "
+                  f"(over {per_app['n']} apps; the average app ran {per_app['avg'] / total_probes * 100:.0f}% "
+                  f"of the {total_probes} probe battery)")
         for pid, bundle, ac, reason in arows:
             pct = ac / n_appl * 100 if n_appl else 0.0
             bar = "█" * round(pct / 100 * 20)
