@@ -1442,10 +1442,17 @@ def main():
               f"{_f(row['winner_median']):>6}{_f(row['winner_mean']):>7}{_f(row['winner_max']):>6}"
               f"{_f(row['winner_stdev']):>5}")
     if hk_ranked:   # which hackathons produced the sloppiest / cleanest apps (min 10 graded, so it's not noise)
-        top = sorted(hk_ranked, key=lambda x: -x["median_slop"])[:3]
-        bot = sorted(hk_ranked, key=lambda x: x["median_slop"])[:3]
-        print("     sloppiest (median slop, n≥10 graded): " + ", ".join(f"{r['hackathon']} {r['median_slop']}" for r in top))
-        print("     cleanest  (median slop, n≥10 graded): " + ", ".join(f"{r['hackathon']} {r['median_slop']}" for r in bot))
+        top = sorted(hk_ranked, key=lambda x: -x["median_slop"])[:5]
+        bot = sorted(hk_ranked, key=lambda x: x["median_slop"])[:5]
+        print(f"     SLOPPIEST 5 hackathons (median slop, n≥10 graded):")
+        for r in top:
+            print(f"       {r['hackathon'][:36]:<36} med {r['median_slop']:>6.1f}   (n{r['graded']})")
+        print(f"     CLEANEST 5 hackathons (median slop, n≥10 graded):")
+        for r in bot:
+            print(f"       {r['hackathon'][:36]:<36} med {r['median_slop']:>6.1f}   (n{r['graded']})")
+    elif hk_rows:
+        print(f"     (sloppiest/cleanest ranking needs hackathons with ≥10 graded apps; "
+              f"{sum(1 for r in hk_rows if r['graded'] >= 10)} qualify so far)")
 
     # (a3) AUTH SURFACE, the login/signup/SSO shape of the graded apps, and the reach it implies for the authed
     # probes. self registerable (a password signup we can drive) is the slice the authed surface + email + browser
