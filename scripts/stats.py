@@ -1932,6 +1932,42 @@ def main():
             print(f"    {label:12} median {statistics.median(xs):>9.2f}{u}  mean {statistics.mean(xs):>9.2f}{u}  "
                   f"sd {sd:>9.2f}  min {min(xs):>7.2f}  max {max(xs):>10.2f}   (n {len(xs)})")
 
+    # PERF DIAGNOSTICS: the heavier perf audits that do NOT feed the score (report_only), across the apps each one
+    # flagged. Page weight in MB, DOM nodes and request count as counts, cache savings in KiB. Small n by design:
+    # a probe only records here when its audit flagged the app, so this is the distribution over the flagged tail.
+    def _diag_val(f, pid):
+        ev = f.get("evidence", {}) or {}
+        if pid == "perf-weight-001":
+            v = ev.get("value")
+            return v / 1048576 if isinstance(v, (int, float)) else None   # bytes -> MB
+        if pid in ("perf-dom-001", "perf-requests-001"):
+            v = ev.get("value")
+            return float(v) if isinstance(v, (int, float)) else None
+        if pid == "perf-cache-001":
+            d = (ev.get("display") or "").replace(" ", " ").replace(",", "")
+            m = re.search(r"([\d.]+)\s*KiB", d)
+            return float(m.group(1)) if m else None
+        return None
+    _diag = [("perf-weight-001", "page weight (MB)"), ("perf-dom-001", "DOM nodes"),
+             ("perf-requests-001", "requests"), ("perf-cache-001", "cache savings (KiB)")]
+    diag_vals = defaultdict(list)
+    for r in graded:
+        for f in r.get("findings", []):
+            for dpid, label in _diag:
+                if f.get("probe_id") == dpid:
+                    v = _diag_val(f, dpid)
+                    if v is not None:
+                        diag_vals[label].append(v)
+    if diag_vals:
+        sec("PERF DIAGNOSTICS  (heavier perf audits off the score, across the apps each one flagged)")
+        for dpid, label in _diag:
+            xs = diag_vals.get(label)
+            if not xs:
+                continue
+            sd = statistics.stdev(xs) if len(xs) > 1 else 0.0
+            print(f"    {label:20} median {statistics.median(xs):>10.1f}  mean {statistics.mean(xs):>10.1f}  "
+                  f"sd {sd:>10.1f}  min {min(xs):>8.1f}  max {max(xs):>10.1f}   (n {len(xs)})")
+
 
 if __name__ == "__main__":
     main()
