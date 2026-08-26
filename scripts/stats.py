@@ -1518,8 +1518,10 @@ def main():
         sec("SLOP BY AXIS  (the score's security / qa / performance split, across graded apps)")
         for ax in sorted(axis_total, key=lambda a: -axis_total[a]):
             xs = axis_vals[ax]
+            sd = statistics.stdev(xs) if len(xs) > 1 else 0.0
             print(f"    {ax:12} {axis_total[ax]/all_axis*100:4.0f}% of all slop   "
-                  f"median {statistics.median(xs):5.1f}   mean {statistics.mean(xs):5.1f}   (n {len(xs)} apps)")
+                  f"median {statistics.median(xs):5.1f}  mean {statistics.mean(xs):5.1f}  sd {sd:5.1f}  "
+                  f"min {min(xs):4.1f}  max {max(xs):5.1f}   (n {len(xs)})")
         # dominant axis PER APP: is each app's slop mostly one axis, or spread across all three? The corpus
         # shares above hide it. Count each app under the axis with its largest damped subtotal.
         dom = Counter()
@@ -1544,21 +1546,63 @@ def main():
             xs = kind_scores[k]
             print(f"    {k:14} median {statistics.median(xs):5.1f}   mean {statistics.mean(xs):5.1f}   (n {len(xs)})")
 
+    # SLOP DENSITY: slop divided by how much surface discovery actually SAW, so a big app and a tiny app compare
+    # fairly. A high density is much slop per unit of surface (a genuinely sloppy small app); a low density on a
+    # big app is broad but not concentrated. Over graded apps that carry a surface size.
+    dens = []
+    for r in graded:
+        sz = (r.get("observed_surface") or {}).get("surface_size")
+        if isinstance(sz, (int, float)) and sz > 0 and isinstance(r.get("slop_score"), (int, float)):
+            dens.append((r["slop_score"] / sz, r))
+    if len(dens) >= 5:
+        vals = [d for d, _ in dens]
+        sd = statistics.stdev(vals) if len(vals) > 1 else 0.0
+        sec("SLOP DENSITY  (slop per unit of observed surface, so app size does not confound the comparison)")
+        print(f"    median {statistics.median(vals):.2f}  mean {statistics.mean(vals):.2f}  sd {sd:.2f}  "
+              f"min {min(vals):.2f}  max {max(vals):.2f}   (n {len(vals)})")
+        print("    densest apps (most slop per unit of surface):")
+        for d, r in sorted(dens, key=lambda x: -x[0])[:5]:
+            print(f"      {r['repo'][:44]:44} {d:6.2f}   (slop {r['slop_score']}, surface {(r.get('observed_surface') or {}).get('surface_size')})")
+
     # FINDING SEVERITY, the scored findings bucketed by risk priced penalty into tiers, with the # of apps carrying
     # at least one at that tier. Shows the SHAPE of the harm (are the fires a few critical breaches or a long tail
     # of minor ones), which the summed score alone hides.
     sev_findings, sev_apps = Counter(), defaultdict(set)
+    sev_per_app = defaultdict(Counter)   # tier -> {repo: how many findings of that tier the app has}
     for r in graded:
         for f in r.get("findings", []):
             if _scored(f):
                 t = _severity_tier(f["penalty"])
                 sev_findings[t] += 1
                 sev_apps[t].add(r["repo"])
+                sev_per_app[t][r["repo"]] += 1
     if sev_findings:
         sec("FINDING SEVERITY  (scored findings by risk priced penalty tier; apps = # with >=1 at that tier)")
         for tier in ("critical", "serious", "moderate", "minor"):
-            print(f"    {tier:9} (pen {'>=30' if tier=='critical' else '16-29' if tier=='serious' else '8-15' if tier=='moderate' else '1-7':>5})"
-                  f"   {sev_findings.get(tier, 0):>4} findings   across {len(sev_apps.get(tier, set())):>3} apps")
+            pen = ">=30" if tier == "critical" else "16-29" if tier == "serious" else "8-15" if tier == "moderate" else "1-7"
+            line = (f"    {tier:9} (pen {pen:>5})   {sev_findings.get(tier, 0):>4} findings   "
+                    f"across {len(sev_apps.get(tier, set())):>3} apps")
+            counts = list(sev_per_app[tier].values())   # per-app count of that tier, among apps that have one
+            if counts:
+                sd = statistics.stdev(counts) if len(counts) > 1 else 0.0
+                line += (f"   per app: mean {statistics.mean(counts):4.1f}  median {statistics.median(counts):>2.0f}  "
+                         f"sd {sd:4.1f}  min {min(counts):>2}  max {max(counts):>3}")
+            print(line)
+
+    # A11Y RULE BREAKDOWN: which axe rules drive the accessibility slop (qa/accessibility is a top slop category),
+    # counted by how many apps' qa-a11y-001 fire lists each rule. Shows the SPECIFIC defect below the probe level.
+    a11y_rules, a11y_apps = Counter(), 0
+    for r in graded:
+        seen = {rule for f in r.get("findings", []) if f.get("probe_id") == "qa-a11y-001"
+                for rule in ((f.get("evidence", {}) or {}).get("rules") or [])}
+        if seen:
+            a11y_apps += 1
+            for rule in seen:
+                a11y_rules[rule] += 1
+    if a11y_rules:
+        sec(f"A11Y RULE BREAKDOWN  (which axe rules fire, across the {a11y_apps} apps with an accessibility finding)")
+        for rule, c in a11y_rules.most_common(10):
+            print(f"    {rule:34} {c:>4} apps ({100*c/a11y_apps:>3.0f}%)")
 
     # (b2) Lighthouse PERFORMANCE score, 0-100, the number the perf axis grades on, surfaced here. Absent on a
     # corpus from before the switch to Lighthouse, so the section self skips. (a11y is scored by qa-a11y, not shown here.)
