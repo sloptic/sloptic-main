@@ -1520,6 +1520,29 @@ def main():
             xs = axis_vals[ax]
             print(f"    {ax:12} {axis_total[ax]/all_axis*100:4.0f}% of all slop   "
                   f"median {statistics.median(xs):5.1f}   mean {statistics.mean(xs):5.1f}   (n {len(xs)} apps)")
+        # dominant axis PER APP: is each app's slop mostly one axis, or spread across all three? The corpus
+        # shares above hide it. Count each app under the axis with its largest damped subtotal.
+        dom = Counter()
+        for r in graded:
+            live = {a: v for a, v in (r.get("axis_slop") or {}).items() if v > 0}
+            if live:
+                dom[max(live, key=live.get)] += 1
+        if dom:
+            n_dom = sum(dom.values())
+            print("    dominant axis per app (its single biggest slop source): "
+                  + "  ".join(f"{a} {c} ({100*c/n_dom:.0f}%)" for a, c in dom.most_common()))
+
+    # SLOP BY APP KIND: does a static site (little surface) score cleaner than a full web app, or does the score
+    # hold level across kinds? Median slop per kind, over the graded apps.
+    kind_scores = defaultdict(list)
+    for r in graded:
+        if isinstance(r.get("slop_score"), (int, float)):
+            kind_scores[r.get("app_kind") or "?"].append(r["slop_score"])
+    if len(kind_scores) > 1:
+        sec("SLOP BY APP KIND  (median slop per kind, across graded apps)")
+        for k in sorted(kind_scores, key=lambda k: -statistics.median(kind_scores[k])):
+            xs = kind_scores[k]
+            print(f"    {k:14} median {statistics.median(xs):5.1f}   mean {statistics.mean(xs):5.1f}   (n {len(xs)})")
 
     # FINDING SEVERITY, the scored findings bucketed by risk priced penalty into tiers, with the # of apps carrying
     # at least one at that tier. Shows the SHAPE of the harm (are the fires a few critical breaches or a long tail
@@ -1550,6 +1573,23 @@ def main():
         if win["n"] and non["n"]:
             print(f"     winners     (n {win['n']:>4}):  median {win['median']:>3}  mean {win['mean']:>5}  green {win['pct_green']}%")
             print(f"     non winners (n {non['n']:>4}):  median {non['median']:>3}  mean {non['mean']:>5}  green {non['pct_green']}%")
+        # does slop track perf, or are the axes independent? Spearman over apps with BOTH a perf score and a slop
+        # score. Near 0 means independent (the axes measure different things), negative means a clean app also
+        # perfs better, positive means the two pull apart.
+        pairs = []
+        for r in graded:
+            lh = (r.get("observed_surface") or {}).get("lighthouse")
+            if isinstance(lh, dict) and lh.get("performance") is not None and isinstance(r.get("slop_score"), (int, float)):
+                pairs.append((lh["performance"], r["slop_score"]))
+        if len(pairs) >= 10:
+            try:
+                rho = statistics.correlation([p for p, _ in pairs], [s for _, s in pairs], method="ranked")
+            except (statistics.StatisticsError, ValueError):
+                rho = None
+            if rho is not None:
+                rel = ("independent, the axes measure different things" if abs(rho) < 0.2 else
+                       "cleaner apps also perf better" if rho < 0 else "cleaner apps perf worse")
+                print(f"     slop vs perf (Spearman, n {len(pairs)}): rho {rho:+.2f}   ({rel})")
 
     # (c)
     sec(f"PER PROBE FIRE FREQUENCY  (# of the {len(graded)} graded apps each probe fired on)")
@@ -1602,6 +1642,11 @@ def main():
               f"slop {_stat_line(win_scores)}")
         print(f"    non winners  deploy {sum(r.get('deployed', False) for r in non_all)}/{len(non_all)}   "
               f"slop {_stat_line(non_scores)}")
+        if win_scores and non_scores:
+            wm, nm = statistics.median(win_scores), statistics.median(non_scores)
+            verdict = "ship LESS slop" if wm < nm else "ship MORE slop" if wm > nm else "match non winners"
+            gap = (wm - nm) / nm * 100 if nm else 0.0
+            print(f"    -> winners {verdict}: median {wm:.1f} vs {nm:.1f}  ({gap:+.0f}% vs non winners)")
 
     # (e)
     sec(f"ANOMALIES, hand verify (fuzzer bugs & interesting apps hide here)")
@@ -1616,6 +1661,14 @@ def main():
         if r:
             top = sorted(cat_subtotals(r).items(), key=lambda x: -x[1])[:3]
             print(f"      {r['repo']}   {r['slop_score']}   top: " + ", ".join(f"{k[1]} {v:.0f}" for k, v in top))
+        else:
+            print("      (none)")
+    print(f"    cleanest  (lowest slop; the durability floor and what holds up):")
+    for r in sorted((r for r in graded if isinstance(r.get("slop_score"), (int, float))),
+                    key=lambda r: r["slop_score"])[:6] or [None]:
+        if r:
+            top = sorted(cat_subtotals(r).items(), key=lambda x: -x[1])[:2]
+            print(f"      {r['repo']}   {r['slop_score']}   " + ", ".join(f"{k[1]} {v:.0f}" for k, v in top))
         else:
             print("      (none)")
     print(f"\n    → audit any probe: scripts/stats.py {args.results} --audit <probe id>\n")
