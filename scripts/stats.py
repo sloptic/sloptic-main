@@ -33,6 +33,7 @@ import csv
 import json
 import pathlib
 import random
+import re
 import statistics
 import sys
 from collections import Counter, defaultdict
@@ -1546,24 +1547,6 @@ def main():
             xs = kind_scores[k]
             print(f"    {k:14} median {statistics.median(xs):5.1f}   mean {statistics.mean(xs):5.1f}   (n {len(xs)})")
 
-    # SLOP DENSITY: slop divided by how much surface discovery actually SAW, so a big app and a tiny app compare
-    # fairly. A high density is much slop per unit of surface (a genuinely sloppy small app); a low density on a
-    # big app is broad but not concentrated. Over graded apps that carry a surface size.
-    dens = []
-    for r in graded:
-        sz = (r.get("observed_surface") or {}).get("surface_size")
-        if isinstance(sz, (int, float)) and sz > 0 and isinstance(r.get("slop_score"), (int, float)):
-            dens.append((r["slop_score"] / sz, r))
-    if len(dens) >= 5:
-        vals = [d for d, _ in dens]
-        sd = statistics.stdev(vals) if len(vals) > 1 else 0.0
-        sec("SLOP DENSITY  (slop per unit of observed surface, so app size does not confound the comparison)")
-        print(f"    median {statistics.median(vals):.2f}  mean {statistics.mean(vals):.2f}  sd {sd:.2f}  "
-              f"min {min(vals):.2f}  max {max(vals):.2f}   (n {len(vals)})")
-        print("    densest apps (most slop per unit of surface):")
-        for d, r in sorted(dens, key=lambda x: -x[0])[:5]:
-            print(f"      {r['repo'][:44]:44} {d:6.2f}   (slop {r['slop_score']}, surface {(r.get('observed_surface') or {}).get('surface_size')})")
-
     # FINDING SEVERITY, the scored findings bucketed by risk priced penalty into tiers, with the # of apps carrying
     # at least one at that tier. Shows the SHAPE of the harm (are the fires a few critical breaches or a long tail
     # of minor ones), which the summed score alone hides.
@@ -1588,21 +1571,6 @@ def main():
                 line += (f"   per app: mean {statistics.mean(counts):4.1f}  median {statistics.median(counts):>2.0f}  "
                          f"sd {sd:4.1f}  min {min(counts):>2}  max {max(counts):>3}")
             print(line)
-
-    # A11Y RULE BREAKDOWN: which axe rules drive the accessibility slop (qa/accessibility is a top slop category),
-    # counted by how many apps' qa-a11y-001 fire lists each rule. Shows the SPECIFIC defect below the probe level.
-    a11y_rules, a11y_apps = Counter(), 0
-    for r in graded:
-        seen = {rule for f in r.get("findings", []) if f.get("probe_id") == "qa-a11y-001"
-                for rule in ((f.get("evidence", {}) or {}).get("rules") or [])}
-        if seen:
-            a11y_apps += 1
-            for rule in seen:
-                a11y_rules[rule] += 1
-    if a11y_rules:
-        sec(f"A11Y RULE BREAKDOWN  (which axe rules fire, across the {a11y_apps} apps with an accessibility finding)")
-        for rule, c in a11y_rules.most_common(10):
-            print(f"    {rule:34} {c:>4} apps ({100*c/a11y_apps:>3.0f}%)")
 
     # (b2) Lighthouse PERFORMANCE score, 0-100, the number the perf axis grades on, surfaced here. Absent on a
     # corpus from before the switch to Lighthouse, so the section self skips. (a11y is scored by qa-a11y, not shown here.)
@@ -1909,6 +1877,59 @@ def main():
         for r, f in [(r, f) for r, f in email_001 if (f.get("evidence") or {}).get("no_email_60s")][:8]:
             print(f"      {r['repo'].rsplit('/', 1)[-1][:34]:34} no mail, {(f.get('reason') or '')[:48]}")
         print(f"    → audit: scripts/stats.py {args.results} --audit qa-email-001")
+
+    # A11Y RULE BREAKDOWN: which axe rules drive the accessibility slop (qa/accessibility is a top slop category),
+    # counted by how many apps' qa-a11y-001 fire lists each rule. The SPECIFIC defect below the probe level.
+    a11y_rules, a11y_apps = Counter(), 0
+    for r in graded:
+        seen = {rule for f in r.get("findings", []) if f.get("probe_id") == "qa-a11y-001"
+                for rule in ((f.get("evidence", {}) or {}).get("rules") or [])}
+        if seen:
+            a11y_apps += 1
+            for rule in seen:
+                a11y_rules[rule] += 1
+    if a11y_rules:
+        sec(f"A11Y RULE BREAKDOWN  (which axe rules fire, across the {a11y_apps} apps with an accessibility finding)")
+        for rule, c in a11y_rules.most_common(10):
+            print(f"    {rule:34} {c:>4} apps ({100*c/a11y_apps:>3.0f}%)")
+
+    # LIGHTHOUSE BREAKDOWN: the metrics behind the perf score, distributed across the apps with a perf finding.
+    # LCP, FCP, Speed Index in seconds, TBT in ms, CLS unitless. Parsed from the perf-lighthouse-001 metric
+    # strings (the record keeps only the headline score, so this is over the apps that actually scored on perf).
+    def _lh_num(s, unit):
+        s = (s or "").replace(" ", " ").replace(",", "").strip()
+        m = re.search(r"(\d+(?:\.\d+)?)\s*(ms|s)?", s)
+        if not m:
+            return None
+        v, u = float(m.group(1)), (m.group(2) or "")
+        if unit == "s":
+            return v / 1000 if u == "ms" else v
+        if unit == "ms":
+            return v * 1000 if u == "s" else v
+        return v
+    _lh_metrics = [("largest-contentful-paint", "LCP", "s"), ("first-contentful-paint", "FCP", "s"),
+                   ("speed-index", "Speed Index", "s"), ("total-blocking-time", "TBT", "ms"),
+                   ("cumulative-layout-shift", "CLS", "")]
+    lh_vals, lh_apps = defaultdict(list), 0
+    for r in graded:
+        lh_apps += any(f.get("probe_id") == "perf-lighthouse-001" for f in r.get("findings", []))
+        for f in r.get("findings", []):
+            if f.get("probe_id") == "perf-lighthouse-001":
+                mets = (f.get("evidence", {}) or {}).get("metrics") or {}
+                for mid, label, unit in _lh_metrics:
+                    v = _lh_num(mets.get(mid), unit)
+                    if v is not None:
+                        lh_vals[label].append(v)
+    if lh_vals:
+        sec(f"LIGHTHOUSE BREAKDOWN  (the metrics behind the perf score, across the {lh_apps} apps with a perf finding)")
+        for mid, label, unit in _lh_metrics:
+            xs = lh_vals.get(label)
+            if not xs:
+                continue
+            sd = statistics.stdev(xs) if len(xs) > 1 else 0.0
+            u = (" " + unit) if unit else ""
+            print(f"    {label:12} median {statistics.median(xs):>9.2f}{u}  mean {statistics.mean(xs):>9.2f}{u}  "
+                  f"sd {sd:>9.2f}  min {min(xs):>7.2f}  max {max(xs):>10.2f}   (n {len(xs)})")
 
 
 if __name__ == "__main__":
