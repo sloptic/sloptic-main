@@ -3,7 +3,7 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
-from stats import _row, blind_spots, group_parity  # noqa: E402
+from stats import _row, blind_spots, group_parity, probe_applicability  # noqa: E402
 
 
 def _rec(repo, routing, *, deployed=True, slop=10, size=20, findings=3, exp=None, obs=None):
@@ -72,3 +72,26 @@ def test_group_parity_dashes_a_type_with_no_expected_label():
     rows = [_row(_rec("a", "ssr", exp={}, obs={"has_api": True}))]
     assert group_parity(rows, "routing")["ssr"]["parity"]["api"] == (0, 0)
     assert blind_spots(rows, "routing") == []       # no expected -> nothing to be blind about
+
+
+def _cov(applied, na):
+    return {"repo": "x", "coverage": {"applied": applied, "na_reasons_by_probe": na}}
+
+
+def test_probe_applicability_counts_reach_and_dominant_na_reason():
+    # the URL-native coverage view: per probe, on how many apps it APPLIED + why it sat out elsewhere.
+    # zz-* ids aren't in the catalog, so they enter the universe via the records themselves.
+    recs = [_cov(["zz-a", "zz-b"], {"zz-c": "no login surface"}),
+            _cov(["zz-a"], {"zz-b": "no text input", "zz-c": "no login surface"})]
+    n, rows = probe_applicability(recs)
+    by = {pid: (ac, reason) for pid, _bundle, ac, reason in rows}
+    assert n == 2
+    assert by["zz-a"] == (2, "")                     # applied on both, needs no n/a reason
+    assert by["zz-b"] == (1, "no text input")        # applied once, sat out once with a reason
+    assert by["zz-c"] == (0, "no login surface")     # never reached, reason still carried
+
+
+def test_probe_applicability_none_without_per_probe_coverage():
+    # legacy records (kind-level coverage only) or bare records carry no coverage.applied -> nothing to measure
+    assert probe_applicability([{"repo": "x", "coverage": {"na_kinds": ["auth"]}}]) is None
+    assert probe_applicability([{"repo": "y"}]) is None

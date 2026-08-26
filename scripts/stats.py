@@ -450,6 +450,43 @@ def blind_spots(rows: list, key: str) -> list:
     return sorted(spots, key=lambda s: (-s["missed"], -s["expected"]))
 
 
+def probe_applicability(recs):
+    """The URL native parity view: per probe, on how many graded apps did it APPLY (fired or came back clean)
+    vs sit out N/A, and the dominant reason it sat out. Cross stack parity contrasts a stack against the
+    expected surface the SOURCE implies, which a bare URL run cannot emit; this needs only what the grader
+    already records per app (coverage.applied + coverage.na_reasons_by_probe), so it answers "what did we
+    actually test here, and what couldn't we reach" even on one flat url-ingest stack. Denominator is the
+    graded apps that carry per probe coverage; the probe universe is the catalog (falls back to whatever the
+    records reference if the catalog can't load). Returns (n_apps, rows) with each row
+    (probe_id, bundle, applied_count, dominant_na_reason), reach descending; None if no per probe coverage."""
+    graded = [r for r in recs if (r.get("coverage") or {}).get("applied") is not None]
+    if not graded:
+        return None
+    try:
+        cat = {p.id: p.bundle for p in load_catalog(str(_ROOT / "catalog"))}
+    except Exception:                              # a catalog hiccup shouldn't sink the whole dashboard
+        cat = {}
+    applied_count = Counter()
+    na_reasons = defaultdict(Counter)              # probe_id -> reason -> apps that gave it
+    seen = set()                                   # every probe id the records mention (applied or n/a)
+    for r in graded:
+        cov = r["coverage"]
+        for pid in cov.get("applied") or ():
+            applied_count[pid] += 1
+            seen.add(pid)
+        for pid, reason in (cov.get("na_reasons_by_probe") or {}).items():
+            na_reasons[pid][reason] += 1
+            seen.add(pid)
+    universe = set(cat) | seen
+    rows = []
+    for pid in universe:
+        ac = applied_count.get(pid, 0)
+        reason = na_reasons[pid].most_common(1)[0][0] if na_reasons.get(pid) else ""
+        rows.append((pid, cat.get(pid, "?"), ac, reason))
+    rows.sort(key=lambda x: (-x[2], x[0]))         # reach desc, then id (its prefix already carries the bundle)
+    return len(graded), rows
+
+
 _CSV_COLS = ["repo", "app_kind", "web_gradeable", "deployed", "framework", "routing", "api_style", "stack",
              "n_features", "obs_routes", "obs_forms", "obs_inputs", "obs_endpoints",
              "obs_endpoints_reached", "obs_endpoints_dead", "obs_surface_size",
@@ -567,6 +604,33 @@ def parity_report(recs, args):
             print(line)
     if not cov_pct:
         print("  (no coverage data on these records)")
+
+    # PROBE APPLICABILITY, the per probe coverage spectrum: on how many graded apps each probe APPLIED vs sat
+    # out, and why. This is the url-ingest answer to "we can still measure what probes applied and what did
+    # not", cross stack parity above needs source implied expected surface (a bare URL emits none), this needs
+    # only the grader's own per app record, so it works on one flat stack. Grouped by bundle, reach descending.
+    appl = probe_applicability(recs)
+    if appl:
+        n_appl, arows = appl
+        full = sum(1 for r in arows if r[2] == n_appl)
+        never = sum(1 for r in arows if r[2] == 0)
+        partial = len(arows) - full - never
+        print(f"\nPROBE APPLICABILITY  (of {n_appl} graded apps, how many each probe could apply to, and why it "
+              f"sat out; no cross stack ground truth needed)")
+        print(f"  {full} applied on every app  |  {partial} applied on some  |  {never} never reached a target"
+              f"   (probe id prefix carries the bundle: sec / qa / perf)")
+        for pid, bundle, ac, reason in arows:
+            pct = ac / n_appl * 100 if n_appl else 0.0
+            bar = "█" * round(pct / 100 * 20)
+            if ac == n_appl:
+                tail = ""
+            elif reason:
+                tail = f"  na: {reason[:58]}"
+            elif ac == 0:
+                tail = "  na: (never reached, no reason recorded)"
+            else:
+                tail = ""
+            print(f"    {pid:20} {ac:>4}/{n_appl} {pct:5.1f}% │ {bar:<20}{tail}")
 
     # blind spot ranking (prevalence × brokenness = # apps where we missed a surface the source implies)
     print("\nBLIND SPOTS  (fix order, apps where the source says a surface exists but we didn't see it)")
