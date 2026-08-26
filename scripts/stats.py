@@ -1893,9 +1893,10 @@ def main():
         for rule, c in a11y_rules.most_common(10):
             print(f"    {rule:34} {c:>4} apps ({100*c/a11y_apps:>3.0f}%)")
 
-    # LIGHTHOUSE BREAKDOWN: the metrics behind the perf score, distributed across the apps with a perf finding.
-    # LCP, FCP, Speed Index in seconds, TBT in ms, CLS unitless. Parsed from the perf-lighthouse-001 metric
-    # strings (the record keeps only the headline score, so this is over the apps that actually scored on perf).
+    # LIGHTHOUSE BREAKDOWN: the metrics behind the perf score plus the server response time, distributed across the
+    # apps with a perf finding. LCP, FCP, Speed Index in seconds, TBT and TTFB in ms, CLS unitless (the first five
+    # make up the score, TTFB is a diagnostic). Parsed from the perf-lighthouse-001 metric strings (the record
+    # keeps only the headline score, so this is over the apps that actually scored on perf).
     def _lh_num(s, unit):
         s = (s or "").replace(" ", " ").replace(",", "").strip()
         m = re.search(r"(\d+(?:\.\d+)?)\s*(ms|s)?", s)
@@ -1909,7 +1910,7 @@ def main():
         return v
     _lh_metrics = [("largest-contentful-paint", "LCP", "s"), ("first-contentful-paint", "FCP", "s"),
                    ("speed-index", "Speed Index", "s"), ("total-blocking-time", "TBT", "ms"),
-                   ("cumulative-layout-shift", "CLS", "")]
+                   ("cumulative-layout-shift", "CLS", ""), ("server-response-time", "TTFB", "ms")]
     lh_vals, lh_apps = defaultdict(list), 0
     for r in graded:
         lh_apps += any(f.get("probe_id") == "perf-lighthouse-001" for f in r.get("findings", []))
@@ -1921,7 +1922,7 @@ def main():
                     if v is not None:
                         lh_vals[label].append(v)
     if lh_vals:
-        sec(f"LIGHTHOUSE BREAKDOWN  (the metrics behind the perf score, across the {lh_apps} apps with a perf finding)")
+        sec(f"LIGHTHOUSE BREAKDOWN  (the perf score metrics + server response, across the {lh_apps} apps with a perf finding)")
         for mid, label, unit in _lh_metrics:
             xs = lh_vals.get(label)
             if not xs:
