@@ -6,10 +6,12 @@ produced it (not a black-box figure). One tool, three complementary lenses on on
   * --parity         VISIBILITY, did we SEE the app's surface? observed vs expected per stack -> blind spots.
                      (a low slop is only meaningful if discovery saw the surface; blindness clusters by stack.)
   * --precision      the FALSE POSITIVE audit, are the fires REAL? + a worksheet you audit by hand, with a Wilson CI.
+  * --all            all three lenses in one run: the default report, then parity, then precision.
 
 Input is the JSONL that `deploy_and_grade.py --record FILE` appends (one line per app).
 
     uv run python scripts/stats.py results.jsonl                        # the recall report (default)
+    uv run python scripts/stats.py results.jsonl --all                  # all three lenses, one run
     uv run python scripts/stats.py results.jsonl --audit sec-sqli-004   # every app + evidence for one probe
     uv run python scripts/stats.py results.jsonl --json                 # machine readable summary
     uv run python scripts/stats.py results.jsonl --parity [--by X] [--csv F]   # cross stack visibility
@@ -902,7 +904,7 @@ def precision_report(recs, args):
         print(f"            {fires:>5} fires | {pen:>7.0f} pen inside the score   {pid}")
     unval = _unvalidated_probes(recs)
     if unval:
-        print(f"\n(1b) UNVALIDATED, {len(unval)} high-penalty probe(s) fired 0× on this corpus.")
+        print(f"\n(1b) UNVALIDATED, {len(unval)} high penalty probe(s) fired 0× on this corpus.")
         print(f"     0 fires is ABSENCE OF EVIDENCE, not precision (corpus auth-dark / no applicable surface).")
         print(f"     Do NOT read their 0 FP as 'precise', unvalidated until they fire on real surface:")
         for pid, pen in unval[:15]:
@@ -1090,6 +1092,8 @@ def main():
                     help="precision: treat `results` as a filled worksheet -> FP rate + 95%% Wilson CI")
     ap.add_argument("--seed", type=int, default=0, help="precision: RNG seed for --sample (reproducible draw)")
     ap.add_argument("--diff", metavar="PREV", help="run to run regression: diff `results` against a PREVIOUS run's JSONL")
+    ap.add_argument("--all", action="store_true",
+                    help="print all three lenses in one run: the default report, then parity, then precision")
     args = ap.parse_args()
 
     if args.tally:                                    # precision: `results` is a filled worksheet, not a JSONL
@@ -1967,6 +1971,12 @@ def main():
             sd = statistics.stdev(xs) if len(xs) > 1 else 0.0
             print(f"    {label:20} median {statistics.median(xs):>10.1f}  mean {statistics.mean(xs):>10.1f}  "
                   f"sd {sd:>10.1f}  min {min(xs):>8.1f}  max {max(xs):>10.1f}   (n {len(xs)})")
+
+    if args.all:                          # the other two lenses, appended after the default report above
+        print("\n" + "═" * 72)
+        parity_report(recs, args)
+        print("\n" + "═" * 72)
+        precision_report(recs, args)
 
 
 if __name__ == "__main__":
