@@ -253,7 +253,7 @@ def test_audit_category_matches_family_aggregates_and_lists_available(capsys):
     assert "qa/accessibility" not in out
     assert "1/2 graded apps have >=1 finding here   |   2 findings" in out   # one app, its two exposure fires
     assert "slop per affected app:  mean 123.0  median 123.0  stdev 0.0" in out   # 98+25 damped, n=1
-    assert "sec-secrets-002" in out and "sec-exposure-006" in out
+    assert "sec-secrets-002 (70-98)" in out and "sec-exposure-006 (15)" in out   # probe list carries penalty span
 
     audit_category(recs, "nope-not-a-category")   # no match -> names the available categories
     out2 = capsys.readouterr().out

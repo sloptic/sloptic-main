@@ -257,9 +257,14 @@ def audit_category(recs, query):
               f"(min {d['min']}  max {d['max']}, over the {d['n']} apps with a finding here)")
     print(f"  severity:  critical {sev['critical']}  serious {sev['serious']}  "
           f"moderate {sev['moderate']}  minor {sev['minor']}")
-    print("  probes in this category (apps fired on):")
+    try:
+        pcat = {p.id: p for p in load_catalog(str(_ROOT / "catalog"))}
+    except Exception:                             # a catalog hiccup drops the penalty tag, not the list
+        pcat = {}
+    print("  probes in this category (apps fired on, penalty):")
     for pid, apps in sorted(probe_apps.items(), key=lambda x: -len(x[1])):
-        print(f"      {pid:20} {len(apps):>4} apps")
+        span = _penalty_span(pcat[pid]) if pid in pcat else "?"
+        print(f"      {f'{pid} ({span})':30} {len(apps):>4} apps")
     print("  hardest hit apps (by in-score slop from this category):")
     for repo, cs in sorted(app_slop.items(), key=lambda x: -x[1])[:8]:
         pid, pen = app_worst[repo]
@@ -553,6 +558,16 @@ def _worst_penalty(p):
     s = getattr(p, "severity", None)
     rng = getattr(s, "range", None) if s is not None else None
     return rng[1] if rng else p.penalty
+
+
+def _penalty_span(p):
+    """A probe's penalty for display: a single number when fixed ('55'), or its escalator range low-high when it
+    escalates ('70-98'). Reads severity.range, falling back to the nominal penalty when there is no range."""
+    s = getattr(p, "severity", None)
+    rng = getattr(s, "range", None) if s is not None else None
+    if rng and rng[0] != rng[1]:
+        return f"{rng[0]}-{rng[1]}"
+    return f"{rng[0] if rng else p.penalty}"
 
 
 _CSV_COLS = ["repo", "app_kind", "web_gradeable", "deployed", "framework", "routing", "api_style", "stack",
