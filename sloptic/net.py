@@ -177,6 +177,13 @@ def make_client(base_url: str, headers: dict | None = None, **kwargs) -> httpx.C
     # certs are normal for an app under test) -- cert validity is a separate concern, not a connection
     # blocker. Default to not verifying TLS; callers can still override via kwargs.
     kwargs.setdefault("verify", False)
+    # Negotiate HTTP/2 (needs the `h2` package). We present a Chrome User-Agent, and a real Chrome ALWAYS
+    # speaks HTTP/2 to a modern host -- a "Chrome" UA over HTTP/1.1 is a UA/protocol MISMATCH that bot
+    # mitigations (Vercel's Attention Challenge) flag, so on a suspicion-raised IP our HTTP/1.1 fetches got
+    # challenged where a real browser (and even curl, which negotiates h2) sailed through. httpx falls back to
+    # HTTP/1.1 automatically when the server does not offer h2, so this only ever helps. (It does not fix the
+    # TLS JA3 fingerprint, still Python's -- curl_cffi impersonation is the stronger lever if this is not enough.)
+    kwargs.setdefault("http2", True)
     eh = dict(kwargs.get("event_hooks") or {})
     hooks = list(eh.get("response") or []) + [_watch_challenge]   # always: cheap status watch for challenge onset
     if _trace_sink.get() is not None:   # --trace active -> ALSO record every request this client makes (by probe)
