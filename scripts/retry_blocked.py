@@ -146,15 +146,21 @@ def _status(blocked, rec):
 
 
 def _looks_like_ip_block(statuses):
-    """True when the retry so far shows a SYSTEMIC IP-level flag, not per-app challenging. On a clean IP a thin
-    subset retry recovers most tails; an IP-reputation block re-challenges EVERY app at entry and recovers
-    nothing. Verdict: ANY recovery means it is NOT an IP block (per-app, retry_blocked's normal case), else
-    >= _IP_BLOCK_SAMPLE apps that re-challenged at entry ('none' WITH a bot_challenge). `statuses` is
-    [(kind, bot_challenge_bool)] for the graded apps so far; dnf/plain-none entries are neutral (never a WAF
-    verdict), so a dead-URL streak alone never trips it."""
-    challenged_none = sum(1 for kind, chal in statuses if kind == "none" and chal)
-    recovered = sum(1 for kind, _ in statuses if kind in ("full", "partial"))
-    return recovered == 0 and challenged_none >= _IP_BLOCK_SAMPLE
+    """True when the retry shows a SYSTEMIC IP-level flag, not per-app challenging. On a clean IP a thin subset
+    retry recovers most tails; an IP-reputation block re-challenges EVERY app at entry and recovers nothing.
+
+    WINDOWED, not global: the flag usually DEVELOPS mid-retry, not from the first app. The blocked_probes we
+    re-send ARE the WAF trippers (host-header / cmdi / dos / upload -- that is WHY they were blocked), so the
+    retry's own traffic re-flags the IP after some early recoveries. The old verdict (global `recovered == 0`)
+    was permanently disabled by any SINGLE early recovery, so it only ever caught a flag present from the FIRST
+    app and missed the common case: dozens recover, the IP re-flags, then hundreds entry-challenge with zero
+    recovery and the breaker never fires. Verdict now: of the last _IP_BLOCK_SAMPLE WAF-verdict apps (a recovery
+    OR an entry-challenge; dnf / plain-none are neutral and skipped, so a dead-URL streak never trips it), ALL
+    are zero-recovery entry challenges. `statuses` is [(kind, bot_challenge_bool)] in completion order."""
+    verdicts = [kind for kind, chal in statuses
+                if kind in ("full", "partial") or (kind == "none" and chal)]
+    window = verdicts[-_IP_BLOCK_SAMPLE:]
+    return len(window) >= _IP_BLOCK_SAMPLE and all(kind == "none" for kind in window)
 
 
 def _retry_one(url, blocked, tmpdir, extra_flags, grade_timeout, abort=None):
@@ -316,8 +322,8 @@ def main():
             if not abort.is_set() and _looks_like_ip_block(statuses):
                 abort.set()
                 with _print_lock:
-                    print(f"\n  ⚠ IP-LEVEL FLAG DETECTED — the first {_IP_BLOCK_SAMPLE} apps all re-challenged at "
-                          f"entry and recovered nothing. This is a Vercel IP-reputation block, not per-app "
+                    print(f"\n  ⚠ IP-LEVEL FLAG DETECTED — the last {_IP_BLOCK_SAMPLE} graded apps all re-challenged "
+                          f"at entry and recovered nothing. This is a Vercel IP-reputation block, not per-app "
                           f"challenging.\n    Stopping: this tool cannot dig out an IP block, and retrying the "
                           f"rest only re-warms the flag and resets its (hours-long) decay. Halt Vercel traffic "
                           f"from this box, confirm the flag cleared (waf_probe.py), then re-run this retry.",

@@ -147,12 +147,24 @@ def test_ip_block_breaker_trips_on_all_entry_challenged_no_recovery():
     assert _looks_like_ip_block([("none", True)] * _IP_BLOCK_SAMPLE) is True
 
 
-def test_ip_block_breaker_holds_fire_on_any_recovery_or_small_sample():
-    # a single recovery means it is per-app challenging (retry_blocked's normal case), never an IP flag
+def test_ip_block_breaker_holds_fire_when_recovery_is_the_most_recent_signal():
+    # a recovery in the recent window means we are NOT in a sustained block regime (a re-challenge streak that a
+    # fresh recovery broke), so don't abort -- the window is trailing, so a recovery AFTER the nones clears it
     assert _looks_like_ip_block([("none", True)] * _IP_BLOCK_SAMPLE + [("full", False)]) is False
     assert _looks_like_ip_block([("none", True)] * _IP_BLOCK_SAMPLE + [("partial", True)]) is False
     # below the sample threshold it waits for more evidence
     assert _looks_like_ip_block([("none", True)] * (_IP_BLOCK_SAMPLE - 1)) is False
+
+
+def test_ip_block_breaker_trips_on_midrun_flag_onset_after_early_recoveries():
+    # THE regression: the flag develops MID-retry -- dozens recover on a still-clean IP, then the retry's own
+    # WAF-tripper traffic re-flags it and every later app entry-challenges with zero recovery. The old global
+    # `recovered == 0` was permanently disabled by those early recoveries and never fired; the windowed verdict
+    # sees the trailing all-none streak and aborts.
+    statuses = [("full", False)] * 40 + [("none", True)] * _IP_BLOCK_SAMPLE
+    assert _looks_like_ip_block(statuses) is True
+    # and a lone recovery way back in the history does not hold fire on a current sustained block
+    assert _looks_like_ip_block([("partial", True)] + [("none", True)] * _IP_BLOCK_SAMPLE) is True
 
 
 def test_ip_block_breaker_ignores_dnf_and_non_challenge_blocks():
