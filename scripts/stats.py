@@ -1665,6 +1665,14 @@ def main():
                 line += (f"   per app: mean {statistics.mean(counts):4.1f}  median {statistics.median(counts):>2.0f}  "
                          f"sd {sd:4.1f}  min {min(counts):>2}  max {max(counts):>3}")
             print(line)
+        # EXPECTED findings per app over ALL graded apps (zeros counted): E[X] = sum_k k*Pr(X=k), the empirical
+        # mean count, with its variance. This is the UNCONDITIONAL expectation, what a random graded app carries,
+        # distinct from the per app line above, which conditions on apps that already have >=1 at the tier.
+        print(f"    expected per app  (all {len(graded)} graded, zeros counted; E = sum_k k*Pr(k)):")
+        for tier in ("critical", "serious", "moderate", "minor"):
+            xs = [sev_per_app[tier].get(r["repo"], 0) for r in graded]
+            var = statistics.pvariance(xs) if len(xs) > 1 else 0.0
+            print(f"      {tier:9} E={statistics.mean(xs):.2f}  var={var:.2f}  sd={var ** 0.5:.2f}")
 
     # (b2) Lighthouse PERFORMANCE score, 0-100, the number the perf axis grades on, surfaced here. Absent on a
     # corpus from before the switch to Lighthouse, so the section self skips. (a11y is scored by qa-a11y, not shown here.)
@@ -2130,6 +2138,19 @@ def main():
         print("    least realized  (cleanest for how much the applied battery could have dinged):")
         for repo, slop, ceiling, ratio in sorted(mp_rows, key=lambda x: x[3])[:6]:
             print(f"      {repo:52} {ratio * 100:5.1f}%   (slop {slop} / max {ceiling:.0f})")
+
+    # WORST FINDING SEVERITY: the single highest penalty finding per app, aggregated across apps, so the tail
+    # (how bad is the worst single hit on a typical app) is legible next to the tier COUNTS in [6]. Over graded
+    # apps carrying >=1 scored finding, which on this corpus is all of them (the header floor guarantees one).
+    worst = [m for m in (max((f["penalty"] for f in r.get("findings", []) if _scored(f)), default=0)
+                         for r in graded) if m > 0]
+    wd = _dist(worst)
+    if wd:
+        sec("WORST FINDING SEVERITY  (the single highest penalty finding per app, aggregated; how severe the "
+            "worst hit is)")
+        print(f"    5-number:  min {wd['min']:.0f}  |  Q1 {wd['q1']:.0f}  |  median {wd['median']:.0f}  |  "
+              f"Q3 {wd['q3']:.0f}  |  max {wd['max']:.0f}")
+        print(f"    mean {wd['avg']}  |  stdev {wd['stdev']}  (n {wd['n']})")
 
     if args.all:                          # the other two lenses, appended after the default report above
         print("\n" + "═" * 72)
