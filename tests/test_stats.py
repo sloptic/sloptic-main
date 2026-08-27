@@ -233,3 +233,27 @@ def test_hm_formats_seconds_as_hours_minutes():
     assert _hm(0) == "0h 00m"
     assert _hm(3600) == "1h 00m"
     assert _hm(125) == "0h 02m"
+
+
+def test_audit_category_matches_family_aggregates_and_lists_available(capsys):
+    from stats import audit_category
+    recs = [
+        {"repo": "https://a", "deployed": True, "functional": True, "slop_score": 123, "findings": [
+            {"probe_id": "sec-secrets-002", "bundle": "security", "category": "secrets-exposure",
+             "penalty": 98, "reason": "key in bundle"},
+            {"probe_id": "sec-exposure-006", "bundle": "security", "category": "exposure",
+             "penalty": 25, "reason": "open json"}]},
+        {"repo": "https://b", "deployed": True, "functional": True, "slop_score": 30, "findings": [
+            {"probe_id": "qa-a11y-001", "bundle": "qa", "category": "accessibility",
+             "penalty": 30, "reason": "contrast"}]},
+    ]
+    audit_category(recs, "exposure")            # 'exposure' matches BOTH exposure categories, not accessibility
+    out = capsys.readouterr().out
+    assert "security/secrets-exposure" in out and "security/exposure" in out
+    assert "qa/accessibility" not in out
+    assert "1/2 graded apps have >=1 finding here   |   2 findings" in out   # one app, its two exposure fires
+    assert "sec-secrets-002" in out and "sec-exposure-006" in out
+
+    audit_category(recs, "nope-not-a-category")   # no match -> names the available categories
+    out2 = capsys.readouterr().out
+    assert "no scored category matched" in out2 and "accessibility" in out2 and "exposure" in out2

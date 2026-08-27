@@ -13,6 +13,7 @@ Input is the JSONL that `deploy_and_grade.py --record FILE` appends (one line pe
     uv run python scripts/stats.py results.jsonl                        # the recall report (default)
     uv run python scripts/stats.py results.jsonl --all                  # all three lenses, one run
     uv run python scripts/stats.py results.jsonl --audit sec-sqli-004   # every app + evidence for one probe
+    uv run python scripts/stats.py results.jsonl --category exposure     # aggregate one category (grouped, not by probe)
     uv run python scripts/stats.py results.jsonl --json                 # machine readable summary
     uv run python scripts/stats.py results.jsonl --parity [--by X] [--csv F]   # cross stack visibility
     uv run python scripts/stats.py results.jsonl --precision [--show N]         # false positive audit
@@ -213,6 +214,53 @@ def audit(recs, probe_id):
             print(f"      $ {_curl(t)}   -> {t.get('status')}")
     print(f"\n  {probe_id} fired in {hits} app(s)."
           f"{'' if any(True for r in recs for f in r.get('findings', []) if f['probe_id'] == probe_id and (f.get('evidence') or {}).get('repro')) else '  (no repro records, regrade to capture replayable requests)'}")
+
+
+def audit_category(recs, query):
+    """Aggregate ONE category across the corpus, the group-by-category analog of --audit (group-by-probe). Matches
+    any scored category whose name contains QUERY, case insensitive, so 'exposure' catches security/exposure,
+    backend-exposure and secrets-exposure, then rolls up apps, findings, in-score damped slop, severity, the member
+    probes, and the apps it hit hardest. Drill into any single probe with --audit <probe id> for the repro."""
+    q = query.lower()
+    graded = [r for r in recs if _is_graded(r)]
+    matched = sorted({(f["bundle"], f["category"]) for r in graded for f in r.get("findings", [])
+                      if _scored(f) and q in f["category"].lower()})
+    if not matched:
+        allcats = sorted({f["category"] for r in graded for f in r.get("findings", []) if _scored(f)})
+        print(f"\n=== category: {query} ===\n  no scored category matched '{query}'.")
+        print("  available: " + ", ".join(allcats))
+        return
+    matchset = set(matched)
+    print(f"\n=== category: {query} ===  (matched: " + ", ".join(f"{b}/{c}" for b, c in matched) + ")")
+    probe_apps = defaultdict(set)                       # probe_id -> {repos it fired on within the category}
+    sev = Counter()
+    findings = 0
+    app_slop, app_worst = {}, {}                        # repo -> in-score category slop / worst (probe, penalty)
+    for r in graded:
+        subt = cat_subtotals(r)
+        best, hit = None, False
+        for f in r.get("findings", []):
+            if _scored(f) and (f["bundle"], f["category"]) in matchset:
+                hit, findings = True, findings + 1
+                probe_apps[f["probe_id"]].add(r["repo"])
+                sev[_severity_tier(f["penalty"])] += 1
+                if best is None or f["penalty"] > best[1]:
+                    best = (f["probe_id"], f["penalty"])
+        if hit:
+            app_slop[r["repo"]] = sum(v for k, v in subt.items() if k in matchset)
+            app_worst[r["repo"]] = best
+    print(f"  {len(app_slop)}/{len(graded)} graded apps have >=1 finding here   |   {findings} findings   |   "
+          f"slop {sum(app_slop.values()):.1f} (damped, inside the score)")
+    print(f"  severity:  critical {sev['critical']}  serious {sev['serious']}  "
+          f"moderate {sev['moderate']}  minor {sev['minor']}")
+    print("  probes in this category (apps fired on):")
+    for pid, apps in sorted(probe_apps.items(), key=lambda x: -len(x[1])):
+        print(f"      {pid:20} {len(apps):>4} apps")
+    print("  hardest hit apps (by in-score slop from this category):")
+    for repo, cs in sorted(app_slop.items(), key=lambda x: -x[1])[:8]:
+        pid, pen = app_worst[repo]
+        print(f"      {repo:52} {cs:6.1f}   worst: {pid} pen={pen}")
+    print("\n  -> per finding repro: scripts/stats.py <results> --audit <probe id>")
 
 
 def _is_graded(r):
@@ -1163,6 +1211,9 @@ def main():
                     "visibility) and --precision (false positive audit). One tool, three lenses on one file.")
     ap.add_argument("results", help="the JSONL from deploy_and_grade --record (or a filled worksheet, with --tally)")
     ap.add_argument("--audit", metavar="PROBE", help="list every app + evidence where PROBE fired, then exit")
+    ap.add_argument("--category", metavar="CAT",
+                    help="aggregate one category across the corpus (e.g. exposure, accessibility), grouped by "
+                         "category instead of by probe, then exit")
     ap.add_argument("--json", action="store_true", help="emit a machine readable summary instead of the report")
     ap.add_argument("--sigma", type=float, default=2.0, help="high outlier threshold in stdevs (default 2)")
     ap.add_argument("--charts", action="store_true",
@@ -1206,6 +1257,9 @@ def main():
         return
     if args.audit:
         audit(recs, args.audit)
+        return
+    if args.category:
+        audit_category(recs, args.category)
         return
     if args.charts:
         import pathlib
