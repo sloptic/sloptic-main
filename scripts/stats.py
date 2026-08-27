@@ -2142,15 +2142,22 @@ def main():
     # WORST FINDING SEVERITY: the single highest penalty finding per app, aggregated across apps, so the tail
     # (how bad is the worst single hit on a typical app) is legible next to the tier COUNTS in [6]. Over graded
     # apps carrying >=1 scored finding, which on this corpus is all of them (the header floor guarantees one).
-    worst = [m for m in (max((f["penalty"] for f in r.get("findings", []) if _scored(f)), default=0)
-                         for r in graded) if m > 0]
-    wd = _dist(worst)
+    worst_rows = []      # (repo, penalty, category, probe_id) of each app's single hardest finding
+    for r in graded:
+        scored = [f for f in r.get("findings", []) if _scored(f)]
+        if scored:
+            wf = max(scored, key=lambda f: f["penalty"])
+            worst_rows.append((r["repo"], wf["penalty"], wf.get("category", "?"), wf.get("probe_id", "?")))
+    wd = _dist([w[1] for w in worst_rows])
     if wd:
         sec("WORST FINDING SEVERITY  (the single highest penalty finding per app, aggregated; how severe the "
             "worst hit is)")
         print(f"    5-number:  min {wd['min']:.0f}  |  Q1 {wd['q1']:.0f}  |  median {wd['median']:.0f}  |  "
               f"Q3 {wd['q3']:.0f}  |  max {wd['max']:.0f}")
         print(f"    mean {wd['avg']}  |  stdev {wd['stdev']}  (n {wd['n']})")
+        print("    hardest hit  (highest single finding penalty):")
+        for repo, pen, cat, pid in sorted(worst_rows, key=lambda x: -x[1])[:6]:
+            print(f"      {repo:52} {pen:>3}   {cat} ({pid})")
 
     if args.all:                          # the other two lenses, appended after the default report above
         print("\n" + "═" * 72)
