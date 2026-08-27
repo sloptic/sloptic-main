@@ -468,6 +468,9 @@ browser = [
 ]
 
 [package.dev-dependencies]
+browser = [
+    { name = "playwright" },
+]
 dev = [
     { name = "pytest" },
 ]
@@ -483,6 +486,7 @@ requires-dist = [
 provides-extras = ["browser"]
 
 [package.metadata.requires-dev]
+browser = [{ name = "playwright", specifier = ">=1.61.0" }]
 dev = [{ name = "pytest", specifier = ">=8" }]
 
 [[package]]

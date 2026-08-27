@@ -54,6 +54,16 @@ exclude = ["**/hidden/**", "**/catalog-hidden/**"]
 
 [dependency-groups]
 dev = ["pytest>=8"]
+# Mirror of the `browser` extra as a uv dependency-group so a plain `uv sync` installs Playwright by default
+# (via default-groups below) and never silently strips it -- naive `uv sync` prunes the playwright PACKAGE
+# otherwise and browser grading (qa-a11y via axe, perf-cwv, sec-domxss, SPA form discovery) goes dark. Keep
+# this version in lockstep with [project.optional-dependencies].browser; the public pip install path stays
+# the extra (`pip install sloptic[browser]`). The Chromium BINARY is separate (~/.cache/ms-playwright, outside
+# the venv, uv never touches it); a fresh machine still needs `uv run playwright install chromium` once.
+browser = ["playwright>=1.61.0"]
+
+[tool.uv]
+default-groups = ["dev", "browser"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
