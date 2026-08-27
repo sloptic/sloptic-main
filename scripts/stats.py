@@ -251,6 +251,10 @@ def audit_category(recs, query):
             app_worst[r["repo"]] = best
     print(f"  {len(app_slop)}/{len(graded)} graded apps have >=1 finding here   |   {findings} findings   |   "
           f"slop {sum(app_slop.values()):.1f} (damped, inside the score)")
+    d = _dist(list(app_slop.values()))            # how much slop this category ALONE adds to a typical affected app
+    if d:
+        print(f"  slop per affected app:  mean {d['avg']}  median {d['median']}  stdev {d['stdev']}  "
+              f"(min {d['min']}  max {d['max']}, over the {d['n']} apps with a finding here)")
     print(f"  severity:  critical {sev['critical']}  serious {sev['serious']}  "
           f"moderate {sev['moderate']}  minor {sev['minor']}")
     print("  probes in this category (apps fired on):")
