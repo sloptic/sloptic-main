@@ -8,7 +8,8 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 from stats import (  # noqa: E402
-    _dnf_reason, _is_graded, _modalities, _severity_tier, auth_surface, by_hackathon, lighthouse_scores)
+    _dnf_reason, _is_graded, _modalities, _severity_tier, _worst_penalty, auth_surface, by_hackathon,
+    lighthouse_scores)
 
 from sloptic.eligibility import is_ungradeable_challenge  # noqa: E402
 
@@ -207,3 +208,20 @@ def test_diff_report_json_movers_and_fire_deltas(capsys):
     assert d["common"] == 1 and d["added"] == ["https://c"] and d["removed"] == ["https://b"]
     assert d["score_delta"]["net"] == -30 and d["score_delta"]["improved"] == 1 and d["score_delta"]["regressed"] == 0
     assert d["probe_fire_delta"]["sec-x"] == -1 and d["gone_fire_pairs"] == 1 and d["new_fire_pairs"] == 0
+
+
+def test_worst_penalty_uses_top_of_severity_range_else_nominal():
+    # the max-possible ceiling ([23]) needs each probe's WORST rung, not its base. severity.range[1] is that
+    # top rung; a probe with no severity block falls back to its nominal penalty. (qa-email-001: base 5, worst 72.)
+    class _Sev:
+        def __init__(self, rng):
+            self.range = rng
+
+    class _Probe:
+        def __init__(self, severity, penalty):
+            self.severity = severity
+            self.penalty = penalty
+
+    assert _worst_penalty(_Probe(_Sev((5, 72)), 5)) == 72     # escalates above base -> top of range
+    assert _worst_penalty(_Probe(None, 40)) == 40             # no severity block -> nominal
+    assert _worst_penalty(_Probe(_Sev(None), 30)) == 30       # severity but no range -> nominal

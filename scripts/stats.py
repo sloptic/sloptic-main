@@ -487,6 +487,16 @@ def probe_applicability(recs):
     return len(graded), rows
 
 
+def _worst_penalty(p):
+    """The worst a probe can deduct: the top of its severity range (its highest escalator rung), falling back
+    to the nominal penalty when the probe has no severity block. This is the ceiling for the max achievable slop,
+    the worst that can happen if the probe fired at full severity, not the base rung (39 of 102 probes escalate
+    above base, so the base understates the ceiling)."""
+    s = getattr(p, "severity", None)
+    rng = getattr(s, "range", None) if s is not None else None
+    return rng[1] if rng else p.penalty
+
+
 _CSV_COLS = ["repo", "app_kind", "web_gradeable", "deployed", "framework", "routing", "api_style", "stack",
              "n_features", "obs_routes", "obs_forms", "obs_inputs", "obs_endpoints",
              "obs_endpoints_reached", "obs_endpoints_dead", "obs_surface_size",
@@ -2045,6 +2055,66 @@ def main():
             sd = statistics.stdev(xs) if len(xs) > 1 else 0.0
             print(f"    {label:20} median {statistics.median(xs):>10.1f}  mean {statistics.mean(xs):>10.1f}  "
                   f"sd {sd:>10.1f}  min {min(xs):>8.1f}  max {max(xs):>10.1f}   (n {len(xs)})")
+
+    # SLOP TO SURFACE RATIO: slop score / observed surface size = slop DENSITY. Two apps on the same raw slop
+    # aren't equal, the one that carried more surface for it is relatively cleaner, so this is the eventual tie
+    # breaker on the ranking. A tiny surface inflates the ratio (a size 1 app is discovery blind, not dense), so
+    # the density LISTS gate on surface >= 10; the distribution reports all, tiny denominators drive its tail.
+    ratio_rows = [(r["repo"], r["slop_score"], (r.get("observed_surface") or {}).get("surface_size"))
+                  for r in graded if (r.get("observed_surface") or {}).get("surface_size")]
+    if ratio_rows:
+        ratios = [(repo, slop, size, slop / size) for repo, slop, size in ratio_rows]
+        rd = _dist([x[3] for x in ratios])
+        sec("SLOP TO SURFACE RATIO  (slop score / observed surface size = slop density; the eventual tie "
+            "breaker: same slop, more surface carried = relatively cleaner)")
+        if rd:
+            print(f"    n={rd['n']}  mean={rd['avg']}  median={rd['median']}  stdev={rd['stdev']}  "
+                  f"min={rd['min']}  max={rd['max']}  (q1={rd['q1']} q3={rd['q3']})")
+        surf = _dist([x[2] for x in ratios])
+        if surf:
+            print(f"    surface size   median={surf['median']}  mean={surf['avg']}  min={surf['min']:.0f}  "
+                  f"max={surf['max']:.0f}   (routes + forms + inputs + endpoints observed)")
+        dense = [x for x in ratios if x[2] >= 10]
+        print("    densest slop  (most slop per unit of surface, surface >= 10):")
+        for repo, slop, size, ratio in sorted(dense, key=lambda x: -x[3])[:6]:
+            print(f"      {repo:52} {ratio:6.2f}   (slop {slop} / surface {size})")
+        print("    lowest density  (most surface carried per unit of slop, surface >= 10):")
+        for repo, slop, size, ratio in sorted(dense, key=lambda x: x[3])[:6]:
+            print(f"      {repo:52} {ratio:6.2f}   (slop {slop} / surface {size})")
+
+    # SLOP VS MAX POSSIBLE: slop score / the worst case slop if every APPLIED probe fired its TOP rung. This is
+    # the fraction of ACHIEVABLE slop an app realized, and unlike raw slop it is coverage aware: an app on which
+    # more probes applied has a bigger ceiling, so the same raw slop over a bigger ceiling reads as relatively
+    # cleaner. The slop native complement to the surface ratio above, and the other eventual tie breaker.
+    try:
+        worst_pen = {p.id: _worst_penalty(p) for p in load_catalog(str(_ROOT / "catalog"))}
+    except Exception:                     # a catalog hiccup shouldn't sink the report
+        worst_pen = {}
+    mp_rows = []
+    for r in graded:
+        applied = (r.get("coverage") or {}).get("applied")
+        if not (applied and worst_pen):
+            continue
+        ceiling = sum(worst_pen.get(pid, 0) for pid in applied)
+        if ceiling > 0:
+            mp_rows.append((r["repo"], r["slop_score"], ceiling, r["slop_score"] / ceiling))
+    if mp_rows:
+        pct = _dist([x[3] * 100 for x in mp_rows])
+        sec("SLOP VS MAX POSSIBLE  (slop score / worst case slop if every APPLIED probe fired its top rung = "
+            "the fraction of achievable slop realized; coverage aware, the slop native tie breaker)")
+        if pct:
+            print(f"    n={pct['n']}  mean={pct['avg']}%  median={pct['median']}%  stdev={pct['stdev']}%  "
+                  f"min={pct['min']}%  max={pct['max']}%  (q1={pct['q1']}% q3={pct['q3']}%)")
+        ceil = _dist([x[2] for x in mp_rows])
+        if ceil:
+            print(f"    max possible   median={ceil['median']:.0f}  mean={ceil['avg']:.0f}  min={ceil['min']:.0f}  "
+                  f"max={ceil['max']:.0f}   (sum of the applied probes' worst case penalties)")
+        print("    most realized  (highest fraction of achievable slop, worst apps for the surface they were tested on):")
+        for repo, slop, ceiling, ratio in sorted(mp_rows, key=lambda x: -x[3])[:6]:
+            print(f"      {repo:52} {ratio * 100:5.1f}%   (slop {slop} / max {ceiling:.0f})")
+        print("    least realized  (cleanest for how much the applied battery could have dinged):")
+        for repo, slop, ceiling, ratio in sorted(mp_rows, key=lambda x: x[3])[:6]:
+            print(f"      {repo:52} {ratio * 100:5.1f}%   (slop {slop} / max {ceiling:.0f})")
 
     if args.all:                          # the other two lenses, appended after the default report above
         print("\n" + "═" * 72)
