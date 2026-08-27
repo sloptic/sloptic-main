@@ -8,7 +8,7 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 from stats import (  # noqa: E402
-    _dnf_reason, _is_graded, _modalities, _severity_tier, _worst_penalty, auth_surface, by_hackathon,
+    _dnf_reason, _hm, _is_graded, _modalities, _severity_tier, _worst_penalty, auth_surface, by_hackathon,
     lighthouse_scores)
 
 from sloptic.eligibility import is_ungradeable_challenge  # noqa: E402
@@ -225,3 +225,11 @@ def test_worst_penalty_uses_top_of_severity_range_else_nominal():
     assert _worst_penalty(_Probe(_Sev((5, 72)), 5)) == 72     # escalates above base -> top of range
     assert _worst_penalty(_Probe(None, 40)) == 40             # no severity block -> nominal
     assert _worst_penalty(_Probe(_Sev(None), 30)) == 30       # severity but no range -> nominal
+
+
+def test_hm_formats_seconds_as_hours_minutes():
+    # the [12] total-run duration: whole seconds -> 'Hh MMm', minutes zero-padded, seconds truncated
+    assert _hm(38157) == "10h 35m"     # 635.95 min -> 10h 35m (truncates, not rounds)
+    assert _hm(0) == "0h 00m"
+    assert _hm(3600) == "1h 00m"
+    assert _hm(125) == "0h 02m"

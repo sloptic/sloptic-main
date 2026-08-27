@@ -124,6 +124,12 @@ def _stat_line(xs):
             f"stdev={sd:.1f}  min={xs[0]:g}  max={xs[-1]:g}  (q1={q[0]:.0f} q3={q[2]:.0f})")
 
 
+def _hm(seconds):
+    """Whole seconds -> 'Hh MMm' (e.g. 38032 -> '10h 33m'), for the run-duration summary."""
+    h, m = divmod(int(seconds) // 60, 60)
+    return f"{h}h {m:02d}m"
+
+
 def _histogram(scores, bins=10, width=44):
     if not scores:
         return ["  (no scores)"]
@@ -1776,6 +1782,15 @@ def main():
     # (f) TIMING, the wall clock as its own signal: where time goes, and the slowest apps
     if timed:
         sec(f"TIMING  (wall clock seconds per phase, across {len(timed)} apps)")
+        # total time to run the grade: the run's WALL CLOCK (first record to last, from their ts) vs the summed
+        # per app compute (total_s). Their ratio is the effective concurrency the run actually achieved.
+        stamps = [r["ts"] for r in recs if r.get("ts")]
+        if len(stamps) >= 2:
+            wall = max(stamps) - min(stamps)
+            compute = sum(r["timings"].get("total_s", 0) for r in timed)
+            conc = f"   |   ~{compute / wall:.1f}x effective concurrency" if wall > 0 else ""
+            print(f"    total run: wall clock {_hm(wall)} (first to last of {len(stamps)} records)   |   "
+                  f"compute {_hm(compute)} summed{conc}")
         for key, label in _PHASES:
             xs = _phase(key)
             if xs:
