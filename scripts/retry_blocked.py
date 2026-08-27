@@ -33,6 +33,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -50,6 +51,26 @@ _print_lock = threading.Lock()
 
 _SKIPPED = object()      # sentinel record: this app was NOT retried because the IP-block circuit breaker tripped
 _IP_BLOCK_SAMPLE = 8     # entry-challenged apps with ZERO recovery before we call it an IP-level flag (not per-app)
+
+# THROTTLE: identical to run_batch's, and for the SAME reason -- and it matters more here. run_batch spaces its
+# job STARTS with --delay so its per-IP request rate stays under Vercel's WAF threshold; that politeness is why
+# the main run graded thousands of apps without the IP getting flagged. retry_blocked had NO throttle, so it
+# fired the blocked apps (~all Vercel) back-to-back at full concurrency: the first ~50 apps' requests are the
+# runway, then the cumulative volume trips the WAF, the IP flags, and every later request 403s (the run "dies")
+# -- exactly the failure run_batch's throttle exists to prevent. Space job starts globally across all workers.
+_throttle_lock = threading.Lock()
+_next_start = [0.0]      # monotonic time the next job may START
+
+
+def _throttle(delay: float) -> None:
+    if delay <= 0:
+        return
+    with _throttle_lock:
+        now = time.monotonic()
+        wait = max(0.0, _next_start[0] - now)
+        _next_start[0] = max(now, _next_start[0]) + delay
+    if wait:
+        time.sleep(wait)
 
 
 def _read_jsonl(path):
@@ -163,12 +184,13 @@ def _looks_like_ip_block(statuses):
     return len(window) >= _IP_BLOCK_SAMPLE and all(kind == "none" for kind in window)
 
 
-def _retry_one(url, blocked, tmpdir, extra_flags, grade_timeout, abort=None):
+def _retry_one(url, blocked, tmpdir, extra_flags, grade_timeout, abort=None, delay=0.0):
     """Subset re-grade one app to its OWN temp record, read it back, return (url, blocked, record|None).
     If `abort` is already set when this job starts (the IP-block circuit breaker tripped), skip it and return
     _SKIPPED -- spending more traffic on a flagged IP only re-warms the flag and resets its decay."""
     if abort is not None and abort.is_set():
         return url, blocked, _SKIPPED
+    _throttle(delay)   # politeness gap before this job's first request -- keeps the per-IP rate under the WAF flag
     rec_path = os.path.join(tmpdir, hashlib.md5(url.encode()).hexdigest() + ".jsonl")
     cmd = PY + [str(_HERE / "deploy_and_grade.py"), url, "--url", "--record", rec_path,
                 "--grade-timeout", str(grade_timeout)]
@@ -238,6 +260,11 @@ def main():
     ap = argparse.ArgumentParser(description="retry the WAF-blocked tail on challenged apps, post-run")
     ap.add_argument("--results", required=True, help="the main run's results .jsonl (never mutated)")
     ap.add_argument("--concurrency", type=int, default=4, help="apps retried in parallel (default 4)")
+    ap.add_argument("--delay", type=float, default=2.0, metavar="SECONDS",
+                    help="global minimum gap between job STARTS across all workers, the politeness throttle that "
+                         "keeps the per-IP request rate under Vercel's WAF flag (default 2.0; the blocked set is "
+                         "~all Vercel, so unthrottled it floods the IP after ~50 apps and every later request 403s). "
+                         "Raise it if the IP still flags; 0 disables (matches the old unthrottled behavior)")
     ap.add_argument("--grade-timeout", type=int, default=900, help="per-app subset-grade timeout (s)")
     ap.add_argument("--browser-auth", action="store_true", help="pass through to the grader (MATCH the main run)")
     ap.add_argument("--no-browser", action="store_true", help="pass through to the grader (MATCH the main run)")
@@ -299,7 +326,8 @@ def main():
     abort = threading.Event()         # set by the IP-block circuit breaker; pending jobs then skip immediately
     statuses = []                     # (kind, bot_challenge) per graded app, for the breaker's verdict
     with ThreadPoolExecutor(max_workers=args.concurrency) as ex:
-        futs = [ex.submit(_retry_one, url, bp, tmpdir, flags, args.grade_timeout, abort) for url, bp, flags in job_flags]
+        futs = [ex.submit(_retry_one, url, bp, tmpdir, flags, args.grade_timeout, abort, args.delay)
+                for url, bp, flags in job_flags]
         for f in as_completed(futs):
             done += 1
             url, blocked, rec = f.result()

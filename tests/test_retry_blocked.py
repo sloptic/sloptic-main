@@ -11,7 +11,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 from retry_blocked import (  # noqa: E402
     _IP_BLOCK_SAMPLE, _fold_and_summary, _load_jobs, _looks_like_ip_block, _session_flags, _status,
-    _to_outcome, merge)
+    _throttle, _to_outcome, merge)
 
 from sloptic.aggregate import compute_slop_score  # noqa: E402
 
@@ -223,3 +223,22 @@ def test_fold_and_summary_folds_blocked_and_copies_the_rest(tmp_path):
     assert rows[0]["retry"]["recovered"] == ["sec-cmdi-001"]
     assert rows[0]["slop_score"] == 7                                             # clean recovery -> exact
     assert rows[1] == main[1]                                                     # unblocked app untouched
+
+
+def test_throttle_spaces_job_starts_and_zero_disables():
+    # the WAF politeness gap: retry_blocked flooded Vercel with no throttle (first ~50 apps then every request
+    # 403s). delay=0 must be a no-op; delay>0 spaces global job starts by ~delay each (first start is free).
+    import time
+
+    import retry_blocked as rb
+    rb._next_start[0] = 0.0
+    t0 = time.monotonic()
+    rb._throttle(0)                       # disabled -> returns immediately
+    assert time.monotonic() - t0 < 0.05
+    rb._next_start[0] = 0.0
+    d = 0.15
+    t0 = time.monotonic()
+    for _ in range(3):                    # 3 starts -> 2 gaps of d (the first is free)
+        rb._throttle(d)
+    elapsed = time.monotonic() - t0
+    assert 2 * d - 0.05 <= elapsed <= 2 * d + 0.20
