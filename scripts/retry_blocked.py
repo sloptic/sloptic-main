@@ -188,7 +188,17 @@ def _looks_like_ip_block(statuses, sample=_IP_BLOCK_SAMPLE):
     return len(window) >= sample and all(kind == "none" for kind in window)
 
 
-def _retry_one(url, blocked, tmpdir, extra_flags, grade_timeout, abort=None, delay=0.0, inject_pool=1):
+# Light, BENIGN probes to pad the retry with (`--pad-benign`), so each session opens with normal reads before it
+# touches the blocked attack probes -- diluting the "pure attacker" behavioral signal toward run_batch's
+# survivable mix. PROVEN NOT the IP (curl 200s the same IP), so the lever is the CLIENT's behavior; run_batch and
+# the retry share the client + IP, the only difference is run_batch's attacks are diluted in a benign battery.
+# These are header/meta/content-type/a11y reads: no attack payloads, low fan-out, and EARLY in catalog order so
+# they run first. Their findings are DROPPED before the merge (pure traffic camouflage -- they already have valid
+# results in the main grade; only the blocked set is real recovery). See [[vercel-challenge-is-client-not-ip]].
+_BENIGN_PAD = ("sec-headers-001", "sec-headers-002", "qa-ctype-001", "qa-http-001", "qa-seo-001", "qa-a11y-001")
+
+
+def _retry_one(url, blocked, tmpdir, extra_flags, grade_timeout, abort=None, delay=0.0, inject_pool=1, pad=()):
     """Subset re-grade one app to its OWN temp record, read it back, return (url, blocked, record|None).
     If `abort` is already set when this job starts (the IP-block circuit breaker tripped), skip it and return
     _SKIPPED -- spending more traffic on a flagged IP only re-warms the flag and resets its decay.
@@ -205,14 +215,19 @@ def _retry_one(url, blocked, tmpdir, extra_flags, grade_timeout, abort=None, del
     rec_path = os.path.join(tmpdir, hashlib.md5(url.encode()).hexdigest() + ".jsonl")
     cmd = PY + [str(_HERE / "deploy_and_grade.py"), url, "--url", "--record", rec_path,
                 "--grade-timeout", str(grade_timeout)]
-    for pid in blocked:
+    probes = [p for p in pad if p not in blocked] + list(blocked)   # benign pad first (also catalog-ordered early)
+    for pid in probes:
         cmd += ["--probe", pid]
     cmd += extra_flags
     env = {**os.environ, "SLOPTIC_INJECT_POOL": str(inject_pool), "SLOPTIC_EXPOSURE_POOL": str(inject_pool)}
     try:
         subprocess.run(cmd, timeout=grade_timeout + 300, capture_output=True, env=env)
         recs = _read_jsonl(rec_path)
-        return url, blocked, (recs[-1] if recs else None)
+        rec = recs[-1] if recs else None
+        if rec and pad:   # drop the camouflage probes' findings -- only the blocked set is real recovery to merge
+            keep = set(blocked)
+            rec["findings"] = [f for f in (rec.get("findings") or []) if f.get("probe_id") in keep]
+        return url, blocked, rec
     except Exception:
         return url, blocked, None   # DNF -> _status reports dnf, merge recovers nothing
 
@@ -276,6 +291,12 @@ def main():
                     help=f"abort the retry after N consecutive zero-recovery entry challenges (default "
                          f"{_IP_BLOCK_SAMPLE}). The flag is intermittent (apps recover in the tail even mid-flag), "
                          f"so a low N throws away recoverable apps; raise it to grind through, or 0 to never abort")
+    ap.add_argument("--pad-benign", action="store_true",
+                    help="EXPERIMENT: prepend light benign probes (headers/ctype/http/seo/a11y) to each app's "
+                         "retry set so the session opens benign before the attack probes, diluting the "
+                         "pure-attacker behavioral signal Vercel keys on (curl proves it's NOT the IP; run_batch "
+                         "survives because its attacks are diluted in a benign battery). Pad findings are dropped "
+                         "before the merge (camouflage only). A/B against the default to see if the flag moves past ~40")
     ap.add_argument("--inject-pool", type=int, default=1, metavar="N",
                     help="injection/exposure fan-out width in the grade (default 1 = SERIAL, the pre-v23 behavior "
                          "that recovered 769/785 on the v20 retry). run_batch uses 6 for speed, but a 6-wide burst "
@@ -345,8 +366,9 @@ def main():
     abort = threading.Event()         # set by the IP-block circuit breaker; pending jobs then skip immediately
     statuses = []                     # (kind, bot_challenge) per graded app, for the breaker's verdict
     with ThreadPoolExecutor(max_workers=args.concurrency) as ex:
+        pad = _BENIGN_PAD if args.pad_benign else ()
         futs = [ex.submit(_retry_one, url, bp, tmpdir, flags, args.grade_timeout, abort, args.delay,
-                          args.inject_pool) for url, bp, flags in job_flags]
+                          args.inject_pool, pad) for url, bp, flags in job_flags]
         for f in as_completed(futs):
             done += 1
             url, blocked, rec = f.result()
