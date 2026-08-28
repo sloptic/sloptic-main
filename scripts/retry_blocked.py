@@ -50,7 +50,10 @@ PY = [str(_VENV_PY)] if _VENV_PY.exists() else [sys.executable]
 _print_lock = threading.Lock()
 
 _SKIPPED = object()      # sentinel record: this app was NOT retried because the IP-block circuit breaker tripped
-_IP_BLOCK_SAMPLE = 8     # entry-challenged apps with ZERO recovery before we call it an IP-level flag (not per-app)
+_IP_BLOCK_SAMPLE = 25    # consecutive zero-recovery entry challenges before we abort. RELAXED from 8: the flag is
+#                          INTERMITTENT (apps still recover in the tail even mid-flag -- observed 3 late successes
+#                          right after a 9-challenge cluster), so a low bar aborts a run that would still recover.
+#                          Only a long sustained dead streak is a truly hopeless hard flag. Tunable; 0 disables.
 
 # THROTTLE: identical to run_batch's, and for the SAME reason -- and it matters more here. run_batch spaces its
 # job STARTS with --delay so its per-IP request rate stays under Vercel's WAF threshold; that politeness is why
@@ -166,22 +169,23 @@ def _status(blocked, rec):
     return ("partial" if recovered else "none"), recovered, total, onset
 
 
-def _looks_like_ip_block(statuses):
-    """True when the retry shows a SYSTEMIC IP-level flag, not per-app challenging. On a clean IP a thin subset
-    retry recovers most tails; an IP-reputation block re-challenges EVERY app at entry and recovers nothing.
+def _looks_like_ip_block(statuses, sample=_IP_BLOCK_SAMPLE):
+    """True when the retry shows a SUSTAINED, hopeless IP-level flag -- abort so it stops re-warming a dead run.
+    `sample` <= 0 DISABLES the breaker (run to completion regardless).
 
-    WINDOWED, not global: the flag usually DEVELOPS mid-retry, not from the first app. The blocked_probes we
-    re-send ARE the WAF trippers (host-header / cmdi / dos / upload -- that is WHY they were blocked), so the
-    retry's own traffic re-flags the IP after some early recoveries. The old verdict (global `recovered == 0`)
-    was permanently disabled by any SINGLE early recovery, so it only ever caught a flag present from the FIRST
-    app and missed the common case: dozens recover, the IP re-flags, then hundreds entry-challenge with zero
-    recovery and the breaker never fires. Verdict now: of the last _IP_BLOCK_SAMPLE WAF-verdict apps (a recovery
-    OR an entry-challenge; dnf / plain-none are neutral and skipped, so a dead-URL streak never trips it), ALL
-    are zero-recovery entry challenges. `statuses` is [(kind, bot_challenge_bool)] in completion order."""
+    WINDOWED, not global: the flag usually DEVELOPS mid-retry, not from the first app. But it is also
+    INTERMITTENT -- apps keep recovering in the tail even while the IP is flagged (observed 3 late successes
+    right after a 9-challenge cluster). So the bar must be a LONG streak: of the last `sample` WAF-verdict apps
+    (a recovery OR an entry-challenge; dnf / plain-none are neutral and skipped, so a dead-URL streak never trips
+    it), ALL are zero-recovery entry challenges. A single recovery anywhere in the window resets it, so an
+    intermittent-success run never aborts -- only a genuinely dead sustained streak does. `statuses` is
+    [(kind, bot_challenge_bool)] in completion order."""
+    if sample <= 0:
+        return False
     verdicts = [kind for kind, chal in statuses
                 if kind in ("full", "partial") or (kind == "none" and chal)]
-    window = verdicts[-_IP_BLOCK_SAMPLE:]
-    return len(window) >= _IP_BLOCK_SAMPLE and all(kind == "none" for kind in window)
+    window = verdicts[-sample:]
+    return len(window) >= sample and all(kind == "none" for kind in window)
 
 
 def _retry_one(url, blocked, tmpdir, extra_flags, grade_timeout, abort=None, delay=0.0, inject_pool=1):
@@ -268,6 +272,10 @@ def main():
     ap = argparse.ArgumentParser(description="retry the WAF-blocked tail on challenged apps, post-run")
     ap.add_argument("--results", required=True, help="the main run's results .jsonl (never mutated)")
     ap.add_argument("--concurrency", type=int, default=4, help="apps retried in parallel (default 4)")
+    ap.add_argument("--ip-block-sample", type=int, default=_IP_BLOCK_SAMPLE, metavar="N",
+                    help=f"abort the retry after N consecutive zero-recovery entry challenges (default "
+                         f"{_IP_BLOCK_SAMPLE}). The flag is intermittent (apps recover in the tail even mid-flag), "
+                         f"so a low N throws away recoverable apps; raise it to grind through, or 0 to never abort")
     ap.add_argument("--inject-pool", type=int, default=1, metavar="N",
                     help="injection/exposure fan-out width in the grade (default 1 = SERIAL, the pre-v23 behavior "
                          "that recovered 769/785 on the v20 retry). run_batch uses 6 for speed, but a 6-wide burst "
@@ -358,10 +366,10 @@ def main():
             # cannot dig out -- and every further retry only re-warms the flag. When that pattern is unmistakable,
             # STOP (pending jobs skip via the abort event; in-flight ones finish).
             statuses.append((kind, bool((rec or {}).get("bot_challenge"))))
-            if not abort.is_set() and _looks_like_ip_block(statuses):
+            if not abort.is_set() and _looks_like_ip_block(statuses, args.ip_block_sample):
                 abort.set()
                 with _print_lock:
-                    print(f"\n  ⚠ IP-LEVEL FLAG DETECTED — the last {_IP_BLOCK_SAMPLE} graded apps all re-challenged "
+                    print(f"\n  ⚠ IP-LEVEL FLAG DETECTED — the last {args.ip_block_sample} graded apps all re-challenged "
                           f"at entry and recovered nothing. This is a Vercel IP-reputation block, not per-app "
                           f"challenging.\n    Stopping: this tool cannot dig out an IP block, and retrying the "
                           f"rest only re-warms the flag and resets its (hours-long) decay. Halt Vercel traffic "
