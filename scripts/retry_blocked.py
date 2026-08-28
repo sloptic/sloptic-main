@@ -188,14 +188,23 @@ def _looks_like_ip_block(statuses, sample=_IP_BLOCK_SAMPLE):
     return len(window) >= sample and all(kind == "none" for kind in window)
 
 
-# Light, BENIGN probes to pad the retry with (`--pad-benign`), so each session opens with normal reads before it
-# touches the blocked attack probes -- diluting the "pure attacker" behavioral signal toward run_batch's
-# survivable mix. PROVEN NOT the IP (curl 200s the same IP), so the lever is the CLIENT's behavior; run_batch and
-# the retry share the client + IP, the only difference is run_batch's attacks are diluted in a benign battery.
-# These are header/meta/content-type/a11y reads: no attack payloads, low fan-out, and EARLY in catalog order so
-# they run first. Their findings are DROPPED before the merge (pure traffic camouflage -- they already have valid
-# results in the main grade; only the blocked set is real recovery). See [[vercel-challenge-is-client-not-ip]].
-_BENIGN_PAD = ("sec-headers-001", "sec-headers-002", "qa-ctype-001", "qa-http-001", "qa-seo-001", "qa-a11y-001")
+def _benign_pad_probes():
+    """The FULL benign battery (`--pad-benign`), so each retry session opens like run_batch's full grade does:
+    ~all the tier-0/1 passive+ordinary probes FIRST, then the blocked attack tail LAST (the pipeline re-sorts by
+    safety.order_weight, so benign always runs before attack regardless of --probe order). PROVEN not the IP
+    (curl 200s the same IP): run_batch and the retry share client+IP; the ONLY difference is run_batch fires
+    ~40 benign probes before its attack tail (WAF trips only at the tail, after the client already reads as
+    'mostly benign'), while the retry's subset is attack-from-probe-#1. A 6-probe pad was far too little dilution
+    -- run_batch's ratio is ~3:1 benign:attack. This returns the whole tier-0/1 set EXCEPT perf-* (Lighthouse is
+    a heavy ~3min render and discovery already does a benign browser render, so it adds cost without more benign
+    SIGNAL). Pad findings are dropped before the merge (camouflage; those probes already graded in the main run).
+    See [[vercel-challenge-is-client-not-ip]]."""
+    try:
+        from sloptic import safety
+        return tuple(p.id for p in load_catalog(str(_ROOT / "catalog"))
+                     if safety.order_weight(p.id) <= 1 and not p.id.startswith("perf-"))
+    except Exception:   # catalog/safety hiccup -> a minimal light benign set still opens the session benign
+        return ("sec-headers-001", "sec-headers-002", "qa-ctype-001", "qa-http-001", "qa-seo-001", "qa-a11y-001")
 
 
 def _retry_one(url, blocked, tmpdir, extra_flags, grade_timeout, abort=None, delay=0.0, inject_pool=1, pad=()):
@@ -366,7 +375,7 @@ def main():
     abort = threading.Event()         # set by the IP-block circuit breaker; pending jobs then skip immediately
     statuses = []                     # (kind, bot_challenge) per graded app, for the breaker's verdict
     with ThreadPoolExecutor(max_workers=args.concurrency) as ex:
-        pad = _BENIGN_PAD if args.pad_benign else ()
+        pad = _benign_pad_probes() if args.pad_benign else ()
         futs = [ex.submit(_retry_one, url, bp, tmpdir, flags, args.grade_timeout, abort, args.delay,
                           args.inject_pool, pad) for url, bp, flags in job_flags]
         for f in as_completed(futs):
