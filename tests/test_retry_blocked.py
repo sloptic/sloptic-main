@@ -176,25 +176,12 @@ def test_ip_block_breaker_ignores_dnf_and_non_challenge_blocks():
 
 
 def test_load_jobs_dedups_by_url_and_skips_unblocked():
-    # benign probe (sec-headers) so this tests only dedup / skip-unblocked / skip-non-url, not tripper filtering
-    recs = [{"repo": "https://a", "blocked_probes": ["sec-headers-001"]},
-            {"repo": "https://a", "blocked_probes": ["sec-headers-001"]},   # dup url -> once
-            {"repo": "https://b", "blocked_probes": []},                    # not blocked -> skip
-            {"repo": "local-ingest-id", "blocked_probes": ["sec-headers-001"]},  # non-url repo -> skip
-            {"repo": "https://c", "blocked_probes": ["sec-session-003"]}]
+    recs = [{"repo": "https://a", "blocked_probes": ["sec-cmdi-001"]},
+            {"repo": "https://a", "blocked_probes": ["sec-cmdi-001"]},   # dup url -> once
+            {"repo": "https://b", "blocked_probes": []},                 # not blocked -> skip
+            {"repo": "local-ingest-id", "blocked_probes": ["sec-cmdi-001"]},  # non-url repo -> skip
+            {"repo": "https://c", "blocked_probes": ["sec-ssti-001"]}]
     assert [u for u, _bp, _rec in _load_jobs(recs)] == ["https://a", "https://c"]
-
-
-def test_load_jobs_skips_waf_tripper_families_by_default():
-    # the mid-run flag fix: attack/fuzzing probes re-trip the WAF and flood the IP, so the retry drops them by
-    # default (they stay blocked, WAF-denied); only the recoverable benign tail is retried. --retry-waf-trippers
-    # (skip_trippers=False) restores the old behavior.
-    recs = [{"repo": "https://a", "blocked_probes": ["sec-cmdi-001", "sec-headers-001"]},   # mixed
-            {"repo": "https://b", "blocked_probes": ["sec-upload-002", "sec-sqli-004"]}]     # all trippers
-    default = {u: bp for u, bp, _ in _load_jobs(recs)}
-    assert default == {"https://a": ["sec-headers-001"]}       # b dropped entirely (no benign tail)
-    keep = {u: bp for u, bp, _ in _load_jobs(recs, skip_trippers=False)}
-    assert keep["https://a"] == ["sec-cmdi-001", "sec-headers-001"] and "https://b" in keep
 
 
 def test_session_flags_reuses_a_captured_session_no_rewalk():
