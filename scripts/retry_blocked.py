@@ -184,21 +184,29 @@ def _looks_like_ip_block(statuses):
     return len(window) >= _IP_BLOCK_SAMPLE and all(kind == "none" for kind in window)
 
 
-def _retry_one(url, blocked, tmpdir, extra_flags, grade_timeout, abort=None, delay=0.0):
+def _retry_one(url, blocked, tmpdir, extra_flags, grade_timeout, abort=None, delay=0.0, inject_pool=1):
     """Subset re-grade one app to its OWN temp record, read it back, return (url, blocked, record|None).
     If `abort` is already set when this job starts (the IP-block circuit breaker tripped), skip it and return
-    _SKIPPED -- spending more traffic on a flagged IP only re-warms the flag and resets its decay."""
+    _SKIPPED -- spending more traffic on a flagged IP only re-warms the flag and resets its decay.
+
+    `inject_pool` forces SERIAL injection/exposure fan-out (pool=1) in the grade, the pre-v23 behavior. run_batch
+    parallelizes the injection fan-out (SLOPTIC_INJECT_POOL=6, ba6fe93) to save time, but that fires a 6-wide
+    BURST of attack requests per app -- diluted across run_batch's benign battery it's fine, but the retry fires
+    ONLY the blocked (attack) probes on ~all-Vercel apps, so the bursts stack into an attack pattern Protectd's
+    fast edge WAF flags after ~50 apps. The v20 retry recovered 769/785 with serial injection; this restores it,
+    re-firing the SAME probes one request at a time to reach the real app past the challenge, not a burst."""
     if abort is not None and abort.is_set():
         return url, blocked, _SKIPPED
-    _throttle(delay)   # politeness gap before this job's first request -- keeps the per-IP rate under the WAF flag
+    _throttle(delay)   # optional politeness gap before this job's first request
     rec_path = os.path.join(tmpdir, hashlib.md5(url.encode()).hexdigest() + ".jsonl")
     cmd = PY + [str(_HERE / "deploy_and_grade.py"), url, "--url", "--record", rec_path,
                 "--grade-timeout", str(grade_timeout)]
     for pid in blocked:
         cmd += ["--probe", pid]
     cmd += extra_flags
+    env = {**os.environ, "SLOPTIC_INJECT_POOL": str(inject_pool), "SLOPTIC_EXPOSURE_POOL": str(inject_pool)}
     try:
-        subprocess.run(cmd, timeout=grade_timeout + 300, capture_output=True)
+        subprocess.run(cmd, timeout=grade_timeout + 300, capture_output=True, env=env)
         recs = _read_jsonl(rec_path)
         return url, blocked, (recs[-1] if recs else None)
     except Exception:
@@ -260,11 +268,14 @@ def main():
     ap = argparse.ArgumentParser(description="retry the WAF-blocked tail on challenged apps, post-run")
     ap.add_argument("--results", required=True, help="the main run's results .jsonl (never mutated)")
     ap.add_argument("--concurrency", type=int, default=4, help="apps retried in parallel (default 4)")
-    ap.add_argument("--delay", type=float, default=2.0, metavar="SECONDS",
-                    help="global minimum gap between job STARTS across all workers, the politeness throttle that "
-                         "keeps the per-IP request rate under Vercel's WAF flag (default 2.0; the blocked set is "
-                         "~all Vercel, so unthrottled it floods the IP after ~50 apps and every later request 403s). "
-                         "Raise it if the IP still flags; 0 disables (matches the old unthrottled behavior)")
+    ap.add_argument("--inject-pool", type=int, default=1, metavar="N",
+                    help="injection/exposure fan-out width in the grade (default 1 = SERIAL, the pre-v23 behavior "
+                         "that recovered 769/785 on the v20 retry). run_batch uses 6 for speed, but a 6-wide burst "
+                         "of attack requests per app, fired on the ~all-Vercel blocked set, stacks into a pattern "
+                         "Vercel's WAF flags after ~50 apps. Serial re-fires the SAME probes gently, one at a time")
+    ap.add_argument("--delay", type=float, default=0.0, metavar="SECONDS",
+                    help="optional global minimum gap between job STARTS across all workers (default 0; the real "
+                         "lever was --inject-pool, not pacing)")
     ap.add_argument("--grade-timeout", type=int, default=900, help="per-app subset-grade timeout (s)")
     ap.add_argument("--browser-auth", action="store_true", help="pass through to the grader (MATCH the main run)")
     ap.add_argument("--no-browser", action="store_true", help="pass through to the grader (MATCH the main run)")
@@ -326,8 +337,8 @@ def main():
     abort = threading.Event()         # set by the IP-block circuit breaker; pending jobs then skip immediately
     statuses = []                     # (kind, bot_challenge) per graded app, for the breaker's verdict
     with ThreadPoolExecutor(max_workers=args.concurrency) as ex:
-        futs = [ex.submit(_retry_one, url, bp, tmpdir, flags, args.grade_timeout, abort, args.delay)
-                for url, bp, flags in job_flags]
+        futs = [ex.submit(_retry_one, url, bp, tmpdir, flags, args.grade_timeout, abort, args.delay,
+                          args.inject_pool) for url, bp, flags in job_flags]
         for f in as_completed(futs):
             done += 1
             url, blocked, rec = f.result()
