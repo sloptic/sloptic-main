@@ -205,14 +205,33 @@ def _retry_one(url, blocked, tmpdir, extra_flags, grade_timeout, abort=None, del
         return url, blocked, None   # DNF -> _status reports dnf, merge recovers nothing
 
 
-def _load_jobs(records):
-    """The challenged apps to (re-)fold: (url, blocked_probes), deduped by url (a url is graded once)."""
+# The attack / path-fuzzing probe FAMILIES: they send injection payloads or fuzz many odd paths, so a WAF
+# blocks them BY DESIGN on a WAF-fronted host. They cannot recover (the WAF intercepts every time), and
+# re-firing them is what floods the IP and takes the recoverable benign tail down with it. This is WHY the main
+# grade never flagged the IP (it ran these as a thin slice of a benign-dominated full battery) but the retry
+# does (it runs ONLY the blocked probes, which are led by these). Scoped by family, not by observed onset:
+# once the IP flags, ANY probe gets recorded as the onset, so the onset set is contaminated with benign probes.
+_WAF_TRIPPER_PREFIXES = (
+    "sec-sqli", "sec-cmdi", "sec-ssti", "sec-xxe", "sec-lfi", "sec-ssrf", "sec-filterinj", "sec-split",
+    "sec-redirect", "sec-hosthdr", "sec-upload", "sec-dos", "sec-exposure", "sec-authbypass", "sec-xss")
+
+
+def _is_waf_tripper(probe_id: str) -> bool:
+    return probe_id.startswith(_WAF_TRIPPER_PREFIXES)
+
+
+def _load_jobs(records, skip_trippers=True):
+    """The challenged apps to (re-)fold: (url, blocked_probes), deduped by url. With `skip_trippers` (default),
+    the attack/fuzzing families are dropped from each app's retry set so the retry fires only the recoverable
+    benign tail and never re-floods the IP; a dropped tripper simply stays blocked in the merge (honest -- it is
+    WAF-denied, not recoverable)."""
     seen, jobs = set(), []
     for r in records:
         url = _url_of(r)
-        if r.get("blocked_probes") and url and url not in seen:
+        bp = [p for p in (r.get("blocked_probes") or []) if not (skip_trippers and _is_waf_tripper(p))]
+        if bp and url and url not in seen:
             seen.add(url)
-            jobs.append((url, r.get("blocked_probes"), r))
+            jobs.append((url, bp, r))
     return jobs
 
 
@@ -276,13 +295,25 @@ def main():
     ap.add_argument("--remerge", action="store_true",
                     help="skip grading: re-fold the EXISTING <results>.retry.jsonl into .merged.jsonl (use "
                          "after a merge-logic fix — the fold is pure, so no re-grade is needed)")
+    ap.add_argument("--retry-waf-trippers", action="store_true",
+                    help="also re-fire the probes proven to trip the WAF (challenge onsets). Default SKIPS them: "
+                         "they re-trip every time on a WAF-fronted host (unrecoverable) and re-firing them floods "
+                         "the IP and takes the recoverable tail down too — the root cause of the mid-run flag")
     args = ap.parse_args()
 
     records = _read_jsonl(args.results)
-    jobs = _load_jobs(records)
-    print(f"blocked apps to retry: {len(jobs)} of {len(records)} records", flush=True)
+    skip_trippers = not args.retry_waf_trippers
+    jobs = _load_jobs(records, skip_trippers)
+    if skip_trippers:
+        blocked = [p for r in records for p in (r.get("blocked_probes") or [])]
+        n_trip = sum(1 for p in blocked if _is_waf_tripper(p))
+        print(f"skipping {n_trip}/{len(blocked)} blocked probes in the attack/fuzzing families (they re-trip the "
+              f"WAF and flood the IP; they stay blocked, WAF-denied not recoverable). Override: "
+              f"--retry-waf-trippers.", flush=True)
+    print(f"blocked apps to retry: {len(jobs)} of {len(records)} records "
+          f"(apps with a recoverable, non-tripper tail)", flush=True)
     if not jobs:
-        print("nothing blocked — no retry needed."); return
+        print("nothing recoverable — every blocked probe is a WAF-tripper (WAF-denied)."); return
 
     retry_file = args.results + ".retry.jsonl"
     merged_file = args.results + ".merged.jsonl"
