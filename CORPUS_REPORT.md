@@ -51,6 +51,8 @@ The events span North America (the majority, largely US and Canadian university 
 
 Sloptic is a **black box** grader. It reads no source, needs no spec, and returns one **slop score**: deductions only, unbounded, lower is better, `0` means nothing was found. The score splits into three axes (security, quality, performance) whose subtotals sum exactly to the total. Penalties are risk priced (frequency times severity) and damped, so one root cause counts once no matter how many ways we detect it. Because it ignores the stack, the same **102 probes** run identically against every app, which is what makes 1,625 unrelated apps comparable on one number. And every grade ships a coverage report, so a `0` that means "clean" is never confused with a `0` that means "we could not reach the surface." It grades the unauthenticated observable surface, and it grades only failures that are independent of intent, defects no matter what the app is for.
 
+One more thing the score does that a scanner does not: it ranks. A raw number becomes a percentile against a frozen reference curve, and because many apps share a score, ties break in a fixed order, a catastrophe first (an exploitable app never percentiles above a clean one at the same number), then the single worst finding (a smaller worst trapdoor ranks ahead of a bigger one), then how much of its worst case the app actually defended. Two apps at 50 are not treated as equal.
+
 ## 4. First look at the number
 
 The first thing we wanted to know is whether the score even behaves like a ruler.
@@ -163,7 +165,7 @@ You cannot inject SQL into a static site, and a managed backend's only misconfig
 | SSO only, no signup to drive | 7% |
 | a login wall with no signup | 9% |
 
-Only **14%** of apps let us self register and reach the data plane, and of those 233, just **14 carried an authed surface finding** (broken email verification, a weak password reset, a stored XSS). The authenticated half of every app is a surface we mostly cannot open.
+Only **14%** of apps let us self register and reach the data plane, and of those 233, just **14 carried an authed surface finding**. The most common, on 8 of them, is a signup that promises a confirmation email and never sends it: you register, the app tells you to check your inbox, and nothing arrives, so the account is stranded before it starts. It is the broken not hackable tier again, one login deeper, and invisible to anyone who does not actually try to sign up. The authenticated half of every app is a surface we mostly cannot open.
 
 **Third, a bot challenge blocked the deep probes on hundreds of apps.** Two thirds of the corpus lives on Vercel, and Vercel's edge threw a challenge at **29% of the whole run** (**66% of the Vercel apps**). Most of those, 690, challenged only after all the probes had run, so the grade is valid. But 90 were withheld outright, and on **404 apps the security axis was left not clean tested**, the challenge tripped exactly on the heavy security probes (`sec-hosthdr`, `sec-cmdi`, `sec-dos`, `sec-upload`). So even where a backend exists, the WAF often stands between us and it.
 
@@ -196,6 +198,12 @@ The corpus carries each app's contest result, which let us ask a question we cou
 
 They are not. Winners ship a **12% higher** median slop and perform slightly worse, and the gap holds on both measures. The likeliest reason is ambition: a winning app tends to attempt more, and more surface is more room for slop to land. Whatever the cause, the point stands. Judging rewards the idea, the demo, and the execution, and none of those predict durability. This one number is the cleanest case for the whole instrument: an objective durability read carries a signal the human judging does not.
 
+## 9.1 Who ships the cleanest, by event and by stack
+
+Slop varies more than threefold across events. The sloppiest hackathons (median slop, at least ten graded apps) are hack-brown-2026 at 105.8, ellehacks-2026 at 79.6, and hackeurope at 67.5; the cleanest are oregonhacks at 28.3, wildhacks-2026 at 30.2, and la-hacks-2025 at 33.7. Prestige does not track cleanliness, the flagship events sit in the middle of the pack.
+
+By hosting stack the pattern is sharper, and it makes the report's recurring point for us. Streamlit apps are the cleanest of any platform, a median slop of **0**, and not because they are well built: a Streamlit app is a frontend with almost no attackable surface, so there is nothing to find. Vercel and GitHub Pages sit low too (medians around 45), both frontend heavy. Render, Firebase, and Lovable sit at the sloppy end (medians of 58 to 67), because that is where a real backend and a real feature set live, which is more surface to get wrong. A low score can mean a clean app or a thin one, which is exactly why the coverage report ships with every grade.
+
 ## 10. Under the hood of the two heavy axes
 
 Accessibility and performance are 46% of all the slop, so we opened both up.
@@ -222,6 +230,8 @@ Four times out of five, an accessibility finding is text you cannot read against
 | TBT (main thread blocking) | 370 ms | median fine, but the mean is 7.4 seconds and the max is **168 seconds** |
 
 The server is not the problem. Layout is not the problem. The problem is the shipped bundle: a median page weighs **4.0 MB** (one weighs 124 MB), some ship over 2,000 requests, and a handful lock the main thread for minutes. TTFB and CLS the platform and the framework hand you for free. LCP, TBT, and page weight are the parts the builder controls, and they are the parts that are heavy. Performance slop is a bundle discipline problem wearing an infrastructure costume.
+
+And the axes are not independent of each other. Across the corpus a lower overall score goes with a better Lighthouse score (Spearman rho of -0.57), so the app that skips the security floor tends to skip the performance one too. Slop is a habit, not a one off, and the teams that hardened one thing tended to harden the rest.
 
 ## 11. What never fired, and the reach frontier
 
