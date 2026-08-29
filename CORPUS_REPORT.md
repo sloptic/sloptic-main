@@ -11,6 +11,7 @@
 We pointed one black box grader at every submission we could find from 80 hackathons and asked a single question: from the outside, what does AI era failure actually look like? Here is what we found.
 
 - Slop is overwhelmingly **chronic, not acute**. On 1,625 live apps, the failure is the missing floor (no security headers, slow heavy pages, broken accessibility, a button that does nothing), not exploitable holes. Only **2.9%** carry an exploitable finding, and essentially none an injection or remote code execution class.
+- **But the corpus is not benign.** Nearly half the apps, **47%**, carry a **critical** finding (one priced at 30 or more), and 90% of those criticals are functional failures, a crash, a dead control, an unusably slow page, not exploits. These apps are broken far more often than they are hackable.
 - The acute danger that remains **moved into the managed backend, and this run finally reached it.** The single largest exploitable class is a world readable or writable Supabase or Firebase backend, **18 apps**, several of them serving plaintext passwords or bulk emails to any anonymous visitor.
 - **The AI builder story flipped.** A year ago Lovable's slop premium was entirely performance. Here it is no longer statistically significant on the score, and what stands out instead is that AI built apps leak their managed backend at **13%** (11 of 82), more than ten times the population rate.
 - **Winners are not cleaner.** The apps the judges picked carry **12% more** median slop than the ones they passed over, so human judged merit does not predict whether the thing holds up.
@@ -90,9 +91,38 @@ Drill into the single categories and the concentration is stark: **performance 2
 
 A finding at 98% is nearly a constant. It taxes everyone and separates no one. The signal that actually ranks apps lives in the middle, the accessibility tiers, the spread of Core Web Vitals, dead controls at 13%, and the rare severe classes below. That middle band is where two apps at "looks done" pull apart.
 
-## 6. Chronic, not acute (the headline)
+## 6. How bad is it, and what does "bad" mean?
 
-Now the question we came for. Split every security finding into **acute**, exploitable right now, versus **chronic**, a missing mitigation, and the population is lopsided.
+Before splitting security into exploitable and not, we priced every finding into a severity tier and counted the apps carrying each. This is where the corpus stops looking benign.
+
+| tier (priced penalty) | findings | apps with at least one | expected per app |
+|---|---:|---:|---:|
+| **critical (30+)** | 993 | **759 (47%)** | 0.61 |
+| serious (16 to 29) | 766 | 654 (40%) | 0.47 |
+| moderate (8 to 15) | 2,526 | 1,613 (99%) | 1.55 |
+| minor (1 to 7) | 5,096 | 1,606 (99%) | 3.14 |
+
+Nearly half the corpus, **47%**, carries a **critical** finding. That is a far larger number than the 2.9% exploitable rate we are about to report, and the gap between the two is the whole point. Two details make it read correctly. First, the criticals arrive as independent rare events: the expected count per app is 0.61 with a variance of 0.58, so close to a Poisson process that an app with one critical rarely has a second, and the tail of apps with three or four is thin. Second, and this is the part that matters, split those 993 critical findings by axis:
+
+| critical findings | count | share |
+|---|---:|---:|
+| quality | 529 | 53% |
+| performance | 359 | 36% |
+| security | 105 | 11% |
+
+**Ninety percent of the criticals are quality and performance, not security.** The four that dominate are a catastrophically slow page (Lighthouse red, 22% of apps), a dead control that does nothing when you click it (13%), a crash on malformed input (8%), and a critical accessibility violation (6%). Only **86 apps (5%)** carry a security critical at all, and only **47 (2.9%)** an exploitable one.
+
+So read the corpus at three levels, not two:
+
+- **Exploitable, the acute security tier: 2.9%.** A leaked backend, a served secret.
+- **Critical but not exploitable: 47% carry one.** The app is badly broken, it crashes, a button is dead, the page is unusably slow, but nobody is stealing data through it.
+- **Chronic hygiene: 67 to 98%.** The cheap universal floor, a missing header, faint text.
+
+The middle tier is the finding a "3% exploitable" headline hides. **These apps are broken far more often than they are hackable.** And the failures in that tier are exactly the kind a polished demo conceals: the demo clicks the three buttons that work, not the dead fourth, and it never sends the malformed input that 500s the API. That gap between what the demo shows and what the app does is the whole reason a durability grader has to look past the demo.
+
+## 6.1 Within security, chronic not acute
+
+Now narrow to the security axis alone and ask the question we came for. Split every security finding into **acute**, exploitable right now, versus **chronic**, a missing mitigation, and the population is lopsided.
 
 | tier | rate | what it is |
 |---|---:|---|
