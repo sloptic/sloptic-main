@@ -11,6 +11,7 @@
 We pointed one black box grader at every submission we could find from 80 hackathons and asked a single question: from the outside, what does AI era failure actually look like? Here is what we found.
 
 - Slop is overwhelmingly **chronic, not acute**. On 1,625 live apps, the failure is the missing floor (no security headers, slow heavy pages, broken accessibility, a button that does nothing), not exploitable holes. Only **2.9%** carry an exploitable finding, and essentially none an injection or remote code execution class.
+- **But the corpus is not benign.** Nearly half the apps, **47%**, carry a **critical** finding (one priced at 30 or more), and 90% of those criticals are functional failures, a crash, a dead control, an unusably slow page, not exploits. These apps are broken far more often than they are hackable.
 - The acute danger that remains **moved into the managed backend, and this run finally reached it.** The single largest exploitable class is a world readable or writable Supabase or Firebase backend, **18 apps**, several of them serving plaintext passwords or bulk emails to any anonymous visitor.
 - **The AI builder story flipped.** A year ago Lovable's slop premium was entirely performance. Here it is no longer statistically significant on the score, and what stands out instead is that AI built apps leak their managed backend at **13%** (11 of 82), more than ten times the population rate.
 - **Winners are not cleaner.** The apps the judges picked carry **12% more** median slop than the ones they passed over, so human judged merit does not predict whether the thing holds up.
@@ -49,6 +50,8 @@ The events span North America (the majority, largely US and Canadian university 
 ## 3. How the grade works, in one breath
 
 Sloptic is a **black box** grader. It reads no source, needs no spec, and returns one **slop score**: deductions only, unbounded, lower is better, `0` means nothing was found. The score splits into three axes (security, quality, performance) whose subtotals sum exactly to the total. Penalties are risk priced (frequency times severity) and damped, so one root cause counts once no matter how many ways we detect it. Because it ignores the stack, the same **102 probes** run identically against every app, which is what makes 1,625 unrelated apps comparable on one number. And every grade ships a coverage report, so a `0` that means "clean" is never confused with a `0` that means "we could not reach the surface." It grades the unauthenticated observable surface, and it grades only failures that are independent of intent, defects no matter what the app is for.
+
+One more thing the score does that a scanner does not: it ranks. A raw number becomes a percentile against a frozen reference curve, and because many apps share a score, ties break in a fixed order, a catastrophe first (an exploitable app never percentiles above a clean one at the same number), then the single worst finding (a smaller worst trapdoor ranks ahead of a bigger one), then how much of its worst case the app actually defended. Two apps at 50 are not treated as equal.
 
 ## 4. First look at the number
 
@@ -90,9 +93,38 @@ Drill into the single categories and the concentration is stark: **performance 2
 
 A finding at 98% is nearly a constant. It taxes everyone and separates no one. The signal that actually ranks apps lives in the middle, the accessibility tiers, the spread of Core Web Vitals, dead controls at 13%, and the rare severe classes below. That middle band is where two apps at "looks done" pull apart.
 
-## 6. Chronic, not acute (the headline)
+## 6. How bad is it, and what does "bad" mean?
 
-Now the question we came for. Split every security finding into **acute**, exploitable right now, versus **chronic**, a missing mitigation, and the population is lopsided.
+Before splitting security into exploitable and not, we priced every finding into a severity tier and counted the apps carrying each. This is where the corpus stops looking benign.
+
+| tier (priced penalty) | findings | apps with at least one | expected per app |
+|---|---:|---:|---:|
+| **critical (30+)** | 993 | **759 (47%)** | 0.61 |
+| serious (16 to 29) | 766 | 654 (40%) | 0.47 |
+| moderate (8 to 15) | 2,526 | 1,613 (99%) | 1.55 |
+| minor (1 to 7) | 5,096 | 1,606 (99%) | 3.14 |
+
+Nearly half the corpus, **47%**, carries a **critical** finding. That is a far larger number than the 2.9% exploitable rate we are about to report, and the gap between the two is the whole point. Two details make it read correctly. First, the criticals arrive as independent rare events: the expected count per app is 0.61 with a variance of 0.58, so close to a Poisson process that an app with one critical rarely has a second, and the tail of apps with three or four is thin. Second, and this is the part that matters, split those 993 critical findings by axis:
+
+| critical findings | count | share |
+|---|---:|---:|
+| quality | 529 | 53% |
+| performance | 359 | 36% |
+| security | 105 | 11% |
+
+**Ninety percent of the criticals are quality and performance, not security.** The four that dominate are a catastrophically slow page (Lighthouse red, 22% of apps), a dead control that does nothing when you click it (13%), a crash on malformed input (8%), and a critical accessibility violation (6%). Only **86 apps (5%)** carry a security critical at all, and only **47 (2.9%)** an exploitable one.
+
+So read the corpus at three levels, not two:
+
+- **Exploitable, the acute security tier: 2.9%.** A leaked backend, a served secret.
+- **Critical but not exploitable: 47% carry one.** The app is badly broken, it crashes, a button is dead, the page is unusably slow, but nobody is stealing data through it.
+- **Chronic hygiene: 67 to 98%.** The cheap universal floor, a missing header, faint text.
+
+The middle tier is the finding a "3% exploitable" headline hides. **These apps are broken far more often than they are hackable.** And the failures in that tier are exactly the kind a polished demo conceals: the demo clicks the three buttons that work, not the dead fourth, and it never sends the malformed input that 500s the API. That gap between what the demo shows and what the app does is the whole reason a durability grader has to look past the demo.
+
+## 6.1 Within security, chronic not acute
+
+Now narrow to the security axis alone and ask the question we came for. Split every security finding into **acute**, exploitable right now, versus **chronic**, a missing mitigation, and the population is lopsided.
 
 | tier | rate | what it is |
 |---|---:|---|
@@ -133,7 +165,7 @@ You cannot inject SQL into a static site, and a managed backend's only misconfig
 | SSO only, no signup to drive | 7% |
 | a login wall with no signup | 9% |
 
-Only **14%** of apps let us self register and reach the data plane, and of those 233, just **14 carried an authed surface finding** (broken email verification, a weak password reset, a stored XSS). The authenticated half of every app is a surface we mostly cannot open.
+Only **14%** of apps let us self register and reach the data plane, and of those 233, just **14 carried an authed surface finding**. The most common, on 8 of them, is a signup that promises a confirmation email and never sends it: you register, the app tells you to check your inbox, and nothing arrives, so the account is stranded before it starts. It is the broken not hackable tier again, one login deeper, and invisible to anyone who does not actually try to sign up. The authenticated half of every app is a surface we mostly cannot open.
 
 **Third, a bot challenge blocked the deep probes on hundreds of apps.** Two thirds of the corpus lives on Vercel, and Vercel's edge threw a challenge at **29% of the whole run** (**66% of the Vercel apps**). Most of those, 690, challenged only after all the probes had run, so the grade is valid. But 90 were withheld outright, and on **404 apps the security axis was left not clean tested**, the challenge tripped exactly on the heavy security probes (`sec-hosthdr`, `sec-cmdi`, `sec-dos`, `sec-upload`). So even where a backend exists, the WAF often stands between us and it.
 
@@ -166,6 +198,12 @@ The corpus carries each app's contest result, which let us ask a question we cou
 
 They are not. Winners ship a **12% higher** median slop and perform slightly worse, and the gap holds on both measures. The likeliest reason is ambition: a winning app tends to attempt more, and more surface is more room for slop to land. Whatever the cause, the point stands. Judging rewards the idea, the demo, and the execution, and none of those predict durability. This one number is the cleanest case for the whole instrument: an objective durability read carries a signal the human judging does not.
 
+## 9.1 Who ships the cleanest, by event and by stack
+
+Slop varies more than threefold across events. The sloppiest hackathons (median slop, at least ten graded apps) are hack-brown-2026 at 105.8, ellehacks-2026 at 79.6, and hackeurope at 67.5; the cleanest are oregonhacks at 28.3, wildhacks-2026 at 30.2, and la-hacks-2025 at 33.7. Prestige does not track cleanliness, the flagship events sit in the middle of the pack.
+
+By hosting stack the pattern is sharper, and it makes the report's recurring point for us. Streamlit apps are the cleanest of any platform, a median slop of **0**, and not because they are well built: a Streamlit app is a frontend with almost no attackable surface, so there is nothing to find. Vercel and GitHub Pages sit low too (medians around 45), both frontend heavy. Render, Firebase, and Lovable sit at the sloppy end (medians of 58 to 67), because that is where a real backend and a real feature set live, which is more surface to get wrong. A low score can mean a clean app or a thin one, which is exactly why the coverage report ships with every grade.
+
 ## 10. Under the hood of the two heavy axes
 
 Accessibility and performance are 46% of all the slop, so we opened both up.
@@ -192,6 +230,8 @@ Four times out of five, an accessibility finding is text you cannot read against
 | TBT (main thread blocking) | 370 ms | median fine, but the mean is 7.4 seconds and the max is **168 seconds** |
 
 The server is not the problem. Layout is not the problem. The problem is the shipped bundle: a median page weighs **4.0 MB** (one weighs 124 MB), some ship over 2,000 requests, and a handful lock the main thread for minutes. TTFB and CLS the platform and the framework hand you for free. LCP, TBT, and page weight are the parts the builder controls, and they are the parts that are heavy. Performance slop is a bundle discipline problem wearing an infrastructure costume.
+
+And the axes are not independent of each other. Across the corpus a lower overall score goes with a better Lighthouse score (Spearman rho of -0.57), so the app that skips the security floor tends to skip the performance one too. Slop is a habit, not a one off, and the teams that hardened one thing tended to harden the rest.
 
 ## 11. What never fired, and the reach frontier
 
