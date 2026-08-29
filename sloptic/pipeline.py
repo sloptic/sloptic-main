@@ -7,18 +7,31 @@ so multiple vulnerable endpoints cost more than one but less than linearly.
 """
 from __future__ import annotations
 
+import contextlib
+import inspect
+import os
 import time
 from dataclasses import dataclass, field, replace
 
 import httpx
 
-from . import auth, platform_id, secretscan
+try:
+    import fcntl
+except ImportError:   # non-POSIX (Windows) -> the cross-process Lighthouse lock degrades to a no-op
+    fcntl = None
+
+from . import auth, lighthouse, platform_id, safety, secretscan
 from .aggregate import compute_axis_slop, compute_slop_score, coverage_metrics
 from .deploy import Deployer
 from .discovery import discover, surface_metrics
-from .net import make_client, set_trace_probe, start_trace
-from .probes import MATCHERS, PREDICATES, _repro_from_resp, describe
-from .schema import Form, Outcome, Probe, Profile, Report
+from .net import challenge_onset, is_bot_challenge, make_client, request_counts, set_trace_probe, start_trace
+
+# A late-challenge grade is kept only if at least this fraction of the catalog ran BEFORE the WAF tripped (so
+# most outcomes saw the real app). Below it, too much of the grade is contaminated -> withhold like an entry challenge.
+_MIN_VALID_FRACTION = 0.6
+from .probes import (MATCHERS, PREDICATES, _email_account, _prime_email, _rebuild_account, _repro_from_resp,
+                     describe)
+from .schema import Form, Outcome, Probe, Profile, Report, Severity
 
 
 def _source_secret_outcome(source_dir) -> Outcome:
@@ -40,6 +53,14 @@ def _source_secret_outcome(source_dir) -> Outcome:
                    outcome="clean", penalty=0, variant_group_id="hardcoded-secrets", evidence=evidence)
 
 
+# The browser register (launch + fill + submit) is memoized once per identity, but it is TIMING-SENSITIVE on an
+# app that never settles to networkidle: a single slow/timed-out attempt used to be cached and then poison every
+# authed probe for that identity. Retry a hard failure (a None) up to this many times before caching it, so one
+# flaky launch no longer sends the whole session/idor/race suite to N/A; a genuinely session-less app still caps
+# here and stops relaunching. 2 = one retry (bounded ~+45s worst case on an app that truly can't self-register).
+_BROWSER_REG_MAX_TRIES = 2
+
+
 @dataclass
 class _Ctx:
     base_url: str
@@ -47,9 +68,73 @@ class _Ctx:
     profile: Profile
     headers: dict | None = None
     browser_register: object = None   # optional callback: browser-driven SPA registration for the auth self-oracle
+    lighthouse: dict | None = None    # per-app median Lighthouse report (run once by run(); read by lighthouse_audit)
     evidence: dict = field(default_factory=dict)  # a predicate may record measured values here; the
     #     executor snapshots it onto the outcome and resets it before the next probe (probes run serially)
     _browser_cache: dict = field(default_factory=dict)  # per-suffix browser-registration RESULT (see register)
+    email: object = None   # EmailReceiver | None -- the email-verification probes poll it; typed `object` so the
+    #     hot pipeline path never imports email_verify
+    _email_cache: dict = field(default_factory=dict)  # the one shared EmailVerifyResult (run once per app)
+
+    def email_address(self, suffix: str = ""):
+        """A controlled inbox address for this grade, minted once PER IDENTITY (suffix) and cached, so each lane
+        signs up with the address WE own for that identity and the flow polls the right box. Distinct suffixes get
+        DISTINCT addresses -- the two-account IDOR probes ("_a"/"_b") thus register two genuinely separate users.
+        None when no receiver is configured -> the lanes fall back to a dummy @example.com (unchanged)."""
+        if self.email is None:
+            return None
+        key = "address" + suffix
+        if key not in self._email_cache:
+            import secrets
+            tag = secrets.token_hex(6)
+            self._email_cache["tag" + suffix] = tag
+            self._email_cache[key] = self.email.address(tag)
+        return self._email_cache[key]
+
+    def _browser_register_once(self, suffix, base_url):
+        """ONE browser registration per identity (launch + fill + submit is 20-40s), memoized and SHARED between
+        the auth self-oracle (here) and the email flow, so an email-gated SPA is browser-registered exactly once.
+        Signs up with this identity's controlled address when a receiver is configured, so the SPA mails the
+        confirmation to us; None/dummy otherwise (unchanged).
+
+        A hard FAILURE (a None -- no session) is RETRIED up to _BROWSER_REG_MAX_TRIES before being memoized: only a
+        SUCCESS (a session, or an email_pending handoff the email flow completes) short-circuits the retry. See the
+        constant -- one flaky launch on a never-settling app must not memoize-poison the whole authed suite."""
+        if self.browser_register is None:
+            return None
+        store = self._browser_cache
+        if suffix not in store:
+            addr = self.email_address(suffix)
+            kwargs = {}
+            if addr:
+                kwargs["email"] = addr
+                # LANE B: hand the browser lane a CODE fetcher for the email-first wizard, but ONLY if it accepts
+                # one (the real browser.register_in_browser does; a 2-arg test stub does not -> don't break it).
+                if self.email is not None and _accepts_kwarg(self.browser_register, "code_getter"):
+                    kwargs["code_getter"] = lambda _s=suffix: self._poll_email_code(_s)
+            result = None
+            for _ in range(_BROWSER_REG_MAX_TRIES):
+                result = self.browser_register(base_url, **kwargs)
+                if result:                       # a session or an email_pending handoff -> done, don't relaunch
+                    break
+            store[suffix] = result               # cache the success, or the last failure once the budget is spent
+        return store[suffix]
+
+    def _poll_email_code(self, suffix: str = ""):
+        """Poll our inbox for a verification CODE (the email-first browser wizard's in-session fetch): this
+        identity's tag, the flow's announced window, first code or None. Kept here (not in the browser layer) so
+        the receiver dependency stays on ctx."""
+        if self.email is None:
+            return None
+        self.email_address(suffix)                       # ensure the tag is minted
+        tag = self._email_cache.get("tag" + suffix)
+        if not tag:
+            return None
+        try:
+            msg = self.email.poll(tag, 60.0)
+        except Exception:
+            return None
+        return msg.codes[0] if (msg and msg.codes) else None
 
     def register(self, suffix: str = ""):
         """Self-register (self-as-oracle) for the authed-surface probes, with the browser fallback threaded in:
@@ -61,20 +146,94 @@ class _Ctx:
         at concurrency). The first probe for an identity pays it; the rest reuse the captured
         cookies/bearer/backend_reads. A fresh httpx client is still built PER CALL, so per-probe close semantics
         are unchanged (no shared-lifecycle risk); distinct suffixes (idor's "_a"/"_b") stay distinct identities."""
-        cached = real = self.browser_register
-        if real is not None:
-            store = self._browser_cache
-
-            def cached(base_url, _s=suffix, _real=real):
-                if _s not in store:
-                    store[_s] = _real(base_url)   # ONE browser registration per identity, reused across probes
-                return store[_s]
+        # UNIFICATION: reuse a session already established for THIS identity -- seeded by the authenticated crawl
+        # (Gap B) or captured by the email flow -- instead of registering AGAIN. This is the primary-identity ("")
+        # de-dup: without it the crawl registers once to authenticate discovery and the probes register a SECOND
+        # time, two browser launches per auth app (the sample6 perf regression). The IDOR pair (_a/_b) still mints
+        # distinct identities. Rebuilt into a fresh client per call so per-probe close stays safe.
+        if suffix not in ("_a", "_b"):
+            seeded = self._email_cache.get("account_session")
+            if seeded and not auth._provided_session(self.headers):
+                return _rebuild_account(self.base_url, seeded)
+        cached = None
+        if self.browser_register is not None:
+            def cached(base_url, _s=suffix):
+                return self._browser_register_once(_s, base_url)
+        # EMAIL-VERIFICATION lane (built only when a receiver is configured): on an email-gated signup, complete
+        # the verification and reuse THAT authenticated session. Built for EVERY identity, including the two-account
+        # IDOR suffixes ("_a"/"_b"): each mints its own address and verifies independently, so an email-gated app
+        # yields two genuinely distinct verified users. A second identity is gated on the first (see _email_account),
+        # so a broken-email app abandons IDOR fast instead of polling twice more. The flow runs at most once per
+        # identity (memoized on ctx), rebuilt into a fresh client per call so per-probe close stays safe.
+        email_cb = None
+        if self.email is not None and not auth._provided_session(self.headers):
+            def email_cb(session_less_acct, _self=self, _s=suffix):
+                return _email_account(_self, session_less_acct, _s)
         return auth.register_account(self.base_url, self.profile, suffix=suffix,
-                                     browser_register=cached, headers=self.headers)
+                                     browser_register=cached, headers=self.headers, email_verify=email_cb)
+
+
+def _accepts_kwarg(fn, name: str) -> bool:
+    """Does `fn` accept keyword `name` (named param or **kwargs)? Guards passing code_getter to the real browser
+    lane without breaking a 2-arg test stub."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in params or any(p.kind == p.VAR_KEYWORD for p in params.values())
 
 
 def _applicable(probe: Probe, profile: Profile) -> bool:
     return all(profile.capabilities.get(req, False) for req in probe.applicability.requires)
+
+
+def _needs_lighthouse(catalog: list[Probe]) -> bool:
+    """Should the pipeline spend the ~2-3min Lighthouse run for this catalog? Iff some probe DECLARES it needs
+    the `lighthouse` capability. Keyed on the declared requirement (not a predicate name) so scoring can't go
+    dark when predicates change: perf-lighthouse-001 (predicate lighthouse_perf_score) and the report_only
+    lighthouse_audit diagnostics all declare `requires: [lighthouse]`, so any one of them triggers the run."""
+    return any("lighthouse" in p.applicability.requires for p in catalog)
+
+
+@contextlib.contextmanager
+def _lighthouse_lock():
+    """Cross-process THROTTLE on the Lighthouse perf trace, so concurrent grades don't corrupt each other's
+    LCP/TBT timing. run_batch shells one grade per job, so a thread lock wouldn't reach across them -- this is
+    a counting semaphore over N flock files. SLOPTIC_LIGHTHOUSE_LOCK names the base path (run_batch sets it
+    under --concurrency); SLOPTIC_LIGHTHOUSE_SLOTS is how many traces may run AT ONCE:
+      1 (default) = strict mutex, one clean trace at a time -- best fidelity, slowest lane;
+      2-3 on a many-thread box = a few near-clean lanes -- the overnight sweet spot;
+      >= --concurrency = effectively unthrottled -- fastest, most contended (the pre-lock behavior).
+    Each slot is an EXCLUSIVE flock, so the OS frees it if a grade dies mid-trace: no stranded slots, no
+    deadlock, no manual cleanup. Unset lock path -> no-op. Pick the slot count by MEASURING contention on your
+    box (grade a subset at slots=1 vs wide and compare the perf distributions), not by guessing."""
+    path = os.environ.get("SLOPTIC_LIGHTHOUSE_LOCK")
+    if not path or fcntl is None:
+        yield
+        return
+    try:
+        slots = max(1, int(os.environ.get("SLOPTIC_LIGHTHOUSE_SLOTS", "1")))
+    except ValueError:
+        slots = 1
+    fhs = [open(f"{path}.{i}", "w") for i in range(slots)]
+    held = None
+    try:
+        while held is None:
+            for fh in fhs:                                  # grab any free lane
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    held = fh
+                    break
+                except OSError:
+                    continue
+            if held is None:
+                time.sleep(0.25)                            # all lanes busy; trivial wait vs a ~minute-long trace
+        yield
+    finally:
+        if held is not None:
+            fcntl.flock(held, fcntl.LOCK_UN)
+        for fh in fhs:
+            fh.close()
 
 
 def _fetch_path(probe: Probe, client: httpx.Client, path: str) -> httpx.Response:
@@ -135,13 +294,28 @@ _PENALTY_CAP = 250   # runaway guard on penalty_override — above any real per-
                      # ~100 rules max), so it only ever catches a bug, never clips a legitimate multi-barrier fire
 
 
+def _severity_penalty(sev: Severity, ev: dict) -> int:
+    """Authority-anchored point (SCORING_V2_SPEC.md): start at `default` (abstention = range low), lift to the
+    single HIGHEST escalator rung whose evidence flag the predicate set, clamp to [lo, hi]. Rungs never sum.
+    Default low, evidence lifts. The range's own `hi` caps it (always <= the 100 anchor), so _PENALTY_CAP is moot."""
+    lo, hi = sev.range
+    matched = [e.point for e in sev.escalators if ev.get(e.evidence)]
+    point = max(sev.default, *matched) if matched else sev.default
+    return int(min(hi, max(lo, point)))
+
+
 def _run_probe(probe: Probe, ctx: _Ctx, client: httpx.Client, profile: Profile) -> list[Outcome]:
     """Resolve one probe to its outcome(s): applicability gate, then an oracle predicate or a
     declarative fan-out across discovered targets. One Outcome per (probe x target)."""
     client.cookies.clear()  # each probe starts from a clean session (no cross-probe leak)
     target = probe.probe.get("target", "")
     if not _applicable(probe, profile):
-        return [_outcome(probe, "not_applicable", 0, target)]
+        # name the exact surface precondition(s) the app lacked. Most probes gate HERE, and without a reason
+        # they reported N/A blank -> the "(no reason recorded)" that dominated the coverage audit. Now the
+        # fresh run can size WHY each family didn't apply (missing endpoint / form / password field / ...).
+        unmet = [r for r in probe.applicability.requires if not profile.capabilities.get(r, False)]
+        ev = {"na_reason": "requires unmet: " + ", ".join(unmet)} if unmet else {}
+        return [_outcome(probe, "not_applicable", 0, target, evidence=ev)]
     if "predicate" in probe.probe:
         # RESOLVED OUTSIDE THE GUARD BELOW, deliberately. A name the registry doesn't know is OUR bug — a
         # catalog/probes mismatch — not something the target did, and it must not be laundered into an N/A
@@ -157,7 +331,8 @@ def _run_probe(probe: Probe, ctx: _Ctx, client: httpx.Client, profile: Profile) 
             # a predicate drives an UNTRUSTED target; a hostile/edge-case response must degrade this
             # one probe to N/A, never crash the whole grade (run must not DNF). Calibration is the
             # backstop: a predicate that ALWAYS raises fails the suite.
-            return [_outcome(probe, "not_applicable", 0, target)]
+            return [_outcome(probe, "not_applicable", 0, target,
+                             evidence={"na_reason": "predicate raised on the target response"})]
         ev = dict(ctx.evidence)   # snapshot regardless of verdict — clean/n/a stats are the point here
         if slop is None:
             # the predicate couldn't establish the conditions to test (e.g. self-registration failed
@@ -165,8 +340,16 @@ def _run_probe(probe: Probe, ctx: _Ctx, client: httpx.Client, profile: Profile) 
             return [_outcome(probe, "not_applicable", 0, target, evidence=ev)]
         pen = probe.penalty
         override = ev.get("penalty_override")   # a predicate MAY set an ABSOLUTE penalty that can EXCEED the
-        if slop and isinstance(override, (int, float)) and override >= 0:   # nominal ceiling (the a11y per-rule
-            pen = max(1, min(round(override), _PENALTY_CAP))                # severity sum); runaway-guarded
+        if slop:                                                           # nominal ceiling (the a11y per-rule sum).
+            if ev.get("report_only"):                                      # Precedence: report_only (off-score, 0) >
+                pen = 0                                                    # v2 severity block (range+evidence ladder)
+            elif probe.severity is not None:                              # > raw penalty_override (a11y/perf code
+                pen = _severity_penalty(probe.severity, ev)                # compute) > nominal probe.penalty.
+            elif isinstance(override, (int, float)) and override >= 0:
+                # keep 1-decimal FLOAT: the continuous-measurement probes (lighthouse/contrast/link+control
+                # fraction) set a fractional override, and rounding to int here would re-clump exactly the
+                # spread we want. Discrete probes set whole numbers, so this is a no-op for them.
+                pen = max(1.0, min(round(float(override), 1), _PENALTY_CAP))
         return [_outcome(probe, "slop_detected" if slop else "clean", pen if slop else 0,
                          target, reason=describe(probe) if slop else "", evidence=ev)]
     na_if_absent = probe.probe.get("na_if_absent", False)
@@ -212,17 +395,56 @@ def _run_probe(probe: Probe, ctx: _Ctx, client: httpx.Client, profile: Profile) 
     return produced
 
 
+def _blocked(probes: list[Probe]) -> tuple[list[str], list[str]]:
+    """Probes a challenge prevented from running -> (their ids, the bundles/axes left INCOMPLETE). The axes are
+    what a consumer needs: a bundle with any blocked probe cannot be presented or ranked as clean."""
+    return [p.id for p in probes], sorted({p.bundle for p in probes})
+
+
+def _captured_session(ctx) -> dict | None:
+    """The replayable session (Cookie/Bearer/apikey) the grade ESTABLISHED, read from what the register / auth-crawl
+    / email lane already memoized on ctx -- never triggers a fresh registration. A subset RETRY replays this via
+    --header and SKIPS the 26-nav browser register walk (the walk re-hammers the app and re-trips its per-app WAF
+    block). Reads the unified crawl/email session first, else whatever the authed injection probes captured."""
+    cache = getattr(ctx, "_email_cache", None)
+    if not isinstance(cache, dict):
+        return None
+    base = {k.lower() for k in (getattr(ctx, "headers", None) or {})}
+
+    def _sess(hdrs):
+        return {k: v for k, v in hdrs.items()
+                if k.lower() in ("cookie", "authorization", "apikey") and k.lower() not in base}
+    snap = cache.get("account_session")                    # unified session (auth-crawl Gap B / email flow)
+    if isinstance(snap, dict) and isinstance(snap.get("headers"), dict) and _sess(snap["headers"]):
+        return _sess(snap["headers"])
+    hdrs = cache.get("_authed_headers")                    # else whatever the authed injection probes captured
+    if isinstance(hdrs, dict) and _sess(hdrs):
+        return _sess(hdrs)
+    return None
+
+
 def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_progress=None,
         source_dir=None, seed_features=None, cached_profile=None, on_profile=None, perceive=None,
         browser_register=None, recon: bool = False, auth_crawl: bool = False, trace: bool = False,
-        login_creds=None) -> Report:
+        login_creds=None, email_receiver=None, on_phase=None) -> Report:
     """on_progress(done, total, probe, outcomes): called twice per probe — before it runs with
     outcomes=None (so a caller can show what's currently testing), and after with its outcomes.
 
     cached_profile: a FROZEN discovered surface (the per-commit cache, build 1b) reused VERBATIM instead
     of crawling — only its base_url is re-bound to this deployment. on_profile(profile): called once with
     a freshly-discovered surface (cache MISS) so the caller can persist it. Mutually exclusive: a HIT
-    skips discovery entirely (no crawl, no browser, no on_profile); a MISS discovers then hands it back."""
+    skips discovery entirely (no crawl, no browser, no on_profile); a MISS discovers then hands it back.
+
+    on_phase(name, label, important): OPTIONAL phase-boundary hook (crawl / lighthouse / probes). important=True
+    flags a LONG, otherwise-silent phase a watched grade should see even when not verbose (chiefly the ~2-3min
+    Lighthouse trace). Formatting + verbosity are the caller's; best-effort — a callback error never touches the
+    grade."""
+    def _phase(name, label, important=False):
+        if on_phase:
+            try:
+                on_phase(name, label, important)
+            except Exception:
+                pass
     try:
         handle = deployer.deploy()  # inside try so teardown runs even if deploy/health fails
         # --login: authenticate with team-provided demo/test creds BEFORE the crawl, so BOTH discovery and the
@@ -233,14 +455,27 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
             if login_headers:
                 headers = {**(headers or {}), **login_headers}
                 auth_crawl = False   # we hold a real session -> no throwaway self-register for the crawl
+        # UNIFICATION: the authenticated crawl (Gap B) establishes a session to MAP the authed surface; capture
+        # it here so ctx.register REUSES it instead of registering a SECOND time (the sample6 two-browser-launches
+        # regression). Populated by discovery._crawl_auth_headers only on the auth_crawl path.
+        crawl_session_sink: dict = {}
         if cached_profile is not None:
             # FROZEN surface: reuse the cached crawl, re-pointing only the origin at THIS deployment's
             # ephemeral URL (routes/forms/endpoints are relative paths; base_url is the sole absolute).
             # Skips the crawl + interaction clicking entirely -> their timing non-determinism leaves the score.
             profile = replace(cached_profile, base_url=handle.base_url)
         else:
+            _phase("discover", "crawling the surface"
+                   + (" (browser render)" if render else "")
+                   + (" + auth register" if auth_crawl else "") + " ...", important=bool(render))
+            _t_disc = time.monotonic()
             profile = discover(handle.base_url, render=render, headers=headers, seed_features=seed_features,
-                               perceive=perceive, auth_crawl=auth_crawl)
+                               perceive=perceive, auth_crawl=auth_crawl, browser_register=browser_register,
+                               crawl_session_sink=crawl_session_sink, email_receiver=email_receiver)
+            _phase("discovered", f"surface: {len(profile.routes)} routes, {len(profile.forms)} forms, "
+                   f"{len(profile.endpoints)} endpoints"
+                   + (", auth entrypoint" if profile.capabilities.get("has_auth_entrypoint") else "")
+                   + f", render={profile.render_state or 'n/a'}  ({time.monotonic() - _t_disc:.0f}s)")
             if on_profile is not None:
                 on_profile(profile)   # cache MISS -> hand the freshly-minted canonical surface to the caller
         if recon:   # deploy -> discover(render + classify) -> STOP, skipping the probe gauntlet. Recon only needs
@@ -256,10 +491,78 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
         trace_sink = start_trace(trace)   # always reset (clears any stale sink); None when trace off. BEFORE
         #                                   make_client so the shared declarative client is hooked too.
         with make_client(origin, headers, timeout=15.0, follow_redirects=True) as client:
-            ctx = _Ctx(origin, client, profile, headers, browser_register=browser_register)
+            ctx = _Ctx(origin, client, profile, headers, browser_register=browser_register, email=email_receiver)
+            # UNIFICATION: hand the crawl's already-established session to ctx.register so the primary identity
+            # reuses it (no second registration). Only when we didn't already hold a --header/--login session
+            # (that path sets auth_crawl=False -> no crawl session anyway) and the crawl actually got one.
+            _crawl_sess = crawl_session_sink.get("session")
+            if _crawl_sess and not auth._provided_session(headers):
+                ctx._email_cache["account_session"] = _crawl_sess
+            # ENTRY GATE: if the target answers with a bot-challenge / WAF interstitial / sleeping-app page,
+            # grading it draws false findings from its HTML AND hides the real surface (false cleans). Withhold
+            # the grade instead of scoring the interstitial. The record is flagged bot_challenge -> excluded
+            # from the score distribution, never read as a clean grade.
+            try:
+                if is_bot_challenge(client.get(origin)):   # challenged from the FIRST fetch -> ungradeable, withhold
+                    bp, ia = _blocked(catalog)              # nothing ran -> the whole battery is blocked
+                    return Report(slop_score=0, outcomes=[], surface=surface_metrics(profile),
+                                  platform=platform_id.classify_live(client, origin),
+                                  bot_challenge=True, challenge_stage="entry",
+                                  blocked_probes=bp, incomplete_axes=ia, trace=trace_sink or [])
+            except Exception:   # best-effort side check: a failed probe fetch must never gate the grade
+                pass
+            # SHELL-ONLY SHORT-CIRCUIT: discovery found a canvas-shell host (Streamlit) whose real app did NOT
+            # render — 'error' (crash screen) or 'stuck' (won't come up). The full browser battery would grind the
+            # framework shell (no networkidle, register/upload/domxss all timing out) for ~480s and DNF on the
+            # grade timeout — for a record is_shell_only EXCLUDES from the curve regardless. Stop here with the
+            # shell state recorded (excluded, never read as a clean grade) instead of burning the budget. A
+            # RENDERED shell (render_state 'rendered') falls through and grades its real surface normally.
+            if profile.render_state in ("error", "stuck"):
+                return Report(slop_score=0, outcomes=[], surface=surface_metrics(profile),
+                              platform=platform_id.classify_live(client, origin), trace=trace_sink or [])
+            # EAGER EMAIL PRIME: fire the email registration NOW -- before the ~2-3min Lighthouse run and the probe
+            # loop -- so a confirmation mail is delivered by the time a qa-email / register-lane probe polls for it.
+            # The up-to-60s wait then OVERLAPS the rest of the grade instead of blocking it (the poll finds the mail
+            # already there). No-op without a receiver / auth entrypoint; the send is memoized so the later poll
+            # reuses it, and it's best-effort (never raises into the grade).
+            if email_receiver is not None and profile.capabilities.get("has_auth_entrypoint"):
+                _prime_email(ctx)
+            # PERF: run Lighthouse ONCE (pinned 13.4.1, median-of-N) and cache it on ctx for the Lighthouse-backed
+            # probes. Gated on the catalog carrying a probe that DECLARES `requires: [lighthouse]` (skip the ~2-3min
+            # run otherwise) and on the app being real+reachable (past the entry gate + shell short-circuit above).
+            # Keying on the declared capability, NOT a predicate name, so it stays correct as predicates are added:
+            # the SCORING probe perf-lighthouse-001 uses `lighthouse_perf_score`, which a `== "lighthouse_audit"`
+            # check silently missed (perf axis would go dark if the report_only lighthouse_audit probes were ever
+            # dropped, and a `--probe perf-lighthouse-001` subset never triggered the run). Best-effort: on failure
+            # ctx.lighthouse stays None -> those probes read N/A, never DNF the grade. Grade the LANDING page (a
+            # sub-path deploy's real app), not the bare origin. Sets the `lighthouse` capability so the YAMLs gate.
+            if _needs_lighthouse(catalog):
+                _phase("lighthouse",
+                       f"running Lighthouse perf trace ({lighthouse.DEFAULT_RUNS} run(s), up to ~2-3 min) ...",
+                       important=True)
+                _t_lh = time.monotonic()
+                try:
+                    with _lighthouse_lock():   # host-wide: one Chrome perf trace at a time under --concurrency
+                        ctx.lighthouse = lighthouse.measure(origin.rstrip("/") + (profile.landing_path or "/"))
+                    profile.capabilities["lighthouse"] = True
+                    _lh_sc = lighthouse.perf_score(ctx.lighthouse)
+                    _phase("lighthouse_done",
+                           (f"Lighthouse perf score {_lh_sc:.2f}" if _lh_sc is not None
+                            else "Lighthouse done, no score")
+                           + f"  ({time.monotonic() - _t_lh:.0f}s)")
+                except lighthouse.PSIError as e:
+                    _phase("lighthouse_done",
+                           f"Lighthouse unavailable ({time.monotonic() - _t_lh:.0f}s): {str(e)[:70]}")
+            _phase("probes", f"running {total} probes ...")
+            # Run low-volume probes FIRST, the high-volume injection/stress tail LAST: on an adaptive-WAF host a
+            # challenge then trips late (during the tail), so the recovery keeps the already-collected outcomes
+            # (it scores only PRE-onset). Stable sort -> catalog order preserved within each tier; a completed
+            # grade's score is order-independent, so this never perturbs a clean grade.
+            catalog = sorted(catalog, key=lambda p: safety.order_weight(p.id))
+            cat_index = {p.id: i for i, p in enumerate(catalog)}
             for i, probe in enumerate(catalog):
-                if trace:
-                    set_trace_probe(probe.id)                  # tag every request this probe makes (fired or not)
+                set_trace_probe(probe.id)                      # tag every request (for --trace AND the always-on
+                #                                                challenge-onset watch); cheap ContextVar set
                 if on_progress:
                     on_progress(i, total, probe, None)              # starting probe i (0-indexed)
                 try:
@@ -273,14 +576,56 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
                 outcomes.extend(probe_outcomes)
                 if on_progress:
                     on_progress(i + 1, total, probe, probe_outcomes)  # done: i+1 probes completed
+                if challenge_onset():   # a CONFIRMED challenge tripped during/before this probe -> STOP: every
+                    break               # request past here hits the interstitial, not the app (and stops hammering)
             # OFF-SCORE diagnostic: identify the hosting platform + AI builder from one origin fetch (headers +
             # served HTML). Inside the client block so it reuses the session; never raises -> never DNFs a grade.
             plat = platform_id.classify_live(client, origin)
+            onset_probe = challenge_onset()   # a probe id if the WAF tripped MID-grade, else None
+            if not onset_probe:               # no mid-grade trip -> a challenge may still appear only at the END
+                try:
+                    end_challenged = is_bot_challenge(client.get(origin))
+                except Exception:
+                    end_challenged = False
+            else:
+                end_challenged = False
+            req_counts = request_counts() or {}
         if source_dir:   # static source scan (submission zip / --source DIR); absent for a bare --target
             outcomes.append(_source_secret_outcome(source_dir))
+        # RECOVERY: a probe's outcome is trustworthy only if it ran BEFORE the confirmed challenge onset. Keep
+        # the PRE-ONSET outcomes; drop the rest (they ran against the interstitial). Withhold if too few probes
+        # saw the real app (an early trip). An END-only challenge (no mid-grade onset) means every probe ran on
+        # the app -> keep them all. The v17 sample proved such kept grades match clean ones.
+        stage, bot_challenge = "", False
+        blocked_probes, incomplete_axes = [], []
+        if onset_probe:
+            bot_challenge = True
+            onset_idx = cat_index.get(onset_probe, total)
+            if onset_idx < _MIN_VALID_FRACTION * total:   # too little clean data -> ungradeable, like an entry challenge
+                bp, ia = _blocked(catalog)                # nothing usable ran -> the whole battery is blocked
+                return Report(slop_score=0, outcomes=[], surface=surface_metrics(profile), platform=plat,
+                              bot_challenge=True, challenge_stage="entry", challenge_onset=onset_probe,
+                              request_counts=req_counts, blocked_probes=bp, incomplete_axes=ia,
+                              trace=trace_sink or [])
+            outcomes = [o for o in outcomes if cat_index.get(o.probe_id, total) < onset_idx]
+            blocked_probes, incomplete_axes = _blocked(catalog[onset_idx:])   # the tail a challenge cut off
+            stage = "late"
+        elif end_challenged:
+            bot_challenge, stage = True, "late"
+        surface = surface_metrics(profile)
+        if ctx.lighthouse:   # capture the Lighthouse performance score (0-100) onto the record -- the perf axis
+            perf = lighthouse.perf_score(ctx.lighthouse)   # already grades on it; this surfaces it for the stats.
+            surface["lighthouse"] = {"performance": round(perf * 100) if perf is not None else None}
+        sess = _captured_session(ctx)               # the session the grade established -> a retry replays it, no re-walk
+        attempted = (ctx.browser_register is not None
+                     or (isinstance(ctx._email_cache, dict) and "_authed_headers" in ctx._email_cache))
         return Report(slop_score=compute_slop_score(outcomes), outcomes=outcomes,
-                      axis_slop=compute_axis_slop(outcomes), surface=surface_metrics(profile),
-                      coverage=coverage_metrics(outcomes), platform=plat, trace=trace_sink or [])
+                      axis_slop=compute_axis_slop(outcomes), surface=surface,
+                      coverage=coverage_metrics(outcomes), platform=plat, bot_challenge=bot_challenge,
+                      challenge_stage=stage, challenge_onset=onset_probe or "", request_counts=req_counts,
+                      blocked_probes=blocked_probes, incomplete_axes=incomplete_axes, trace=trace_sink or [],
+                      session_replay=sess,
+                      session_established=(True if sess else (False if attempted else None)))
     finally:
         deployer.teardown()
 

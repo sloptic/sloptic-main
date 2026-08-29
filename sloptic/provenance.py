@@ -13,10 +13,11 @@ they are the larger share of corpus penalty:
     between versions. Bump axe and a11y findings move with no app having changed. The engine is vendored and
     git-tracked (`vendor/axe.min.js`, pinned at 4.10.2) so a run is reproducible — but without the version in
     the row, a future curve comparison cannot tell an app that got worse from a rule that got stricter.
-  * `perf-cwv-001/002` are measured **inside Chromium** under a CDP CPU throttle, so they move with the browser
-    build. `perf-ttfb-*` and `perf-load-001` are wall-clock and move with host load and core count.
-  * The one thing that does NOT need this is `perf-loadtime-001`, which computes against a fixed published
-    PROFILE instead of measuring — recorded here anyway, because the profile IS the definition of that number.
+  * the perf axis is now **Lighthouse** (pinned `lighthouse@13.4.1`, median-of-N), so a perf number moves with
+    the Lighthouse build AND the Chrome it drives the trace on — a Chrome auto-update shifts the metrics even
+    with Lighthouse pinned. The Lighthouse version is recorded here; the exact Chrome is stamped on every perf
+    finding's evidence. A bump in either is the signal to re-freeze the curve. (`perf-load-001`, the burst
+    stress test, is still wall-clock and moves with host load and core count.)
 
 So this module is not bookkeeping. For two thirds of the score it is what makes a number comparable to the same
 number from another run at all.
@@ -33,7 +34,7 @@ import platform
 import re
 import secrets
 
-from . import perf
+from . import lighthouse
 
 # THE SHAPE OF A RESULT ROW, versioned so a consumer can tell before it parses. Rows written before this
 # existed carry no field at all, and absence MEANS 1 — that is the whole contract for reading them, and it is
@@ -105,14 +106,9 @@ def collect(*, flags: dict | None = None) -> dict:
             # from run_batch's single preflight; None on a standalone grade that never launched a browser
             "chromium": os.environ.get(_CHROMIUM_ENV) or None,
             "axe_core": _axe_version(),
-        },
-        # the profile IS the definition of perf-loadtime-001 and the tier thresholds, so a curve comparison
-        # needs it even though it never varies with the machine
-        "perf_profile": dict(perf.PROFILE),
-        "perf_thresholds": {
-            "ttfb_profile": perf.TTFB_PROFILE, "ttfb_ceiling": perf.TTFB_CEILING,
-            "weight_profile": perf.WEIGHT_PROFILE, "weight_ceiling": perf.WEIGHT_CEILING,
-            "requests_profile": perf.REQUESTS_PROFILE, "loadtime_ceiling": perf.LOADTIME_CEILING,
+            # perf is now Lighthouse (pinned): its reproducibility depends on the Lighthouse version and the
+            # Chrome it drives (the exact Chrome is stamped on each perf finding's evidence). A bump = re-freeze.
+            "lighthouse": lighthouse.LIGHTHOUSE_VERSION,
         },
         "flags": dict(flags or {}),
     }

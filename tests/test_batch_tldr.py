@@ -56,3 +56,16 @@ def test_eta_footer_shows_batch_progress_and_eta_for_the_full_dump():
     # non-tldr full-dump footer: batch [done/total], this-app seconds, and the same throughput ETA as --tldr
     assert _eta_footer(180, 398, 294, 5999) == "    └─ batch [180/398] · 294s this app · ETA 99:59"
     assert "ETA" not in _eta_footer(1, 398, 2, 0)      # first app: no throughput yet -> no ETA shown
+
+
+def test_tldr_line_appends_the_app_url():
+    # the app's URL is appended LAST so it's clickable and the fixed-width columns before it don't shift
+    line = _tldr_line(3, 60, "cool-thing", {"slop_score": 40}, 47.0, 323.0, tail="",
+                      url="https://coolthing.vercel.app")
+    assert line.rstrip().endswith("https://coolthing.vercel.app")
+    assert "cool-thing" in line and "slop 40" in line          # label + score still present
+
+
+def test_tldr_line_url_appears_on_a_wedge_line_too():
+    line = _tldr_line(5, 20, "hunger", None, 900.0, 100.0, tail="!wedged", url="https://x.app")
+    assert line.rstrip().endswith("https://x.app")

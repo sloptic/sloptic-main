@@ -382,6 +382,45 @@ def test_inert_controls_clears_off_channel_and_active_controls():
         srv.shutdown()
 
 
+def test_inert_controls_clears_a_download_link():
+    # a <a download>/file link triggers a DOWNLOAD, not a nav/DOM change -- a real effect on its own channel, so
+    # it must clear, not read as dead (killthebill's 'Sample 1/2' CSV links were exactly this FP). A handler-less
+    # button STILL flags, so the download watcher cannot cost recall.
+    import http.server
+    import threading
+
+    page = ("<!doctype html><html><body>"
+            "<a href='/report.csv' download='report.csv'>Download CSV</a>"      # download channel -> live
+            "<button id='dead'>Show details</button>"                           # no handler -> genuinely DEAD
+            "</body></html>").encode("ascii")
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path.startswith("/report.csv"):
+                body = b"a,b\n1,2\n"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/csv")
+                self.send_header("Content-Disposition", "attachment; filename=report.csv")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers(); self.wfile.write(body); return
+            self.send_response(200); self.send_header("Content-Type", "text/html"); self.end_headers()
+            self.wfile.write(page)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        dead = browser.inert_controls(base)
+        assert dead is not None
+        assert "Download CSV" not in dead                 # download fired -> not "dead"
+        assert "Show details" in dead                     # genuinely inert -> still flagged (recall preserved)
+    finally:
+        srv.shutdown()
+
+
 @pytest.fixture
 def serve():
     deployers = []
@@ -470,18 +509,10 @@ def test_xss_injectable_fires_via_execution_not_reflection(serve):
     assert xss_injectable(h, _P()) is False        # marker reflects but nothing executes -> clean
 
 
-def test_cwv_detects_slow_paint(serve):
-    # vulnerable /slow injects content late (high FCP); hardened has it in the initial HTML (fast)
-    slow = browser.first_contentful_paint(serve("vulnerable") + "/slow")
-    assert slow is not None and slow > 1000
-    fast = browser.first_contentful_paint(serve("hardened") + "/slow")
-    assert fast is not None and fast < 1000
-
-
 # End-to-end: the browser probes through the FULL pipeline (browser capability gate + predicate +
 # scoring), not just the helper primitives above. Closes the gap where run(..., render=...) — and so
 # the browser_ok gate and the median-of-N slow_first_paint predicate — was never exercised.
-_BROWSER_PROBES = ("sec-domxss-001", "perf-cwv-001", "qa-console-001", "qa-a11y-001")
+_BROWSER_PROBES = ("sec-domxss-001", "qa-console-001", "qa-a11y-001")
 
 
 def _browser_run(app: str):
@@ -492,7 +523,6 @@ def _browser_run(app: str):
 def test_browser_pipeline_fires_on_vulnerable():
     o = _browser_run("vulnerable").by_id
     assert o["sec-domxss-001"] == "slop_detected"  # /dom innerHTMLs q -> the injected payload executes
-    assert o["perf-cwv-001"] == "slop_detected"    # /slow paints late -> median FCP over the gate
     assert o["qa-console-001"] == "slop_detected"  # homepage throws an uncaught JS error on load
     assert o["qa-a11y-001"] == "slop_detected"     # missing lang + unlabeled inputs
 
@@ -500,7 +530,6 @@ def test_browser_pipeline_fires_on_vulnerable():
 def test_browser_pipeline_clears_on_hardened():
     o = _browser_run("hardened").by_id
     assert o["sec-domxss-001"] == "clean"          # /dom uses textContent -> no execution
-    assert o["perf-cwv-001"] == "clean"            # /slow content in initial HTML -> fast FCP
     assert o["qa-console-001"] == "clean"          # no uncaught errors on load
     assert o["qa-a11y-001"] == "clean"             # lang set + every input aria-labeled
 
@@ -548,44 +577,6 @@ def test_contrast_clean_on_high_contrast():
     srv = _serve_html(_HIGH_CONTRAST)
     try:
         assert browser.contrast_violations("http://127.0.0.1:%d/" % srv.server_address[1]) == 0
-    finally:
-        srv.shutdown()
-
-
-# --- Core Web Vitals (perf-cwv-002 / slow_core_web_vitals) --------------------------------
-from sloptic.net import make_client        # noqa: E402
-from sloptic.probes import slow_core_web_vitals  # noqa: E402
-
-# an 800ms synchronous busy-loop blocks the main thread on load -> Total Blocking Time well past 600ms
-_CWV_POOR = ("<!doctype html><html lang=en><head><title>t</title></head><body><h1>slow</h1>"
-             "<script>const t0=performance.now();while(performance.now()-t0<800){}</script></body></html>")
-_CWV_CLEAN = "<!doctype html><html lang=en><head><title>t</title></head><body><h1>fast</h1></body></html>"
-
-
-class _CwvProbe:
-    probe = {"target": "/", "samples": 2}
-
-
-def _cwv_ctx(url):
-    return type("C", (), {"base_url": url, "headers": None, "client": make_client(url), "evidence": {}})()
-
-
-def test_cwv_fires_on_poor_web_vitals():
-    srv = _serve_html(_CWV_POOR)
-    try:
-        ctx = _cwv_ctx("http://127.0.0.1:%d/" % srv.server_address[1])
-        assert slow_core_web_vitals(ctx, _CwvProbe()) is True
-        assert "TBT" in ctx.evidence["failed"]        # main-thread block is the metric that trips
-    finally:
-        srv.shutdown()
-
-
-def test_cwv_clean_on_fast_page():
-    srv = _serve_html(_CWV_CLEAN)
-    try:
-        ctx = _cwv_ctx("http://127.0.0.1:%d/" % srv.server_address[1])
-        assert slow_core_web_vitals(ctx, _CwvProbe()) is False
-        assert ctx.evidence["failed"] == []
     finally:
         srv.shutdown()
 

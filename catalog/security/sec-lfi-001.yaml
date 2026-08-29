@@ -4,6 +4,7 @@ category: path-traversal
 pool: public
 evidence_model: provable
 penalty: 40   # arbitrary file read / local file inclusion -> source & secret disclosure, often RCE
+severity_ref: path-traversal
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:

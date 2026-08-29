@@ -12,6 +12,17 @@ from sloptic import probes
 from sloptic.schema import Profile
 
 
+def _jwt(sub, email=None):
+    """A minimal decodable (unsigned) JWT carrying sub/email -- what _supabase_authed_only reads to identify the
+    fresh test user's OWN rows and exclude them."""
+    import base64
+    claims = {"sub": sub}
+    if email:
+        claims["email"] = email
+    seg = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+    return "h." + seg + ".s"
+
+
 def _serve(handler_body):
     class _H(http.server.BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -249,9 +260,9 @@ def _serve_authed(rules):
 
 
 def test_supabase_authed_only_fires_on_authenticated_rls_bypass():
-    # broken RLS: anon is denied ([]), but a FRESH authed user (created nothing) sees everyone's rows ->
-    # `using (auth.role() = 'authenticated')` -> the IDOR equivalent. Sensitive table+columns -> fires.
-    ANON, JWT = "eyJanon", "eyJfreshuser"
+    # broken RLS: anon is denied ([]), but a FRESH authed user sees a row owned by SOMEONE ELSE (id=1, not its
+    # sub) -> `using (auth.role() = 'authenticated')` -> the IDOR equivalent. Sensitive table+columns -> fires.
+    ANON, JWT = "eyJanon", _jwt("fresh-uid")
 
     def rules(path, bearer):
         if "/rest/v1/messages" in path:
@@ -286,6 +297,47 @@ def test_supabase_authed_only_skips_anon_open_table():
     try:
         with httpx.Client(timeout=5) as c:
             assert probes._supabase_authed_only(c, base, "eyJanon", "eyJfresh", ["users"]) is None
+    finally:
+        srv.shutdown()
+
+
+def test_supabase_authed_only_clean_when_only_own_row_returns():
+    # THE sec-backend-002 FALSE-POSITIVE PIN (a measured 40-point FP): correct per-user RLS + the near-universal
+    # Supabase handle_new_user() trigger -> the fresh user reads ONLY its OWN auto-created profile row (id == its
+    # sub). anon denied, fresh-authed sees [own row] -> the OLD gate fired at 40 on a correctly-configured app.
+    fresh = _jwt("fresh-uid", "hlrlstest@example.com")
+
+    def rules(path, bearer):
+        if "/rest/v1/profiles" in path and path != "/rest/v1/":
+            return (200, json.dumps([{"id": "fresh-uid", "email": "hlrlstest@example.com",
+                                      "full_name": "Fresh"}]).encode()) if bearer == fresh else (200, b"[]")
+        return 200, b"[]"
+    srv = _serve_authed(rules)
+    base = "http://127.0.0.1:%d" % srv.server_address[1]
+    try:
+        with httpx.Client(timeout=5) as c:
+            assert probes._supabase_authed_only(c, base, "eyJanon", fresh, ["profiles"]) is None
+    finally:
+        srv.shutdown()
+
+
+def test_supabase_authed_only_still_fires_on_a_cross_user_row():
+    # the other half of the pin: a DIFFERENT user's row (id != the fresh sub) is a genuine cross-user leak -> it
+    # must still fire, so the own-row filter doesn't silence real "any authed user reads everything" bypasses.
+    fresh = _jwt("fresh-uid", "hlrlstest@example.com")
+
+    def rules(path, bearer):
+        if "/rest/v1/profiles" in path and path != "/rest/v1/":
+            return (200, json.dumps([{"id": "victim-uid", "email": "victim@x.com",
+                                      "full_name": "Victim"}]).encode()) if bearer == fresh else (200, b"[]")
+        return 200, b"[]"
+    srv = _serve_authed(rules)
+    base = "http://127.0.0.1:%d" % srv.server_address[1]
+    try:
+        with httpx.Client(timeout=5) as c:
+            hit = probes._supabase_authed_only(c, base, "eyJanon", fresh, ["profiles"])
+        assert hit and hit["table"] == "profiles" and hit["rows"] == 1 and "email" in hit["columns"]
+        assert "cross-user" in hit["repro"]["matched"]
     finally:
         srv.shutdown()
 
@@ -343,3 +395,52 @@ def test_predicate_na_when_no_backend_config():
     ctx = type("C", (), {"client": httpx.Client(base_url="http://127.0.0.1:1"),
                          "profile": Profile(base_url="http://127.0.0.1:1", routes=["/"]), "evidence": {}})()
     assert probes.exposed_backend_readable(ctx, type("P", (), {"probe": {}})()) is None
+
+
+# --- v20 sec-backend-001 hardening: `credit` substring + Firestore/RTDB sensitivity-gate parity ------------
+
+def test_credits_column_is_not_sensitive_but_credit_card_is():
+    # `credit` was a bare substring matching game/leaderboard `credits`; narrowed to credit_?card
+    assert probes._sensitive_columns(["credits", "score", "level"]) == []
+    assert probes._sensitive_columns(["credit_card"]) == ["credit_card"]
+    assert probes._sensitive_columns(["creditcard"]) == ["creditcard"]
+
+
+def test_firestore_public_collection_without_pii_is_clean(serve):
+    # a world-readable but public-by-design collection (a leaderboard of handle+score) is NOT a leak now that
+    # the Firestore path applies the same column-sensitivity gate as the Supabase read path
+    def h(path):
+        if "/documents/leaderboard" in path:
+            return 200, "application/json", json.dumps({"documents": [
+                {"name": "p/databases/(default)/documents/leaderboard/1",
+                 "fields": {"score": {"integerValue": "5"}, "handle": {"stringValue": "ace"}}}]}).encode()
+        return 200, "application/json", b'{"documents": []}'
+    base = serve(h)
+    with httpx.Client(timeout=5) as c:
+        assert probes._firestore_readable(c, base, "my-proj", "AIzaKEY", ["leaderboard"]) is None
+
+
+def test_firestore_fire_reports_sensitive_fields(serve):
+    # a collection carrying a PII field still fires, and now names the field that made it a leak
+    def h(path):
+        if "/documents/users" in path:
+            return 200, "application/json", json.dumps({"documents": [
+                {"name": "p/databases/(default)/documents/users/1",
+                 "fields": {"email": {"stringValue": "a@x.com"}, "bio": {"stringValue": "hi"}}}]}).encode()
+        return 200, "application/json", b'{"documents": []}'
+    base = serve(h)
+    with httpx.Client(timeout=5) as c:
+        hit = probes._firestore_readable(c, base, "my-proj", "AIzaKEY", ["users"])
+    assert hit["sensitive_fields"] == ["email"] and "carrying email" in hit["repro"]["matched"]
+
+
+def test_rtdb_sensitive_names_flags_users_tree():
+    data = {"users": {"u1": {"email": "a@x.com", "name": "Al"}, "u2": {"email": "b@x.com"}}}
+    names = probes._rtdb_sensitive_names(data)
+    assert "users" in names and "email" in names
+
+
+def test_rtdb_sensitive_names_clean_on_public_tree():
+    # a public-by-design tree (config + a leaderboard of handle+score) carries no sensitive node/field name
+    data = {"leaderboard": {"e1": {"handle": "ace", "score": 5}}, "config": {"maxPlayers": 4}}
+    assert probes._rtdb_sensitive_names(data) == []

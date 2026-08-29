@@ -96,12 +96,25 @@ def _grade(contrast):
 
 
 def test_barely_failing_now_costs_far_less_than_invisible_text():
-    mild, mild_impacts, mild_sf = _grade([n(3.8)])       # 0.84 -> minor
-    bad, bad_impacts, bad_sf = _grade([n(1.1)])          # 0.24 -> critical
-    assert mild_impacts == {"minor": 1} and bad_impacts == {"critical": 1}
-    assert mild == _a11y_penalty({"minor": 1}) and bad == _a11y_penalty({"critical": 1})
+    from sloptic.probes import _contrast_penalty
+    mild, mild_impacts, mild_sf = _grade([n(3.8)])       # 0.84 shortfall
+    bad, bad_impacts, bad_sf = _grade([n(1.1)])          # 0.24 shortfall (invisible)
+    # contrast is CONTINUOUS now: not a tier in impacts, but a float penalty from the (unrounded) shortfall
+    assert mild_impacts == {} and bad_impacts == {}
+    assert bad == 20.0 and 5.0 < mild < 6.0              # 0.24 -> flat critical 20; ~0.84 -> ~5.5, continuous
     assert bad > mild, "a page of invisible text must outscore one that just misses the bar"
     assert mild_sf == 0.84 and bad_sf == 0.24
+
+
+def test_contrast_penalty_is_continuous_through_the_tier_anchors():
+    from sloptic.probes import _contrast_penalty
+    # band boundaries score exactly the old tier values (calibration preserved)...
+    assert _contrast_penalty(0.30) == 20.0 and _contrast_penalty(0.50) == 12.0
+    assert _contrast_penalty(0.75) == 7.0 and _contrast_penalty(1.0) == 3.0
+    # ...but BETWEEN boundaries the value now varies (de-quantized), monotonic in shortfall
+    assert 12.0 < _contrast_penalty(0.40) < 20.0
+    assert _contrast_penalty(0.40) > _contrast_penalty(0.45) > _contrast_penalty(0.50)
+    assert _contrast_penalty(0.10) == 20.0                # below 0.30 -> flat max (effectively invisible)
 
 
 def test_without_contrast_data_the_price_is_unchanged_from_before():

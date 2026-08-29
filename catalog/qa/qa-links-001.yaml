@@ -3,14 +3,20 @@ bundle: qa
 category: broken-links
 pool: public
 evidence_model: provable
-penalty: 12   # within-QA calibration (NOT a QA-vs-security retreat): a single dead internal link's own
-              # freq×sev is genuinely lower than its tier-mates (a11y 26, crash 32). At 24 it ranked near
-              # CSRF (25), overstating one broken link relative to real accessibility/crash failures. 24->12.
+penalty: 24   # nominal floor; the REAL penalty is a CONTINUOUS penalty_override the predicate computes from the
+              # FRACTION of internal nav that's a dead end: 24*(1+dead/total), ~24 (a lone dead link) up to ~48
+              # (all nav 404s). No severity block, so the override (float) is the scored value -- a spectrum, not
+              # a flat 25, so a mostly-broken site sorts above a one-dead-link site (de-clumping for percentiles).
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:
-  # fetch each same-origin <a href> on the homepage; fire on the first that lands on a 4xx.
-  # redirects are followed (a redirect that resolves is not broken); 5xx is left to crash-resistance
+  # fetch each same-origin <a href> on the homepage; fire on the first that lands on a 4xx DEAD END.
+  # redirects are followed (a redirect that resolves is not broken); 5xx is left to crash-resistance.
+  # PRECISION (v18 live-audit, ~20% FP): (1) extraction skips non-links -- an uninterpolated template literal
+  # (/${s.url}), a Cloudflare-INJECTED /cdn-cgi/ link -- and HTML-unescapes hrefs (`?a=1&amp;b=2` IS `?a=1&b=2`
+  # to a browser; not unescaping fetched a literal &amp; -> 400). (2) a DEAD END is not-found (404/410) or
+  # malformed (400), NOT access-control: 401/403 (page exists, gated) + 429 (rate-limited) are skipped -- the
+  # link WORKS, it isn't broken (case-forward /auth/login -> 403 was a gated page, not a dead link).
   predicate: broken_links
   target: /
   max_attempts: 40

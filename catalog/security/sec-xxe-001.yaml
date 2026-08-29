@@ -4,6 +4,7 @@ category: xxe
 pool: public
 evidence_model: provable
 penalty: 40   # XML external entity -> file read / SSRF / RCE
+severity_ref: xxe
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:

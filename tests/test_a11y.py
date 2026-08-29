@@ -65,8 +65,11 @@ class _Probe:
     probe = {"target": "/"}
 
 
-def _ctx(url):
-    return type("C", (), {"base_url": url, "headers": None, "client": None, "evidence": {}})()
+def _ctx(url, browser=False):
+    # a11y_hard_fails is the browser-OFF fallback: it defers (N/A) when the browser ran (axe is authoritative),
+    # so the ctx carries profile.capabilities["browser"]. Default False -> the static check runs (the cases below).
+    prof = type("P", (), {"capabilities": {"browser": browser}})()
+    return type("C", (), {"base_url": url, "headers": None, "client": None, "evidence": {}, "profile": prof})()
 
 
 @pytest.mark.parametrize("fault", ["lang", "alt", "title", "label", "contrast"])
@@ -81,3 +84,10 @@ def test_a11y_clean_on_accessible_document(serve):
 def test_a11y_ignores_barriers_inside_nonrendered_regions(serve):
     # <img>/<input> without a name inside <script> / <!-- --> is not rendered -> stripped -> stays clean
     assert a11y_hard_fails(_ctx(serve(NONVISIBLE)), _Probe()) is False
+
+
+def test_a11y_static_defers_to_axe_when_the_browser_ran(serve):
+    # the fix for the +1093-pt v18 override: a page that WOULD trip the static control-name fail must read N/A
+    # when the browser ran, so axe (qa-a11y-001, same variant group, MAX-in-group) isn't overridden by this
+    # blind pre-JS pass. Browser OFF still fires (asserted above); browser ON defers.
+    assert a11y_hard_fails(_ctx(serve(FAULTS["label"]), browser=True), _Probe()) is None

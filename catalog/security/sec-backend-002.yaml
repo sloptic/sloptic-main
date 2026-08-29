@@ -7,6 +7,7 @@ penalty: 40   # catastrophic Broken Access Control (OWASP A01:2025, the #1 risk)
               # every OTHER user's data — RLS/Rules present but over-permissive (`using(authenticated)` /
               # `if request.auth != null`). The IDOR equivalent on a BaaS SPA — an attacker just signs up.
               # Same catastrophic tier as anon-open (sec-backend-001) and classic BOLA/IDOR.
+severity_ref: access-control   # authed-tier BOLA (any logged-in user reads everything); sets cross_user_read + bulk_read
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:

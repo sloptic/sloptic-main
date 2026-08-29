@@ -17,3 +17,4 @@ probe:
   # global feed behind login (a social timeline) — rare in a CRUD-tracker corpus, and it still declared the
   # data private. Self-decides N/A: no auth-gated JSON collection, or two accounts can't be minted.
   predicate: api_bola_collection
+severity_ref: access-control   # shared block in catalog/_severity_classes.yaml (api_bola_collection sets cross_user_read + bulk_read)

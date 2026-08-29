@@ -35,14 +35,15 @@ def test_header_policy_matchers_ignore_server_errors():
 
 
 def test_hsts_suppressed_on_preloaded_platform_subdomains():
-    # sec-headers-003: a missing HSTS header on an ephemeral platform subdomain whose HSTS-preloaded apex
-    # already browser-enforces HTTPS for all subdomains is no real exposure -> suppress (upside-only). On a
-    # custom domain it's a genuine omission and still fires.
-    assert response_missing_header(_resp_host(200, "foo.vercel.app"), "strict-transport-security") is False
-    assert response_missing_header(_resp_host(200, "my-app.netlify.app"), "strict-transport-security") is False
-    assert response_missing_header(_resp_host(200, "svc.onrender.com"), "strict-transport-security") is False
-    assert response_missing_header(_resp_host(200, "app.example.com"), "strict-transport-security") is True
-    assert response_missing_header(_resp_host(200, "notvercel.app"), "strict-transport-security") is True  # no dot sep
+    # sec-headers-003: a missing HSTS header where HTTPS is ALREADY browser-enforced is no real exposure ->
+    # suppress (upside-only). That covers Google's HSTS-preloaded TLDs (every *.app / *.dev / *.page, incl.
+    # run.app / railway.app / workers.dev / a bare *.app site) plus specific preloaded platform domains. A
+    # custom domain (.com/.io/...) is a genuine omission and still fires.
+    for host in ("foo.vercel.app", "my-app.netlify.app", "svc.onrender.com", "bychen.workers.dev",
+                 "svc-x.up.railway.app", "notvercel.app", "myproj.web.app", "user.github.io", "brand.page"):
+        assert response_missing_header(_resp_host(200, host), "strict-transport-security") is False, host
+    for host in ("app.example.com", "secure.mybank.io", "shop.co"):
+        assert response_missing_header(_resp_host(200, host), "strict-transport-security") is True, host
     # scoped to HSTS only: OTHER header probes still fire on a platform subdomain
     assert response_missing_header(_resp_host(200, "foo.vercel.app"), "x-content-type-options") is True
 
@@ -181,11 +182,11 @@ def test_a11y_penalty_damps_stacked_barriers():
     critical barrier cost 30 against a security ceiling of 40. The SHAPE is unchanged — worst counts full, each
     additional decays by 0.6 — only the tier values moved."""
     from sloptic.probes import _a11y_penalty
-    assert _a11y_penalty({"serious": 1}) == 12                  # a lone contrast miss
+    assert _a11y_penalty({"serious": 1}) == 12                  # a lone barrier (1-decimal float now: 12.0 == 12)
     assert _a11y_penalty({"critical": 1}) == 20                 # a screen-reader blocker -> HALF the sec ceiling
-    assert _a11y_penalty({"critical": 1, "serious": 1}) == 27   # additive but DAMPED: 20 + 12*.6 (not a raw 32)
-    assert _a11y_penalty({"serious": 3}) == 24                  # worst full, rest decay: 12 + 7.2 + 4.32
-    assert _a11y_penalty({"moderate": 1, "minor": 2}) == 10      # 7 + 3*.6 + 3*.36 -> cosmetics stay cheap
+    assert _a11y_penalty({"critical": 1, "serious": 1}) == 27.2  # additive but DAMPED: 20 + 12*.6 (1-decimal)
+    assert _a11y_penalty({"serious": 3}) == 23.5                # worst full, rest decay: 12 + 7.2 + 4.32 = 23.52
+    assert _a11y_penalty({"moderate": 1, "minor": 2}) == 9.9     # 7 + 3*.6 + 3*.36 = 9.88 -> cosmetics stay cheap
     assert _a11y_penalty({}) == 0
 
 

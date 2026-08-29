@@ -90,3 +90,52 @@ def test_clean_when_output_is_escaped():
 
 def test_na_without_json_create_endpoint():
     assert _run(vuln=True, endpoints=[]) is None
+
+
+# ---- browser-create fallback: reaches SPA/auth-gated creates the httpx POST can't store --------------------
+
+def test_browser_create_fallback_fires_confirmed_execution(monkeypatch):
+    # no JSON create endpoint the httpx path can POST, but a browser + content form: the browser-create lane
+    # drives the create and CONFIRMS execution -> fire, via="browser-create".
+    from sloptic import probes
+    monkeypatch.setattr(probes.browser, "create_and_check_execution",
+                        lambda base, payload, marker, headers=None, timeout=12.0: True)
+    ctx = _ctx("http://127.0.0.1:1", endpoints=[])
+    ctx.profile.capabilities["browser"] = True
+    try:
+        assert stored_xss_api(ctx, _P()) is True
+        assert ctx.evidence.get("via") == "browser-create" and ctx.evidence.get("execution_confirmed")
+    finally:
+        ctx.client.close()
+
+
+def test_browser_create_fallback_when_httpx_post_is_rejected(monkeypatch):
+    # a create endpoint exists but the httpx POST can't store it (404/401/JS-fetch-only) -> the browser-create
+    # lane still reaches it and confirms execution -> fire.
+    from sloptic import probes
+    monkeypatch.setattr(probes.browser, "create_and_check_execution",
+                        lambda base, payload, marker, headers=None, timeout=12.0: True)
+    srv = _serve(vuln=True)                                   # app only accepts POST /api/items
+    url = "http://127.0.0.1:%d" % srv.server_address[1]
+    ctx = _ctx(url, endpoints=[Endpoint(path="/api/other", method="post",   # 404 on POST -> not stored via httpx
+                                        raw_path="/api/other", body_fields=["text"])])
+    ctx.profile.capabilities["browser"] = True
+    try:
+        assert stored_xss_api(ctx, _P()) is True
+        assert ctx.evidence.get("via") == "browser-create"
+    finally:
+        ctx.client.close()
+        srv.shutdown()
+
+
+def test_browser_create_fallback_no_false_fire(monkeypatch):
+    # the browser lane never confirmed execution -> no fire, honest N/A (never a false clean either).
+    from sloptic import probes
+    monkeypatch.setattr(probes.browser, "create_and_check_execution",
+                        lambda base, payload, marker, headers=None, timeout=12.0: False)
+    ctx = _ctx("http://127.0.0.1:1", endpoints=[])
+    ctx.profile.capabilities["browser"] = True
+    try:
+        assert stored_xss_api(ctx, _P()) is None
+    finally:
+        ctx.client.close()

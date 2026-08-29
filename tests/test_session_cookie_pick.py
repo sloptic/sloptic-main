@@ -148,6 +148,31 @@ def test_the_provider_widening_did_not_take_the_non_session_cookies_with_it():
         assert not _is_session_cookie(name), name
 
 
+def test_vendor_client_by_design_cookies_are_not_judged_as_the_session():
+    """The whole sec-session-001 fire set on the v18 corpus (23/23) was a 100%-FP misattribution: every fire
+    judged a vendor cookie that is JS-readable BY DESIGN and is not the app's session. Guard each shape, and
+    guard that the REAL session for the same vendor is still recognised (so the exclusion did not over-reach)."""
+    from sloptic.auth import _is_session_cookie
+    # excluded: the pre-login PKCE nonce, Clerk's dev handshake JWT, a 3rd-party ad-tracker session id
+    for name in ("sb-mbwhwlyyxqveyojjjufe-auth-token-code-verifier",   # Supabase PKCE verifier (9 apps)
+                 "__clerk_db_jwt", "__clerk_db_jwt_u0uDmqLB",          # Clerk dev handshake (13 apps)
+                 "taboola_session_id"):                                # third-party tracker (1 app)
+        assert not _is_session_cookie(name), name
+    # NOT taken with them: Supabase's real session cookie and Clerk's real __session must still be judged
+    for name in ("sb-mbwhwlyyxqveyojjjufe-auth-token", "__session"):
+        assert _is_session_cookie(name), name
+
+
+def test_the_real_session_is_still_picked_when_the_pkce_verifier_sits_beside_it():
+    # end-to-end: an app that DOES set both a real auth-token cookie and the PKCE verifier must be judged on
+    # the real one — the exclusion removes the verifier from contention, it does not blank the whole app.
+    r = _resp(f"sb-ref-auth-token={_JWT}; Path=/; HttpOnly; Secure; SameSite=Lax",
+              "sb-ref-auth-token-code-verifier=A1b2C3d4E5f6G7h8I9j0KlMnOpQrStUvWxYz012345; Path=/")
+    c = auth.session_cookie(r)
+    assert c is not None and c["name"] == "sb-ref-auth-token"   # the session, not the verifier
+    assert c["httponly"] is True
+
+
 def test_the_browser_lane_names_WHICH_stage_it_failed_at():
     """Five distinct outcomes used to collapse into one bare None, and diagnosing them by inspection cost three
     refuted theories in a row. The diag out-param is what turns "187 apps, cause unknown" into a distribution."""

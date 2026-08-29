@@ -4,6 +4,7 @@ category: security-headers
 pool: public
 evidence_model: provable
 penalty: 5
+severity: {cvss: "n/a", vrt: "P5", range: [5, 5], default: 5, tier: chore-floor}   # clickjacking / X-Frame
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:

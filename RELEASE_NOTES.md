@@ -1,4 +1,4 @@
-# Sloptic v1.1.0
+# Sloptic v2.0.0
 
 Sloptic grades any deployed web app, whatever its stack or purpose, and returns one
 **slop score** you can compare across apps (lower is better, `0` means nothing found),
@@ -6,9 +6,48 @@ along with where that app ranks against a frozen population of others. It reads 
 and needs no spec, so the same grade applies to every submission no matter what each one
 was built with.
 
-This builds on the v1.0 engine. The scoring model and the frozen reference curve (2026.1) are
-unchanged, so grades stay comparable to v1.0; the changes below are precision and diagnostics,
-not a new ruler.
+Versions 1.1 and 1.2 kept the 2026.1 curve, so grades stayed comparable and the changes were
+precision and diagnostics. Version 2.0 is different: it is a **new ruler**. New probe families and
+continuous scoring changed what the number measures, and the reference curve moved to **2026.3**, so
+a 2.0 score does not compare to a 1.x one. A 2.0 percentile is quoted against 2026.3.
+
+## What's new in 2.0.0
+
+- **Managed backend exposure, reached and confirmed.** A new browser and API lane checks whether an
+  app's managed backend (Supabase or Firebase) is readable or writable by an anonymous client, and
+  proves it by reading a real row or completing a real insert rather than guessing. On the 2026.3
+  corpus this is the single largest exploitable class, 18 apps leaking a table to anyone, several with
+  plaintext passwords. The prior ruler could not reach it; this one does.
+- **Continuous scoring, so the number spreads.** Performance and color contrast now score on a
+  continuous scale instead of pass, half, and fail tiers. An app at a Lighthouse score of 85 carries
+  the small penalty it earns rather than rounding to zero, and contrast severity scales with how far
+  below the threshold it sits. The distribution spreads toward near unique scores, which is what a
+  ranking wants.
+- **Weakest link tiebreak.** At an equal score, the app whose single worst finding is smaller now
+  ranks ahead, inserted between the catastrophe gate and the defended surface breadth. One severe
+  trapdoor, a broken deploy, a locked out signup, or silent data loss, is worse than the same slop
+  spread over moderate findings, and the ranking now says so.
+- **The reach frontier.** New probes drive the app off its happy path, establishing a session,
+  creating data and reading it back, and driving a second account, so the stored XSS, integrity, cross
+  site request, and access control checks can reach a surface a passive fetch never sees. On a corpus
+  that is two thirds static frontends this surface is often absent, but where it exists the probes now
+  fire.
+- **Perf and accessibility on the seasoned engines.** Performance is measured by a pinned Lighthouse
+  (13.4.1), accessibility by a pinned axe-core (4.10.2), each consumed at its source rather than
+  rebuilt, so the two axes sit at the frontier of what those fields can measure and move only when the
+  pinned engine does.
+
+## What's new in 1.2.0
+
+- **Bot-challenge / interstitial guard.** A CDN or WAF sometimes serves a challenge page ("Just a
+  moment...", a Cloudflare `cf-mitigated` response), and a sleeping app can serve a wake-up page,
+  in place of the real app. Grading that is doubly wrong: its HTML draws false findings, and it
+  hides the real surface so every later probe reports a false clean. Sloptic now detects these
+  interstitials (`net.is_bot_challenge`): if the target answers with one, the grade is **withheld**
+  and flagged `bot_challenge` rather than scored, and a mitigation that trips *mid-grade* (from the
+  grader's own active traffic) is caught by an end-of-run re-check. Flagged records are excluded
+  from corpus statistics. Conservative by design: a genuine 403 or error page is not treated as a
+  challenge, so a real grade is never withheld.
 
 ## What's new in 1.1.0
 
@@ -33,8 +72,6 @@ not a new ruler.
   be graded on its universal floor without being actively tested. Fail-closed (an unclassified probe is treated
   active) and CI-locked. A passive grade is a subset, not comparable to a full grade.
 
-The frozen reference curve stays **2026.1** (the score distribution did not move).
-
 ## Highlights
 
 - **Comparable by design.** A raw score becomes a percentile against a frozen reference
@@ -42,23 +79,23 @@ The frozen reference curve stays **2026.1** (the score distribution did not move
   population." That comparison is what separates Sloptic from a scanner.
 - **Exact, tie-aware ranking.** The percentile is read off the full frozen distribution,
   not interpolated between a handful of landmarks. Two apps at the same score are not
-  treated as equal: ties break on whether a catastrophe fired, then on how much worst-case
-  slop the app actually defended (the score it would carry had every applicable probe
-  fired), then on the breadth of surface it exercised.
+  treated as equal: ties break on whether a catastrophe fired, then on the size of the single
+  worst finding, then on how much worst case slop the app defended (the score it would carry
+  had every applicable probe fired), then on the breadth of surface it exercised.
 - **Catastrophe gate.** An exploitable-now class (SQL injection, a served secret file, a
-  world-readable managed backend) is reported as an absolute gate whatever the rank says. A
+  world readable managed backend) is reported as an absolute gate whatever the rank says. A
   favorable comparison to equally-broken peers never launders it.
-- **91 probes across three axes.** Security (57), quality and correctness (22), and
-  performance (12). Each axis reports its own damped subtotal, and the three sum exactly
+- **102 probes across three axes.** Security (60), quality and correctness (29), and
+  performance (13). Each axis reports its own damped subtotal, and the three sum exactly
   to the slop score.
 - **Deduction-only and risk-priced.** No positive credit, no 0-to-100 ceiling. Each
   penalty is frequency times severity. A probe's detection variants collapse to one
   finding, and repeated instances of one category have diminishing marginal penalty, so a
   single root cause counts once.
 - **Intent-independent.** Sloptic only fires on failures that are defects regardless of
-  what the app is for: a leaked SQL error, a login with no rate limiting, near-invisible
-  text, a crash on malformed input, a dev build shipped to production. It never judges
-  whether a feature is good.
+  what the app is for: a world readable managed backend, a login with no rate limiting, text too
+  faint to read, a button that does nothing, a crash on malformed input, a dev build shipped to
+  production. It never judges whether a feature is good.
 - **Coverage honesty.** Every grade ships a coverage report, so a `0` that means "clean"
   is distinguishable from a `0` that means "we could not reach the surface."
 - **Stack-blind deployment.** The same catalog runs against a local subprocess, a
@@ -67,43 +104,40 @@ The frozen reference curve stays **2026.1** (the score distribution did not move
 
 ## Reproducibility and calibration
 
-The score is stable, which is the property a ranking depends on. Two independent
-full-corpus runs of live web apps agree closely:
+The score is stable because it is deterministic by construction, which is the property a ranking
+depends on. No model sits in the number: the perception and coverage LLM only proposes targets, and a
+deterministic probe alone decides every fire, at temperature 0 with a cached plan. The two seasoned
+engines are pinned (axe-core 4.10.2, Lighthouse 13.4.1). Repeat runs of the 1.x engine over the full
+corpus correlated at **0.97 or higher**, with deciles better than 92 percent identical and no
+systematic drift; 2.0 adds probes, not nondeterminism, so the movement that remains is confined to the
+places where black box nondeterminism is unavoidable, stateful browser behavior, Core Web Vitals
+timing, and the security tail behind authentication.
 
-- Spearman rank correlation **0.974**.
-- Deciles **92.6 percent identical** (96 percent within one decile).
-- **92 percent** of apps scored exactly the same; no systematic drift.
+Correctness is anchored two ways: a fixed set of reference apps with a known answer key (the
+vulnerable app must accrue slop, the hardened app must score `0`), and a recall benchmark of scenarios
+tagged with a CWE. `uv run pytest -q` runs the calibration suite.
 
-The movement that remains is confined to the probes where black-box nondeterminism is
-unavoidable (stateful browser behaviors, Core Web Vitals timing, and the auth or
-timing-gated security tail); the deterministic surface holds.
+## Frozen reference curve: 2026.3
 
-Correctness is anchored two ways: a fixed set of reference apps with a known answer key
-(the vulnerable app must accrue slop, the hardened app must score `0`), and a recall
-benchmark of CWE-tagged scenarios. `uv run pytest -q` runs the calibration suite (865
-tests).
-
-## Frozen reference curve: 2026.1
-
-This release ships reference curve **2026.1** (final), frozen from a corpus run of 1,537
-live web apps. It stores the full score distribution as anonymous per-app rows (score,
-whether a catastrophe fired, worst-case slop defended, surface breadth) with no per-app
-identity, so a percentile is exact rather than interpolated and ties resolve the same way
-every time. A percentile is always quoted against a named curve version, so the claim is
+This release ships reference curve **2026.3** (provisional), frozen from a corpus run of 1,625
+live web apps. It stores the full score distribution as anonymous per app rows (score, whether a
+catastrophe fired, the single worst finding, worst case slop defended, surface breadth) with no per
+app identity, so a percentile is exact rather than interpolated and ties resolve the same way every
+time. A percentile is always quoted against a named curve version, so the claim is
 checkable and does not drift as the population changes.
 
 ## Scope, honestly
 
-Sloptic is strongest on the unauthenticated, observable surface and on client-rendered
-apps with same-origin backends. It is weaker where a defect hides behind authentication
-it cannot establish black-box, or where judging the finding needs product intent. Those
-limits are reported, not hidden.
+Sloptic is strongest on the unauthenticated, observable surface and on apps rendered on the client
+with backends on the same origin. It is weaker where a defect hides behind authentication it cannot
+establish from the outside, or where judging the finding needs product intent. Those limits are
+reported, not hidden.
 
-The recall audit (measuring the false-negative rate against ground-truth benchmarks
+The recall audit (measuring the false negative rate against ground truth benchmarks
 across the full catalog) is in progress and continues in a follow-up release. This
 release guarantees stability (the ruler repeats) and precision on the classes that
 carry explicit precision rules; findings elsewhere are unaudited rather than vouched.
-That unaudited mass is dominated by deterministic presence checks where false-positive
+That unaudited mass is dominated by deterministic presence checks where false positive
 risk is structurally low, but since the audit cannot distinguish "no rule needed" from
 "no rule written," we report it as unaudited rather than claim a precision we have not
 checked. The recall number is not yet claimed.
@@ -112,7 +146,7 @@ checked. The recall number is not yet claimed.
 
 ```sh
 uv sync                      # core
-uv sync --group browser      # adds Playwright, for accessibility, CWV, and DOM-XSS probes
+uv sync --group browser      # adds Playwright, for accessibility, CWV, and DOM XSS probes
 uv run playwright install chromium
 ```
 

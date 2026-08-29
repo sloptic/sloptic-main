@@ -4,6 +4,7 @@ category: response-splitting
 pool: public
 evidence_model: provable
 penalty: 20   # CRLF into a response header = header injection / response splitting (cache poisoning, XSS)
+severity: {cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:L/A:N", cvss_score: 6.1, vrt: "n/a", range: [45, 45], default: 45}   # CVSS-only (no VRT); REPRICED 20->45
 applicability:
   requires: [any_endpoint_accepts_text_input]
 probe:

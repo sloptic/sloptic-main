@@ -76,6 +76,18 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 # web-search on retries (see plan_deploy `online`), so the base model needn't be bleeding-edge. Override
 # with OPENROUTER_MODEL (e.g. qwen/qwen3.7-max for even lower hallucination, openai/gpt-5-mini for OpenAI).
 DEFAULT_MODEL = os.environ.get("OPENROUTER_MODEL", "qwen/qwen3.7-plus")
+
+
+def _reasoning() -> dict:
+    """OpenRouter reasoning control, env-driven, default OFF. Building a Dockerfile is a grounded pattern-match
+    that the build/health RETRY loop verifies against ground truth -- that loop IS the reasoning, so internal
+    CoT is redundant output tokens (the dominant cost at corpus scale) AND, at temp 0, a reasoning model's
+    high-variance thinking would break the plan-cache's same-commit->same-plan determinism. `reasoning:
+    {enabled:false}` is the lever OpenRouter actually honors (verified: Alibaba ignores the chat_template
+    passthrough; reasoning.exclude only HIDES the thinking, still generated + billed). Set
+    OPENROUTER_REASONING=low|medium|high to opt a reasoning model back in for a stubborn deploy tail."""
+    mode = os.environ.get("OPENROUTER_REASONING", "off").strip().lower()
+    return {"effort": mode} if mode in ("low", "medium", "high") else {"enabled": False}
 AUDIT_TIMEOUT_S = 180   # HARD wall-clock cap on ONE coverage-audit LLM call (p75 was 43s; a hang once hit 1486s)
 NET = "hl-deploy-net"
 APP = "hl-deploy-app"
@@ -228,21 +240,65 @@ class CloneError(Exception):
     is itself a signal, so it's recorded distinctly instead of crashing the run with a traceback."""
 
 
-def clone(url_or_path: str, timeout: int = 300) -> pathlib.Path:
+class RepoTooLargeError(CloneError):
+    """The repo exceeds --max-repo-mb (committed node_modules / datasets / model weights). A CloneError
+    subclass so the existing handler records it as a skip; the 'REPO TOO LARGE' prefix keeps it countable
+    separately from a genuine clone failure. The point: spend the run's hours on gradeable apps, not on
+    downloading + building one team's vendored 900MB node_modules."""
+
+
+_GH_REPO = re.compile(r"github\.com[/:]([^/]+)/([^/.\s]+)", re.I)
+
+
+def _github_size_mb(url: str) -> float | None:
+    """Repo size in MB from the GitHub API WITHOUT cloning — the cheap pre-gate for committed-bloat repos
+    (the API's `size` counts the whole checkout). None if not a GitHub URL or the API didn't answer, in which
+    case the post-clone `du` check is the fallback. Uses GITHUB_TOKEN if set (60/hr anon -> 5000/hr)."""
+    m = _GH_REPO.search(url)
+    if not m:
+        return None
+    headers = {"Accept": "application/vnd.github+json"}
+    tok = os.environ.get("GITHUB_TOKEN")
+    if tok:
+        headers["Authorization"] = "Bearer " + tok
+    try:
+        r = httpx.get(f"https://api.github.com/repos/{m.group(1)}/{m.group(2)}", headers=headers, timeout=15)
+        if r.status_code == 200:
+            return (r.json().get("size") or 0) / 1024.0   # the API 'size' field is in KB
+    except httpx.HTTPError:
+        pass
+    return None
+
+
+def clone(url_or_path: str, timeout: int = 300, max_mb: int = 0) -> pathlib.Path:
     if pathlib.Path(url_or_path).exists():
         return pathlib.Path(url_or_path).resolve()
+    if max_mb:   # cheapest gate: skip committed node_modules / datasets / weights WITHOUT paying the download
+        sz = _github_size_mb(url_or_path)
+        if sz is not None and sz > max_mb:
+            raise RepoTooLargeError(f"REPO TOO LARGE ({sz:.0f}MB > {max_mb}MB, GitHub API) — skipped pre-clone")
     tmp = pathlib.Path(tempfile.mkdtemp(prefix="hl-deploy-"))
     dest = tmp / "repo"
     print(f"  cloning {url_or_path} ...")
     try:
+        # GIT_LFS_SKIP_SMUDGE: don't pull LFS blobs (model weights / datasets) — a build that truly needs them
+        # will just fail (fine); most don't, and skipping them is a large bandwidth + disk win on this box.
         p = subprocess.run(["git", "clone", "--depth", "1", url_or_path, str(dest)],
-                           capture_output=True, text=True, timeout=timeout)
+                           capture_output=True, text=True, timeout=timeout,
+                           env={**os.environ, "GIT_LFS_SKIP_SMUDGE": "1"})
         if p.returncode != 0:
             raise CloneError(f"clone failed: {p.stderr.strip()[:200]}")
     except (subprocess.TimeoutExpired, CloneError) as e:
         shutil.rmtree(tmp, ignore_errors=True)   # don't leak a partial/huge clone on failure
         raise CloneError(f"CLONE TIMEOUT (>{timeout}s)"
                          if isinstance(e, subprocess.TimeoutExpired) else str(e))
+    if max_mb:   # safety net for non-GitHub URLs, an API undercount, or submodules the API 'size' misses
+        du = subprocess.run(["du", "-sm", str(dest)], capture_output=True, text=True)
+        parts = du.stdout.split()
+        mb = int(parts[0]) if parts and parts[0].isdigit() else 0
+        if mb > max_mb:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise RepoTooLargeError(f"REPO TOO LARGE ({mb}MB > {max_mb}MB on disk) — skipped post-clone")
     return dest
 
 
@@ -252,6 +308,33 @@ def _record_plan_meta(result: dict, plan: dict) -> None:
     parity ground-truth don't drop those apps."""
     for k in ("app_kind", "web_gradeable", "stack", "stack_profile", "expected_surface", "features"):
         result[k] = plan.get(k)
+
+
+_VERDICT_RANK = {"not_applicable": 0, "clean": 1}   # a probe that JUDGED (clean) outranks one that couldn't (n/a)
+# evidence keys worth keeping on an unfired verdict: bulky repro/response bodies live on FIRES, so a clean/n-a
+# entry keeps only its light audit signal (status, what it measured, WHY it was n/a). Bounds the size blow-up.
+_VERDICT_EV_KEYS = ("na_reason", "status", "records", "sources", "app_sources", "sensitive_columns",
+                    "checked", "tried", "collection", "endpoint", "fails")
+
+
+def _verdicts(outcomes: list) -> list[dict]:
+    """Every APPLIED-but-UNFIRED probe verdict, collapsed to one entry per probe -- the dark-recall audit set.
+    A `clean` is the probe asserting "no defect here" (a candidate false-NEGATIVE to sample against ground
+    truth); a `not_applicable` carries its na_reason (the COVERAGE map -- where a probe structurally could not
+    see, e.g. the 177 login apps whose auth capture failed). Fires are already in `findings`, so a probe that
+    fired anywhere is excluded here. Fan-out collapses to the strongest applied state (clean > not_applicable)."""
+    fired = {o.probe_id for o in outcomes if o.outcome == "slop_detected"}
+    best: dict[str, dict] = {}
+    for o in outcomes:
+        if o.outcome == "slop_detected" or o.probe_id in fired:
+            continue
+        cur = best.get(o.probe_id)
+        if cur is None or _VERDICT_RANK[o.outcome] > _VERDICT_RANK[cur["outcome"]]:
+            ev = {k: o.evidence[k] for k in _VERDICT_EV_KEYS if k in o.evidence}
+            best[o.probe_id] = {"probe_id": o.probe_id, "bundle": o.bundle, "category": o.category,
+                                "outcome": o.outcome, "na_reason": o.evidence.get("na_reason", ""),
+                                "evidence": ev}
+    return sorted(best.values(), key=lambda v: (v["bundle"], v["probe_id"]))
 
 
 def gather_context(repo: pathlib.Path) -> str:
@@ -361,8 +444,8 @@ def plan_deploy(context: str, model: str, error: str = "", prev: dict = None, on
     # temperature 0: greedy decoding makes the source-read (deploy plan + feature SEED) as reproducible as an
     # LLM gets — same repo -> near-same plan. Combined with the per-commit plan CACHE (see main), the LLM's
     # contribution is frozen, so re-grading identical code can't yield a different score (the fairness bug).
-    body = {"model": model, "temperature": 0,
-            "messages": [{"role": "system", "content": _SYSTEM}, {"role": "user", "content": user}]}
+    body = {"model": model, "temperature": 0, "reasoning": _reasoning(),   # CoT OFF by default: the retry loop
+            "messages": [{"role": "system", "content": _SYSTEM}, {"role": "user", "content": user}]}  # is the reasoning
     if online:   # retries: let the model WEB-SEARCH for current dep versions / deploy config it may not know
         body["plugins"] = [{"id": "web", "max_results": 3, "search_prompt":
                             "Use these web results for CURRENT dependency versions, framework config, and "
@@ -374,6 +457,17 @@ def plan_deploy(context: str, model: str, error: str = "", prev: dict = None, on
                                 "HTTP-Referer": "https://hacklet.league", "X-Title": "hacklet-deploy"})
     except httpx.HTTPError as e:
         sys.exit(f"OpenRouter request failed: {e}")
+    if r.status_code == 400 and "reasoning" in body and "reasoning" in r.text.lower():
+        # this model MANDATES reasoning and 400s on {enabled:false}. Resend WITHOUT the param (it will think --
+        # a poor fit for a cost-sensitive run, so prefer a hybrid that honors enabled:false) rather than
+        # sys.exit-ing the entire batch on the first repo. One retry, then fall through to the real error.
+        body.pop("reasoning", None)
+        try:
+            r = httpx.post(OPENROUTER_URL, json=body, timeout=120,
+                           headers={"Authorization": "Bearer " + key,
+                                    "HTTP-Referer": "https://hacklet.league", "X-Title": "hacklet-deploy"})
+        except httpx.HTTPError as e:
+            sys.exit(f"OpenRouter request failed: {e}")
     if r.status_code != 200:
         sys.exit(f"OpenRouter {r.status_code}: {r.text[:400]}")
     content = r.json()["choices"][0]["message"]["content"]
@@ -527,8 +621,9 @@ def _llm_json(system: str, user: str, model: str = DEFAULT_MODEL, timeout: float
         # call) and is more deterministic. reasoning:{enabled:false} is the OpenRouter-canonical lever and the ONE
         # that actually works here — chat_template_kwargs.enable_thinking is a provider passthrough Alibaba SILENTLY
         # IGNORES (verified live), and reasoning.exclude only HIDES thinking (still generated + billed). Default
-        # keeps reasoning on (the validated baseline).
-        body["reasoning"] = {"enabled": False}
+        # keeps reasoning on (the validated baseline). The default-off value is env-tunable via _reasoning()
+        # (OPENROUTER_REASONING), so one knob governs both this and the deploy-plan call; unset -> {enabled:false}.
+        body["reasoning"] = _reasoning()
     out = {}
 
     def _call():
@@ -758,10 +853,30 @@ def _parse_login(spec):
     return (ident.strip(), pw) if sep and ident.strip() else None
 
 
+def _build_email_receiver(cfg):
+    """cfg = (email_domain, email_endpoint, email_token) or None -> an HttpReceiver for the email-verification
+    probes, else None (they then read N/A). Built INSIDE the grade worker so the httpx client stays in the child."""
+    if not cfg:
+        return None
+    domain, endpoint, token = cfg
+    if not (domain and endpoint):
+        return None
+    from sloptic.email_verify import HttpReceiver
+    return HttpReceiver(domain=domain, endpoint=endpoint, token=token or "")
+
+
+def _grade_phase_line(name, label, important):
+    """on_phase sink for a direct/standalone grade: surface the LONG, otherwise-silent phases -- chiefly the
+    ~2-3min Lighthouse trace -- so a watched run shows it's alive instead of looking frozen. Discovery already
+    prints its own banner just above, so skip that one here to avoid a duplicate line."""
+    if name in ("lighthouse", "lighthouse_done"):
+        print(f"  {label}", flush=True)
+
+
 def _grade_worker(url, use_browser, features, q, cached_profile=None, cache_key=None, repo_url=None,
                   proactive=False, model=DEFAULT_MODEL, browser_auth=False, session_headers=None,
                   llm_reasoning=False, recon=False, controlled_deploy=False, trace=False, login_creds=None,
-                  probe_filter=None):
+                  probe_filter=None, email_cfg=None):
     os.setsid()   # own process group so the parent can SIGKILL this child AND its headless chrome together
     try:
         render = browser.render_routes if use_browser else None
@@ -790,7 +905,8 @@ def _grade_worker(url, use_browser, features, q, cached_profile=None, cache_key=
             print(f"  discovering surface ({_kinds}) — this runs before the first probe ...", flush=True)
         report = run(RemoteDeployer(url, health_timeout=20),
                      select_probes(load_catalog(str(_ROOT / "catalog")), probe_filter),
-                     render=render, on_progress=_grade_heartbeat, seed_features=features, headers=session_headers,
+                     render=render, on_progress=_grade_heartbeat, on_phase=_grade_phase_line,
+                     seed_features=features, headers=session_headers,
                      cached_profile=cached_profile, on_profile=on_profile, perceive=perceive,
                      browser_register=browser_register, recon=recon,
                      # authenticate the CRAWL (not just the probes): an SPA hides upload/item-CRUD behind login,
@@ -801,7 +917,8 @@ def _grade_worker(url, use_browser, features, q, cached_profile=None, cache_key=
                      # (used for the crawl directly). Degrades safely: no register session -> crawl stays login-only.
                      auth_crawl=((browser_auth or controlled_deploy) and use_browser and not session_headers),
                      trace=trace,   # --trace: record every probe's requests (payloads/endpoints) into the record
-                     login_creds=login_creds)   # --login: authenticate with team-provided demo creds pre-crawl
+                     login_creds=login_creds,   # --login: authenticate with team-provided demo creds pre-crawl
+                     email_receiver=_build_email_receiver(email_cfg))   # None unless --email-domain + --email-endpoint
         q.put(("ok", report))
     except BaseException as e:   # report ANY failure back to the parent instead of dying silently
         q.put(("err", f"{type(e).__name__}: {e}"))
@@ -820,7 +937,7 @@ def _hard_kill_group(p) -> None:
 def grade(url: str, use_browser: bool, timeout=None, features=None,
           cached_profile=None, cache_key=None, repo_url=None, proactive=False, model=DEFAULT_MODEL,
           browser_auth=False, session_headers=None, llm_reasoning=False, recon=False, controlled_deploy=False,
-          trace=False, login_creds=None, probe_filter=None):
+          trace=False, login_creds=None, probe_filter=None, email_cfg=None):
     """Grade the running app in a CHILD PROCESS. A subprocess (not an in-process SIGALRM) because a signal
     can't interrupt a Playwright CPU-spin (the browser probes), but an EXTERNAL SIGKILL of the child + its
     chrome always works. `timeout` is the grading phase's OWN wall-clock budget (independent of deploy time,
@@ -832,7 +949,7 @@ def grade(url: str, use_browser: bool, timeout=None, features=None,
     p = ctx.Process(target=_grade_worker,
                     args=(url, use_browser, features, q, cached_profile, cache_key, repo_url, proactive, model,
                           browser_auth, session_headers, llm_reasoning, recon, controlled_deploy, trace,
-                          login_creds, probe_filter))
+                          login_creds, probe_filter, email_cfg))
     p.start()
     try:
         result = q.get(timeout=timeout)              # timeout=None (direct run) blocks until the child reports
@@ -858,6 +975,10 @@ def grade(url: str, use_browser: bool, timeout=None, features=None,
 # unreachable, a 4xx/5xx entry, or a known host placeholder (a Pages/Vercel/Netlify "no site here" page
 # that answers 200/404 but hosts no app — otherwise we'd grade the placeholder to meaningless garbage).
 _UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+# preflight statuses that mean "the server is UP and refusing/rate-limiting us" (a transient WAF/edge block), NOT
+# a dead deployment -> recorded as a challenge (recoverable), never dead_url. _WAF_MARK tags the reason string.
+_WAF_STATUS = frozenset({403, 429, 503})
+_WAF_MARK = "WAF-BLOCK"
 _DEAD_PAGE = re.compile(
     r"There isn't a GitHub Pages site here|"                          # GitHub Pages: no site published
     r"DEPLOYMENT_NOT_FOUND|The deployment could not be found|"        # Vercel
@@ -868,6 +989,23 @@ _DEAD_PAGE = re.compile(
 # broken/missing root route). Only visible in the RENDERED dom — the static shell doesn't carry it. Match
 # the not-found message as the page's main content, tolerant of the exact wording (React/Vue/Angular defaults).
 _GHOST_PATH = "/__hacklet_nonexistent_probe_9z8x7q__"   # a path no real app serves -> reveals catch-all/404 behavior
+
+# Free-tier PaaS that SPIN DOWN idle apps and COLD-START on the first request (~20-40s), holding the connection
+# while the app boots. A default ~10s reachability timeout marks a live-but-cold app 'unreachable' -> dead_url:
+# on the v17 corpus 30% of Render 'dead' apps were simply cold (HTTP 200 after 20-31s). Give the READ a long
+# window (connect stays short, so a genuinely-down host still fails fast) so a cold app gets graded, not lost.
+_COLD_START_SUFFIX = ("onrender.com", "render.com", "railway.app", "fly.dev", "koyeb.app", "cyclic.app",
+                      "adaptable.app")
+_COLD_START_READ = 45.0
+
+
+def _reach_timeout(url: str, base_timeout: float):
+    """A cold-start-serving PaaS host gets a long READ timeout (connect stays short) so a spinning-up app isn't
+    written off as dead; every other host keeps the base timeout."""
+    host = urlsplit(url).netloc.lower().split(":")[0]
+    if any(host == s or host.endswith("." + s) for s in _COLD_START_SUFFIX):
+        return httpx.Timeout(connect=min(base_timeout, 10.0), read=_COLD_START_READ, write=10.0, pool=10.0)
+    return base_timeout
 _CLIENT_404 = re.compile(
     r"page not ?found|could(n'?t| not) be found|this page (does ?n'?t|does not) exist|"
     r"404\D{0,40}(not ?found|error|does ?n'?t exist)|nothing (to see )?here|"
@@ -1030,10 +1168,15 @@ def _dead_url_reason(url: str, render=None, timeout: float = 10.0, platform_host
     if non_app:
         return non_app
     try:
-        r = httpx.get(url, timeout=timeout, follow_redirects=True, verify=False,
+        r = httpx.get(url, timeout=_reach_timeout(url, timeout), follow_redirects=True, verify=False,
                       headers={"User-Agent": _UA})
     except httpx.HTTPError as e:
         return f"unreachable ({type(e).__name__})"
+    if r.status_code in _WAF_STATUS:   # 403/429/503 = access-denied / rate-limited / temporarily-unavailable: the
+        return f"{_WAF_MARK} HTTP {r.status_code}"   # server is UP and refusing us (a WAF/edge block, transient), NOT a
+        #                                             dead URL. Marked so the caller records a CHALLENGE (recoverable,
+        #                                             visible to the retry circuit breaker), never dead_url -- else a
+        #                                             transient per-app Vercel block permanently discards a live app.
     if r.status_code >= 400:
         return f"HTTP {r.status_code}"
     if _DEAD_PAGE.search(r.text[:6000]):
@@ -1133,6 +1276,14 @@ def main():
                          "--header 'Cookie: sessionid=…'; a bolt/Supabase/Firebase (token) app -> --header "
                          "'Authorization: Bearer eyJ…' (from DevTools -> Network -> an authed request). A single "
                          "provided session is ONE identity, so the cross-user IDOR/BOLA probes stay N/A (no false pos).")
+    ap.add_argument("--email-domain", metavar="DOMAIN",
+                    help="throwaway inbox domain WE own for the email-verification probes (e.g. anachron.dev); "
+                         "registration addresses are hl-<tag>@DOMAIN")
+    ap.add_argument("--email-endpoint", metavar="URL",
+                    help="HTTP endpoint returning received mail as JSON (the Cloudflare Email Worker's /mail); "
+                         "without --email-domain + --email-endpoint the email-verification probes read N/A")
+    ap.add_argument("--email-token", metavar="TOKEN", default="",
+                    help="Bearer token for --email-endpoint (the Worker's MAIL_TOKEN secret)")
     ap.add_argument("--no-web-search", dest="web_search", action="store_false",
                     help="don't let the LLM web-search on retries (default: retries CAN search OpenRouter's "
                          "web plugin for current dep versions / deploy config, ~$0.02/retry)")
@@ -1148,17 +1299,24 @@ def main():
                     "cache — re-plan from scratch every run (default: a commit's SUCCESSFUL plan is frozen so "
                     "re-grades are reproducible; the cache lives at HL_CACHE_DIR, default ~/.cache/hacklet-plan)")
     ap.add_argument("--attempts", type=int, default=3, help="max deploy attempts (LLM fixes errors between)")
+    ap.add_argument("--retry-timeouts", action="store_true", dest="retry_timeouts",
+                    help="retry a BUILD TIMEOUT like a normal error (default: give up -- a timeout is a "
+                         "'too heavy' verdict, and re-planning rarely slims heavy deps enough to fit).")
     ap.add_argument("--build-timeout", type=int, default=480, dest="build_timeout",
                     help="kill a docker build after N seconds (default 480). Lower = better batch "
                          "throughput but risks false-killing a genuinely heavy build; 300 is aggressive")
-    ap.add_argument("--grade-timeout", type=int, default=None, dest="grade_timeout",
+    ap.add_argument("--grade-timeout", type=int, default=600, dest="grade_timeout",
                     help="wall-clock cap (seconds) on the grading phase, externally enforced by killing the "
-                         "grade subprocess (even a Playwright CPU-spin, which a signal can't touch). Default "
-                         "NONE for a DIRECT run — you're watching it, so it runs to completion; Ctrl-C kills "
-                         "the child + its chrome cleanly. run_batch ALWAYS passes an explicit value, so a "
-                         "BATCH stays bounded — one pathological app can't stall an overnight run.")
+                         "grade subprocess + its process group (even a Playwright CPU-spin OR a wedged Lighthouse "
+                         "Chrome, which a signal / subprocess timeout can't reach). Default 600 so a DIRECT run "
+                         "can't hang indefinitely on the silent ~2-3min Lighthouse phase (productive apps p95 "
+                         "~510s, so 600 rarely false-kills). Pass 0 to disable the cap — watch it to completion, "
+                         "Ctrl-C kills the child + its chrome cleanly. run_batch passes its own value (480).")
     ap.add_argument("--clone-timeout", type=int, default=300, dest="clone_timeout",
                     help="git clone timeout in seconds (default 300; a timeout is recorded, not a crash)")
+    ap.add_argument("--max-repo-mb", type=int, default=0, dest="max_repo_mb",
+                    help="skip repos larger than this (committed node_modules / datasets / weights); checked via "
+                         "the GitHub API pre-clone, then du post-clone. 0 = off. ~300 is a good throughput knob.")
     ap.add_argument("--checkpoint", metavar="FILE", help="write the stack-ID here right after planning, so "
                     "an external kill (wedge) can still recover the app's classification for deploy-parity")
     ap.add_argument("--no-browser", dest="browser", action="store_false",
@@ -1245,6 +1403,15 @@ def main():
             # also catches a client-side 404 (SPA renders 'not found' at HTTP 200) via a one-route render.
             dead = _dead_url_reason(url, render=(browser.render_routes if args.browser else None),
                                     platform_hosts=set(args.inferred_platform_hosts or []), is_anchor=is_anchor)
+            if dead and dead.startswith(_WAF_MARK):
+                # the server is UP but WAF/edge-blocking our client (a transient per-app block, e.g. Vercel under
+                # our automated traffic) -> a CHALLENGE, not a dead URL. Recorded like an entry-challenge so it's
+                # recoverable and VISIBLE to the retry's IP-block circuit breaker (which keys on bot_challenge),
+                # instead of a permanent dead_url that discards a live app and hides the cascade.
+                result.update(bot_challenge=True, challenge_stage="entry",
+                              deploy_error=f"WAF/edge block — {dead[len(_WAF_MARK):].strip()}")
+                print(f"\n  WAF/EDGE BLOCK ({dead}) — recorded as a challenge (recoverable), not a dead URL.")
+                return
             if dead:
                 result["dead_url"] = True                         # counted as "url does not work" (deployed=False)
                 result["deploy_error"] = f"URL DEAD — {dead}"
@@ -1253,7 +1420,7 @@ def main():
             print(f"\n=== url-ingest: grading live app (no clone/plan/deploy) → {url} ===")
         else:
             _t = time.monotonic()
-            repo = clone(args.repo, timeout=args.clone_timeout)
+            repo = clone(args.repo, timeout=args.clone_timeout, max_mb=args.max_repo_mb)
             timings["clone_s"] = round(time.monotonic() - _t, 1)
             context = gather_context(repo)
             _sha = _git_sha(repo)   # immutable commit identity for the caches (None on a local path -> no cache)
@@ -1308,10 +1475,17 @@ def main():
                     timings["deploy_s"] += round(time.monotonic() - _t, 1)   # a failed attempt cost time too
                     error = str(e)
                     result["deploy_error"] = (error.strip().splitlines() or ["unknown"])[0][:200]
-                    if "BUILD TIMEOUT" in result["deploy_error"]:
-                        result["timeout"] = "build"   # 'took forever to build' — a bloat/deployability signal
                     print(f"  deploy failed:\n{error[-800:]}")
                     _docker("rm", "-f", "-v", APP, DB)   # tear down this attempt's containers + volume
+                    if "BUILD TIMEOUT" in result["deploy_error"]:
+                        result["timeout"] = "build"   # 'took forever to build' — a bloat/deployability signal
+                        if not args.retry_timeouts:
+                            # a timeout is a 'too heavy to build in the budget' VERDICT, not a fixable error: a
+                            # re-plan rarely slims torch/tensorflow enough to fit, so another attempt just burns
+                            # a second/third full build_timeout on a doomed repo. Give up now; the retries stay
+                            # for BUILD FAILED / health failures, where a re-plan actually pays off.
+                            print("  BUILD TIMEOUT — not retrying (heavy deps); giving up to keep the run moving")
+                            break
             if plan:   # kind + stack + features + source-implied surface — recorded even on deploy FAILURE, so
                 _record_plan_meta(result, plan)          # the stack-distribution + parity ground-truth stay whole
             if not url:
@@ -1326,14 +1500,16 @@ def main():
         _t = time.monotonic()
         try:
             report = grade(url, args.browser or args.recon or args.controlled_deploy,  # recon/controlled NEED the render
-                           timeout=args.grade_timeout,
+                           timeout=(args.grade_timeout or None),   # 0 -> None: no cap (watch a direct run to the end)
+
                            features=(plan.get("features") if plan else None),   # url-ingest has no plan
                            cached_profile=cached_profile,
                            cache_key=(None if args.no_cache else _sha), repo_url=args.repo,
                            proactive=args.proactive, model=args.model, browser_auth=args.browser_auth,
                            session_headers=_parse_headers(args.headers), llm_reasoning=args.llm_reasoning,
                            recon=args.recon, controlled_deploy=args.controlled_deploy, trace=args.trace,
-                           login_creds=_parse_login(args.login), probe_filter=args.probe)
+                           login_creds=_parse_login(args.login), probe_filter=args.probe,
+                           email_cfg=(args.email_domain, args.email_endpoint, args.email_token))
         except GradeTimeout as e:
             timings["grade_s"] = round(time.monotonic() - _t, 1)
             result["grade_timeout"] = True         # deployed but ungradeable in budget (broken/pathological
@@ -1377,7 +1553,14 @@ def main():
             findings.append(f)
         result.update(slop_score=report.slop_score, axis_slop=report.axis_slop,
                       observed_surface=report.surface, coverage=report.coverage,
-                      platform=report.platform, findings=findings)
+                      platform=report.platform, bot_challenge=report.bot_challenge,
+                      challenge_stage=report.challenge_stage, challenge_onset=report.challenge_onset,
+                      request_counts=report.request_counts, blocked_probes=report.blocked_probes,
+                      incomplete_axes=report.incomplete_axes, findings=findings,
+                      verdicts=_verdicts(report.outcomes),   # applied-but-unfired probes -> dark-recall audit set
+                      session_established=report.session_established)
+        if report.session_replay:   # the session the grade established -> retry_blocked replays it via --header and
+            result["session_replay"] = report.session_replay   # SKIPS the 26-nav register walk (the block re-trip)
         if report.trace:   # --trace only: per-probe request log (payloads/endpoints), viewable via stats.py --audit
             result["trace"] = report.trace
         if args.recon:

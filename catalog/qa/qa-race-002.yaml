@@ -6,6 +6,7 @@ pool: public
 evidence_model: oracle
 penalty: 30   # data corruption / lost updates under concurrency. Same tier as qa-race-001; the variant
               # group means only one of the two counts, never both.
+severity_ref: race-condition
 probe:
   predicate: race_resource_ids_api
   bursts: 3

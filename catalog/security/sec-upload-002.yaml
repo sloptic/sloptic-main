@@ -5,6 +5,7 @@ pool: public
 evidence_model: provable
 penalty: 35   # stored XSS: user-uploaded active content served executable in-origin runs on every viewer.
               # Anchored to sec-xss-001 (reflected XSS) — same impact class, a distinct upload-persisted vector.
+severity_ref: xss   # stored XSS via file upload (active content served executable in-origin) -> stored -> 85
 applicability:
   requires: [any_endpoint_accepts_text_input]
 probe:

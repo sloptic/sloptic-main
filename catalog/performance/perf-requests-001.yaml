@@ -2,11 +2,16 @@ id: perf-requests-001
 bundle: performance
 category: request-count
 pool: public
-evidence_model: provable
-penalty: 10   # >50 round trips to render the homepage -> slower every load, and much
-              # worse on high-latency mobile connections.
+evidence_model: oracle
+penalty: 10   # PROVISIONAL (re-priced on v19). Too many network requests. Lighthouse network-requests count.
+              # needs=75 half, fail=150 full.
 applicability:
-  requires: [at_least_one_http_endpoint_exists]
+  requires: [lighthouse]
 probe:
-  predicate: perf_request_count
-  target: /
+  predicate: lighthouse_audit
+  report_only: true   # OFF-SCORE: fires as a per-metric diagnostic finding at 0 penalty;
+                      # the perf axis is scored once on the overall headline (perf-lighthouse-001).
+  audit: network-requests
+  mode: numeric
+  needs_above: 75
+  fail_above: 150

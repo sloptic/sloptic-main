@@ -1,0 +1,21 @@
+id: qa-email-002
+bundle: qa
+category: email-verification
+pool: public
+evidence_model: provable
+# REPORT_ONLY in v1 (the predicate forces off-score) until the admission-test validates the family. Rationale:
+# the confirmation email arrives but you cannot get in after acting on it -- the link is dead / the token is
+# unrecognised / it verifies but a subsequent login still fails. The user did everything asked and is still
+# locked out: a broken core feature (functional-suitability, Nielsen 4), the same lockout severity as
+# no-email-within-60s (qa-email-001's top rung). Binary, so no scope to escalate.
+severity: {iso_25010: "functional-suitability", nielsen: "4", range: [72, 72], default: 72}
+applicability:
+  requires: [has_auth_entrypoint]
+probe:
+  predicate: email_verification_inert
+tp_definition: |
+  TP: a confirmation email arrives, we follow its same-host verification link, and the user still cannot get in
+  -- no session from the link AND a login with the registered creds still fails (dead link / bad token / no-op,
+  all caught here). NOT (confounders): the link (or a subsequent login) DOES establish a session, incl. the
+  'verify then log in' pattern -> clean; the email is code-only / no followable link -> N/A; no email at all ->
+  N/A (qa-email-001's job).

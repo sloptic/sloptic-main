@@ -1,0 +1,23 @@
+id: qa-deploy-001
+bundle: qa
+category: availability
+pool: public
+evidence_model: provable
+penalty: 34   # PROVISIONAL (v2.0 Family 1 -- re-price from the corpus footrule before the 2026.3 freeze): the
+              # app's data layer is dead for every real visitor (localhost / private-IP / unset-env backend URL
+              # shipped to prod). A shipped-broken deployment: more severe than diffuse hygiene, but the page
+              # still renders so it is not a crash. Gate-shaped (rare, decisive), not middle-band.
+              # SCORED only when the private host is OBSERVED requested at runtime (an operative dead data layer);
+              # a bundle-present-but-never-requested match (dead env||localhost fallback / template constant) is an
+              # OFF-SCORE diagnostic at 0 (report_only), NOT scored -- see unreachable_backend_reference.
+severity: {iso_25010: "reliability", nielsen: "4", range: [0, 85], default: 0, escalators: [{evidence: observed, point: 85, vrt_variant: "backend host observed in live runtime traffic = dead data layer for real visitors"}]}   # presence-only stays report_only 0
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  predicate: unreachable_backend_reference
+tp_definition: |
+  TP: the deployed app actually attempts, for a real visitor, a request to a backend no visitor can reach
+  (localhost / private IP) and the data layer fails -- an operative broken deploy.
+  NOT (confounders/FP): the address is PRESENT in the bundle but never requested in prod -- a dead
+  `env || localhost` fallback (the prod env override wins at runtime), a CORS/OAuth-origin allowlist entry, a
+  comment, or a corpus-shared template constant (e.g. localhost:9999). Presence != use.

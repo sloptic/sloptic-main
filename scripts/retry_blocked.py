@@ -1,0 +1,423 @@
+#!/usr/bin/env python3
+"""Retry the WAF-blocked probe tail on each challenged app, AFTER the main corpus run (the ~10-min Vercel
+reset is long elapsed by then). Re-grades ONLY each app's `blocked_probes` via `deploy_and_grade --probe`
+(a subset = little traffic, so it mostly clears the WAF before re-tripping), then folds the recovered
+outcomes back into the record: clears `incomplete_axes` where the tail came back clean, adds any findings,
+recomputes the score. Injection fires ~0% on the corpus, so this mostly converts "incomplete" -> "tested
+clean" (the completeness point) and LOUDLY surfaces anything that actually fires.
+
+Safety: the main results file is never mutated. Subset retry grades go to <results>.retry.jsonl (marked
+`probe_filter`, RECALL-ONLY -> only ever used to SUPPLEMENT a full-grade record, never as a standalone
+score), and the folded grades to <results>.merged.jsonl. So a retry failure can never corrupt the
+calibration data.
+
+    python scripts/retry_blocked.py --results run.jsonl [--browser-auth] [--concurrency N]
+
+One pass by default (recovers most of the tail on fresh-budget apps; sticky apps stay flagged, honestly).
+
+An IP-LEVEL flag is NOT per-app challenging: it re-challenges every app at entry and recovers nothing, and
+this tool cannot dig one out (the ~10-min per-app reset does not apply -- IP reputation lasts hours). A circuit
+breaker detects that pattern and ABORTS early, because each further retry only re-warms the flag and resets its
+decay -- let the IP decay (halt Vercel traffic, confirm with waf_probe), then re-run.
+
+Re-fold an already-run retry without re-grading (pure, seconds — e.g. after a merge() fix):
+
+    python scripts/retry_blocked.py --results run.jsonl --remerge
+"""
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+_HERE = Path(__file__).resolve().parent
+_ROOT = _HERE.parent
+sys.path.insert(0, str(_ROOT))
+from sloptic.aggregate import compute_axis_slop, compute_slop_score  # noqa: E402
+from sloptic.catalog import load_catalog  # noqa: E402
+from sloptic.schema import Outcome  # noqa: E402
+
+_VENV_PY = _ROOT / ".venv" / "bin" / "python"
+PY = [str(_VENV_PY)] if _VENV_PY.exists() else [sys.executable]
+_print_lock = threading.Lock()
+
+_SKIPPED = object()      # sentinel record: this app was NOT retried because the IP-block circuit breaker tripped
+_IP_BLOCK_SAMPLE = 25    # consecutive zero-recovery entry challenges before we abort. RELAXED from 8: the flag is
+#                          INTERMITTENT (apps still recover in the tail even mid-flag -- observed 3 late successes
+#                          right after a 9-challenge cluster), so a low bar aborts a run that would still recover.
+#                          Only a long sustained dead streak is a truly hopeless hard flag. Tunable; 0 disables.
+
+# THROTTLE: identical to run_batch's, and for the SAME reason -- and it matters more here. run_batch spaces its
+# job STARTS with --delay so its per-IP request rate stays under Vercel's WAF threshold; that politeness is why
+# the main run graded thousands of apps without the IP getting flagged. retry_blocked had NO throttle, so it
+# fired the blocked apps (~all Vercel) back-to-back at full concurrency: the first ~50 apps' requests are the
+# runway, then the cumulative volume trips the WAF, the IP flags, and every later request 403s (the run "dies")
+# -- exactly the failure run_batch's throttle exists to prevent. Space job starts globally across all workers.
+_throttle_lock = threading.Lock()
+_next_start = [0.0]      # monotonic time the next job may START
+
+
+def _throttle(delay: float) -> None:
+    if delay <= 0:
+        return
+    with _throttle_lock:
+        now = time.monotonic()
+        wait = max(0.0, _next_start[0] - now)
+        _next_start[0] = max(now, _next_start[0]) + delay
+    if wait:
+        time.sleep(wait)
+
+
+def _read_jsonl(path):
+    out = []
+    p = Path(path)
+    if not p.exists():
+        return out
+    for line in p.read_text().splitlines():
+        line = line.strip()
+        if line:
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    return out
+
+
+def _url_of(rec):
+    """The live URL a url-ingest record grades (stored in `repo`); None for non-url records."""
+    u = (rec.get("repo") or "").strip()
+    return u if u.startswith("http") else None
+
+
+def _to_outcome(f):
+    # PRODUCTION serialization (deploy_and_grade.py) stores the variant group under "group" and writes NO
+    # "outcome" key (findings are all fired). Read "group" first — reading the dataclass field name
+    # `variant_group_id` here silently dropped every group, so from-scratch recompute stopped collapsing
+    # multi-syntax findings (5 SQLi variants scored as 5, not 1) and inflated the merged score.
+    return Outcome(probe_id=f.get("probe_id", ""), bundle=f.get("bundle", ""), category=f.get("category", ""),
+                   outcome=f.get("outcome", "slop_detected"), penalty=f.get("penalty", 0) or 0,
+                   variant_group_id=f.get("group") or f.get("variant_group_id"), target=f.get("target", ""),
+                   reason=f.get("reason", ""), evidence=f.get("evidence") or {})
+
+
+def _graded(rec):
+    """True only for a retry record that ACTUALLY graded — not a DNF (dead url, deploy fail, timeout, crash).
+    A real grade always writes deployed=true + slop_score + blocked_probes; a DNF has none of them, and must
+    count as 'recovered nothing' so a failed retry never spuriously clears the block."""
+    return bool(rec) and bool(rec.get("deployed")) and "slop_score" in rec
+
+
+def merge(main_rec, retry_rec, bundle_of):
+    """Fold a subset-retry record into the full-grade record (pure). A None/DNF retry reproduces the original
+    record exactly (the score invariant). `bundle_of`: probe_id -> bundle, for the residual axes."""
+    main_blocked = list(main_rec.get("blocked_probes") or [])
+    if not main_blocked:
+        return dict(main_rec)
+    # a DNF retry recovered nothing -> keep the whole original block (never false-clear on a failed retry)
+    still_blocked = set(retry_rec.get("blocked_probes") or []) if _graded(retry_rec) else set(main_blocked)
+    still_blocked &= set(main_blocked)                              # never invent a block the main run didn't have
+    recovered = [p for p in main_blocked if p not in still_blocked]  # ran in the retry (clean OR fired)
+    new_findings = list((retry_rec or {}).get("findings") or [])
+    findings = list(main_rec.get("findings") or []) + new_findings
+    merged = dict(main_rec)
+    merged["findings"] = findings
+    # A CLEAN recovery (tail ran, nothing fired) changes COVERAGE, not the score — keep main's exact stored
+    # slop_score/axis_slop. Only a genuine new finding recomputes. (Serialized findings are deduped by
+    # (probe_id, reason) with a `count`, so a from-scratch recompute can drift a point or two off the
+    # pipeline's score; recomputing only when the retry actually fired keeps the 700+ clean recoveries exact.)
+    if new_findings:
+        outs = [_to_outcome(f) for f in findings]
+        merged["slop_score"] = compute_slop_score(outs)
+        merged["axis_slop"] = compute_axis_slop(outs)
+    merged["blocked_probes"] = sorted(still_blocked)
+    merged["incomplete_axes"] = sorted({bundle_of[p] for p in still_blocked if p in bundle_of})
+    merged["retry"] = {
+        "recovered": sorted(recovered),
+        "fired": [f.get("probe_id") for f in (retry_rec or {}).get("findings") or []],
+        "still_blocked": sorted(still_blocked),
+    }
+    return merged
+
+
+def _status(blocked, rec):
+    """How the retry went for one app: (kind, recovered, total, onset). kind is
+      full    — every blocked probe ran; the WAF did NOT re-challenge
+      partial — got SOME back, then re-challenged (fresh-budget app, tail too long for one pass)
+      none    — re-challenged immediately, recovered nothing (sticky/collapse app)
+      dnf     — the retry grade itself failed (dead url / timeout) -> recovered nothing, NOT a WAF verdict"""
+    total = len(blocked)
+    if rec and rec.get("bot_challenge") and not _graded(rec):
+        # WAF/edge-blocked at the PREFLIGHT (deploy_and_grade recorded a challenge, not dead_url) -> re-challenged,
+        # recovered nothing. Counts as a WAF verdict (unlike a dead-url DNF) so a CASCADE of these trips the
+        # IP-block circuit breaker, which aborts the rest instead of re-hammering and re-warming the flag.
+        return "none", 0, total, "preflight"
+    if not _graded(rec):
+        return "dnf", 0, total, None
+    still = set(rec.get("blocked_probes") or []) & set(blocked)
+    recovered = total - len(still)
+    onset = rec.get("challenge_onset") or ""
+    if not still:
+        return "full", recovered, total, onset
+    return ("partial" if recovered else "none"), recovered, total, onset
+
+
+def _looks_like_ip_block(statuses, sample=_IP_BLOCK_SAMPLE):
+    """True when the retry shows a SUSTAINED, hopeless IP-level flag -- abort so it stops re-warming a dead run.
+    `sample` <= 0 DISABLES the breaker (run to completion regardless).
+
+    WINDOWED, not global: the flag usually DEVELOPS mid-retry, not from the first app. But it is also
+    INTERMITTENT -- apps keep recovering in the tail even while the IP is flagged (observed 3 late successes
+    right after a 9-challenge cluster). So the bar must be a LONG streak: of the last `sample` WAF-verdict apps
+    (a recovery OR an entry-challenge; dnf / plain-none are neutral and skipped, so a dead-URL streak never trips
+    it), ALL are zero-recovery entry challenges. A single recovery anywhere in the window resets it, so an
+    intermittent-success run never aborts -- only a genuinely dead sustained streak does. `statuses` is
+    [(kind, bot_challenge_bool)] in completion order."""
+    if sample <= 0:
+        return False
+    verdicts = [kind for kind, chal in statuses
+                if kind in ("full", "partial") or (kind == "none" and chal)]
+    window = verdicts[-sample:]
+    return len(window) >= sample and all(kind == "none" for kind in window)
+
+
+def _benign_pad_probes():
+    """The FULL benign battery (`--pad-benign`), so each retry session opens like run_batch's full grade does:
+    ~all the tier-0/1 passive+ordinary probes FIRST, then the blocked attack tail LAST (the pipeline re-sorts by
+    safety.order_weight, so benign always runs before attack regardless of --probe order). PROVEN not the IP
+    (curl 200s the same IP): run_batch and the retry share client+IP; the ONLY difference is run_batch fires
+    ~40 benign probes before its attack tail (WAF trips only at the tail, after the client already reads as
+    'mostly benign'), while the retry's subset is attack-from-probe-#1. A 6-probe pad was far too little dilution
+    -- run_batch's ratio is ~3:1 benign:attack. This returns the whole tier-0/1 set EXCEPT perf-* (Lighthouse is
+    a heavy ~3min render and discovery already does a benign browser render, so it adds cost without more benign
+    SIGNAL). Pad findings are dropped before the merge (camouflage; those probes already graded in the main run).
+    See [[vercel-challenge-is-client-not-ip]]."""
+    try:
+        from sloptic import safety
+        return tuple(p.id for p in load_catalog(str(_ROOT / "catalog"))
+                     if safety.order_weight(p.id) <= 1 and not p.id.startswith("perf-"))
+    except Exception:   # catalog/safety hiccup -> a minimal light benign set still opens the session benign
+        return ("sec-headers-001", "sec-headers-002", "qa-ctype-001", "qa-http-001", "qa-seo-001", "qa-a11y-001")
+
+
+def _retry_one(url, blocked, tmpdir, extra_flags, grade_timeout, abort=None, delay=0.0, inject_pool=1, pad=()):
+    """Subset re-grade one app to its OWN temp record, read it back, return (url, blocked, record|None).
+    If `abort` is already set when this job starts (the IP-block circuit breaker tripped), skip it and return
+    _SKIPPED -- spending more traffic on a flagged IP only re-warms the flag and resets its decay.
+
+    `inject_pool` forces SERIAL injection/exposure fan-out (pool=1) in the grade, the pre-v23 behavior. run_batch
+    parallelizes the injection fan-out (SLOPTIC_INJECT_POOL=6, ba6fe93) to save time, but that fires a 6-wide
+    BURST of attack requests per app -- diluted across run_batch's benign battery it's fine, but the retry fires
+    ONLY the blocked (attack) probes on ~all-Vercel apps, so the bursts stack into an attack pattern Protectd's
+    fast edge WAF flags after ~50 apps. The v20 retry recovered 769/785 with serial injection; this restores it,
+    re-firing the SAME probes one request at a time to reach the real app past the challenge, not a burst."""
+    if abort is not None and abort.is_set():
+        return url, blocked, _SKIPPED
+    _throttle(delay)   # optional politeness gap before this job's first request
+    rec_path = os.path.join(tmpdir, hashlib.md5(url.encode()).hexdigest() + ".jsonl")
+    cmd = PY + [str(_HERE / "deploy_and_grade.py"), url, "--url", "--record", rec_path,
+                "--grade-timeout", str(grade_timeout)]
+    probes = [p for p in pad if p not in blocked] + list(blocked)   # benign pad first (also catalog-ordered early)
+    for pid in probes:
+        cmd += ["--probe", pid]
+    cmd += extra_flags
+    env = {**os.environ, "SLOPTIC_INJECT_POOL": str(inject_pool), "SLOPTIC_EXPOSURE_POOL": str(inject_pool)}
+    try:
+        subprocess.run(cmd, timeout=grade_timeout + 300, capture_output=True, env=env)
+        recs = _read_jsonl(rec_path)
+        rec = recs[-1] if recs else None
+        if rec and pad:   # drop the camouflage probes' findings -- only the blocked set is real recovery to merge
+            keep = set(blocked)
+            rec["findings"] = [f for f in (rec.get("findings") or []) if f.get("probe_id") in keep]
+        return url, blocked, rec
+    except Exception:
+        return url, blocked, None   # DNF -> _status reports dnf, merge recovers nothing
+
+
+def _load_jobs(records):
+    """The challenged apps to (re-)fold: (url, blocked_probes), deduped by url (a url is graded once)."""
+    seen, jobs = set(), []
+    for r in records:
+        url = _url_of(r)
+        if r.get("blocked_probes") and url and url not in seen:
+            seen.add(url)
+            jobs.append((url, r.get("blocked_probes"), r))
+    return jobs
+
+
+def _session_flags(rec, browser_auth_flag):
+    """Per-app flags so the retry REUSES the main grade's session instead of re-doing the 26-nav register walk
+    (which re-hammers the app and re-trips its per-app WAF block -- the DNF-wave root cause). REUSE a captured
+    session via --header; if the main grade proved NO self-serve session (attempted + failed), DROP --browser-auth
+    so the retry never re-walks a doomed signup (browser render still runs -- --browser is on by default). Returns
+    the per-app browser/session flags to use in place of the shared browser_auth_flag."""
+    sess = rec.get("session_replay")
+    if isinstance(sess, dict) and sess:
+        flags = list(browser_auth_flag)                    # keep browser probes running; --header short-circuits the walk
+        for k, v in sess.items():
+            flags += ["--header", "%s: %s" % (k, v)]
+        return flags, "reuse"
+    if rec.get("session_established") is False and browser_auth_flag:
+        return [], "no-signup"                             # drop --browser-auth -> no doomed re-walk
+    return list(browser_auth_flag), "as-is"
+
+
+def _fold_and_summary(records, collected, tally, merged_file, results_path, retry_file):
+    """Fold every graded retry record into its full-grade record -> .merged.jsonl (main untouched), then
+    print the run summary. Shared by the live retry and --remerge so a fold is byte-identical either way."""
+    bundle_of = {p.id: p.bundle for p in load_catalog(str(_ROOT / "catalog"))}
+    n_recovered = n_fired = n_apps = 0
+    with open(merged_file, "w") as out:
+        for r in records:
+            url = _url_of(r)
+            if r.get("blocked_probes") and collected.get(url) is not None:
+                r = merge(r, collected[url], bundle_of)
+                n_apps += 1
+                n_recovered += len(r["retry"]["recovered"])
+                n_fired += len(r["retry"]["fired"])
+            out.write(json.dumps(r) + "\n")
+    print(f"\nRETRY DONE — apps: FULL={tally['full']}  partial={tally['partial']}  none={tally['none']}  "
+          f"dnf={tally['dnf']}   ·   {n_recovered} probes recovered · {n_fired} NEW findings")
+    if n_fired:
+        print("  ⚠ NEW findings on previously-blocked apps — inspect .merged.jsonl (retry.fired)")
+    if not n_recovered:
+        print("  (NO recovery — every blocked app re-challenged or DNF'd; blocked tails stay flagged)")
+    print(f"  merged -> {merged_file}   ·   raw retry -> {retry_file}   ·   main untouched: {results_path}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="retry the WAF-blocked tail on challenged apps, post-run")
+    ap.add_argument("--results", required=True, help="the main run's results .jsonl (never mutated)")
+    ap.add_argument("--concurrency", type=int, default=4, help="apps retried in parallel (default 4)")
+    ap.add_argument("--ip-block-sample", type=int, default=_IP_BLOCK_SAMPLE, metavar="N",
+                    help=f"abort the retry after N consecutive zero-recovery entry challenges (default "
+                         f"{_IP_BLOCK_SAMPLE}). The flag is intermittent (apps recover in the tail even mid-flag), "
+                         f"so a low N throws away recoverable apps; raise it to grind through, or 0 to never abort")
+    ap.add_argument("--pad-benign", action="store_true",
+                    help="EXPERIMENT: prepend light benign probes (headers/ctype/http/seo/a11y) to each app's "
+                         "retry set so the session opens benign before the attack probes, diluting the "
+                         "pure-attacker behavioral signal Vercel keys on (curl proves it's NOT the IP; run_batch "
+                         "survives because its attacks are diluted in a benign battery). Pad findings are dropped "
+                         "before the merge (camouflage only). A/B against the default to see if the flag moves past ~40")
+    ap.add_argument("--inject-pool", type=int, default=1, metavar="N",
+                    help="injection/exposure fan-out width in the grade (default 1 = SERIAL, the pre-v23 behavior "
+                         "that recovered 769/785 on the v20 retry). run_batch uses 6 for speed, but a 6-wide burst "
+                         "of attack requests per app, fired on the ~all-Vercel blocked set, stacks into a pattern "
+                         "Vercel's WAF flags after ~50 apps. Serial re-fires the SAME probes gently, one at a time")
+    ap.add_argument("--delay", type=float, default=0.0, metavar="SECONDS",
+                    help="optional global minimum gap between job STARTS across all workers (default 0; the real "
+                         "lever was --inject-pool, not pacing)")
+    ap.add_argument("--grade-timeout", type=int, default=900, help="per-app subset-grade timeout (s)")
+    ap.add_argument("--browser-auth", action="store_true", help="pass through to the grader (MATCH the main run)")
+    ap.add_argument("--no-browser", action="store_true", help="pass through to the grader (MATCH the main run)")
+    # email-verification flags: MATCH the main run, else a WAF-blocked authed probe on an email-gated app is
+    # retried with no receiver -> reads N/A -> the recall the email lane added is lost exactly on the retry path.
+    ap.add_argument("--email-domain", help="pass through to the grader (MATCH the main run)")
+    ap.add_argument("--email-endpoint", help="pass through to the grader (MATCH the main run)")
+    ap.add_argument("--email-token", default="", help="pass through to the grader (MATCH the main run)")
+    ap.add_argument("--remerge", action="store_true",
+                    help="skip grading: re-fold the EXISTING <results>.retry.jsonl into .merged.jsonl (use "
+                         "after a merge-logic fix — the fold is pure, so no re-grade is needed)")
+    args = ap.parse_args()
+
+    records = _read_jsonl(args.results)
+    jobs = _load_jobs(records)
+    print(f"blocked apps to retry: {len(jobs)} of {len(records)} records", flush=True)
+    if not jobs:
+        print("nothing blocked — no retry needed."); return
+
+    retry_file = args.results + ".retry.jsonl"
+    merged_file = args.results + ".merged.jsonl"
+
+    # --remerge: the retry already ran; just re-fold its records (e.g. after fixing merge()). Pure, seconds.
+    if args.remerge:
+        collected = {_url_of(r): r for r in _read_jsonl(retry_file) if _url_of(r)}
+        if not collected:
+            print(f"no retry records at {retry_file} — run the retry first (without --remerge)."); return
+        print(f"re-merge only: folding {len(collected)} existing retry records from {retry_file}", flush=True)
+        tally = Counter()
+        for url, bp, _r in jobs:
+            tally[_status(bp, collected.get(url))[0]] += 1
+        _fold_and_summary(records, collected, tally, merged_file, args.results, retry_file)
+        return
+
+    # --browser-auth is decided PER APP now (session reuse), so it's split out of the shared `common` flags.
+    browser_auth_flag = ["--browser-auth"] if args.browser_auth else []
+    common = ["--no-browser"] if args.no_browser else []
+    if args.email_domain:
+        common += ["--email-domain", args.email_domain]
+    if args.email_endpoint:
+        common += ["--email-endpoint", args.email_endpoint]
+    if args.email_token:
+        common += ["--email-token", args.email_token]
+    # per-app flags: replay a captured session (no re-walk) / skip a doomed signup / re-walk as before.
+    modes = Counter()
+    job_flags = []
+    for url, bp, rec in jobs:
+        sflags, mode = _session_flags(rec, browser_auth_flag)
+        modes[mode] += 1
+        job_flags.append((url, bp, common + sflags))
+    if browser_auth_flag:
+        print("  session reuse: %d replay a captured session, %d skip a doomed signup, %d re-walk (no session "
+              "info) -- fewer register walks -> fewer re-tripped WAF blocks" %
+              (modes["reuse"], modes["no-signup"], modes["as-is"]), flush=True)
+    tmpdir = tempfile.mkdtemp(prefix="sloptic-retry-")
+    collected = {}                    # url -> retry record (None on DNF or a circuit-breaker skip)
+    tally = Counter()
+    done = skipped = 0
+    abort = threading.Event()         # set by the IP-block circuit breaker; pending jobs then skip immediately
+    statuses = []                     # (kind, bot_challenge) per graded app, for the breaker's verdict
+    with ThreadPoolExecutor(max_workers=args.concurrency) as ex:
+        pad = _benign_pad_probes() if args.pad_benign else ()
+        futs = [ex.submit(_retry_one, url, bp, tmpdir, flags, args.grade_timeout, abort, args.delay,
+                          args.inject_pool, pad) for url, bp, flags in job_flags]
+        for f in as_completed(futs):
+            done += 1
+            url, blocked, rec = f.result()
+            if rec is _SKIPPED:
+                collected[url] = None    # not retried -> merge keeps the original block (recovered nothing)
+                skipped += 1
+                continue
+            collected[url] = rec
+            kind, n, tot, onset = _status(blocked, rec)
+            tally[kind] += 1
+            mark = {"full": "✓ FULL", "partial": "~ part", "none": "✗ none", "dnf": "· dnf "}[kind]
+            note = f" re-challenge@{onset}" if kind in ("partial", "none") and onset else ""
+            with _print_lock:
+                print(f"  [{done}/{len(jobs)}] {mark} {n:>2}/{tot:<2}{note:<28} {url}", flush=True)
+            # CIRCUIT BREAKER: retry_blocked's whole premise is that a thin subset retry clears a PER-APP
+            # challenge. An IP-level flag re-challenges every app at entry and recovers nothing, which this tool
+            # cannot dig out -- and every further retry only re-warms the flag. When that pattern is unmistakable,
+            # STOP (pending jobs skip via the abort event; in-flight ones finish).
+            statuses.append((kind, bool((rec or {}).get("bot_challenge"))))
+            if not abort.is_set() and _looks_like_ip_block(statuses, args.ip_block_sample):
+                abort.set()
+                with _print_lock:
+                    print(f"\n  ⚠ IP-LEVEL FLAG DETECTED — the last {args.ip_block_sample} graded apps all re-challenged "
+                          f"at entry and recovered nothing. This is a Vercel IP-reputation block, not per-app "
+                          f"challenging.\n    Stopping: this tool cannot dig out an IP block, and retrying the "
+                          f"rest only re-warms the flag and resets its (hours-long) decay. Halt Vercel traffic "
+                          f"from this box, confirm the flag cleared (waf_probe.py), then re-run this retry.",
+                          flush=True)
+
+    # persist raw retry records (for inspection + later --remerge), then fold into the merged grades
+    with open(retry_file, "w") as rf:
+        for rec in collected.values():
+            if rec is not None:
+                rf.write(json.dumps(rec) + "\n")
+    _fold_and_summary(records, collected, tally, merged_file, args.results, retry_file)
+    if abort.is_set():
+        print(f"  ⚠ ABORTED on an IP-level flag — {skipped} apps left un-retried; their blocked tails stay "
+              f"flagged in .merged.jsonl. Re-run after the IP decays to recover them.")
+    shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()

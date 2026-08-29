@@ -1,0 +1,15 @@
+id: perf-minify-001
+bundle: performance
+category: minification
+pool: public
+evidence_model: oracle
+penalty: 10   # PROVISIONAL (re-priced on v19). Unminified JS/CSS in prod. Lighthouse unminified-javascript /
+              # unminified-css (token-density, not our avg-line-length that Turbopack chunks tripped).
+applicability:
+  requires: [lighthouse]
+probe:
+  predicate: lighthouse_audit
+  report_only: true   # OFF-SCORE: fires as a per-metric diagnostic finding at 0 penalty;
+                      # the perf axis is scored once on the overall headline (perf-lighthouse-001).
+  audits: [unminified-javascript, unminified-css]
+  mode: score

@@ -5,6 +5,7 @@ pool: public
 evidence_model: provable
 penalty: 15   # every shared/bookmarked link is dead — the app works from home but not from a deep link.
               # Moderate UX-functional severity (above a dead back button, below a total non-render).
+severity: {iso_25010: "interaction-capability", nielsen: "2", range: [28, 28], default: 28}   # direct load of a real route renders only the shell
 applicability:
   requires: [browser]   # must render to see whether the client paints the route; N/A without --browser
 probe:
@@ -14,3 +15,7 @@ probe:
   # catch-all/SPA host qualifies (a 200-status check can't see this; the route 'works' but the client never
   # paints it). Render a guaranteed-nonexistent route as the fallback, render each discovered route, and fire
   # when a real route renders ~identically to the fallback. Self-N/A on honest-404 hosts / no app route.
+  # PRECISION (v18 live-audit, 9/16 sampled fires were auth-gated FPs): a route that renders a LOGIN/auth screen
+  # matching the fallback is auth-GATED (working), not a dead deep link -- the login-screen gate in
+  # deep_link_broken suppresses it, while a NON-login blank-shell match (evdojo /topics -> home, help-now /about
+  # -> 404) still fires. Also excludes MID-PATH /api/ (/x/api/feedback) and the /index.html entry alias.

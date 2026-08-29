@@ -1,0 +1,15 @@
+id: perf-lcp-001
+bundle: performance
+category: lcp-strategy
+pool: public
+evidence_model: oracle
+penalty: 8   # PROVISIONAL (re-priced on v19). LCP element discovered late / lazy-loaded hero. Lighthouse
+             # lcp-discovery-insight.
+applicability:
+  requires: [lighthouse]
+probe:
+  predicate: lighthouse_audit
+  report_only: true   # OFF-SCORE: fires as a per-metric diagnostic finding at 0 penalty;
+                      # the perf axis is scored once on the overall headline (perf-lighthouse-001).
+  audit: lcp-discovery-insight
+  mode: score

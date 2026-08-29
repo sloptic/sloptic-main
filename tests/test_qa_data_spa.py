@@ -14,7 +14,8 @@ from urllib.parse import urlparse
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from sloptic.net import make_client  # noqa: E402
 from sloptic.pipeline import _Ctx  # noqa: E402
-from sloptic.probes import data_integrity_list_roundtrip, race_resource_ids_api  # noqa: E402
+from sloptic.probes import (  # noqa: E402
+    api_bola_collection, data_integrity_list_roundtrip, race_resource_ids_api)
 from sloptic.schema import Endpoint, Profile  # noqa: E402
 
 
@@ -60,11 +61,16 @@ def _make_app(mode):   # durable | lossy | atomic | racy
                 if mode != "lossy":                          # durable/atomic/racy store; lossy drops the write
                     items.append({"id": iid, **body})
                 return self._j(201, {"id": iid})
+            if path == "/api/recommendation":               # a stateless RPC: 2xx, computes, persists nothing
+                return self._j(200, {"score": 0.7})
             return self._j(404, {})
 
         def do_GET(self):
-            if urlparse(self.path).path == "/api/items":
+            path = urlparse(self.path).path
+            if path == "/api/items":
                 return self._j(200, {"items": items})
+            if path == "/api/recommendation":               # sibling is a status/config OBJECT, not a collection
+                return self._j(200, {"hasApiKey": False})
             return self._j(404, {})
     return H
 
@@ -107,6 +113,104 @@ def test_integrity_clean_when_durable():
 
 def test_integrity_na_without_create_endpoint():
     assert _run(data_integrity_list_roundtrip, "durable", endpoints=[]) is None
+
+
+def test_integrity_na_on_a_stateless_rpc_not_a_collection():
+    # the v18 FP class (3 of 4 fires: encounter/recommendation/config): POST is 2xx but its sibling GET is a
+    # status/config OBJECT, not a resource list -> nothing was ever persisted there -> N/A, not silent data loss.
+    rpc = [Endpoint(path="/api/recommendation", method="post", raw_path="/api/recommendation",
+                    body_fields=["task"])]
+    assert _run(data_integrity_list_roundtrip, "durable", endpoints=rpc) is None
+
+
+def test_integrity_na_on_an_auth_endpoint():
+    # fahimni's /backend/auth.php fired here: a login POST has body fields but its 'collection' is not a public
+    # data list. A password field (or an auth-verb path) excludes it from the create set -> N/A.
+    auth = [Endpoint(path="/api/login", method="post", raw_path="/api/login",
+                     body_fields=["username", "password"])]
+    assert _run(data_integrity_list_roundtrip, "durable", endpoints=auth) is None
+
+
+# ---- browser persist-confirm fallback: flips N/A -> confirmed-clean, NEVER fires loss (absence is ambiguous) --
+
+def test_integrity_browser_confirm_flips_na_to_clean(monkeypatch):
+    # httpx can't round-trip (no JSON create endpoint), but a browser drives the create and reads the canary back
+    # from the client-rendered DOM -> the write persisted -> confirmed clean, via="browser".
+    from sloptic import probes
+    monkeypatch.setattr(probes.browser, "create_and_read_back",
+                        lambda base, submit_value, locate, headers=None, timeout=12.0: "<li>%s</li>" % submit_value)
+    srv = _serve("durable")
+    url = "http://127.0.0.1:%d" % srv.server_address[1]
+    ctx = _ctx(url, endpoints=[])
+    ctx.profile.capabilities["browser"] = True
+    try:
+        assert data_integrity_list_roundtrip(ctx, _Probe()) is False
+        assert ctx.evidence.get("via") == "browser" and ctx.evidence.get("durable") is True
+    finally:
+        ctx.client.close()
+        srv.shutdown()
+
+
+def test_integrity_browser_absence_stays_na_never_fires(monkeypatch):
+    # the canary did NOT read back -> ambiguous (form not found / render lag), so we stay N/A and never fire a
+    # false data-loss from the browser lane.
+    from sloptic import probes
+    monkeypatch.setattr(probes.browser, "create_and_read_back",
+                        lambda base, submit_value, locate, headers=None, timeout=12.0: "<li>nothing</li>")
+    srv = _serve("durable")
+    url = "http://127.0.0.1:%d" % srv.server_address[1]
+    ctx = _ctx(url, endpoints=[])
+    ctx.profile.capabilities["browser"] = True
+    try:
+        assert data_integrity_list_roundtrip(ctx, _Probe()) is None
+    finally:
+        ctx.client.close()
+        srv.shutdown()
+
+
+# ---- IDOR browser cross-user fallback: reaches the SPA client-rendered feed the httpx collection scan can't ----
+
+def _bola_ctx(monkeypatch, verdict):
+    from sloptic import probes
+    calls = {}
+    def fake(base, submit_value, locate, a_headers, b_headers, timeout=12.0):
+        calls["ran"] = True
+        return verdict
+    monkeypatch.setattr(probes.browser, "cross_user_read_back", fake)
+    srv = _serve("durable")
+    url = "http://127.0.0.1:%d" % srv.server_address[1]
+    ctx = _ctx(url, endpoints=[])                 # no collection endpoint -> httpx path can't test
+    ctx.profile.capabilities["browser"] = True
+    return srv, ctx, calls
+
+
+def test_bola_collection_browser_fallback_fires_cross_user(monkeypatch):
+    srv, ctx, calls = _bola_ctx(monkeypatch, True)
+    try:
+        assert api_bola_collection(ctx, _Probe()) is True        # B saw A's gated created value
+        assert calls.get("ran") and ctx.evidence.get("via") == "browser" and ctx.evidence.get("cross_user_read")
+    finally:
+        ctx.client.close()
+        srv.shutdown()
+
+
+def test_bola_collection_browser_fallback_clean_when_owner_scoped(monkeypatch):
+    srv, ctx, calls = _bola_ctx(monkeypatch, False)
+    try:
+        assert api_bola_collection(ctx, _Probe()) is False       # A saw it, anon+B did not -> observed clean
+        assert ctx.evidence.get("via") == "browser"
+    finally:
+        ctx.client.close()
+        srv.shutdown()
+
+
+def test_bola_collection_browser_fallback_na_when_create_unobservable(monkeypatch):
+    srv, ctx, calls = _bola_ctx(monkeypatch, None)               # A's create never surfaced -> untestable
+    try:
+        assert api_bola_collection(ctx, _Probe()) is None        # honest N/A, never a false clean
+    finally:
+        ctx.client.close()
+        srv.shutdown()
 
 
 def test_race_fires_on_duplicate_ids_under_concurrency():

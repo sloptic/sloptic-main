@@ -1,0 +1,26 @@
+id: sec-sri-001
+bundle: security
+category: supply-chain
+pool: public
+evidence_model: provable
+penalty: 12   # PROVISIONAL (v2.0 Family 4 -- re-price from the corpus footrule + rank_variance before the
+              # 2026.3 freeze): a middle-band supply-chain hygiene gap, not an active exploit. Cite the W3C SRI
+              # recommendation, not our judgment. CONDITIONALLY prevalent (only apps loading cross-origin
+              # script/style), so it may be a low-variance tax among applicable apps -> rank_variance decides
+              # whether it stays scored and at what price. Anchored: a cross-origin script with/without integrity.
+severity: {cvss: "n/a", vrt: "P5", range: [10, 10], default: 10, tier: chore-floor}   # missing SRI on cross-origin subresource = defense-in-depth; REPRICED 12->10
+applicability:
+  requires: [at_least_one_http_endpoint_exists]   # further self-gated by the predicate: N/A with no cross-origin subresource
+probe:
+  # parse the served homepage HTML; fire when a cross-origin CODE-EXECUTING subresource (script / stylesheet /
+  # modulepreload / preload as=script|style) ships without an integrity= hash. First-party is by registrable
+  # domain (PSL); excludes hosts SRI can't protect (per-UA font CSS, tag loaders) + builder-injected assets.
+  # N/A when no SRI-applicable cross-origin subresource exists.
+  predicate: subresource_integrity_missing
+  target: /
+tp_definition: |
+  TP: a THIRD-PARTY, app-uncontrolled, code-executing subresource that SRI COULD protect is loaded without
+  integrity (a compromised CDN could inject undetectably).
+  NOT (confounders/FP): SRI is inapplicable so there is no better way (fonts.googleapis.com serves per-UA CSS,
+  a hash breaks it); first-party / app-controlled (registrable-domain match via the PSL); a non-executing
+  resource (preloaded image).

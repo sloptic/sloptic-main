@@ -3,15 +3,22 @@ and routes a static crawl misses (SPAs), and (later) so DOM/stored XSS and Core 
 measured. Optional: every entry point degrades to None when no browser is available, so the rest of
 the runner is unaffected.
 
-Browser-agnostic: tries Playwright's pinned bundled Chromium first (reproducible), then any system
-browser (chromium / chrome / msedge channels), so it works wherever one is available.
+Browser-agnostic: drives the REAL system Chrome/Edge first (a legitimate branded-browser fingerprint),
+then Chromium channels, and Playwright's bundled Chromium only as a last resort. The ORDER matters for
+reach, not merely availability: bundled headless Chromium presents a HeadlessChrome UA + automation tells
+that WAF/bot mitigations (Vercel's default DDoS challenge) escalate on, which reputation-flagged a grading
+IP across every Vercel host; the real installed Chrome the dev box and laptop drive never tripped it.
 """
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
+import os
 import pathlib
 import re
+import signal
+import threading
 import time
 import urllib.parse
 
@@ -38,13 +45,90 @@ def browser_available() -> bool:
     return browser_preflight()[0]
 
 
-# Pinned bundled Chromium first (reproducible), then any system browser. Bundled Chromium for
-# Ubuntu 26.04 needs Playwright >= 1.61 (microsoft/playwright#40117); until that releases (latest is
-# 1.60) the bundled launch fails here and a system Chrome/Edge channel is used instead.
-_LAUNCH_ORDER = ({}, {"channel": "chromium"}, {"channel": "chrome"}, {"channel": "msedge"})
+# Real branded Chrome/Edge FIRST, bundled Chromium LAST. Not for availability (any of these renders the
+# page) but for LEGITIMACY: bundled headless Chromium transmits a HeadlessChrome UA + automation tells that
+# trip WAF/bot challenges and got a grading IP reputation-flagged across every Vercel host, while the real
+# installed Chrome the dev box/laptop drive never did (proven: same IP, same corpus, many runs, no flag --
+# the only variable was that the Dell had bundled Chromium installed and used it first). Reproducibility (a
+# pinned bundled build) is the lesser concern and the per-commit surface cache already absorbs cross-box
+# render variance. Bundled Chromium stays as the final fallback so a box with no system browser still runs.
+_LAUNCH_ORDER = ({"channel": "chrome"}, {"channel": "msedge"}, {"channel": "chromium"}, {})
 
 
 _LAST_LAUNCH_ERROR = ""
+
+
+_RENDER_HANG_GRACE = 45.0   # a render that blows total_timeout by this much is WEDGED (a CPU-spun renderer whose
+#                             Playwright timeout never fired) -> kill the browser so the call raises. Bounds a hang
+#                             to ~total_timeout+45 (~105s) instead of the 900s external grade SIGKILL, and lets the
+#                             grade fall through to the HTTP probes instead of recording an empty 900s DNF.
+
+
+def _descendant_pids(root: int) -> list[int]:
+    """PIDs descending from `root` (the chromium tree + its node driver), read from /proc -- no psutil dep.
+    Kills ONLY descendants of THIS process, never a process group, so it is safe whether or not the caller
+    ran setsid (render_routes is also called from direct CLI runs / tests under the user's own shell group)."""
+    children: dict[int, list[int]] = {}
+    try:
+        pids = [int(e) for e in os.listdir("/proc") if e.isdigit()]
+    except OSError:
+        return []
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                data = f.read()
+            # fields after the (possibly space/paren-containing) comm: state ppid pgrp ... -> ppid is index 1
+            ppid = int(data[data.rindex(")") + 1:].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+        children.setdefault(ppid, []).append(pid)
+    out, stack = [], [root]
+    while stack:                                   # BFS the child map; a wedged chromium spawns zygote/gpu/renderers
+        for c in children.get(stack.pop(), []):
+            out.append(c)
+            stack.append(c)
+    return out
+
+
+@contextlib.contextmanager
+def _kill_browser_on_stall(deadline_s: float):
+    """Arm a one-shot timer that force-kills this process's browser descendants if the wrapped block runs past
+    `deadline_s`. A Playwright sync call on a CPU-spun renderer does NOT honor its own timeout (the driver can't
+    talk to a wedged renderer) -- only killing the process makes the blocked call raise. Yields a {'v': bool}
+    that reads True iff the kill fired, so the caller can flag the hang. Kills descendants only (never a group)."""
+    root = os.getpid()
+    fired = {"v": False}
+
+    def _fire():
+        fired["v"] = True
+        for pid in _descendant_pids(root):
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+    timer = threading.Timer(deadline_s, _fire)
+    timer.daemon = True
+    timer.start()
+    try:
+        yield fired
+    finally:
+        timer.cancel()
+
+
+_BROWSER_LANE_DEADLINE = 180.0   # any single browser lane finishes well under this; a longer run is a wedged
+#                                  renderer -> kill the browser so the lane returns its safe default instead of
+#                                  hanging to the 900s external grade SIGKILL (measured: the v23 register-lane
+#                                  runaways). Generous vs the lanes' own ~45-60s budgets, so no false kill.
+
+
+def _browser_guarded(fn):
+    """Arm the wedge-watchdog around a whole browser lane. A Playwright sync call on a CPU-spun renderer doesn't
+    honor its own timeout (the driver can't talk to a wedged renderer), so ONLY killing the browser process makes
+    it raise -- which the lane's own `except` then turns into its safe default. Kills descendants of THIS process
+    only (never a group), and lanes run sequentially per grade, so one lane's watchdog never touches another's."""
+    @functools.wraps(fn)
+    def _wrap(*args, **kwargs):
+        with _kill_browser_on_stall(_BROWSER_LANE_DEADLINE):
+            return fn(*args, **kwargs)
+    return _wrap
 
 
 def _launch(p):
@@ -117,18 +201,50 @@ _NO_CLICK = re.compile(
     r"log ?out|sign ?out|delete|remove|pay\b|buy\b|checkout|subscribe|purchase|confirm|"
     r"send\b|publish|invite|download|share|tweet|facebook|instagram|external|https?://", re.I)
 
+# FORMLESS-create discovery (the React shape with no <form>): which text input is the content field, which button
+# triggers the write. The content is a benign canary, so Send/Post/Publish ARE safe create triggers here -- only a
+# delete/pay/logout is off-limits (that's what _DESTRUCTIVE_BTN blocks).
+_CREATE_INPUT_HINT = re.compile(
+    r"add|create|new|title|name|task|todo|note|post|message|comment|reply|write|caption|body|content|item|"
+    r"description|label|subject|say something|type here|what.?s", re.I)
+_CREATE_BTN = re.compile(r"\b(add|create|new|post|save|submit|publish|send|comment|reply|insert|share)\b|^\s*\+\s*$", re.I)
+_DESTRUCTIVE_BTN = re.compile(r"delete|remove|\bpay\b|\bbuy\b|checkout|purchase|log ?out|sign ?out|cancel|unsubscribe", re.I)
+
 
 _MAX_REVEALED = 120   # bound the appended fragment: with a[href] in the harvest, a link-heavy nav could
 #                       otherwise paste hundreds of elements onto every route's dom
 
 
-def _reveal_hidden_controls(page, max_clicks: int = 6, per_wait_ms: int = 350) -> str:
+# Bound the DOM harvest IN JS so a pathological page (thousands of nested controls) can't return a multi-MB
+# payload whose Python-side DESERIALIZE holds the GIL -- which stalls the whole grade past the timeout AND
+# blocks the (thread-based) hang-watchdog from ever firing (measured on foodbridge.me: render wedged >900s while
+# the watchdog Timer never ran). Slice the element count and truncate each outerHTML; near-lossless for real apps.
+_CONTROLS_JS = "els => els.slice(0, 400).map(e => (e.outerHTML || '').slice(0, 4000))"
+_TRIGGER_CAP = 150   # examine at most this many reveal candidates -- inner_text()/evaluate() per element is a
+#                      round trip, so an unbounded trigger set on a huge DOM is itself minutes of wall clock
+
+
+def _reveal_hidden_controls(page, max_clicks: int = 6, per_wait_ms: int = 350, deadline: float | None = None) -> str:
     """Click reveal-intent controls (login / upload / menu triggers) to surface INTERACTION-GATED forms
     and inputs a static render misses, and return the revealed <form>/modal HTML (appended to the route's
     dom for discovery to scan). Reveal-ONLY: never clicks a submit / pay / delete / logout / external
     control (_NO_CLICK), so it opens UI without acting on the app; bounded by max_clicks + an Escape reset
     between clicks so one page can't loop or drift far from its initial state."""
     revealed, seen, clicked = [], set(), 0
+    # Bound EVERY element op (inner_text/evaluate/click/fill) to a few seconds: on a wedged renderer a single
+    # el.inner_text() blocks the Playwright DEFAULT (~30s), and the deadline check between elements can't interrupt
+    # a call stuck INSIDE it -- measured as the residual 900s discover-phase runaways (one 29s inner_text per app).
+    # Restored to the default in the finally so the rest of the lane's ops are unaffected.
+    with contextlib.suppress(Exception):
+        page.set_default_timeout(2500)
+    try:
+        return _reveal_hidden_controls_inner(page, max_clicks, per_wait_ms, deadline, revealed, seen, clicked)
+    finally:
+        with contextlib.suppress(Exception):
+            page.set_default_timeout(30000)
+
+
+def _reveal_hidden_controls_inner(page, max_clicks, per_wait_ms, deadline, revealed, seen, clicked) -> str:
     # `a[href]` is here for a reason worth spelling out: harvesting only form controls made this pass blind to
     # interaction-gated ROUTES. Measured on OopsSec, clicking the account menu reveals <a href="/wishlists">
     # and <a href="/cart"> — live 200 pages — and dropping them broke the whole chain downstream: no route
@@ -136,14 +252,15 @@ def _reveal_hidden_controls(page, max_clicks: int = 6, per_wait_ms: int = 350) -
     # no target and reports clean. Route discovery gates chunk discovery gates endpoint discovery.
     _controls = "input, textarea, select, form, a[href]"
     with contextlib.suppress(Exception):   # baseline: controls already present -> append only NEWLY revealed
-        for h in (page.eval_on_selector_all(_controls, "els => els.map(e => e.outerHTML)") or []):
+        for h in (page.eval_on_selector_all(_controls, _CONTROLS_JS) or []):
             seen.add(h[:160])
     triggers = []
     with contextlib.suppress(Exception):
-        triggers = page.query_selector_all("button, a, [role=button], [role=tab], summary, [onclick]")
+        triggers = page.query_selector_all("button, a, [role=button], [role=tab], summary, [onclick]")[:_TRIGGER_CAP]
     for el in triggers:
-        if clicked >= max_clicks:
-            break
+        if clicked >= max_clicks or (deadline is not None and time.monotonic() > deadline):
+            break                          # wall-clock deadline is GIL-cooperative (checked between elements),
+            #                                the one guard that works when a thread-watchdog can't (GIL held)
         try:
             label = ((el.inner_text() or "") + " " + (el.get_attribute("aria-label") or "")).strip().lower()[:80]
         except Exception:
@@ -163,7 +280,7 @@ def _reveal_hidden_controls(page, max_clicks: int = 6, per_wait_ms: int = 350) -
         except Exception:
             continue
         with contextlib.suppress(Exception):   # controls that APPEARED since baseline (a revealed login/upload)
-            for frag in (page.eval_on_selector_all(_controls, "els => els.map(e => e.outerHTML)") or []):
+            for frag in (page.eval_on_selector_all(_controls, _CONTROLS_JS) or []):
                 key = frag[:160]
                 if key not in seen and len(revealed) < _MAX_REVEALED:
                     seen.add(key)
@@ -177,7 +294,7 @@ def _reveal_hidden_controls(page, max_clicks: int = 6, per_wait_ms: int = 350) -
 _DRIVE_ROUTES = 3   # drive actions on only the first few routes (submit+wait is costly + mutates) -> grade budget
 
 
-def _drive_actions(page, max_actions: int = 5, per_wait_ms: int = 450) -> None:
+def _drive_actions(page, max_actions: int = 5, per_wait_ms: int = 450, deadline: float | None = None) -> None:
     """ACT on the page — fill visible forms with benign values and submit them, and click NON-destructive
     action buttons — so the app FIRES its OWN business API calls, which the net_sink harvest turns into real
     endpoints. This surfaces the INTERACTION-GATED runtime surface (a chat submit -> /api/chat) that no static
@@ -187,8 +304,8 @@ def _drive_actions(page, max_actions: int = 5, per_wait_ms: int = 450) -> None:
     (they submit discovered forms). Best-effort + isolated (suppress) so one hostile control never breaks the render."""
     acted = 0
     with contextlib.suppress(Exception):                     # 1. real <form>s: fill benign values + submit
-        for form in page.query_selector_all("form"):
-            if acted >= max_actions:
+        for form in page.query_selector_all("form")[:_TRIGGER_CAP]:
+            if acted >= max_actions or (deadline is not None and time.monotonic() > deadline):
                 break
             with contextlib.suppress(Exception):
                 if not form.is_visible() or _NO_CLICK.search((form.inner_text() or "")[:200]):
@@ -202,8 +319,8 @@ def _drive_actions(page, max_actions: int = 5, per_wait_ms: int = 450) -> None:
                 page.wait_for_timeout(per_wait_ms)           # let the fetch land so net_sink captures it
                 acted += 1
     with contextlib.suppress(Exception):                     # 2. action BUTTONS (SPA onclick->fetch, not a <form>)
-        for btn in page.query_selector_all("button, [role=button]"):
-            if acted >= max_actions:
+        for btn in page.query_selector_all("button, [role=button]")[:_TRIGGER_CAP]:
+            if acted >= max_actions or (deadline is not None and time.monotonic() > deadline):
                 break
             with contextlib.suppress(Exception):
                 lbl = ((btn.inner_text() or "") + " " + (btn.get_attribute("aria-label") or "")).strip().lower()[:80]
@@ -216,10 +333,67 @@ def _drive_actions(page, max_actions: int = 5, per_wait_ms: int = 450) -> None:
                 acted += 1
 
 
+# --- websocket-rendered SPAs (Streamlit) -----------------------------------------------------------------
+# Streamlit is NOT a canvas app: it's a React frontend that paints REAL DOM elements from Protocol-Buffer
+# "deltas" over a websocket, but only AFTER `load` fires on the static shell, and Community Cloud parks idle
+# apps behind a "get this app back up" page. So a `wait_until="load"` + 300ms capture snapshots the ~108-node
+# bootstrap shell every time — which made every Streamlit app grade identically (the framework, not the
+# submission). Wake a sleeping app, then wait for the real app to paint, crash, or exhaust the budget, so the
+# surface probe sees the actual app — or an honest "won't come up" failure, which is exactly what a judge
+# hitting a slept app sees too.
+_ST_HOST = ".streamlit.app"
+_ST_SLEEP = re.compile(r"gone to sleep|get this app back up", re.I)
+_ST_ERROR = re.compile(r"error running app|oh no\s*[.,]|connection error", re.I)
+# the app has really painted: the view container exists AND several st-widgets rendered (the shell alone has none)
+_ST_READY_JS = ('() => !!document.querySelector(\'[data-testid="stAppViewContainer"]\') '
+                '&& document.querySelectorAll(\'[data-testid^="st"]\').length > 5')
+
+
+def _looks_streamlit(page, url: str) -> bool:
+    """Cheap gate so the slow await only runs for Streamlit (host suffix, or a Streamlit root in the DOM)."""
+    if _ST_HOST in (url or ""):
+        return True
+    try:
+        return bool(page.query_selector('[data-testid="stApp"], [data-testid="stAppViewContainer"]'))
+    except Exception:
+        return False
+
+
+def await_streamlit(page, budget_s: float = 60.0) -> str:
+    """Drive a Streamlit page to a terminal state and return it:
+      'rendered' — the real app painted (view container + real widgets)
+      'error'    — Streamlit's "Oh no. Error running app." crash screen (a genuine functional failure)
+      'stuck'    — never came up within budget_s (asleep-and-won't-wake / too slow / dead)
+    Wakes a sleeping Community-Cloud app first. Bounded by budget_s so a dead app can't stall the crawl."""
+    t0 = time.monotonic()
+    woke = False
+    while time.monotonic() - t0 < budget_s:
+        try:
+            txt = (page.evaluate("() => document.body ? document.body.innerText : ''") or "")[:3000]
+            if _ST_ERROR.search(txt):
+                return "error"
+            if not woke and _ST_SLEEP.search(txt):
+                for sel in ('button:has-text("get this app back up")', 'button:has-text("back up")'):
+                    el = page.query_selector(sel)
+                    if el:
+                        el.click()
+                        woke = True
+                        break
+            elif page.evaluate(_ST_READY_JS):
+                page.wait_for_timeout(600)   # let the last deltas settle before the DOM snapshot
+                return "rendered"
+        except Exception:
+            pass
+        page.wait_for_timeout(1500)
+    return "stuck"
+
+
+
+
 def render_routes(base_url: str, paths, headers=None, timeout: float = 12.0,
                   total_timeout: float = 60.0, interact: bool = True,
                   interact_routes: int = 6, net_sink: list | None = None,
-                  script_sink: list | None = None) -> dict[str, str]:
+                  script_sink: list | None = None, meta_sink: dict | None = None) -> dict[str, str]:
     """Render each same-origin path in ONE reused browser session and return {path: rendered_DOM}.
     Paths that fail to load are omitted; {} if no browser is available. A single launch is amortized
     across all routes — a launch-per-route helper would relaunch (and re-warm) the browser each time.
@@ -237,8 +411,14 @@ def render_routes(base_url: str, paths, headers=None, timeout: float = 12.0,
         from playwright.sync_api import sync_playwright
     except ImportError:
         return out
+    hung = {"v": False}   # rebound to the watchdog's flag once we enter the with; stays False if we never do
     try:
-        with sync_playwright() as pw:
+        # WEDGE BACKSTOP: total_timeout is only checked BETWEEN routes, so a single route op that never returns
+        # (a goto on a CPU-spun renderer whose 12s Playwright timeout can't fire, a hanging _drive_actions) escapes
+        # it and burns to the 900s external grade kill (measured: ~8% of a corpus, empty records). The watchdog
+        # kills the browser at total_timeout+grace so the wedged call raises -> we return the partial render and
+        # the grade proceeds to the HTTP probes. meta_sink records the hang.
+        with _kill_browser_on_stall(total_timeout + _RENDER_HANG_GRACE) as hung, sync_playwright() as pw:
             b = _launch(pw)
             if b is None:
                 return out
@@ -264,18 +444,163 @@ def render_routes(base_url: str, paths, headers=None, timeout: float = 12.0,
                     url = base_url.rstrip("/") + path
                     with contextlib.suppress(Exception):
                         page.goto(url, timeout=timeout * 1000, wait_until="load")
-                        page.wait_for_timeout(300)  # let client JS paint the route's forms/inputs
+                        if idx == 0 and _looks_streamlit(page, url):
+                            # websocket-rendered SPA: wake + wait for the real app. Bounded to ~35s (covers a
+                            # cold-start wake; a slower app is marked 'stuck', not waited on) so a mostly-dead
+                            # Streamlit corpus can't burn the run — still within the crawl deadline.
+                            st_state = await_streamlit(page, budget_s=max(8.0, min(35.0, deadline - time.monotonic())))
+                            if meta_sink is not None:      # rendered|error|stuck -> the record's shell_only signal
+                                meta_sink["render_state"] = st_state
+                        else:
+                            page.wait_for_timeout(300)  # let client JS paint the route's forms/inputs
                         dom = page.content()
                         if interact and idx < interact_routes:  # bound: reveal-clicking every route on a big
-                            dom += _reveal_hidden_controls(page)  # SPA is the grade-timeout — cap to the first N
+                            dom += _reveal_hidden_controls(page, deadline=deadline)  # SPA is the grade-timeout
                             if net_sink is not None and idx < _DRIVE_ROUTES:   # then ACT (submit/click) to fire
-                                _drive_actions(page)                            # the app's business API calls
+                                _drive_actions(page, deadline=deadline)         # the app's business API calls
                         out[path] = dom
             finally:
                 b.close()
     except Exception:
-        return out
+        pass                       # a wedge-kill tears the browser down mid-op; return whatever rendered so far
+    if hung["v"] and meta_sink is not None:
+        meta_sink["render_hang"] = True   # observability: this app wedged the renderer and was force-unblocked
     return out
+
+
+# ---- browser-driven OAuth capture: reveal an SDK-initiated authorize URL a static crawl can't see ---------
+_SSO_TRIGGER = re.compile(
+    r"(?:sign|log|continue)\s*(?:in|up)?\s*with\s+"
+    r"(?:google|github|microsoft|apple|facebook|discord|gitlab|slack|linkedin|twitter|okta|auth0)"
+    r"|continue with|single sign[- ]?on|\bsso\b", re.I)
+# oauth-ish URLs to intercept (narrow, so non-oauth traffic isn't routed through Python); the authorize hop
+# leaves the app's own origin, which is how we tell a real provider redirect from a same-origin /auth?redirect_uri.
+_OAUTH_NAV = re.compile(r"/oauth2?/(?:v\d/)?authorize|/o/oauth2|accounts\.google\.com|github\.com/login/oauth|"
+                        r"login\.microsoftonline\.com|appleid\.apple\.com|dialog/oauth|\.auth0\.com/authorize", re.I)
+_SSO_ROUTES = ("/login", "/signin", "/sign-in", "/auth", "/account/login")
+
+
+def _find_sso_triggers(page):
+    """Clickable elements likely to START an OAuth flow: a 'Sign in with <provider>' button, or a link to an
+    oauth route/provider. Best-effort and bounded -- a false match just wastes one click (aborted)."""
+    out = []
+    with contextlib.suppress(Exception):
+        for el in page.query_selector_all("a[href], button, [role='button'], input[type='submit'], [onclick]"):
+            with contextlib.suppress(Exception):
+                href = el.get_attribute("href") or ""
+                blob = ((el.inner_text() or "")[:120] + " " + (el.get_attribute("aria-label") or ""))
+                if _SSO_TRIGGER.search(blob) or _OAUTH_NAV.search(href):
+                    out.append(el)
+    return out
+
+
+_SSO_PROVIDER_WORDS = ("google", "github", "gitlab", "microsoft", "azure", "facebook", "apple",
+                       "discord", "twitter", "linkedin", "slack", "spotify", "twitch", "okta", "auth0")
+
+
+def _sso_provider_slugs(triggers) -> list[str]:
+    """Provider slugs inferred from the 'Continue with <provider>' trigger text, so the server-mediated SSO replay
+    below POSTs the right provider(s) to the allauth endpoint (default google when none is recognisable)."""
+    slugs: list[str] = []
+    for el in triggers:
+        with contextlib.suppress(Exception):
+            t = (el.inner_text() or "").lower()
+            for w in _SSO_PROVIDER_WORDS:
+                if w in t and w not in slugs:
+                    slugs.append(w)
+    return slugs
+
+
+def capture_sso_authorize(base_url, headers=None, timeout: float = 12.0, total_timeout: float = 45.0,
+                          max_clicks: int = 6) -> list[str]:
+    """Drive the app's OWN 'Sign in with <provider>' control and capture the outgoing OAuth authorize request
+    (redirect_uri and all) WITHOUT completing the flow. SDK-initiated SSO (Supabase/Firebase/NextAuth/Auth0/
+    Clerk) builds the authorize URL in JS at click time, so it never appears server-side -- only a click reveals
+    it. Provider navigations are ABORTED (the request event still fires first, so we capture the URL) so one
+    click can't strand us before the next. Returns the captured authorize URLs, deduped; []. NEVER submits
+    credentials -- it stops at the redirect to the provider."""
+    out: list[str] = []
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return out
+    origin = urllib.parse.urlparse(base_url).netloc.lower()
+    seen: set[str] = set()
+    try:
+        with _kill_browser_on_stall(total_timeout + _RENDER_HANG_GRACE), sync_playwright() as pw:
+            b = _launch(pw)
+            if b is None:
+                return out
+            try:
+                page = b.new_page()
+                _apply_auth(page, base_url, headers)
+
+                def _cap(req):
+                    with contextlib.suppress(Exception):
+                        u = req.url
+                        if u not in seen and _OAUTH_NAV.search(u) \
+                                and urllib.parse.urlparse(u).netloc.lower() not in ("", origin):
+                            seen.add(u)
+                            out.append(u)      # a real authorize hop: oauth-shaped AND left our origin
+                page.on("request", _cap)
+
+                def _route(route):             # abort only the cross-origin provider nav; let the app run
+                    with contextlib.suppress(Exception):
+                        u = route.request.url
+                        if _OAUTH_NAV.search(u) and urllib.parse.urlparse(u).netloc.lower() not in ("", origin):
+                            route.abort()
+                            return
+                    with contextlib.suppress(Exception):
+                        route.continue_()
+                page.route(_OAUTH_NAV, _route)
+
+                page.goto(base_url.rstrip("/") + "/", timeout=int(timeout * 1000), wait_until="load")
+                page.wait_for_timeout(400)
+                triggers = _find_sso_triggers(page)
+                for route in _SSO_ROUTES:      # entry page had no SSO control -> try the login routes
+                    if triggers:
+                        break
+                    with contextlib.suppress(Exception):
+                        page.goto(base_url.rstrip("/") + route, timeout=int(timeout * 1000), wait_until="load")
+                        page.wait_for_timeout(300)
+                        triggers = _find_sso_triggers(page)
+                prov_slugs = _sso_provider_slugs(triggers)   # captured before any click navigation detaches them
+                for el in triggers[:max_clicks]:
+                    if out:
+                        break                  # one captured authorize URL is enough to inspect the redirect_uri
+                    with contextlib.suppress(Exception):
+                        el.click(timeout=2500)
+                        page.wait_for_timeout(700)   # let the SDK build + fire the authorize navigation
+                # SERVER-MEDIATED SSO (django-allauth headless & similar): 'Continue with <provider>' is a
+                # SAME-ORIGIN, CSRF-protected POST that 302s to the provider -- nothing cross-origin fires for the
+                # click-capture above, and a driven click can't reproduce the app's own CSRF header (a 403). The
+                # login page did set a csrftoken cookie, so REPLAY the standard allauth provider-redirect POST with
+                # it and read the 302 Location. Read-only (max_redirects=0, never follows to the provider), and
+                # naturally scoped: no csrftoken cookie -> skipped, and a non-allauth app 404s the path harmlessly.
+                if not out:
+                    with contextlib.suppress(Exception):
+                        csrf = next((c["value"] for c in page.context.cookies()
+                                     if c["name"] == "csrftoken"), "")
+                        if csrf:
+                            for prov in (prov_slugs or ["google"]):
+                                if out:
+                                    break
+                                with contextlib.suppress(Exception):
+                                    r = page.context.request.post(
+                                        base_url.rstrip("/") + "/_allauth/browser/v1/auth/provider/redirect",
+                                        headers={"X-CSRFToken": csrf, "Referer": base_url},
+                                        form={"provider": prov, "callback_url": base_url, "process": "login"},
+                                        max_redirects=0)
+                                    loc = r.headers.get("location", "")
+                                    if loc and _OAUTH_NAV.search(loc) \
+                                            and urllib.parse.urlparse(loc).netloc.lower() not in ("", origin):
+                                        out.append(loc)
+            finally:
+                with contextlib.suppress(Exception):
+                    b.close()
+    except Exception:
+        pass
+    return list(dict.fromkeys(out))
 
 
 # ---- browser-driven SPA registration (auth self-oracle, client-rendered path) --------------------
@@ -387,6 +712,60 @@ def _fill_and_submit_signup(page, creds) -> bool:
     return False
 
 
+# A magic-link / email-OTP button: "Send magic link", "Continue with email", "Email me a link", plus a bare
+# passwordless "Sign in". Only ever consulted on a form we've confirmed has NO password field, so matching
+# sign-in is safe. Deliberately NOT a bare "send" (a contact form's Send would match) -- it must pair with link/
+# email or be an auth verb.
+_MAGIC_SUBMIT = re.compile(r"magic|send.*link|email.*link|link.*email|get.*link|passwordless|one.?time|"
+                           r"continue with email|email me|sign ?in|log ?in|continue|get started", re.I)
+# The click denylist, magic-scoped: the genuinely dangerous / off-site verbs, but NOT "send"/"confirm" -- a
+# magic-link button legitimately says "Send magic link" / "Confirm your email", and it only ever mails OUR own
+# controlled address. Everything destructive (pay/delete/logout/publish/share/social/external) still blocked.
+_MAGIC_NO_CLICK = re.compile(r"log ?out|sign ?out|delete|remove|pay\b|buy\b|checkout|subscribe|purchase|"
+                             r"publish|invite|download|share|tweet|facebook|instagram|external|https?://", re.I)
+
+
+def _fill_and_submit_magic(page, creds) -> bool:
+    """PASSWORDLESS magic-link / email-OTP request: a visible email field on a form with NO password anywhere.
+    Fill our controlled address and submit so the app's JS mails a magic link (verify_in_browser then follows it).
+    Strictly gated -- if any visible password field exists we do nothing (that's the password lane's job, and an
+    email-only submit there would be wrong). Runs only AFTER every password-signup attempt failed, so it can only
+    convert a dead-end N/A, never disturb the tuned password path. True once an email-first form was submitted."""
+    with contextlib.suppress(Exception):
+        for pw in page.query_selector_all("input[type=password]"):
+            if pw.is_visible():
+                return False                                 # a password form is present -> not passwordless, not ours
+        email_el = None
+        for el in page.query_selector_all("input"):
+            with contextlib.suppress(Exception):
+                if not el.is_visible():
+                    continue
+                typ = (el.get_attribute("type") or "text").lower()
+                hint = _field_hint(el)
+                if typ == "email" or "email" in hint or "mail" in hint:
+                    el.fill(creds["email"]); email_el = el
+                elif typ in ("text", "") and any(h in hint for h in ("user", "name", "handle", "login")):
+                    el.fill(creds["email"])                  # some passwordless forms label the email field 'username'
+                elif typ == "checkbox":
+                    el.check()                               # terms / agree
+                elif (el.get_attribute("required") is not None
+                      and typ not in ("checkbox", "radio", "hidden", "submit", "button", "file")
+                      and not (el.input_value() or "").strip()):
+                    el.fill(creds["email"])                  # keep a required field from silently blocking submit
+        if email_el is None:
+            return False                                     # no email field -> not an email-first auth form
+        for btn in page.query_selector_all("button, input[type=submit], [role=button]"):
+            with contextlib.suppress(Exception):
+                lbl = ((btn.inner_text() or "") + " " + (btn.get_attribute("value") or "") + " "
+                       + (btn.get_attribute("aria-label") or "")).strip().lower()[:60]
+                if (_MAGIC_SUBMIT.search(lbl) or _SIGNUP_SUBMIT.search(lbl)) and not _MAGIC_NO_CLICK.search(lbl) and btn.is_visible():
+                    btn.click(timeout=2500)
+                    return True
+        page.keyboard.press("Enter")                         # fallback: submit the focused email field's form
+        return True
+    return False
+
+
 # Conventional signup routes a 'Get Started' / 'Sign up' CTA navigates to via the JS router (QuizForge's
 # /register et al.) — an <a> LINK the button-only reveal can't open. Tried in order when the homepage has no
 # fillable signup, so a separate-route signup (the common SPA shape) is still reached.
@@ -409,6 +788,26 @@ _SIGNUP_ROUTES = ("/register", "/signup", "/sign-up", "/join", "/auth/register",
 # sign[ _-]?up, not "sign ?up|sign-up": the underscore form is Devise's canonical Rails route
 # (/users/sign_up) and this file's own precision test caught it missing.
 _SIGNUP_LINK = re.compile(r"sign[ _-]?up|regist|create[ _-]?account|get[ _-]?started|\bjoin\b", re.I)
+
+
+# A JS-router signup CTA: a <button>/[role=button] whose onClick pushes the signup route (no <a href>, so
+# _signup_hrefs can't see it). Narrower than _SIGNUP_SUBMIT (no bare continue/submit/create -- those match
+# random CTAs); it must name signup/register/join so clicking it navigates to the signup, never submits a login.
+_SIGNUP_TRIGGER = re.compile(r"sign ?up|register|create (?:your )?account|get started|join now|\bjoin\b", re.I)
+
+
+def _first_signup_trigger(page):
+    """The first visible JS-router signup CTA that is NOT an <a href> (those are _signup_hrefs' job). Element
+    handle or None; clicking it should navigate to the client-rendered signup view a route-guess/href walk misses."""
+    with contextlib.suppress(Exception):
+        for el in page.query_selector_all("button, [role='button'], [onclick]"):
+            with contextlib.suppress(Exception):
+                if not el.is_visible() or el.get_attribute("href"):
+                    continue
+                lbl = ((el.inner_text() or "") + " " + (el.get_attribute("aria-label") or "")).strip().lower()[:60]
+                if _SIGNUP_TRIGGER.search(lbl) and not _NO_CLICK.search(lbl):
+                    return el
+    return None
 
 
 def _signup_hrefs(page, base_url: str) -> list[str]:
@@ -447,14 +846,46 @@ def _signup_hrefs(page, base_url: str) -> list[str]:
     return out[:6]
 
 
-def _reach_and_submit_signup(page, base_url, creds, timeout) -> bool:
+# A visible auth INTENT on a link/button: login / sign-in / sign-up / register / account. Its presence means the
+# app has a self-serve auth surface worth exploring; its ABSENCE (with no password field either) means there is
+# none, so the guessed-route fishing below is pure WAF antagonism with ~zero yield.
+_AUTH_INTENT = re.compile(r"log ?in|sign ?in|log ?on|sign ?up|register|create account|get started|"
+                          r"\baccount\b|\bjoin\b|my account", re.I)
+
+
+def _page_has_auth_entrypoint(page) -> bool:
+    """Any self-serve auth surface on the current page: a password field, or a link/button reading as a
+    login/signup/account intent. When NONE is present the app has no self-serve auth -> the guessed-route fishing
+    (8 _SIGNUP_ROUTES + the magic routes) hammers the app for nothing (a real /signup is always LINKED, so it was
+    already tried via _signup_hrefs). Preserves visibility where auth exists -- a login-only or magic-link app
+    still shows a sign-in link, so it is still fished -- and cuts the fishing only on genuinely no-auth pages,
+    which is where the walk is pure WAF-bait (the sample3large per-app-block trigger)."""
+    with contextlib.suppress(Exception):
+        if page.query_selector("input[type=password]"):
+            return True
+        for el in page.query_selector_all("a, button, [role=button], input[type=submit]"):
+            with contextlib.suppress(Exception):
+                txt = ((el.inner_text() or "") + " " + (el.get_attribute("aria-label") or "")
+                       + " " + (el.get_attribute("value") or ""))[:80]
+                if _AUTH_INTENT.search(txt):
+                    return True
+    return False
+
+
+def _reach_and_submit_signup(page, base_url, creds, timeout, total_timeout: float = 45.0) -> bool:
     """Get to a fillable signup and submit it. The homepage (reveal an inline modal) first; if the signup lives
     on its OWN route — a 'Get Started' <a> link the reveal can't open — walk conventional signup paths and try
-    each. True once a signup form was filled + submitted (the app's own JS then makes the real request)."""
+    each. True once a signup form was filled + submitted (the app's own JS then makes the real request).
+    Wall-clock bounded by `deadline`: the ~10-nav walk x an unbounded reveal per nav could otherwise run to the
+    900s grade kill on a slow app (measured: the 6 residual discover-phase runaways), and a thread-watchdog can't
+    interrupt a GIL-holding step -- so the deadline is checked BETWEEN navs and threaded into each reveal."""
+    deadline = time.monotonic() + total_timeout
+    homepage_has_auth = False
     with contextlib.suppress(Exception):
         page.goto(base_url.rstrip("/") + "/", timeout=timeout * 1000, wait_until="load")
         page.wait_for_timeout(300)
-        _reveal_hidden_controls(page)
+        _reveal_hidden_controls(page, deadline=deadline)
+        homepage_has_auth = _page_has_auth_entrypoint(page)   # gate the guessed-route fishing below
         # The homepage is the one place we have no route-name evidence, so require the form to LOOK like a
         # signup. Without this an app whose landing page is a login gets its login submitted and the walk to
         # /signup never happens.
@@ -462,8 +893,10 @@ def _reach_and_submit_signup(page, base_url, creds, timeout) -> bool:
             return True
     # THE APP'S OWN LINKS BEFORE OUR GUESSES. A hash-only href (#signup, #/signup) is client-side routing that
     # a goto may not re-trigger from the same document, so click those instead; anything with a path or query
-    # is navigable.
+    # is navigable. High signal + low antagonism -> always tried, even on a page with no other auth tell.
     for href in _signup_hrefs(page, base_url):
+        if time.monotonic() > deadline:
+            return False
         with contextlib.suppress(Exception):
             if "#" in href and href.split("#", 1)[0].rstrip("/") in (page.url or "").rstrip("/"):
                 frag = "#" + href.split("#", 1)[1]
@@ -471,17 +904,163 @@ def _reach_and_submit_signup(page, base_url, creds, timeout) -> bool:
             else:
                 page.goto(href, timeout=timeout * 1000, wait_until="load")
             page.wait_for_timeout(400)
-            _reveal_hidden_controls(page)
+            _reveal_hidden_controls(page, deadline=deadline)
             if _fill_and_submit_signup(page, creds):
                 return True
+    # JS-ROUTER signup CTA: a 'Sign up' <button> (onClick router push, no <a href>) is invisible to the href
+    # walk above -- click it to reach the client-rendered signup view, then reveal + fill. Guarded: the fill only
+    # proceeds if a password field actually appears, so a mis-click never submits a login. Measured: the residual
+    # auth-blocked apps that read 'no visible password field reached' on route-router SPAs.
+    if time.monotonic() < deadline:
+        trig = _first_signup_trigger(page)
+        if trig is not None:
+            with contextlib.suppress(Exception):
+                trig.click(timeout=2500)
+                page.wait_for_timeout(500)
+                _reveal_hidden_controls(page, deadline=deadline)
+                if _fill_and_submit_signup(page, creds):
+                    return True
+    # GUESSED-ROUTE FISHING: 8 conventional /signup paths. Worth it only when the app SHOWS a self-serve auth
+    # surface; on a no-auth page these 8 navigations are pure WAF antagonism (~zero yield -- a real signup is
+    # linked, tried above) and were a chunk of the per-app-block trigger. Skip them when there's no auth tell.
+    if not homepage_has_auth:
+        return False
     for route in _SIGNUP_ROUTES:
+        if time.monotonic() > deadline:
+            break
         with contextlib.suppress(Exception):
             page.goto(base_url.rstrip("/") + route, timeout=timeout * 1000, wait_until="load")
             page.wait_for_timeout(400)
-            _reveal_hidden_controls(page)
+            _reveal_hidden_controls(page, deadline=deadline)
             if _fill_and_submit_signup(page, creds):
                 return True
     return False
+
+
+def _reach_and_submit_magic(page, base_url, creds, timeout) -> bool:
+    """PASSWORDLESS magic-link / email-OTP request (LANE C). Try the homepage and the common auth routes with the
+    email-first submitter. THE LAST RESORT -- register_in_browser calls this only after the password-signup lane
+    AND the email-first wizard (LANE B) both found nothing, so it converts a dead-end N/A and never preempts a
+    password signup or a code wizard. True once an email-only auth form was submitted (the app then mails a link
+    that verify_in_browser follows). Gated on the homepage showing an auth surface -- a magic-link app still shows
+    a sign-in link, so it's still tried; a no-auth page skips the fishing (same WAF-antagonism cut as above)."""
+    for i, route in enumerate(("/", "/login", "/signin")):   # where a magic-link / passwordless form actually lives
+        with contextlib.suppress(Exception):
+            page.goto(base_url.rstrip("/") + route, timeout=timeout * 1000, wait_until="load")
+            page.wait_for_timeout(350)
+            _reveal_hidden_controls(page)
+            if i == 0 and not _page_has_auth_entrypoint(page):
+                return False                                 # no auth surface -> skip the magic fishing too
+            if _fill_and_submit_magic(page, creds):
+                return True
+    return False
+
+
+# --- LANE B: email-first signup WIZARD (step 1 = email + emailed CODE, no password; step 2 = create password) --
+# The shape register_in_browser's password-keyed path can't submit (its step 1 has no password field, e.g.
+# insightaco). Driven IN ONE SESSION so the emailed code stays valid: fill email -> trigger + wait for the code
+# field -> fetch the code from OUR inbox via a callback -> submit it -> fill a step-2 password if present. Every
+# step is best-effort + safe-degrading (any failure -> return False, the caller then reports the normal N/A).
+_EMAIL_INPUT = "input[type=email], input[name*=email i], input[id*=email i], input[placeholder*=email i]"
+_CODE_INPUT_HINT = re.compile(r"code|otp|verif|pin|token", re.I)
+_STEP_SUBMIT = re.compile(r"continue|next|verif|get.?code|send.?code|confirm|submit|sign.?up|create.?account", re.I)
+
+
+def _has_visible_password(page) -> bool:
+    with contextlib.suppress(Exception):
+        return any(p.is_visible() for p in page.query_selector_all("input[type=password]"))
+    return False
+
+
+def _click_step_button(page, timeout) -> bool:
+    """Click the step's advance button (Continue/Next/Verify/Submit), never a _NO_CLICK control (pay/delete/...)."""
+    with contextlib.suppress(Exception):
+        for b in page.query_selector_all("button, input[type=submit], [role=button]"):
+            if not b.is_visible():
+                continue
+            label = ((b.inner_text() or "") + " " + (b.get_attribute("value") or "")).strip()
+            if label and _STEP_SUBMIT.search(label) and not _NO_CLICK.search(label):
+                b.click(timeout=timeout * 1000)
+                return True
+    return False
+
+
+def _find_code_field(page):
+    """The verification-CODE input(s): a single input hinting code/otp/verif/pin, else a row of single-char
+    maxlength=1 boxes (a boxed OTP widget). None when no code field is present yet."""
+    with contextlib.suppress(Exception):
+        for inp in page.query_selector_all("input"):
+            if not inp.is_visible():
+                continue
+            hint = " ".join(filter(None, [inp.get_attribute("name"), inp.get_attribute("id"),
+                                          inp.get_attribute("placeholder"), inp.get_attribute("aria-label"),
+                                          inp.get_attribute("autocomplete")]))
+            if hint and _CODE_INPUT_HINT.search(hint):
+                return [inp]
+        boxes = [i for i in page.query_selector_all("input")
+                 if i.is_visible() and i.get_attribute("maxlength") == "1"]
+        if 3 <= len(boxes) <= 8:
+            return boxes
+    return None
+
+
+def _fill_code(fields, code) -> bool:
+    with contextlib.suppress(Exception):
+        if len(fields) == 1:
+            fields[0].fill(str(code))
+        else:                                            # a boxed OTP widget: one char per box
+            for f, ch in zip(fields, str(code)):
+                f.fill(ch)
+        return True
+    return False
+
+
+def _reach_email_first_step(page, base_url, timeout) -> bool:
+    """Park on a signup route that shows an EMAIL field with NO visible password -- the email-first step."""
+    for route in [""] + list(_SIGNUP_ROUTES):
+        with contextlib.suppress(Exception):
+            page.goto(base_url.rstrip("/") + (route or "/"), timeout=timeout * 1000, wait_until="load")
+            page.wait_for_timeout(300)
+            _reveal_hidden_controls(page)
+            if page.query_selector(_EMAIL_INPUT) and not _has_visible_password(page):
+                return True
+    return False
+
+
+def _drive_email_first(page, base_url, email, code_getter, creds, timeout) -> bool:
+    """Drive the email-first wizard on an OPEN page. True once it has advanced through the code step (the caller
+    then captures whatever session the app established); False on any dead end. `code_getter()` fetches the code
+    from our inbox IN-SESSION (so re-triggering doesn't matter -- the code we submit is the one just sent)."""
+    if not _reach_email_first_step(page, base_url, timeout):
+        return False
+    email_el = page.query_selector(_EMAIL_INPUT)
+    if email_el is None:
+        return False
+    with contextlib.suppress(Exception):
+        email_el.fill(email)
+    _click_step_button(page, timeout)                    # trigger the code send / advance to the code step
+    fields = None
+    for _ in range(20):                                  # wait up to ~6s for the code field to appear
+        fields = _find_code_field(page)
+        if fields:
+            break
+        with contextlib.suppress(Exception):
+            page.wait_for_timeout(300)
+    if not fields:
+        return False
+    code = None
+    with contextlib.suppress(Exception):
+        code = code_getter()                             # polls OUR inbox (up to ~60s) for the just-sent code
+    if not code:
+        return False
+    fields = _find_code_field(page) or fields            # re-locate: filling email may have re-rendered the DOM
+    if not _fill_code(fields, code):
+        return False
+    _click_step_button(page, timeout)                    # submit the code
+    with contextlib.suppress(Exception):
+        page.wait_for_timeout(500)
+    _fill_and_submit_signup(page, creds)                 # step 2: create a password if the wizard now asks for one
+    return True
 
 
 # A session token PERSISTED in localStorage (Supabase 'sb-<ref>-auth-token', Firebase authUser, or a bare JWT)
@@ -515,7 +1094,245 @@ def _extract_storage_token(page) -> dict:
     return {}
 
 
-def register_in_browser(base_url: str, headers=None, timeout: float = 12.0, total_timeout: float = 45.0):
+# --- browser-driven DATA-PLANE READ-BACK (the SPA write round-trip httpx can't observe) --------------------
+# On an SPA the form action is a placeholder (the real submit is a JS fetch), the created item paints on a
+# CLIENT-SIDE route, and the create is often auth-gated -- so an httpx POST hits the shell and never sees the
+# value come back. Drive the create IN THE BROWSER (carrying any session), let the app's own JS make the real
+# call, then RE-RENDER and read the value back from the rendered DOM. One primitive the stateful cluster shares
+# (qa-input-002 encoding, qa-integrity persistence, stored-xss, IDOR). Best-effort + safe-degrading (flaky).
+def _fill_content_form(page, value: str, timeout: float) -> bool:
+    """Fill a CREATE/content form's text field with `value` (other fields benign) and submit via the app's OWN JS
+    (requestSubmit fires the onsubmit fetch). A content form = a VISIBLE form with a text input/textarea, NO
+    password field (that's login/signup), not a _NO_CLICK (delete/pay/logout) form. True once one is submitted."""
+    with contextlib.suppress(Exception):
+        for form in page.query_selector_all("form"):
+            with contextlib.suppress(Exception):
+                if not form.is_visible() or _NO_CLICK.search((form.inner_text() or "")[:200]):
+                    continue
+                if form.query_selector("input[type=password]"):
+                    continue                                     # a credential form, not content
+                target = None
+                for inp in form.query_selector_all(
+                        "input:not([type=hidden]):not([type=file]):not([type=password]), textarea"):
+                    t = (inp.get_attribute("type") or "text").lower()
+                    if t in ("submit", "button", "checkbox", "radio"):
+                        continue
+                    is_textish = t in ("text", "search", "") or bool(inp.evaluate("e => e.tagName === 'TEXTAREA'"))
+                    if target is None and is_textish:
+                        inp.fill(value)                          # the observable field -> our marker+value
+                        target = inp
+                    else:
+                        inp.fill("hl.probe@example.com" if t == "email" else "hlprobe")
+                if target is None:
+                    continue
+                form.evaluate("f => (f.requestSubmit ? f.requestSubmit() : f.submit())")
+                page.wait_for_timeout(int(timeout * 40))
+                return True
+    return _fill_formless_create(page, value, timeout)   # no <form> matched -> the SPA formless-create shape
+
+
+def _fill_formless_create(page, value: str, timeout: float) -> bool:
+    """FORMLESS create -- a bare text input/textarea/contenteditable + a separate Add/Create/Post/Send button
+    (onClick -> fetch), or a single input that submits on Enter. The common React shape _fill_content_form's
+    <form> scan misses. Fills the most create-hinted content field, then triggers the write. True if it filled +
+    triggered something plausible; the caller's read-back decides if it actually persisted (a wrong guess just
+    fails to read back and stays N/A, never a false fire -- the consumers are one-directional or oracle-gated)."""
+    with contextlib.suppress(Exception):
+        cands = []
+        for i in page.query_selector_all(
+                "input[type=text], input[type=search], input:not([type]), textarea, [contenteditable='true']"):
+            with contextlib.suppress(Exception):
+                if not i.is_visible():
+                    continue
+                if i.evaluate("e => { const f = e.closest('form'); return !!(f && f.querySelector('input[type=password]')); }"):
+                    continue                                     # a login/signup field -> content it is not (register lane's job)
+                cands.append(i)
+        if not cands:
+            return False
+
+        def _hinted(i):
+            with contextlib.suppress(Exception):
+                blob = " ".join((i.get_attribute(a) or "") for a in ("placeholder", "aria-label", "name", "id"))
+                return 1 if _CREATE_INPUT_HINT.search(blob) else 0
+            return 0
+        target = max(cands, key=_hinted)                         # prefer a 'add a task'/'write a post' field
+        with contextlib.suppress(Exception):
+            if (target.get_attribute("contenteditable") or "").lower() == "true":
+                target.click()
+                target.type(value)
+            else:
+                target.fill(value)
+        for b in page.query_selector_all("button, [role='button'], input[type='submit'], input[type='button']"):
+            with contextlib.suppress(Exception):
+                if not b.is_visible():
+                    continue
+                label = (b.inner_text() or b.get_attribute("value") or b.get_attribute("aria-label") or "")[:40]
+                if _CREATE_BTN.search(label) and not _DESTRUCTIVE_BTN.search(label):
+                    b.click(timeout=2500)                        # benign content -> Add/Post/Send are safe triggers
+                    return True
+        with contextlib.suppress(Exception):
+            target.press("Enter")                                # single-input creates usually submit on Enter
+            return True
+    return False
+
+
+def _dom_text(page) -> str:
+    with contextlib.suppress(Exception):
+        return page.inner_text("body") or ""
+    return ""
+
+
+@_browser_guarded
+def _drive_create_and_observe(base_url, submit_value, headers, timeout, observe):
+    """Core browser write round trip: fill a content form with `submit_value` (carrying `headers` -- the
+    register-lane session, so auth-gated creates work), submit via the app's OWN JS, RE-RENDER (in place, then one
+    reload), and return the first truthy `observe(page)`. `observe` reads whatever facet the caller needs -- the
+    rendered DOM text (encoding/integrity), or window.__hl_domxss (stored-xss execution). None if nothing observed.
+    Best-effort + safe-degrading (browser-flaky by nature)."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return None
+    try:
+        with sync_playwright() as pw:
+            b = _launch(pw)
+            if b is None:
+                return None
+            try:
+                page = b.new_page()
+                _apply_auth(page, base_url, headers)
+                with contextlib.suppress(Exception):
+                    page.goto(base_url.rstrip("/") + "/", timeout=timeout * 1000, wait_until="load")
+                    page.wait_for_timeout(300)
+                    _reveal_hidden_controls(page)               # open a create modal/form if it's behind a CTA
+                if not _fill_content_form(page, submit_value, timeout):
+                    return None
+                with contextlib.suppress(Exception):
+                    page.wait_for_load_state("networkidle", timeout=6000)
+                page.wait_for_timeout(500)
+                for attempt in (0, 1):                           # the item may paint in place, or need a reload
+                    result = observe(page)
+                    if result:
+                        return result
+                    with contextlib.suppress(Exception):
+                        page.reload(timeout=timeout * 1000, wait_until="load")
+                        page.wait_for_timeout(600)
+                return None
+            finally:
+                b.close()
+    except Exception:
+        return None
+
+
+def create_and_read_back(base_url: str, submit_value: str, locate: str, headers=None, timeout: float = 12.0):
+    """Drive an SPA write round trip and READ THE VALUE BACK: fill a create form's text field with `submit_value`,
+    submit via the app's JS, re-render, and return the rendered DOM TEXT once `locate` (a unique marker in
+    submit_value) round-trips -- else None. The client-side-route read-back httpx can't do. Consumers check that
+    text (qa-input-002 -> corruption, qa-integrity -> presence)."""
+    def observe(page):
+        text = _dom_text(page)
+        return text if locate in text else None
+    return _drive_create_and_observe(base_url, submit_value, headers, timeout, observe)
+
+
+def create_and_check_execution(base_url: str, payload: str, marker: str, headers=None, timeout: float = 12.0) -> bool:
+    """Drive a STORED-XSS check through the browser create: submit `payload` (a script that sets
+    window.__hl_domxss = marker) into a content form, re-render, and return True iff it EXECUTED -- the stored
+    value ran unescaped in the DOM. Reaches auth-gated / SPA creates the httpx stored_xss_api can't POST to."""
+    def observe(page):
+        with contextlib.suppress(Exception):
+            return marker if page.evaluate("() => window.__hl_domxss") == marker else None
+        return None
+    return bool(_drive_create_and_observe(base_url, payload, headers, timeout, observe))
+
+
+def _render_and_find(browser_obj, base_url, headers, locate, timeout):
+    """Open an ISOLATED context (its own cookie jar) as `headers`' identity, render base_url, reveal any
+    behind-a-CTA feed, and report whether `locate` appears in the rendered DOM text (one reload retry). The
+    read half of the cross-user round trip -- each identity gets a fresh context so A's and B's sessions never mix."""
+    ctxt = browser_obj.new_context()
+    try:
+        page = ctxt.new_page()
+        _apply_auth(page, base_url, headers)
+        with contextlib.suppress(Exception):
+            page.goto(base_url.rstrip("/") + "/", timeout=timeout * 1000, wait_until="load")
+            page.wait_for_timeout(400)
+            _reveal_hidden_controls(page)                        # open a feed/list that only paints on interaction
+            page.wait_for_load_state("networkidle", timeout=6000)
+        for _ in (0, 1):
+            if locate in _dom_text(page):
+                return True
+            with contextlib.suppress(Exception):
+                page.reload(timeout=timeout * 1000, wait_until="load")
+                page.wait_for_timeout(600)
+        return False
+    finally:
+        with contextlib.suppress(Exception):
+            ctxt.close()
+
+
+@_browser_guarded
+def cross_user_read_back(base_url: str, submit_value: str, locate: str,
+                         a_headers, b_headers, timeout: float = 12.0):
+    """Two-session cross-user read-back for IDOR/BOLA on the SPA data plane. CREATE as identity A (a_headers) in a
+    browser and confirm A can see its own canary `locate`; then check an ANONYMOUS render CANNOT see it (the app
+    gates the data -- else it's public by intent, not a leak); then render as an INDEPENDENT identity B (b_headers)
+    and report whether A's canary surfaces in B's OWN view. Returns True (B sees A's gated value -> broken
+    object-level authorization), False (owner-scoped: A saw it, anon/B did not -> clean), or None (A's create
+    couldn't be established/observed -> untestable, never a false clean). Isolated contexts per identity so
+    sessions never mix. Residual intent boundary (same as api_bola_collection): an app that INTENDS a shared feed
+    behind login reads as a leak here -- rare in a CRUD corpus, and the anon gate removes the public-feed case."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return None
+    try:
+        with sync_playwright() as pw:
+            bobj = _launch(pw)
+            if bobj is None:
+                return None
+            try:
+                # --- create as A, in A's own isolated context, and confirm A sees the canary ---
+                ctx_a = bobj.new_context()
+                try:
+                    pa = ctx_a.new_page()
+                    _apply_auth(pa, base_url, a_headers)
+                    with contextlib.suppress(Exception):
+                        pa.goto(base_url.rstrip("/") + "/", timeout=timeout * 1000, wait_until="load")
+                        pa.wait_for_timeout(300)
+                        _reveal_hidden_controls(pa)
+                    if not _fill_content_form(pa, submit_value, timeout):
+                        return None                              # no create surface for A to write through
+                    with contextlib.suppress(Exception):
+                        pa.wait_for_load_state("networkidle", timeout=6000)
+                    pa.wait_for_timeout(500)
+                    seen_by_a = False
+                    for _ in (0, 1):
+                        if locate in _dom_text(pa):
+                            seen_by_a = True
+                            break
+                        with contextlib.suppress(Exception):
+                            pa.reload(timeout=timeout * 1000, wait_until="load")
+                            pa.wait_for_timeout(600)
+                    if not seen_by_a:
+                        return None                              # create never surfaced even to A -> untestable
+                finally:
+                    with contextlib.suppress(Exception):
+                        ctx_a.close()
+                # --- anon must NOT see it (private-by-observation gate) -> else public by intent, not IDOR ---
+                if _render_and_find(bobj, base_url, None, locate, timeout):
+                    return False                                 # visible anonymously -> public data, not a leak
+                # --- render as B (independent identity): B seeing A's gated canary = cross-user read ---
+                return True if _render_and_find(bobj, base_url, b_headers, locate, timeout) else False
+            finally:
+                bobj.close()
+    except Exception:
+        return None
+
+
+@_browser_guarded
+def register_in_browser(base_url: str, headers=None, timeout: float = 12.0, total_timeout: float = 45.0,
+                        email: str | None = None, code_getter=None):
     """SPA self-registration THROUGH the browser (the auth self-oracle's client-rendered path): open the signup
     form, fill throwaway creds, submit so the app's OWN JS makes the real registration request, and return the
     session cookie the server sets IN THE BROWSER — the thing an httpx form-POST can't get on an SPA (the form's
@@ -525,15 +1342,25 @@ def register_in_browser(base_url: str, headers=None, timeout: float = 12.0, tota
     storage_exposed:bool} or None (no browser / no fillable signup / NEITHER a cookie nor a token — email-verify /
     CAPTCHA / SSO). Best-effort + side-effecting: creates ONE throwaway account, like the httpx register; targets a
     SIGNUP form only (a password field), never login/pay/delete (the reveal + _NO_CLICK guards). Caller (auth)
-    decides which cookie/token is the session and whether registration succeeded."""
+    decides which cookie/token is the session and whether registration succeeded.
+
+    `email`, when set, fills the signup's email field with a controlled address WE own (the email-verification
+    flow), so an email-GATED SPA mails the confirmation to us. In that mode the submitted-but-no-session outcome
+    is NOT a bare None: it returns {email_pending: True, creds, cookies, request} so the email flow can poll the
+    inbox and complete the verification link in the browser (verify_in_browser). Callers that pass no email keep
+    the exact old contract (None on no session).
+
+    `code_getter`, when set (with `email`), enables the LANE-B email-first WIZARD fallback: if no password-signup
+    form is reachable but an email-first step is (email + emailed CODE, password on a later step), drive it in one
+    session, calling code_getter() to fetch the code from our inbox mid-flow. None-safe: absent -> old behavior."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
         return None
     import secrets
     uname = "hl_" + secrets.token_hex(5)
-    creds = {"email": uname + "@example.com", "username": uname, "password": "Hl-Probe-Passw0rd!"}
-    captured, seen_bearer, reads, out = {}, {}, [], None
+    creds = {"email": email or (uname + "@example.com"), "username": uname, "password": "Hl-Probe-Passw0rd!"}
+    captured, seen_bearer, reads, out, signup_resp = {}, {}, [], None, {}
     LAST_STAGE.clear()
     try:
         with sync_playwright() as pw:
@@ -560,11 +1387,26 @@ def register_in_browser(base_url: str, headers=None, timeout: float = 12.0, tota
                                 reads.append({"url": req.url, "apikey": apikey})
                 page.on("request", _on_request)
 
-                if not _reach_and_submit_signup(page, base_url, creds, timeout):
-                    LAST_STAGE["stage"] = ("no fillable signup reached: no visible password field on the "
-                                           "homepage (after revealing hidden controls) or at any of %d "
-                                           "conventional signup routes" % len(_SIGNUP_ROUTES))
-                    return None
+                def _on_response(resp):   # the signup RESPONSE body -> lets the caller detect a verification
+                    with contextlib.suppress(Exception):   # 'promise' (announce language, or allauth's JSON
+                        rq = resp.request                  # `verify_email is_pending`) even when a session is granted
+                        if rq.method in ("POST", "PUT") and creds["password"] in (rq.post_data or "") \
+                                and "body" not in signup_resp:
+                            signup_resp["body"] = (resp.text() or "")[:2000]
+                page.on("response", _on_response)
+
+                if not _reach_and_submit_signup(page, base_url, creds, timeout, total_timeout):
+                    # LANE B: EMAIL-FIRST wizard (email + emailed code, password on a later step) when we have an
+                    # inbox AND a code fetcher. LANE C: passwordless magic-link (email-only form). Ordered so the
+                    # wizard, the more complete flow, is tried BEFORE the email-only magic submit -- else magic
+                    # would submit the wizard's step-1 email form and short-circuit it.
+                    wizard_ok = (email is not None and code_getter is not None
+                                 and _drive_email_first(page, base_url, email, code_getter, creds, timeout))
+                    if not wizard_ok and not _reach_and_submit_magic(page, base_url, creds, timeout):
+                        LAST_STAGE["stage"] = ("no fillable signup reached: no visible password field on the "
+                                               "homepage (after revealing hidden controls) or at any of %d "
+                                               "conventional signup routes" % len(_SIGNUP_ROUTES))
+                        return None
                 with contextlib.suppress(Exception):                 # let the registration fetch + Set-Cookie/token land
                     page.wait_for_load_state("networkidle", timeout=8000)
                 page.wait_for_timeout(500)
@@ -586,16 +1428,85 @@ def register_in_browser(base_url: str, headers=None, timeout: float = 12.0, tota
                                            "no token%s (e-mail confirmation / CAPTCHA / approval / SSO-only)"
                                            % (" — a registration request WAS observed" if captured else
                                               " and no registration request was even observed"))
+                    if email is not None:
+                        # EMAIL-FLOW mode: the signup submitted with OUR address but granted no session -> maybe
+                        # e-mail confirmation, maybe CAPTCHA / SSO / admin-approval. Hand back the SUBMITTED state
+                        # (not None) plus the post-submit page TEXT, so the email flow can confirm the page really
+                        # announces e-mail before it treats this as email-gated (and only then poll the inbox).
+                        # Callers in the non-email auth self-oracle path (email is None) still get the old None.
+                        page_text = ""
+                        with contextlib.suppress(Exception):
+                            page_text = (page.inner_text("body") or "")[:5000]
+                        return {"email_pending": True, "creds": creds, "cookies": jar, "page_text": page_text,
+                                "request": captured or None, "backend_reads": reads,
+                                "signup_response": signup_resp.get("body", "")}
                     return None
                 out = {"creds": creds, "cookies": jar, "request": captured or None,
                        "bearer": bearer, "storage_exposed": bool(stored.get("token")),
-                       "backend_reads": reads}
+                       "backend_reads": reads, "signup_response": signup_resp.get("body", "")}
             finally:
                 b.close()
     except Exception as exc:
         LAST_STAGE["stage"] = "browser registration raised %s" % type(exc).__name__
         return None
     return out
+
+
+@_browser_guarded
+def verify_in_browser(link: str, base_url: str = "", headers=None, timeout: float = 12.0):
+    """Complete a SPA e-mail verification: open the emailed confirmation LINK in a fresh browser so the app's OWN
+    JS reads the token out of the URL and establishes the session — an httpx GET can't run that JS, so a
+    client-rendered verify page would otherwise never log us in. Same capture path as register_in_browser:
+    returns {cookies:[{name,value,httponly,secure,samesite}], bearer:str|None, storage_exposed:bool,
+    backend_reads:[...]} when the link grants a session, else None (no browser / inert or dead link). Stateless by
+    design — the token is IN the link, so a fresh context (no prior signup session) completes it just fine."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return None
+    seen_bearer: dict = {}
+    reads: list = []
+    try:
+        with sync_playwright() as pw:
+            b = _launch(pw)
+            if b is None:
+                return None
+            try:
+                page = b.new_page()
+                _apply_auth(page, base_url or link, headers)
+
+                def _on_request(req):
+                    with contextlib.suppress(Exception):
+                        authz = req.headers.get("authorization", "")
+                        if authz[:7].lower() == "bearer " and len(authz) > 27:
+                            seen_bearer["token"] = authz[7:]
+                        apikey = req.headers.get("apikey")
+                        if req.method == "GET" and apikey and "/rest/v1/" in req.url and len(reads) < 10:
+                            if not any(r["url"] == req.url for r in reads):
+                                reads.append({"url": req.url, "apikey": apikey})
+                page.on("request", _on_request)
+                with contextlib.suppress(Exception):
+                    page.goto(link, timeout=int(timeout * 1000), wait_until="commit")
+                with contextlib.suppress(Exception):
+                    page.wait_for_load_state("networkidle", timeout=8000)
+                page.wait_for_timeout(500)
+                cookies = []
+                with contextlib.suppress(Exception):
+                    cookies = page.context.cookies()
+                jar = [{"name": c["name"], "value": c.get("value", ""),
+                        "httponly": bool(c.get("httpOnly")), "secure": bool(c.get("secure")),
+                        "samesite": (c.get("sameSite") or "").lower() in ("lax", "strict")}
+                       for c in cookies]
+                stored = _extract_storage_token(page)
+                bearer = stored.get("token") or seen_bearer.get("token")
+                if not jar and not bearer:
+                    return None   # the link established no session -> inert verification (qa-email-002's concern)
+                return {"cookies": jar, "bearer": bearer,
+                        "storage_exposed": bool(stored.get("token")), "backend_reads": reads}
+            finally:
+                b.close()
+    except Exception:
+        return None
 
 
 # ---- stale UI after a save (qa-staleui-001) ------------------------------------------------------
@@ -641,6 +1552,7 @@ def _fill_create_form(page, marker) -> bool:
     return False
 
 
+@_browser_guarded
 def check_create_reflection(base_url, marker, headers=None, timeout: float = 12.0):
     """Submit a create form (a text field filled with `marker`), then check whether the app reflects the new
     item in the DOM WITHOUT a reload. Returns 'stale' (absent live, present after reload -> the bug),
@@ -750,13 +1662,14 @@ def _quiet_close(popup):
         popup.close()
 
 
+@_browser_guarded
 def inert_controls(url: str, headers=None, timeout: float = 12.0, max_controls: int = 10,
                    per_wait_ms: int = 400, total_timeout: float = 40.0) -> list | None:
     """Click each reveal-safe control on the page and return the labels of the ones that produced NO
     observable effect on ANY watched channel — inert ("dead") controls. None if no browser or the render
     fails; [] if every control did something. Channels: DOM mutation / network / navigation / dialog /
     uncaught error / scroll (smooth-scroll nav) / clipboard (copy) / popup (window.open) / file-chooser
-    (upload). Observed behavior, so event-delegated handlers (invisible to a static check) still clear a
+    (upload) / download (a file link). Observed behavior, so event-delegated handlers (invisible to a static check) still clear a
     control; a control whose only effect is slower than per_wait_ms reads as live-or-skipped, never dead —
     the miss-don't-invent bias that keeps this safe to score. Already-active tabs/toggles (aria-selected/
     pressed) are not clicked (re-clicking them is a correct no-op, not a dead control)."""
@@ -772,7 +1685,7 @@ def inert_controls(url: str, headers=None, timeout: float = 12.0, max_controls: 
             try:
                 page = b.new_page()
                 net, dialogs, errs = {"n": 0}, {"n": 0}, {"n": 0}
-                popups, choosers = {"n": 0}, {"n": 0}
+                popups, choosers, downloads = {"n": 0}, {"n": 0}, {"n": 0}
                 page.on("request", lambda r: net.__setitem__("n", net["n"] + 1))         # ALL network (img/beacon too)
                 page.on("dialog", lambda d: (dialogs.__setitem__("n", dialogs["n"] + 1), d.dismiss()))
                 page.on("pageerror", lambda e: errs.__setitem__("n", errs["n"] + 1))
@@ -781,6 +1694,10 @@ def inert_controls(url: str, headers=None, timeout: float = 12.0, max_controls: 
                 # the DOM/network channels; watch them so those controls clear instead of reading as dead.
                 page.on("popup", lambda p: (popups.__setitem__("n", popups["n"] + 1), _quiet_close(p)))
                 page.on("filechooser", lambda fc: choosers.__setitem__("n", choosers["n"] + 1))
+                # a <a href="report.csv"> / <a download> triggers a file download, not a nav/DOM change -- a real
+                # effect off the other channels, so watch it or those controls read as dead (killthebill's
+                # 'Sample 1/2' CSV links were the qa-deadctrl-001 FP class).
+                page.on("download", lambda d: downloads.__setitem__("n", downloads["n"] + 1))
                 page.add_init_script(script=_INERT_WATCH_JS)   # re-installs the watcher on every navigation
                 _apply_auth(page, url, headers)
                 page.goto(url, timeout=timeout * 1000, wait_until="load")
@@ -801,15 +1718,16 @@ def inert_controls(url: str, headers=None, timeout: float = 12.0, max_controls: 
                             loc.scroll_into_view_if_needed(timeout=1000)
                         page.evaluate("() => { if (window.__hlw) { window.__hlw.muts = 0; window.__hlw.reqs = 0;"
                                       " window.__hlw.clip = 0; window.__hlw.scroll = 0; } }")
-                        n0, d0, e0, p0, f0, url0 = (net["n"], dialogs["n"], errs["n"], popups["n"],
-                                                    choosers["n"], page.url)
+                        n0, d0, e0, p0, f0, dl0, url0 = (net["n"], dialogs["n"], errs["n"], popups["n"],
+                                                         choosers["n"], downloads["n"], page.url)
                         loc.click(timeout=1500)
                         page.wait_for_timeout(per_wait_ms)
                         w = page.evaluate("() => window.__hlw || {muts: 0, reqs: 0, clip: 0, scroll: 0}")
                         navigated = page.url != url0
                         moved = ((w.get("muts") or 0) or (w.get("reqs") or 0) or (w.get("clip") or 0)
                                  or (w.get("scroll") or 0) or (net["n"] - n0) or (dialogs["n"] - d0)
-                                 or (errs["n"] - e0) or (popups["n"] - p0) or (choosers["n"] - f0) or navigated)
+                                 or (errs["n"] - e0) or (popups["n"] - p0) or (choosers["n"] - f0)
+                                 or (downloads["n"] - dl0) or navigated)
                         if not moved:
                             dead.append(label or "(unlabeled)")
                         if navigated:   # a live control that navigated away -> restore + re-tag to continue
@@ -823,31 +1741,6 @@ def inert_controls(url: str, headers=None, timeout: float = 12.0, max_controls: 
         return None
 
 
-def first_contentful_paint(url: str, headers=None, timeout: float = 12.0) -> float | None:
-    """Render url and return First Contentful Paint in milliseconds (the user-facing 'time to see
-    something' metric). None if no browser, render fails, or nothing ever paints."""
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        return None
-    try:
-        with sync_playwright() as pw:
-            b = _launch(pw)
-            if b is None:
-                return None
-            try:
-                page = b.new_page()
-                _apply_auth(page, url, headers)
-                page.goto(url, timeout=timeout * 1000, wait_until="load")
-                page.wait_for_timeout(2500)  # allow delayed/contentful paint to occur
-                return page.evaluate(
-                    "() => { const e = performance.getEntriesByName('first-contentful-paint')[0];"
-                    " return e ? e.startTime : null; }"
-                )
-            finally:
-                b.close()
-    except Exception:
-        return None
 
 
 # Accessibility is graded with axe-core (Deque), the gold-standard WCAG engine, injected into the render.
@@ -855,10 +1748,14 @@ def first_contentful_paint(url: str, headers=None, timeout: float = 12.0) -> flo
 # `incomplete` (needs a human to decide). We take `violations` only, filtered to the WCAG 2 A/AA
 # conformance target (excludes best-practice opinions + aspirational AAA) — so the ingested corpus lands
 # squarely on our objective/intent-independent axis, and `incomplete` is left to the human judge.
-# WCAG 2.0/2.1 A/AA — the established conformance target (ADA / Section 508 / EN 301 549). We omit the
-# newer WCAG 2.2 rules (e.g. target-size), which fire on default-sized controls across most well-built
-# desktop pages and would false-positive; 2.2 can be revisited once we can gauge its precision on real apps.
+# WCAG 2.0/2.1 A/AA — the established conformance target (ADA / Section 508 / EN 301 549), the SCORED set.
 _AXE_WCAG_TAGS = ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"]
+# v2.0 FAMILY 2: the candidate expansion (WCAG 2.2 AA + axe best-practice: target-size, landmarks, heading
+# order, skip links, ...). Run alongside the scored set but captured OFF-SCORE (see a11y_violations_present),
+# so the next corpus re-grade can measure each rule's DECORRELATION from the existing a11y carrier before any
+# of it is promoted to the score. This is the "gauge its precision on real apps first" the old comment asked
+# for. target-size is enabled explicitly (axe ships it disabled by default).
+_AXE_ADVISORY_TAGS = ["wcag22aa", "best-practice"]
 _AXE_JS_CACHE: str | None = None
 
 
@@ -895,6 +1792,7 @@ _CONTRAST_JS = r"""() => {
 }"""
 
 
+@_browser_guarded
 def _eval_page(url, headers, timeout, js_list):
     """Render url once and return the summed result of each JS expression, or None if no browser/render."""
     try:
@@ -947,10 +1845,11 @@ def _contrast_data(violation) -> list:
     return out
 
 
+@_browser_guarded
 def a11y_violations(url: str, headers=None, timeout: float = 12.0) -> list | None:
-    """Render url, inject axe-core, and return its WCAG 2 A/AA violations as [{id, impact}] — the
-    gold-standard deterministic a11y ruleset (~100 rules incl. contrast, ARIA, structure). None if no
-    browser or the render fails."""
+    """Render url, inject axe-core, and return its violations as [{id, impact, tags}] — the WCAG 2 A/AA SCORED
+    ruleset (~100 rules incl. contrast, ARIA, structure) PLUS the Family-2 advisory candidates (WCAG 2.2 AA +
+    axe best-practice). `tags` lets the caller partition scored-vs-advisory. None if no browser / render fails."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -970,10 +1869,11 @@ def a11y_violations(url: str, headers=None, timeout: float = 12.0) -> list | Non
                     page.wait_for_timeout(300)                    # violations (and the count flaps between runs)
                 page.add_script_tag(content=_axe_js())            # defines window.axe
                 results = page.evaluate(
-                    "() => axe.run(document, {runOnly: {type: 'tag', values: %s}})" % json.dumps(_AXE_WCAG_TAGS))
+                    "() => axe.run(document, {runOnly: {type: 'tag', values: %s}, "
+                    "rules: {'target-size': {enabled: true}}})" % json.dumps(_AXE_WCAG_TAGS + _AXE_ADVISORY_TAGS))
                 out = []
                 for v in results.get("violations", []):
-                    rec = {"id": v["id"], "impact": v.get("impact")}
+                    rec = {"id": v["id"], "impact": v.get("impact"), "tags": v.get("tags") or []}
                     if v["id"] == "color-contrast":
                         # axe fixes this rule's impact at "serious" regardless of HOW unreadable the text is,
                         # so 4.4:1 (a hair under AA) and 1.1:1 (effectively invisible) arrive identical. Keep
@@ -1020,19 +1920,57 @@ _RENDER_HEALTH_JS = r"""() => {
 }"""
 
 
+# v2.0 Family 3 -- widen console capture beyond uncaught throws. A CSP that blocks the app's OWN resource and a
+# React hydration mismatch are real functional breakages a browser reports as console.error (NOT pageerror), so
+# the old pageerror-only hook dropped them (qa-console-001 fired only ~39x on the corpus). Curated to two
+# high-precision classes, NOT all console.error, so library log-spam / benign warnings never register.
+_CSP_VIOLATION = re.compile(r"Content Security Policy|Refused to (?:load|execute|apply|connect|frame)", re.I)
+_HYDRATION_ERROR = re.compile(
+    r"Hydration failed|Text content does not match|error while hydrating|did not match\. Server|"
+    r"Minified React error #(?:418|423|425)", re.I)   # React hydration error codes
+
+
+def _console_failure(text: str, origin: str) -> str | None:
+    """Classify a console.error the pageerror hook misses. A hydration / React error is the app's OWN -> 'first'.
+    A CSP violation is 'first' ONLY when it blocks a SAME-ORIGIN resource (the app's own CSP against its own
+    code); a third-party-only block is the CSP working as intended -> 'third'; an unattributable inline block
+    (no URL -- could be an injected third-party inline the CSP correctly stopped) -> None. Anything else -> None
+    (log spam, a 404'd beacon, a benign lib warning), so this never widens into noise."""
+    if _HYDRATION_ERROR.search(text):
+        return "first"
+    if _CSP_VIOLATION.search(text):
+        urls = re.findall(r"https?://[^\s'\"]+", text)
+        if any(urllib.parse.urlparse(u).netloc == origin for u in urls):
+            return "first"                        # a same-origin resource the app's own CSP blocked -> breakage
+        return "third" if urls else None          # third-party block = CSP working; inline = unattributable -> drop
+    return None
+
+
+def _tally_console(pageerrors: list, console_errors_text: list, origin: str) -> dict:
+    """Fold pageerror throws + curated console.error failures into first/third/total counts. Factored out (pure)
+    for testing. `sources` records how many first-party came from each channel, so a widened fire is auditable."""
+    pe_fp = sum(1 for msg, stack in pageerrors if _first_party_error(msg, stack, origin))
+    classes = [_console_failure(t, origin) for t in console_errors_text]
+    c_fp = sum(1 for c in classes if c == "first")
+    c_tp = sum(1 for c in classes if c == "third")
+    return {"first_party": pe_fp + c_fp, "third_party": (len(pageerrors) - pe_fp) + c_tp,
+            "total": len(pageerrors) + c_fp + c_tp, "sources": {"pageerror": pe_fp, "console": c_fp}}
+
+
+@_browser_guarded
 def console_errors(url: str, headers=None, timeout: float = 12.0) -> dict | None:
-    """Render url and capture uncaught JavaScript errors thrown on load (pageerror), split into FIRST-PARTY
-    (the app's own code threw -> a real breakage) and THIRD-PARTY (a widget/analytics script on another
-    origin threw, or the browser sanitized a cross-origin error -> benign noise). Returns
-    {"first_party", "third_party", "total"} or None if no browser / the render fails. Only pageerror is
-    captured, so console.log spam, a 404'd analytics fetch, and a missing source map never register."""
+    """Render url and capture the app's OWN load-time JavaScript failures: uncaught throws (pageerror) PLUS the
+    curated console.error classes a throw hook misses -- a self-blocking CSP and a React hydration mismatch
+    (v2.0 Family 3). Split FIRST-PARTY (real breakage) vs THIRD-PARTY (a cross-origin widget the app renders
+    without -> benign). Returns {first_party, third_party, total, sources, content_len, error_overlay} or None
+    if no browser / render fails. Still ignores console.log spam, a 404'd beacon, and missing source maps."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
         return None
     origin = urllib.parse.urlparse(url).netloc
     try:
-        errs = []
+        errs, console = [], []
         with sync_playwright() as pw:
             b = _launch(pw)
             if b is None:
@@ -1041,6 +1979,7 @@ def console_errors(url: str, headers=None, timeout: float = 12.0) -> dict | None
                 page = b.new_page()
                 page.on("pageerror", lambda e: errs.append((str(getattr(e, "message", "") or e),
                                                             str(getattr(e, "stack", "") or ""))))
+                page.on("console", lambda m: console.append(m.text) if m.type == "error" else None)
                 _apply_auth(page, url, headers)
                 page.goto(url, timeout=timeout * 1000, wait_until="load")
                 page.wait_for_timeout(500)  # let late/async errors surface
@@ -1050,11 +1989,30 @@ def console_errors(url: str, headers=None, timeout: float = 12.0) -> dict | None
                     health = {}
             finally:
                 b.close()
-        fp = sum(1 for msg, stack in errs if _first_party_error(msg, stack, origin))
-        return {"first_party": fp, "third_party": len(errs) - fp, "total": len(errs),
-                "content_len": health.get("content_len"), "error_overlay": bool(health.get("error_overlay"))}
+        res = _tally_console(errs, console, origin)
+        res["content_len"] = health.get("content_len")
+        res["error_overlay"] = bool(health.get("error_overlay"))
+        return res
     except Exception:
         return None
+
+
+# v2.0 FAMILY 4 -- page-quality metrics from one render: (1) is the LCP element an <img>, and its loading attr
+# (loading=lazy on the LCP image DELAYS first paint -- a modern anti-pattern the observer catches), and (2) the
+# total DOM node count (an excessive DOM slows layout/style/interaction -- Lighthouse dom-size). The LCP
+# observer is injected BEFORE load so it captures the real paint.
+_METRICS_JS = """(() => {
+  window.__hlm = {lcp_is_img: false, lcp_loading: ''};
+  const obs = (t, cb) => { try { new PerformanceObserver(cb).observe({type: t, buffered: true}); } catch (e) {} };
+  obs('largest-contentful-paint', l => {
+    const es = l.getEntries(); if (!es.length) return;
+    const el = es[es.length - 1].element;
+    window.__hlm.lcp_is_img = !!(el && el.tagName === 'IMG');
+    window.__hlm.lcp_loading = (el && el.getAttribute && (el.getAttribute('loading') || '').toLowerCase()) || '';
+  });
+})()"""
+
+
 
 
 # Core Web Vitals — LCP (largest content paint), CLS (layout shift), total blocking time (main-thread
@@ -1075,42 +2033,9 @@ _VITALS_JS = """(() => {
 _CWV_THROTTLE = {"offline": False, "latency": 150, "downloadThroughput": 200_000, "uploadThroughput": 93_750}
 
 
-def web_vitals(url: str, headers=None, timeout: float = 25.0, samples: int = 3) -> list | None:
-    """Sample Core Web Vitals over N throttled renders; return [{lcp_ms, cls, tbt_ms}] per run (the caller
-    scores off the player-favorable edge). None if no browser or the render fails."""
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        return None
-    try:
-        with sync_playwright() as pw:
-            b = _launch(pw)
-            if b is None:
-                return None
-            try:
-                out = []
-                for _ in range(samples):
-                    page = b.new_page()
-                    try:
-                        cdp = page.context.new_cdp_session(page)
-                        cdp.send("Network.enable")
-                        cdp.send("Network.emulateNetworkConditions", _CWV_THROTTLE)
-                        cdp.send("Emulation.setCPUThrottlingRate", {"rate": 4})
-                        page.add_init_script(script=_VITALS_JS)   # observers up before any page script
-                        _apply_auth(page, url, headers)
-                        page.goto(url, timeout=timeout * 1000, wait_until="load")
-                        page.wait_for_timeout(2000)   # let LCP finalize + late layout shifts settle (throttled)
-                        v = page.evaluate("() => window.__hlv")
-                        out.append({"lcp_ms": round(v["lcp"]), "cls": round(v["cls"], 3), "tbt_ms": round(v["tbt"])})
-                    finally:
-                        page.close()
-                return out
-            finally:
-                b.close()
-    except Exception:
-        return None
 
 
+@_browser_guarded
 def dom_xss_executes(base_url: str, paths, params=("q",), max_attempts: int = 24,
                      total_timeout: float = 45.0, headers=None, payloads=None) -> bool:
     """Inject an executing payload into candidate query params of each path, render, and return True
@@ -1162,6 +2087,7 @@ def _view_fp(page) -> frozenset:
     return frozenset()
 
 
+@_browser_guarded
 def back_button_broken(base_url: str, headers=None, timeout: float = 12.0):
     """Navigate IN-APP from the entry view to another route (click a same-origin router link — NOT a fresh
     goto, which the browser's own history would always restore), fire the browser BACK button, and check the
@@ -1183,8 +2109,13 @@ def back_button_broken(base_url: str, headers=None, timeout: float = 12.0):
                 _apply_auth(page, base_url, headers)
                 detail = {}
                 page.goto(base_url.rstrip("/") + "/", timeout=timeout * 1000, wait_until="load")
+                with contextlib.suppress(Exception):
+                    page.wait_for_load_state("networkidle", timeout=5000)  # let the SPA finish painting BEFORE we
+                page.wait_for_timeout(300)                                  # fingerprint -> a reproducible entry view
                 url_a, fa = page.url.rstrip("/"), _view_fp(page)
                 detail["entry_url"] = url_a
+                if len(fa) < 3:
+                    return "inconclusive", detail    # entry rendered ~nothing (partial/blank) -> can't judge restoration
                 host = urllib.parse.urlparse(base_url).netloc
                 link, href_used = None, None
                 with contextlib.suppress(Exception):
@@ -1215,9 +2146,21 @@ def back_button_broken(base_url: str, headers=None, timeout: float = 12.0):
                     return "inconclusive", detail                       # the click didn't change the view
                 with contextlib.suppress(Exception):
                     page.go_back(timeout=5000)
-                    page.wait_for_load_state("load", timeout=5000)
+                    page.wait_for_load_state("networkidle", timeout=5000)   # settle the restored view before comparing
                     page.wait_for_timeout(300)
                 url_c, fc = page.url.rstrip("/"), _view_fp(page)
+                # AUTH-GATED back: the app sent Back to a real login FORM (a visible password field) or to an auth
+                # URL -> the gate intercepted, so we never observe whether Back restores the prior view -> N/A, not
+                # a 'dead back button'. NB: key on the password FIELD, not "log in" TEXT -- nearly every landing
+                # page has a "Log in" nav button (toyota's marketing page, findmyseat), and matching that text
+                # over-suppressed normal pages. The replaceState-skip (Back -> about:blank) and view-stuck-on-B
+                # defects have no password field and no auth URL, so they still fire below.
+                on_login_form = False
+                with contextlib.suppress(Exception):
+                    on_login_form = bool(page.evaluate("() => !!document.querySelector('input[type=password]')"))
+                if on_login_form or _AUTH_URL.search(url_c):
+                    detail["auth_gated_on_back"] = True
+                    return "inconclusive", detail
                 content_restored = len(fc & a_only) >= len(fc & b_only)
                 detail.update(after_back_url=url_c, url_restored=(url_c == url_a), content_restored=content_restored)
                 # restored = the entry URL is back AND A's distinctive content returned (not still showing B's)
@@ -1233,12 +2176,28 @@ def _fp_sim(a: frozenset, b: frozenset) -> float:
     return len(a & b) / len(u) if u else 0.0
 
 
+# A route that renders a LOGIN/auth screen is auth-GATED (working correctly), not a broken deep link -- and when
+# the app gates everything, the nonexistent-route fallback renders that same login screen, so a gated route
+# matches it and reads as "broken". The blank-shell case (route+fallback both render the empty shell, no login)
+# is the REAL broken deep link. This separates them: 9 of 16 sampled v18 fires were auth-gated, 7 genuinely broken.
+_LOGIN_SCREEN_JS = """() => {
+  const t = (document.body ? document.body.innerText : '').toLowerCase();
+  return !!document.querySelector('input[type=password]')
+      || /\\b(sign in|log in|login|signin|sign up|forgot password|continue with)\\b/.test(t);
+}"""
+
+# a URL that IS an auth route -- back-navigating to it means the app gated the Back nav (qa-backnav-001), which
+# we cannot score as a "dead back button": we never got to observe whether Back restores the prior view.
+_AUTH_URL = re.compile(r"/(?:login|log-?in|signin|sign-?in|sign_in|auth|register|signup|sign-?up)\b", re.I)
+
+
+@_browser_guarded
 def deep_link_broken(base_url: str, routes, headers=None, timeout: float = 12.0, max_routes: int = 8):
     """FRESH-navigate (goto, not in-app) to a guaranteed-nonexistent route to capture the app's FALLBACK render
     (home / 404 / blank), then fresh-navigate to each discovered route; return ('broken', route) for the first
     that renders ~identically to the fallback (>= 0.92 word-set similarity -> no route-specific content, so a
-    shared/bookmarked link is dead), else ('ok', None) or ('inconclusive', None). Tests the bookmarked-link
-    path a catch-all host's 200 shell hides from an HTTP-only check."""
+    shared/bookmarked link is dead) AND is not merely an auth gate, else ('ok', None) or ('inconclusive', None).
+    Tests the bookmarked-link path a catch-all host's 200 shell hides from an HTTP-only check."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -1270,6 +2229,11 @@ def deep_link_broken(base_url: str, routes, headers=None, timeout: float = 12.0,
                         continue                            # this route rendered blank (slow load?) -> skip, conservative
                     tested += 1
                     if _fp_sim(fp_r, fp_bogus) >= 0.92:     # renders the same as a nonexistent route
+                        is_login = False
+                        with contextlib.suppress(Exception):
+                            is_login = bool(page.evaluate(_LOGIN_SCREEN_JS))
+                        if is_login:
+                            continue                         # a login/auth screen -> auth-gated, not a dead deep link
                         return ("broken", route)
                 return (("ok" if tested else "inconclusive"), None)
             finally:
@@ -1292,6 +2256,7 @@ _ERROR_DOM_JS = """() => {
 }"""
 
 
+@_browser_guarded
 def silent_failure_on_action(base_url: str, headers=None, timeout: float = 12.0) -> str:
     """Fill a create/save form, FORCE its submit request to fail (fulfill the same-origin POST/PUT/PATCH with
     500), and check the app shows a failure indication. Returns 'silent' (the action's request failed but NO
@@ -1343,6 +2308,7 @@ def silent_failure_on_action(base_url: str, headers=None, timeout: float = 12.0)
         return "inconclusive"
 
 
+@_browser_guarded
 def stored_xss_executes(base_url: str, paths, headers=None, total_timeout: float = 45.0, max_pages: int = 20) -> bool:
     """Render each path PLAIN — NO injection, because an XSS payload was already STORED server-side via an API
     write — and return True if it EXECUTES: the app reflected the stored value unescaped into the DOM and it

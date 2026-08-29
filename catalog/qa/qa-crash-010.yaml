@@ -9,6 +9,7 @@ penalty: 16   # ungraceful error handling: a 500 (uncaught exception) instead of
               # hackathon serverless APIs and not catastrophic, so a QA-hygiene tier, not the crash tier.
               # The SEVERE variants are scored elsewhere: a leaked stack trace -> qa-errhyg / sec-debug;
               # a 5xx UNDER LOAD -> perf-load. The reproduce-confirm guard keeps out transient 5xxs.
+severity: {iso_25010: "reliability", nielsen: "3", range: [55, 55], default: 55}   # RFC-anchored 5xx on malformed input
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:

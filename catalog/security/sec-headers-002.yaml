@@ -11,6 +11,7 @@ penalty: 8    # risk=freq×sev: the master backstop for the whole XSS class (+ c
               # floor and the other headers, but below the unconditional-misconfig tier (rate-limit 15) — so a
               # one-commit header fix no longer buys back a quarter of the score. Other headers held
               # (nosniff 3 / HSTS 5 / clickjacking 5 / referrer 2 / x-powered-by 2): narrow, conditional.
+severity: {cvss: "n/a", vrt: "P5", range: [8, 8], default: 8, tier: chore-floor}   # CSP; XSS-class backstop
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:

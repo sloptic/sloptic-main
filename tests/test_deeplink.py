@@ -19,6 +19,9 @@ from sloptic.schema import Profile  # noqa: E402
 _BROKEN_JS = "document.getElementById('app').innerHTML = 'This is the home welcome dashboard about page content view';"
 # ok: the client paints route-specific content from the path
 _OK_JS = "document.getElementById('app').innerHTML = 'This is the ' + location.pathname.replace(/\\//g,' ') + ' page content view here';"
+# login: an auth-GATED app -- EVERY route (and the fallback) renders the login screen. A gated route matching the
+# fallback is correct behavior, not a broken deep link -> must read clean (the v18 auth-gated FP class, 9/16).
+_LOGIN_JS = "document.getElementById('app').innerHTML = '<input type=password> Sign in to your account. Forgot password?';"
 
 
 def _make_app(mode):
@@ -27,7 +30,7 @@ def _make_app(mode):
             pass
 
         def do_GET(self):     # catch-all: 200 HTML shell for EVERY path
-            js = _BROKEN_JS if mode == "broken" else _OK_JS
+            js = {"broken": _BROKEN_JS, "ok": _OK_JS, "login": _LOGIN_JS}[mode]
             body = ("<html><body><div id='app'></div><script>%s</script></body></html>" % js).encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -73,6 +76,13 @@ def test_clean_when_route_renders_its_own_content():
 
 
 @browsermark
+def test_clean_on_an_auth_gated_login_screen():
+    # every route renders the login screen (== the fallback's login screen). That is auth-gating, not a broken
+    # deep link -> the login-screen gate suppresses it. This was 9 of 16 sampled v18 fires (/login, /dashboard, ...).
+    assert _run("login") is not True
+
+
+@browsermark
 def test_na_without_a_non_root_route():
     assert _run("broken", routes=()) is None      # only "/" -> nothing to deep-link test
 
@@ -80,4 +90,6 @@ def test_na_without_a_non_root_route():
 def test_na_when_routes_are_only_api_or_assets():
     # /api/* and media aren't client VIEW routes (an API path renders the shell CORRECTLY) -> filtered out ->
     # nothing left to deep-link test -> N/A, not a fire. No browser needed (filtered before the render).
-    assert _run("broken", routes=("/api/broadcast", "/v1/accounts", "/hero/clip.mp4")) is None
+    # Includes a MID-PATH api call (/options/api/feedback) and the entry alias (/index.html) -- both v18 FPs.
+    assert _run("broken", routes=("/api/broadcast", "/v1/accounts", "/hero/clip.mp4",
+                                  "/options/api/feedback", "/index.html")) is None

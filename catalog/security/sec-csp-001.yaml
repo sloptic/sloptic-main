@@ -7,6 +7,7 @@ pool: public
 evidence_model: provable
 penalty: 5   # a CSP present but toothless ('unsafe-inline' / wildcard script source, no nonce) — a false sense
              # of XSS safety; priced below a MISSING backstop header (8) and re-priced 8->5 with the header trim.
+severity: {cvss: "n/a", vrt: "P5", range: [5, 5], default: 5, tier: chore-floor}   # toothless CSP
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:

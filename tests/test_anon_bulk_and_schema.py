@@ -147,6 +147,107 @@ def test_the_request_is_ANONYMOUS_even_when_a_session_is_supplied():
     assert not any("theirs" in (h.get("Cookie") or "") for h in seen)
 
 
+# ------------------------------------------------ v18 precision: name-only matches that are NOT leaks
+# Thirteen apps fired in the v18 corpus; nine were false. The gate keyed on the column NAME alone, so an LLM
+# token counter, a phonetics table, a shared config contact and five public directories all read as PII dumps.
+# The three gates below (value-type match, per-row variance, public-directory suppression) are grounded in those
+# exact shapes -- and the four REAL leaks in the same run must still fire.
+
+def test_a_column_named_like_pii_whose_values_are_counts_is_not_a_leak():
+    # 2-actual-hack /api/dashboard: `tokens_total` matched `token`, but the values are LLM token COUNTS (ints).
+    rows = [{"id": i, "family": "gpt", "display_name": "M%d" % i, "tokens_total": 1067 + i} for i in range(13)]
+    assert _run({"/api/x": (200, rows)})[0] is not True
+
+
+def test_a_column_named_like_pii_whose_values_are_not_scalars_is_not_a_leak():
+    # aaroncao06/AutoRhythm canonical_syllables.json: `phones` matched `phone`, but the values are ARPAbet
+    # phoneme arrays (['Y','AE1']), not phone numbers.
+    rows = [{"syllable_index": i, "syllable_text": "la", "word_index": i, "phones": ["Y", "AE1"]}
+            for i in range(110)]
+    assert _run({"/api/x": (200, rows)})[0] is not True
+
+
+def test_a_survey_field_named_like_pii_is_not_a_leak():
+    # cheerful-mind-match Patient entity: `phone_bedtime_habit` matched `phone`, but the value is a survey enum.
+    rows = [{"id": i, "age": 30 + i, "concern_duration": "weeks", "phone_bedtime_habit": "1-2 hours"}
+            for i in range(19)]
+    assert _run({"/api/x": (200, rows)})[0] is not True
+
+
+def test_one_shared_contact_repeated_across_config_rows_is_not_a_personal_dump():
+    # restaurantyai /api/policies: 25 policy rows, every one carrying the SAME managerApprovalPhone -- a config
+    # contact, not 25 people's numbers. Per-row variance is what separates a dump from a shared setting.
+    rows = [{"_id": i, "maxTransferFee": 5, "noShowGraceMinutes": 15, "managerApprovalPhone": "+13235550124"}
+            for i in range(25)]
+    assert _run({"/api/x": (200, rows)})[0] is not True
+
+
+def test_a_public_places_directory_is_not_a_leak():
+    # mappy-ai /api/venues: 618 rows of address + a Google Places id + category -- a published listing, not PII.
+    rows = [{"id": i, "address": "%d Main St" % i, "city": "NYC", "category": "cafe",
+             "google_place_id": "ChIJ%d" % i, "google_maps_url": "http://maps/%d" % i} for i in range(20)]
+    assert _run({"/api/x": (200, rows)})[0] is not True
+
+
+def test_a_scraped_org_directory_is_not_a_leak():
+    # eulogy-nu /api/homes: address/email/phone of funeral HOMES, flagged as scraped by `dataSource`.
+    rows = [{"id": i, "name": "Home %d" % i, "address": "%d Elm" % i, "email": "h%d@dir.test" % i,
+             "phone": "555-010%d" % i, "dataSource": "scrape"} for i in range(20)]
+    assert _run({"/api/x": (200, rows)})[0] is not True
+
+
+def test_an_institution_directory_is_not_a_leak():
+    # voh-frontend /api/hospitals: name/address/phone of hospitals, an institutional listing (`departments`).
+    rows = [{"id": i, "name": "Hosp %d" % i, "address": "%d Care Way" % i, "phone": "555-020%d" % i,
+             "departments": ["ER"], "state": "NJ"} for i in range(3)]
+    assert _run({"/api/x": (200, rows)})[0] is not True
+
+
+def test_a_resource_directory_with_opening_hours_is_not_a_leak():
+    # cafeteriasense nj_food_banks.json: address/email/phone of food banks, a resource listing (`hours`).
+    rows = [{"id": i, "name": "Bank %d" % i, "address": "%d Aid Rd" % i, "email": "info%d@cfbnj.test" % i,
+             "phone": "555-030%d" % i, "hours": "9-5", "pickupFrequency": "weekly"} for i in range(10)]
+    assert _run({"/api/x": (200, rows)})[0] is not True
+
+
+# ------------------------------------------------ v18 precision: the four REAL leaks must still fire
+
+def test_a_delivery_manifest_of_named_customers_still_fires():
+    # damm-smart-truck delivery_input.json: real street addresses of named customers with order totals. It has
+    # lat/lon like a directory, but NO listing marker (no place id / category / hours) -> not a directory -> fires.
+    rows = [{"id": i, "name": "Client %d" % i, "address": "Carrer Gran %d, 08506" % i, "lat": 41.9 + i / 1e3,
+             "lon": 2.2, "proformaTotal": 100 + i, "deliveryWindow": "AM"} for i in range(15)]
+    hit, ev = _run({"/api/x": (200, rows)})
+    assert hit is True and "address" in ev["sensitive_columns"]
+
+
+def test_user_owned_records_with_distinct_emails_still_fire():
+    # alertify-unihack /api/reports: 82 rows, 45 distinct submitter emails + Firebase uids. `category` is present
+    # (a directory marker) but `submitted_by_uid` is a per-user ownership column -> ownership vetoes -> fires.
+    rows = [{"id": i, "category": "pothole", "submitted_by_email": "user%d@gmail.com" % i,
+             "submitted_by_uid": "uid%d" % i, "lat": 1.0, "lng": 2.0} for i in range(20)]
+    hit, ev = _run({"/api/x": (200, rows)})
+    assert hit is True and "submitted_by_email" in ev["sensitive_columns"]
+
+
+def test_anon_readable_patient_records_still_fire():
+    # interim-pc04 /api/patient: 44 rows of name + real dob + diagnosis, readable to a stranger -> PHI leak. The
+    # dob values are real dates, distinct per row, and there is no listing marker -> not a directory -> fires.
+    rows = [{"id": i, "name": "Pat %d" % i, "dob": "19%02d-05-12" % (50 + i), "diagnosis": "dx%d" % i}
+            for i in range(44)]
+    hit, ev = _run({"/api/x": (200, rows)})
+    assert hit is True and "dob" in ev["sensitive_columns"]
+
+
+def test_candidate_records_with_an_ownership_column_still_fire():
+    # intelliview-liard /api/get-responses: candidate emails + interview transcripts. `candidateId` is a per-user
+    # ownership column (normalises to an ownership marker) -> not a directory -> fires on the distinct emails.
+    rows = [{"id": i, "candidateEmail": "cand%d@gmail.com" % i, "candidateId": "c%d" % i,
+             "interviewType": "tech"} for i in range(13)]
+    hit, ev = _run({"/api/x": (200, rows)})
+    assert hit is True and "candidateEmail" in ev["sensitive_columns"]
+
+
 # ---------------------------------------------------------------- schema disclosure
 
 # the signature segment must be >= 8 chars: probes._JWT requires it, and a 3-char "sig" meant

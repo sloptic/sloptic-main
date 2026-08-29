@@ -1,12 +1,13 @@
 [project]
 name = "sloptic"
-version = "1.1.1"
-description = "Sloptic, a black-box HTTP resilience grader: deploys a web app, probes it over HTTP, and emits a slop score (deduction-only, lower is better)."
+version = "2.0.0"
+description = "Sloptic grades any deployed web app, whatever its stack or purpose, and gives it one slop score you can compare across apps (lower is better, 0 means nothing found)."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
+    "h2>=4.4.1",
     "httpx>=0.27",
     "pydantic>=2",
     "pyyaml>=6",
@@ -53,6 +54,16 @@ exclude = ["**/hidden/**", "**/catalog-hidden/**"]
 
 [dependency-groups]
 dev = ["pytest>=8"]
+# Mirror of the `browser` extra as a uv dependency-group so a plain `uv sync` installs Playwright by default
+# (via default-groups below) and never silently strips it -- naive `uv sync` prunes the playwright PACKAGE
+# otherwise and browser grading (qa-a11y via axe, perf-cwv, sec-domxss, SPA form discovery) goes dark. Keep
+# this version in lockstep with [project.optional-dependencies].browser; the public pip install path stays
+# the extra (`pip install sloptic[browser]`). The Chromium BINARY is separate (~/.cache/ms-playwright, outside
+# the venv, uv never touches it); a fresh machine still needs `uv run playwright install chromium` once.
+browser = ["playwright>=1.61.0"]
+
+[tool.uv]
+default-groups = ["dev", "browser"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

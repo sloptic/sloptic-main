@@ -4,6 +4,7 @@ category: session
 pool: public
 evidence_model: oracle
 penalty: 20   # a session cookie without HttpOnly is stealable by any XSS
+severity: {cvss: "n/a", vrt: "P5", range: [15, 15], default: 15}   # HttpOnly missing; REPRICED 20->15
 applicability:
   requires: [has_auth_entrypoint]
 probe:

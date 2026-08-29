@@ -1,0 +1,9 @@
+finding,pct_of_graded_apps,tier,n_graded
+No Content-Security-Policy,97.91,chronic,1528
+No clickjacking defense,97.25,chronic,1528
+No X-Content-Type-Options,91.56,chronic,1528
+No Referrer-Policy,90.77,chronic,1528
+Critical accessibility violation,69.96,chronic,1528
+Login with no rate limiting,42.28,chronic,1528
+Any exploitable vulnerability,3.8,acute,1528
+Remote code execution,0.0,acute,1528

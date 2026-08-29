@@ -13,8 +13,8 @@ from urllib.parse import parse_qs, urljoin, urlparse
 
 import httpx
 
-from . import jsmine, openapi
-from .auth import is_password_change_form, login_form
+from . import jsmine, openapi, platform_id
+from .auth import _email_only_form, is_password_change_form, login_form
 from .net import make_client
 from .schema import Endpoint, Form, Profile
 
@@ -89,6 +89,45 @@ def _auth_triggers(markup: str) -> tuple[bool, bool]:
     text = " ".join(re.sub(r"<[^>]+>", " ", m)
                     for m in re.findall(r"<(?:button|a)\b[^>]*>(.*?)</(?:button|a)>", markup, re.S | re.I))
     return bool(_LOGIN_TRIGGER.search(text)), bool(_SIGNUP_TRIGGER.search(text))
+
+
+# SSO / CAPTCHA DETECTION (off-score surface signal): WHY a self-register fails on an app that DOES have auth.
+# We never DRIVE these (no social-login automation, no captcha solving) -- we only SEE them, so an unreachable
+# session reads "SSO-only (google)" / "captcha-gated" instead of an opaque "could not submit". Matched on
+# high-precision signals only: a provider OAuth endpoint, a provider auth SDK, or a "with <provider>" CTA --
+# never a bare provider mention (a Facebook share link / Twitter icon is not SSO).
+_SSO_PROVIDERS = [
+    ("google", re.compile(r"accounts\.google\.com|googleauthprovider|/auth/(?:v1/authorize\?provider=|)google|"
+                          r"(?:sign[ -]?in|log[ -]?in|continue|sign[ -]?up) with google|accounts\.google|gsi/client", re.I)),
+    ("github", re.compile(r"github\.com/login/oauth|githubauthprovider|(?:sign[ -]?in|log[ -]?in|continue) with github|"
+                          r"/auth/(?:v1/authorize\?provider=|)github", re.I)),
+    ("apple", re.compile(r"appleid\.apple\.com|oauthprovider\(['\"]apple|(?:sign[ -]?in|continue) with apple", re.I)),
+    ("microsoft", re.compile(r"login\.microsoftonline|(?:sign[ -]?in|continue) with (?:microsoft|azure)|/auth/(?:azure|microsoft)", re.I)),
+    ("facebook", re.compile(r"facebook\.com/(?:dialog/oauth|v\d+/dialog)|facebookauthprovider|(?:sign[ -]?in|continue) with facebook", re.I)),
+    ("discord", re.compile(r"discord\.com/api/oauth2|(?:sign[ -]?in|continue) with discord", re.I)),
+    ("linkedin", re.compile(r"linkedin\.com/oauth|(?:sign[ -]?in|continue) with linkedin", re.I)),
+    ("gitlab", re.compile(r"gitlab\.com/(?:oauth|-/profile)|(?:sign[ -]?in|continue) with gitlab", re.I)),
+    ("twitter", re.compile(r"(?:sign[ -]?in|continue) with (?:twitter|x)\b|twitterauthprovider", re.I)),
+]
+# framework/BaaS OAuth with no clear provider -> "oauth"
+_SSO_GENERIC = re.compile(r"signinwithoauth|signinwithpopup|signinwithredirect|/auth/v1/authorize\?provider=|"
+                          r"next-auth|/api/auth/(?:signin|callback)|@?clerk\b|auth0\.com|useoauth|oauthprovider", re.I)
+_CAPTCHA_KINDS = [
+    ("recaptcha", re.compile(r"g-recaptcha|recaptcha/api\.js|grecaptcha|google\.com/recaptcha", re.I)),
+    ("hcaptcha", re.compile(r"h-captcha\b|hcaptcha\.com|js\.hcaptcha", re.I)),
+    ("turnstile", re.compile(r"cf-turnstile|challenges\.cloudflare\.com/turnstile|\bturnstile\b", re.I)),
+    ("arkose", re.compile(r"arkoselabs|funcaptcha", re.I)),
+]
+
+
+def _detect_sso_captcha(markup: str) -> tuple[list, str | None]:
+    """(sso_providers, captcha_kind) from a page's markup / bundle. Providers are named when identifiable, else
+    a generic 'oauth' when only a framework OAuth signature is present. captcha is the first widget kind seen."""
+    providers = [name for name, rx in _SSO_PROVIDERS if rx.search(markup)]
+    if not providers and _SSO_GENERIC.search(markup):
+        providers = ["oauth"]
+    captcha = next((name for name, rx in _CAPTCHA_KINDS if rx.search(markup)), None)
+    return providers, captcha
 
 
 # A logout/sign-out link must never be crawled or probed: following it destroys the runner's own
@@ -385,12 +424,40 @@ _MULTI_SUFFIX = {
     "vercel.app", "netlify.app", "github.io", "pages.dev", "web.app", "firebaseapp.com", "surge.sh",
     "onrender.com", "render.com", "herokuapp.com", "railway.app", "fly.dev", "workers.dev", "run.app",
     "deno.dev", "koyeb.app", "cyclic.app", "adaptable.app", "glitch.me", "replit.app",
+    "modal.run", "hf.space", "ondigitalocean.app", "azurewebsites.net", "elasticbeanstalk.com",
+    "pythonanywhere.com", "base44.app",
 }
 # Self-hosting PaaS where teams deploy their OWN BACKEND -> an off-origin host here is the app's responsibility
 # (the outsourced-backend case: probe it). Excludes pure frontend/static hosts (vercel/netlify/github.io), whose
 # own serverless API is same-origin and whose cross-origin siblings are ambiguous -> those fall to 'opaque'.
 _BACKEND_PAAS = {"onrender.com", "render.com", "herokuapp.com", "railway.app", "fly.dev", "workers.dev",
-                 "run.app", "deno.dev", "koyeb.app", "cyclic.app", "adaptable.app"}
+                 "run.app", "deno.dev", "koyeb.app", "cyclic.app", "adaptable.app",
+                 # per-project subdomains where a team deploys its OWN backend (the username-and-app-name
+                 # pattern makes ownership unambiguous): Modal, HF Spaces, DO App Platform, Azure, AWS EB, PA.
+                 "modal.run", "hf.space", "ondigitalocean.app", "azurewebsites.net", "elasticbeanstalk.com",
+                 "pythonanywhere.com"}
+# Generic host tokens that carry NO ownership signal — excluded from sibling-deploy name-matching so a shared
+# word can never attribute (and then attack) an unrelated third party. Only a distinctive ≥5-char app-name
+# token shared with a DEPLOY-host backend attributes it.
+_GENERIC_HOST_TOK = frozenset({
+    "frontend", "backend", "front", "server", "client", "api", "app", "apps", "web", "site", "www", "vercel",
+    "netlify", "github", "pages", "streamlit", "render", "onrender", "railway", "herokuapp", "firebase",
+    "cloudflare", "workers", "prod", "production", "staging", "demo", "main", "test", "https", "http",
+    "modal", "space", "azurewebsites", "pythonanywhere", "ondigitalocean", "elasticbeanstalk",
+})
+
+
+def _name_tokens(host: str) -> set:
+    """Distinctive (≥5-char, non-generic) lowercase tokens in a hostname — the app-name signal used to match a
+    sibling frontend and backend (beatsaber-frontend -> beatsaber-backend) without matching on infra words."""
+    return {t for t in re.findall(r"[a-z0-9]{5,}", host.split(":")[0].lower()) if t not in _GENERIC_HOST_TOK}
+
+
+# Deploy platforms where a team's sibling frontend + backend live (frontend/static hosts + backend PaaS). The
+# name-match ONLY attributes a token-sharing backend on one of THESE — a third-party SaaS is on its own domain,
+# never here, so a shared word like "health" can't cause us to attribute (and then probe) a third party.
+_DEPLOY_SUFFIX = _BACKEND_PAAS | {"vercel.app", "netlify.app", "github.io", "pages.dev", "web.app",
+                                  "firebaseapp.com", "surge.sh", "glitch.me", "replit.app"}
 
 
 def _registrable_domain(host: str) -> str:
@@ -416,6 +483,7 @@ def _classify_hosts(observed, base_url) -> dict:
     it (still yours), but an unlisted vendor slips safely into opaque rather than getting attacked."""
     app_host = urlparse(base_url).netloc
     app_site = _registrable_domain(app_host.split(":")[0])
+    app_tokens = _name_tokens(app_host)              # distinctive app-name tokens, for sibling-deploy attribution
     counts = {"same_origin": 0, "own_backend": 0, "managed_baas": 0, "vendor": 0, "opaque": 0}
     own, baas, opaque = set(), set(), set()
     for _method, url, _pd in observed:
@@ -428,9 +496,11 @@ def _classify_hosts(observed, base_url) -> dict:
             baas.add(h)
         elif _VENDOR_HOSTS.search(h):
             counts["vendor"] += 1
-        elif _registrable_domain(hp) == app_site or ".".join(hp.split(".")[-2:]) in _BACKEND_PAAS:
-            counts["own_backend"] += 1                   # same site OR a self-hosting PaaS deploy -> the app's own
-            own.add(h)
+        elif (_registrable_domain(hp) == app_site or ".".join(hp.split(".")[-2:]) in _BACKEND_PAAS
+              or (".".join(hp.split(".")[-2:]) in _DEPLOY_SUFFIX and _name_tokens(hp) & app_tokens)):
+            counts["own_backend"] += 1                   # same site, a self-host PaaS deploy, OR a sibling deploy
+            own.add(h)                                   #   (distinctive name shared on a deploy host) -> the app's own
+
         else:
             counts["opaque"] += 1                        # unknown branded off-origin -> unattributable: DON'T probe, flag
             opaque.add(h)
@@ -741,6 +811,64 @@ def _mined_api_endpoints(base_url, headers, route_list, existing, app_root: str 
     return out
 
 
+# Auth ROUTE literals in a JS bundle: a quoted client-route path (`"/login"`, React-Router / router config) OR a
+# Next.js app-router chunk segment (`/app/login/page`). The `\b`/`/` boundary keeps `/login` from matching
+# `/logins-report`. Split login-ish vs signup-ish so we can set the right trigger.
+_MINED_LOGIN_ROUTE = re.compile(r"""["'`]/(?:log-?in|sign-?in|authenticate|account|dashboard)\b"""
+                               r"""|/app/(?:login|signin|sign-in|auth|account|dashboard)/""", re.I)
+_MINED_SIGNUP_ROUTE = re.compile(r"""["'`]/(?:sign-?up|register|create-account|join)\b"""
+                                r"""|/app/(?:signup|sign-up|register)/""", re.I)
+# Part 2: the FORM-bearing auth ENTRY path, CAPTURED (not just detected) so the crawl can render that exact
+# non-standard route (a code-split /auth-gateway the conventional-route render never walks). Narrower than the
+# boolean regexes above -- account/dashboard are post-login pages, not the login form, so they credit the
+# boolean but are not rendered as an entry.
+_MINED_LOGIN_PATH = re.compile(r"""["'`](/(?:[\w-]+/)*(?:log-?in|sign-?in|authenticate))\b""", re.I)
+_MINED_SIGNUP_PATH = re.compile(r"""["'`](/(?:[\w-]+/)*(?:sign-?up|register|create-account|join))\b""", re.I)
+
+
+def _clean_mined_path(raw: str) -> str:
+    """Normalise a mined route literal (already the capture group, no surrounding quote) to a renderable path:
+    a leading slash, no query/hash, no trailing slash."""
+    p = "/" + (raw or "").strip().strip("\"'`").lstrip("/")
+    return p.split("?")[0].split("#")[0].rstrip("/") or "/"
+
+
+def _mine_auth_routes(base_url, headers, js_urls, cap: int = _MINE_CHUNK_CAP) -> tuple[bool, bool, str | None, str | None]:
+    """Grep the discovered JS chunks for auth ROUTE literals — a code-split `/login` the crawl never linked to
+    and the CTA scan (_auth_triggers) never saw, so `has_auth_entrypoint` wrongly reads False and the whole auth
+    cluster goes N/A. Returns (login_seen, signup_seen, login_path, signup_path): the booleans credit the auth
+    entrypoint (Part 1); the paths are the FORM route to RENDER so the register lane targets the real form on a
+    non-standard path (Part 2), or None. Cheap: reuses the chunk URLs the crawl already found, and is only called
+    when no auth surface turned up any other way. A false positive just makes the register lane ATTEMPT and
+    self-gate to N/A -- never a false finding."""
+    chunks = [u for u in dict.fromkeys(js_urls) if (u or "").split("?")[0].endswith(".js")][:cap]
+    if not chunks:
+        return False, False, None, None
+    login = signup = False
+    login_path = signup_path = None
+    with make_client(base_url, headers, timeout=8.0, follow_redirects=True) as c:
+        for u in chunks:
+            if login and signup and login_path and signup_path:
+                break
+            try:
+                text = c.get(u).text[:400_000]
+            except (httpx.HTTPError, httpx.InvalidURL):
+                continue
+            login = login or bool(_MINED_LOGIN_ROUTE.search(text))
+            signup = signup or bool(_MINED_SIGNUP_ROUTE.search(text))
+            if login_path is None:
+                m = _MINED_LOGIN_PATH.search(text)
+                if m:
+                    login_path = _clean_mined_path(m.group(1))
+            if signup_path is None:
+                m = _MINED_SIGNUP_PATH.search(text)
+                if m:
+                    signup_path = _clean_mined_path(m.group(1))
+    # a captured FORM path (which allows a non-standard prefix the boolean regex doesn't) also credits the
+    # entrypoint -- so /portal/login sets login even though the boolean's `"/login` anchor never matched it.
+    return login or login_path is not None, signup or signup_path is not None, login_path, signup_path
+
+
 def _endpoints_from_observed(observed, base_url) -> list:
     """Endpoints OBSERVED in the app's own same-origin xhr/fetch traffic during render+interaction — the
     ACCURATE endpoint surface (the app actually called these), which the deterministic crawl and the static
@@ -924,14 +1052,35 @@ def _drop_phantom_surface(base_url, headers, endpoints, forms):
         return False, endpoints, forms
 
 
-def _crawl_auth_headers(base_url: str, forms) -> dict:
-    """Register a THROWAWAY crawl account (httpx, the same flow the probes use) and return its session as
-    request headers a browser render can carry (a Cookie, or a Bearer Authorization) — so the crawl reaches
-    the surface an SPA hides behind login (upload, item CRUD) instead of only mapping the login page. Kept
-    SEPARATE from the probes' session_headers (they self-register fresh identities, incl. two for IDOR).
-    Returns {} when nothing establishes a session (no register API / email-verify / SSO / third-party auth)."""
+def _crawl_auth_headers(base_url: str, forms, auth=(False, False), browser_register=None, session_sink=None,
+                        email_receiver=None) -> dict:
+    """Register a THROWAWAY crawl account and return its session as request headers a browser render can carry (a
+    Cookie, or a Bearer Authorization) — so the crawl reaches the surface an SPA hides behind login (upload, item
+    CRUD) instead of only mapping the login page. Uses the SAME lanes the probes do: httpx form/JSON, and — when
+    `browser_register` is supplied (--browser-auth) — the BROWSER lane, so a CLIENT-RENDERED SPA login (no
+    server-side form, just a 'Sign in' CTA) is registered too. That is Gap B: without the browser lane the crawl
+    could only httpx-register, so SPA authed surface never got mapped and the now-session-aware injection/upload
+    probes had nothing behind login to test. Kept SEPARATE from the probes' session_headers (they self-register
+    fresh identities, incl. two for IDOR). Returns {} when nothing establishes a session (email-verify / SSO)."""
     from .auth import _has_session, register_account   # local: auth is only exercised under --browser-auth
-    acct = register_account(base_url, Profile(base_url=base_url, forms=list(forms)))
+    # carry the crawl's CTA-trigger detection so register_account's browser lane runs even with no server-side
+    # <form> (has_auth_surface = password form OR login/signup trigger).
+    prof = Profile(base_url=base_url, forms=list(forms),
+                   capabilities={"login_trigger": bool(auth[0]), "signup_trigger": bool(auth[1])})
+    # AUTH-CRAWL EMAIL: with a receiver configured, register the crawl account through a DELIVERABLE address WE own
+    # rather than the browser lane's default hl_*@example.com. An app that validates the domain -- or, like a
+    # django-allauth signup, 500s when the confirmation mail can't be delivered to example.com -- would otherwise
+    # fail the crawl register and never authenticate the crawl (mapping only the logged-out surface). Mirrors
+    # ctx._browser_register_once for the probe-time identity; a fresh throwaway address is fine (the session
+    # unifies to the probes via session_sink, so it need not match the probes' inbox).
+    if email_receiver is not None and browser_register is not None:
+        import secrets
+        _crawl_addr = email_receiver.address(secrets.token_hex(6))
+        _raw_reg = browser_register
+
+        def browser_register(_bu, _raw=_raw_reg, _addr=_crawl_addr):
+            return _raw(_bu, email=_addr)
+    acct = register_account(base_url, prof, browser_register=browser_register)
     if not _has_session(acct):
         if acct is not None:
             acct.client.close()
@@ -943,12 +1092,22 @@ def _crawl_auth_headers(base_url: str, forms) -> dict:
     authz = acct.client.headers.get("Authorization")
     if authz:
         out["Authorization"] = authz
+    # UNIFICATION: stash the session as a replayable snapshot so the PROBES reuse it (ctx.register seeds from this)
+    # instead of registering a SECOND time -- the two-browser-launches-per-app cost. Same shape probes._rebuild_account
+    # / _snapshot_session expect. `response` carries Set-Cookie for the cookie-flag probes.
+    if session_sink is not None:
+        session_sink["session"] = {
+            "headers": dict(out),
+            "username": acct.username, "password": acct.password,
+            "response": acct.register_response, "storage_exposed": acct.storage_exposed,
+        }
     acct.client.close()
     return out
 
 
 def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: int = MAX_DEPTH,
-             headers=None, seed_features=None, perceive=None, auth_crawl=False) -> Profile:
+             headers=None, seed_features=None, perceive=None, auth_crawl=False, browser_register=None,
+             crawl_session_sink=None, email_receiver=None) -> Profile:
     """`perceive(rendered_doms, observed)` (optional) — PROACTIVE discovery: an injected LLM reads the rendered
     pages and returns the probeable surface the crawl missed (perceive_surface output), merged in below via
     merge_perceived. LLM-agnostic here: the callback owns the model call; a None/failing one degrades to the
@@ -976,6 +1135,8 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
     js_urls: list[str] = []           # same-origin .js assets to mine for an SPA's API paths
     link_params: dict[str, set] = {}  # path -> query-param NAMES seen in links (?page=, ?id=, ...)
     auth = [False, False]             # [login_trigger, signup_trigger] seen as a button/link across the surface
+    sso_seen: set = set()             # SSO providers + CAPTCHA seen across the surface (off-score: WHY auth is
+    captcha_seen: list = [None]       # unreachable, not a defect). captcha in a list so the scan loops can set it.
 
     with make_client(base_url, headers, timeout=5.0, follow_redirects=True) as c:
         while queue and len(visited) < max_pages:
@@ -993,6 +1154,7 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
                 continue
             html = resp.text
             _l, _s = _auth_triggers(html)   # login/signup as a button/link (a CTA a password-form check misses)
+            _pv, _cx = _detect_sso_captcha(html); sso_seen.update(_pv); captcha_seen[0] = captcha_seen[0] or _cx
             auth[0] |= _l
             auth[1] |= _s
             for form in _parse_forms(_FORM.findall(html), scope_url, path):
@@ -1050,6 +1212,7 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
             routes.setdefault(ep.path, None)
 
     browser_ok = False
+    render_state = None        # Streamlit render outcome (rendered|error|stuck) -> the capture-based shell_only signal
     backend_tables: list = []  # managed-backend tables the app's own runtime traffic read (RLS probe input)
     host_tiers: dict = {}     # off-score: where the app's runtime traffic goes (same-origin / BaaS / vendor /
     if render is not None:    # other off-origin) — populated from the observed net once the browser render runs
@@ -1068,11 +1231,22 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
             # unauthenticated render only maps the LOGIN page — file-upload / idor / backend go N/A for want of
             # a target. Register a throwaway account and carry its session into the browser context (SEPARATE
             # from the probes' session_headers, which stay fresh so IDOR still gets two distinct identities).
-            _auth = _crawl_auth_headers(base_url, forms)
+            _auth = _crawl_auth_headers(base_url, forms, auth=tuple(auth), browser_register=browser_register,
+                                        session_sink=crawl_session_sink, email_receiver=email_receiver)
             if _auth:
                 render_headers = {**(headers or {}), **_auth}
+        render_meta: dict = {}
         rendered = render(base_url, [start_path], headers=render_headers,   # .js URLs (native ESM import() chunks a
-                          net_sink=observed_net, script_sink=observed_scripts) or {}   # static <script> scan can't see)
+                          net_sink=observed_net, script_sink=observed_scripts,
+                          meta_sink=render_meta) or {}   # static <script> scan can't see; meta = Streamlit state
+        render_state = render_meta.get("render_state")
+        if render_state in ("error", "stuck"):
+            # canvas-shell host (Streamlit) whose real app didn't render — 'error' (crash) or 'stuck' (won't come
+            # up). Crawling the rest of the FRAMEWORK shell (its ~125 fake routes, no real forms) costs ~100s and
+            # the pipeline then runs a full battery against it (~300s) and DNFs on the timeout — for a record
+            # is_shell_only EXCLUDES from the curve regardless. Return NOW with just the state so the pipeline
+            # short-circuits. A 'rendered' shell falls through and is crawled + graded normally.
+            return Profile(base_url=base_url, landing_path=start_path, render_state=render_state)
         if rendered:
             browser_ok = True  # a real render returned HTML -> the browser actually launched/works
             any_response = True
@@ -1095,7 +1269,8 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
                 rendered.update(render(base_url, extra, headers=render_headers,
                                        net_sink=observed_net, script_sink=observed_scripts) or {})
             for path, dom in rendered.items():
-                _l, _s = _auth_triggers(dom)   # a SPA paints 'Sign in'/'Sign up' client-side, so scan the DOM too
+                _l, _s = _auth_triggers(dom)
+                _pv, _cx = _detect_sso_captcha(dom); sso_seen.update(_pv); captcha_seen[0] = captcha_seen[0] or _cx   # a SPA paints 'Sign in'/'Sign up' client-side, so scan the DOM too
                 auth[0] |= _l
                 auth[1] |= _s
                 candidates = _parse_forms(_FORM.findall(dom), scope_url, path)
@@ -1216,6 +1391,41 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
     catch_all, endpoints, forms = _drop_phantom_surface(base_url, headers, endpoints, forms)
 
     has_pw = any(any("pass" in name.lower() for name in form.fields) for form in forms)
+    # ROUTE-MINING fallback: a code-split SPA lazy-loads /login into a chunk the crawl never links to, so both the
+    # CTA scan and the rendered crawl miss it and has_auth_entrypoint reads False -> the whole auth cluster N/As.
+    # When nothing else found auth, grep the collected JS chunks for auth ROUTE literals and set the trigger. Gated
+    # to the no-auth-yet case so the extra fetches are only spent where they can recover surface.
+    if not (has_pw or auth[0] or auth[1]) and js_urls:
+        _ml, _ms, _mlp, _msp = _mine_auth_routes(base_url, headers, js_urls)
+        auth[0] |= _ml
+        auth[1] |= _ms
+        # PART 2: render the actual mined FORM route(s) -- a non-standard code-split path (/auth-gateway) the
+        # conventional-route render (_AUTH_ROUTES) never walks -- and harvest its form, so the register lanes
+        # target the real auth surface instead of a guessed /login. Bounded (<=2), gated to the no-auth-yet case.
+        mined = [p for p in dict.fromkeys([_mlp, _msp])
+                 if p and _renderable_route(p) and p not in visited][:2]
+        if mined and render is not None:
+            for mpath, dom in (render(base_url, mined, headers=headers) or {}).items():
+                _l, _s = _auth_triggers(dom)
+                _pv, _cx = _detect_sso_captcha(dom); sso_seen.update(_pv); captcha_seen[0] = captcha_seen[0] or _cx
+                auth[0] |= _l
+                auth[1] |= _s
+                cands = _parse_forms(_FORM.findall(dom), scope_url, mpath)
+                formless = _formless_form(dom, mpath)
+                if formless is not None:
+                    cands.append(formless)
+                for form in cands:
+                    key = _form_key(form)
+                    if key not in seen_forms:
+                        seen_forms.add(key)
+                        forms.append(form)
+                        routes.setdefault(form.action, None)
+            has_pw = has_pw or any(any("pass" in n.lower() for n in f.fields) for f in forms)
+    # an API AUTH ENDPOINT is an auth door too (a JSON login/signup route with no <form> and no CTA button — the
+    # modern SPA-with-backend shape). has_login/has_signup already credit it; has_auth_entrypoint historically did
+    # NOT, so those apps read has_login=True yet had every auth-gated probe N/A. Same source, so align them.
+    auth_endpoint = any(e.kind in ("auth", "signup") or _LOGIN_EP.search(e.raw_path or e.path or "")
+                        for e in endpoints)
     capabilities = {
         "at_least_one_http_endpoint_exists": any_response,
         # text-input surface = HTML form fields OR API query params / JSON body fields (so the
@@ -1228,6 +1438,9 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
         # gate on an ACTUAL successful render, not just --browser: if Playwright/Chrome can't launch,
         # render returns None and browser probes must read N/A, not silently 'clean' (false negative).
         "browser": browser_ok,
+        # set True by the pipeline AFTER a successful Lighthouse run (the perf axis reads Lighthouse). Declared
+        # False here so the lighthouse_audit probes read N/A when the run wasn't attempted or failed.
+        "lighthouse": False,
         # HSTS and other transport-security headers are meaningless over plain HTTP -> gate on this so
         # those probes read N/A (not a false positive) against an http:// target.
         "served_over_https": base_url.lower().startswith("https"),
@@ -1237,11 +1450,21 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
         # so parity credits a CTA login (the audit's #1 has_login=false complaint), not only password forms
         "login_trigger": auth[0],
         "signup_trigger": auth[1],
-        # any auth DOOR — an inline password form OR a login/signup CTA (button/link to a separate route). The
+        # any auth DOOR — an inline password form, a login/signup CTA (button/link), OR an API auth endpoint. The
         # auth self-oracle (httpx form-POST, else the browser register) can ATTEMPT registration wherever one
         # exists; the predicate self-gates to N/A when it can't establish a session, so widening here never
-        # false-fires — it just lets the auth-probe cluster reach the CTA-login SPAs a password-form check missed.
-        "has_auth_entrypoint": has_pw or auth[0] or auth[1],
+        # false-fires — it just lets the auth-probe cluster reach the CTA-login / API-auth SPAs a password-form
+        # check missed. Kept in lockstep with has_login/has_signup (same sources), which previously disagreed.
+        "has_auth_entrypoint": has_pw or auth[0] or auth[1] or auth_endpoint,
+        # NOT on a managed-edge host (vercel/netlify/cloudflare/firebase/... or any WAF-CDN-fronted origin).
+        # The hosting-layer probes (rate-limit, load-burst) require this: on a managed edge those protections
+        # are the VENDOR's (the app inherits them), so grading them measures the platform not the team -- and
+        # the burst trips the vendor's WAF. Self-hosted PaaS (railway/render/fly/...) is NOT edge-managed -> live.
+        "not_edge_managed": not platform_id.edge_managed(platform_id.classify(base_url, headers, None)),
+        # SSO / CAPTCHA seen (off-score): WHY a self-register can't establish a session on an auth app -- a
+        # social-login-only door or a captcha gate, neither of which we drive. Surfaced for the population read.
+        "sso_providers": sorted(sso_seen),
+        "captcha": captcha_seen[0],
     }
     # Landing page for the universal homepage probes (target: /). When --target names a sub-path
     # (user.github.io/Project/) whose origin ROOT is a 404 — GitHub Pages with no user-site repo, a
@@ -1265,7 +1488,7 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
             pass
     return Profile(base_url=base_url, landing_path=landing_path, routes=list(routes), forms=forms,
                    capabilities=capabilities, endpoints=endpoints, host_tiers=host_tiers,
-                   backend_tables=backend_tables)
+                   backend_tables=backend_tables, render_state=render_state)
 
 
 def surface_metrics(profile: Profile) -> dict:
@@ -1346,10 +1569,22 @@ def surface_metrics(profile: Profile) -> dict:
         "browser_rendered": bool(caps.get("browser")),
         "accepts_text_input": bool(caps.get("any_endpoint_accepts_text_input")),
         "has_password_form": bool(caps.get("any_form_has_password")),
+        # SSO / CAPTCHA (off-score population signal): WHY auth is unreachable on apps that have it. has_sso lets
+        # the audit split the "could not submit a signup" bucket into social-login / captcha / other.
+        "sso_providers": caps.get("sso_providers") or [],
+        "has_sso": bool(caps.get("sso_providers")),
+        "captcha": caps.get("captcha"),
+        # SSO-ONLY: an SSO door with NO self-registerable alternative -- no password form AND no email-code /
+        # magic-link signup -- so we structurally cannot establish a session (we never drive social login). The
+        # hard-blocked slice, distinct from SSO-plus-password (which the password lane still registers).
+        "sso_only": (bool(caps.get("sso_providers"))
+                     and not bool(caps.get("any_form_has_password"))
+                     and _email_only_form(forms) is None),
         # composite "how much observable & HEALTHY APP surface we saw" — the parity denominator
         "surface_size": len(app_routes) + inputs + len(healthy_eps),
         "pointer": pointer,                          # LLM-pointer precision telemetry (off-score, build #2)
         "catch_all": bool(caps.get("catch_all")),    # phantom server-side surface was suppressed (soft-404/SPA)
         "host_tiers": profile.host_tiers,            # off-score: backend-tier map (where runtime traffic GOES) —
                                                      # batch-aggregates to size the SPA off-origin gap (Move 2)
+        "render_state": profile.render_state,        # Streamlit: rendered|error|stuck (None = not a canvas-shell host)
     }

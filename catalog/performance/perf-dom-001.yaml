@@ -1,0 +1,17 @@
+id: perf-dom-001
+bundle: performance
+category: dom-size
+pool: public
+evidence_model: oracle
+penalty: 7   # PROVISIONAL (re-priced on v19). Excessive DOM (slows style/layout/interaction). Lighthouse
+             # dom-size-insight node count. needs=1400 (LH warn) half, fail=2500 full.
+applicability:
+  requires: [lighthouse]
+probe:
+  predicate: lighthouse_audit
+  report_only: true   # OFF-SCORE: fires as a per-metric diagnostic finding at 0 penalty;
+                      # the perf axis is scored once on the overall headline (perf-lighthouse-001).
+  audit: dom-size-insight
+  mode: numeric
+  needs_above: 1400
+  fail_above: 2500

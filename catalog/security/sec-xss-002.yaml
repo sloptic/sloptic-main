@@ -6,6 +6,7 @@ pool: public
 evidence_model: provable
 penalty: 35   # stored XSS runs on every viewer of the feed — the #1 serious vuln class. Same tier as
               # sec-xss-001 (reflected) and sec-upload-002 (stored-via-file).
+severity_ref: xss   # stored JSON-API sink -> stored=True -> 85
 applicability:
   requires: [browser]   # must render to CONFIRM execution; N/A without --browser
 probe:

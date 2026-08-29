@@ -2,11 +2,14 @@ id: perf-loadtime-001
 bundle: performance
 category: load-time
 pool: public
-evidence_model: provable
-penalty: 34   # load past the ~5s abandonment ceiling. 53% of mobile visits bounce >3s
-              # (Google 2016); 79% won't return (Akamai). Flagship high-freq churn -> qa/perf top.
+evidence_model: oracle
+penalty: 34   # PROVISIONAL (re-priced on v19). Slow visual load (Speed Index = the whole visual-fill curve,
+              # not one milestone). Lighthouse metric, MEDIAN-of-3.
 applicability:
-  requires: [at_least_one_http_endpoint_exists]
+  requires: [lighthouse]
 probe:
-  predicate: perf_load_time
-  target: /
+  predicate: lighthouse_audit
+  report_only: true   # OFF-SCORE: fires as a per-metric diagnostic finding at 0 penalty;
+                      # the perf axis is scored once on the overall headline (perf-lighthouse-001).
+  audit: speed-index
+  mode: score

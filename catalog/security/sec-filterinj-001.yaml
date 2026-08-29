@@ -7,6 +7,7 @@ penalty: 34   # injection tier, priced just under SQLi/RLS-off (40) on purpose: 
               # widens what a query returns and can defeat the app's own scoping, but it is bounded by whatever
               # row-level policy still applies, whereas raw SQL or an RLS-off table is the whole database. When
               # both are true they are separate findings and the total reflects that.
+severity: {cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:L/A:N", cvss_score: 8.2, vrt: "n/a", range: [75, 75], default: 75}   # CWE-943 PostgREST filter injection; CVSS-only (no VRT); REPRICED 34->75 (just under SQLi)
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:

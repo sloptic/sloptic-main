@@ -9,3 +9,4 @@ applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:
   predicate: api_bola
+severity_ref: access-control   # shared block in catalog/_severity_classes.yaml (api_bola sets cross_user_read + sensitive_fields)

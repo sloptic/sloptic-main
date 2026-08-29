@@ -8,3 +8,4 @@ applicability:
   requires: [has_auth_entrypoint]
 probe:
   predicate: idor_horizontal
+severity_ref: access-control   # shared block in catalog/_severity_classes.yaml (idor_horizontal sets cross_user_read)

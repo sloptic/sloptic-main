@@ -32,6 +32,19 @@ def test_public_findings_render_four_fields(monkeypatch):
     assert card["hidden"]["count"] == 0
 
 
+def test_every_scored_probe_has_authored_card_copy_and_no_stale_keys():
+    # the report card drifted silently once (new probes fell back to generic copy). Pin it: every SCORED
+    # (non-report_only) catalog probe has an authored _CONTENT entry, and _CONTENT has no key for a probe that
+    # no longer exists. report_only probes are off-score diagnostics that never render on a card -> exempt.
+    from sloptic.catalog import default_catalog_dir, load_catalog
+    cat = {p.id: p for p in load_catalog(default_catalog_dir())}
+    scored_missing = [pid for pid, p in cat.items()
+                      if not p.probe.get("report_only") and pid not in rc._CONTENT]
+    stale = [pid for pid in rc._CONTENT if pid not in cat]
+    assert not scored_missing, f"scored probes with no report-card copy: {sorted(scored_missing)}"
+    assert not stale, f"report-card copy for probes that no longer exist: {sorted(stale)}"
+
+
 def test_unauthored_probe_degrades_gracefully(monkeypatch):
     # a probe with no authored entry still renders — 'indicates' falls back to the catalog reason, never blank
     monkeypatch.setattr(rc, "_pool_map", lambda root: {})

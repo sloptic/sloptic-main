@@ -11,21 +11,23 @@ from __future__ import annotations
 import contextlib
 import gzip
 import hashlib
+import html
 import json
+import os
 import re
 import secrets
 import statistics
 import time
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import replace
 
 import httpx
 
-from . import auth, baas, browser, depscan, oob, perf, secretscan
-from .net import make_client
+from . import auth, baas, browser, depscan, email_verify, lighthouse, oob, secretscan
+from .net import make_client, request_counts
 from .schema import Endpoint
-from .discovery import _CATCHALL_PROBE, _body_sig
+from .discovery import _CATCHALL_PROBE, _body_sig, _registrable_domain
 
 
 # --- innocence check: never fire a phantom finding on a catch-all / soft-404 SHELL ------------------------
@@ -97,9 +99,6 @@ _DEBUG_FINGERPRINT = re.compile(
 
 # ---- declarative matchers -------------------------------------------------------------------
 
-def ttfb_at_least(resp, arg) -> bool:
-    # This matcher uses one sample; the production TTFB path samples N and takes the median.
-    return resp.elapsed.total_seconds() >= float(arg)
 
 
 def response_contains(resp, arg) -> bool:
@@ -119,7 +118,12 @@ def _policy_applies(resp) -> bool:
 # header is no real exposure. Suppression only ever REMOVES a penalty (upside-only), so a conservative
 # known-suffix list is safe; a custom domain is never suppressed.
 _HSTS_PRELOADED_SUFFIXES = (
-    ".vercel.app", ".netlify.app", ".onrender.com", ".pages.dev", ".web.app", ".firebaseapp.com",
+    # Google's HSTS-preloaded TLDs (whole TLD, includeSubDomains): every *.app / *.dev / *.page has HTTPS
+    # browser-enforced, so a missing per-app HSTS header is no real exposure. Subsumes vercel/netlify/web.app +
+    # pages.dev, and catches run.app / railway.app / workers.dev / base44.app -- the S1 audit's ~40% preloaded-TLD FP.
+    ".app", ".dev", ".page",
+    # specific HSTS-preloaded platform domains NOT under a preloaded TLD
+    ".onrender.com", ".firebaseapp.com", ".github.io",
 )
 
 
@@ -187,25 +191,6 @@ def response_server_error(resp, arg=None) -> bool:
     return resp.status_code in (500, 502, 503, 504)
 
 
-def response_uncompressed(resp, arg=1024) -> bool:
-    # Slop: a sizeable TEXT response served with no Content-Encoding (gzip/br/deflate) -> wasted
-    # bandwidth and slower loads. Gate on size — small bodies don't benefit from compression, so a
-    # server that skips them is correct, not slop. httpx always sends Accept-Encoding and keeps the
-    # Content-Encoding header, so its presence means the server compressed.
-    if not _policy_applies(resp):
-        return False
-    ctype = resp.headers.get("content-type", "").lower()
-    if not any(t in ctype for t in ("text/", "javascript", "json", "xml", "svg")):
-        return False
-    # `identity` is HTTP's explicit token for "no transformation applied" (RFC 9110 8.4.1), so the header
-    # being PRESENT is not evidence of compression — its VALUE is. Measured on supavulnbase's perf-001
-    # fixture, which serves 124,879 bytes of text/plain with `content-encoding: identity` even when we send
-    # `Accept-Encoding: gzip, deflate, br`: their verify.sh asserts it is uncompressed and passes, and we
-    # read the header, saw it existed and reported clean.
-    enc = resp.headers.get("content-encoding", "").strip().lower()
-    if enc and enc != "identity":
-        return False
-    return len(resp.content) > int(arg)
 
 
 # sec-headers-006 (X-Powered-By) scope: presence is only a MEANINGFUL leak when the VALUE discloses more
@@ -245,9 +230,13 @@ def response_leaks_secret(resp, arg=None) -> bool:
 # (***, xxxx, [REDACTED]) and the OpenAPI spec's own schema examples are excluded.
 _CRED_FIELD = re.compile(
     r'"(?:password|passwd|pwd|hashed_password|password_hash|pwd_hash|user_password|'
-    r'plaintext_password)"\s*:\s*"(?!\s*(?:\*{2,}|x{4,}|redacted|hidden|\.{3})\s*")[^"]{2,}"',
+    r'plaintext_password)"\s*:\s*"(?!\s*(?:\*{2,}|x{4,}|redacted|hidden|\.{3})\s*")([^"]{2,})"',
     re.IGNORECASE,
 )
+# a UI/i18n LABEL, not a credential: a `/api/translate`-style strings endpoint returns "password":"Password" /
+# "Enter your password". A phrase of words ending in "password" (letters+spaces only) or a bullet placeholder is
+# a label; a real value ("EdyDemo6717!", "P@ssw0rd") has digits/symbols and is NOT excluded.
+_CRED_LABEL = re.compile(r"^(?:[a-z]+\s)*passwords?$|^[•●·*]+$", re.IGNORECASE)
 _CRED_HASH = re.compile(
     r"\$2[aby]\$\d\d\$[./A-Za-z0-9]{53}"   # bcrypt
     r"|\$argon2(?:id|i|d)\$"                # argon2
@@ -270,7 +259,11 @@ def response_leaks_credentials(resp, arg=None) -> bool:
         return False
     if _OPENAPI_DOC.search(body[:4000]):
         return False  # a served spec naming a "password" field in its schema isn't a data leak
-    return bool(_CRED_FIELD.search(body) or _CRED_HASH.search(body))
+    if _CRED_HASH.search(body):
+        return True   # a password HASH in the body is unambiguous
+    # a populated "password":"<value>" -- but only if the value is a real credential, not a UI/i18n label
+    # ("password":"Password" from a /api/translate strings endpoint). A real value (EdyDemo6717!) still fires.
+    return any(not _CRED_LABEL.match(m.group(1).strip()) for m in _CRED_FIELD.finditer(body))
 
 
 # Files that must never be served at the webroot (deploying with .env / .git present is classic
@@ -304,14 +297,12 @@ def response_is_git_head(resp, arg=None) -> bool:
 
 
 MATCHERS = {
-    "ttfb_at_least": ttfb_at_least,
     "response_contains": response_contains,
     "response_missing_header": response_missing_header,
     "response_missing_clickjacking_defense": response_missing_clickjacking_defense,
     "response_csp_weak": response_csp_weak,
     "response_cors_misconfigured": response_cors_misconfigured,
     "response_server_error": response_server_error,
-    "response_uncompressed": response_uncompressed,
     "response_has_header": response_has_header,
     "response_is_aws_credentials": response_is_aws_credentials,
     "response_leaks_secret": response_leaks_secret,
@@ -544,10 +535,16 @@ def _tech_error(c, method, reqfn):
     payload that produced it), else (None, None). Reporting the payload keeps the repro honest: with more than
     one candidate, naming the wrong one hands the auditor a request that does not reproduce. The signature set
     is specific DB strings a validation error or SPA shell can't produce, so a match is a high-confidence
-    leak."""
+    leak. PAIRED CANARY (v2.0 foundation #2): a candidate match is confirmed only if a bare literal with NO SQL
+    syntax does NOT also produce the signature; if it does, the string is reflected/generated (an LLM describing
+    a SQL error, an echoed error template) rather than caused by the quote -> not causally specific -> suppress."""
     for payload in _SQLI_ERROR_PAYLOADS:
         m = _SQL_ERROR.search(_do(c, method, reqfn(payload)).text)
         if m:
+            if _SQL_ERROR.search(_do(c, method, reqfn(_SQLI_NOISE_A)).text):
+                return None, None   # bare literal (no quote) reproduces the error signature -> not attributable (#2)
+            if not _reproduces(lambda: _do(c, method, reqfn(payload)), lambda r: _SQL_ERROR.search(r.text)):
+                return None, None   # the quote's error does not reproduce -> nondeterministic endpoint (#1)
             return m.group(0), payload
     return None, None
 
@@ -577,18 +574,51 @@ def _diverges(a, b) -> bool:
     return hi - lo > max(64, hi * 0.15)
 
 
-def _tech_boolean(c, method, reqfn) -> bool:
-    """Strict boolean-blind, gated on the endpoint's own NOISE FLOOR. First send two DIFFERENT inert benign
-    values; if THEY already diverge, the output is content-driven (an LLM/TTS/proxy varies with the input),
-    not a SQL result set, so a true/false split is meaningless -> suppress (error-based still runs). Only on a
-    stable endpoint: fire when the structurally-identical TRUE vs FALSE pair (one boolean apart) diverges AND
-    the split REPRODUCES on a second independent pair (rejects one-off flakiness). This is the differential-
-    control form of the causal-specificity invariant above — a content-reflective endpoint can't fake it."""
-    if _diverges(_do(c, method, reqfn(_SQLI_NOISE_A)), _do(c, method, reqfn(_SQLI_NOISE_B))):
-        return False   # content-reflective / non-deterministic endpoint -> the differential oracle is confounded
-    if not _diverges(_do(c, method, reqfn(_SQLI_TRUE)), _do(c, method, reqfn(_SQLI_FALSE))):
+def _boolean_split(t, f) -> bool:
+    """A DIRECTIONAL boolean-blind split. `col='1' OR '1'='1'` (TRUE) selects EVERY row; `col='1' OR '1'='2'`
+    (FALSE) selects only the col='1' subset — so TRUE returns a SUPERSET of FALSE and a genuine split has the
+    TRUE body DOMINATING FALSE: a status flip (rows vs none), or, at equal status, a TRUE body no smaller than
+    FALSE. The retired symmetric `_diverges` also fired when a fuzzy search returned a different-SIZED hit per
+    query STRING with no ordering — roadio's geocoder answered FALSE='1'='2' with 2023B (Guatemala) > TRUE with
+    312B (Iceland), a v18 false positive. Requiring the direction rejects that while still catching a real
+    result-set gate (the reversed case is not how `OR 1=1` vs `OR 1=2` behaves)."""
+    if not _diverges(t, f):
         return False
-    return _diverges(_do(c, method, reqfn(_SQLI_TRUE)), _do(c, method, reqfn(_SQLI_FALSE)))  # reproduce the split
+    if t.status_code != f.status_code:
+        return True                       # a true/false STATUS flip (both payloads are quote-shaped) is SQL-specific
+    return len(t.text) >= len(f.text)     # equal status -> TRUE (all rows) must be at least as large as FALSE
+
+
+def _reproduces(send, signal) -> bool:
+    """Determinism gate (v2.0 LLM-echo foundation #1): re-send the IDENTICAL request that just matched; its
+    boolean oracle SIGNAL must reproduce. A content-oracle match on a nondeterministic endpoint (a flaky
+    upstream, per-request generation, an LLM in the response path) does not reproduce -> can't-assess, not a
+    fire. Comparing the SIGNAL (does the DB-error / file-content pattern match), not the raw body, tolerates
+    benign nonces / timestamps / request-ids that vary without moving it. Together with the caller's original
+    send this is the roadmap's 'send each request twice'; `send()` issues it, `signal(resp)` is the feature."""
+    return bool(signal(send()))
+
+
+def _tech_boolean(c, method, reqfn) -> bool:
+    """Strict boolean-blind, gated THREE ways against the AI-corpus confounds — a content-reflective search or
+    an LLM in the response path can fake a true/false split, and both did on v18 (0/2 scored boolean fires were
+    real). (1) NOISE FLOOR: two DIFFERENT inert benign values; if THEY already diverge the output is content-
+    driven (an LLM/TTS/proxy varies with the input) -> suppress (error-based still runs). (2) DETERMINISM: the
+    SAME payload sent twice must reproduce — guardian's /api/case-update feeds new_status_label to an LLM that
+    writes fresh guidance each call, so identical requests diverge; its true/false gap is generation variance,
+    not a boolean, and the old 'reproduce on a second pair' passed because ANY two LLM outputs differ. (3)
+    DIRECTIONAL SPLIT: TRUE (OR 1=1, every row) must DOMINATE FALSE (OR 1=2, a subset), reproduced on a second
+    pair — roadio's geocoder returned a different-sized place per string (FALSE > TRUE, the wrong direction) and
+    tripped the old symmetric divergence. This is the differential-control form of the causal-specificity
+    invariant above; the three gates together are what a content-reflective endpoint cannot fake."""
+    if _diverges(_do(c, method, reqfn(_SQLI_NOISE_A)), _do(c, method, reqfn(_SQLI_NOISE_B))):
+        return False   # (1) content-reflective endpoint -> the differential oracle is confounded
+    true1 = _do(c, method, reqfn(_SQLI_TRUE))
+    if _diverges(true1, _do(c, method, reqfn(_SQLI_TRUE))):
+        return False   # (2) identical requests already diverge -> generative/LLM endpoint, not a SQL result set
+    if not _boolean_split(true1, _do(c, method, reqfn(_SQLI_FALSE))):
+        return False   # (3) TRUE must select a SUPERSET of FALSE, not merely differ in size (rejects the geocoder)
+    return _boolean_split(_do(c, method, reqfn(_SQLI_TRUE)), _do(c, method, reqfn(_SQLI_FALSE)))  # reproduce the split
 
 
 # UNION is CUT from api_sqli: its oracle (a concatenated marker appears in the body) is unsalvageable on an
@@ -640,20 +670,26 @@ def api_sqli(ctx, probe) -> bool | None:
     if not targets:
         return None
     budget = probe.probe.get("max_attempts", 120)
+    capped = _request_capped(probe)   # actual-request ceiling: each slot runs error+boolean (2-4 reqs), so bound
+    #                                   the total (a real SQLi short-circuits early; the class collapses to 1 finding)
     delay = probe.probe.get("time_delay", 3)
     tested = False
     slots_tested = 0
     eps_tested: list = []
     deep: list = []  # slots deferred to the UNION/time (blind, last-resort) pass
     techs = ["error", "boolean"]   # SCORED. time is advisory/off-score; union is cut (causal-specificity)
-    with make_client(ctx.base_url, ctx.headers, timeout=max(15.0, delay * 3 + 8),
+    with make_client(ctx.base_url, _authed_headers(ctx), timeout=max(15.0, delay * 3 + 8),
                      follow_redirects=False) as c:
         for ep in targets:
+            if capped():
+                break
             method = ep.method.upper()
             try:
                 base = _do(c, method, _sqli_request(ep, None, _SQLI_BENIGN))
             except (httpx.HTTPError, httpx.InvalidURL):
                 continue
+            if _redirects_to_auth(base):
+                continue  # login-gated target -> not testable without a session; skip (don't fuzz the redirect)
             if _SQL_ERROR.search(base.text):
                 continue  # baseline already errors for unrelated reasons -> can't attribute injection
             if _UPSTREAM_ERROR.search(base.text):
@@ -661,28 +697,46 @@ def api_sqli(ctx, probe) -> bool | None:
             if not _endpoint_is_live(ctx, c, ep.raw_path, method, base):
                 continue  # phantom endpoint (root or per-prefix catch-all shell) -> not a real SQL sink
             eps_tested.append(ep.raw_path)
-            for slot in _sqli_slots(ep):
-                if budget <= 0:
-                    break
-                budget -= 1
-                tested = True
-                slots_tested += 1
-                reqfn = (lambda ep=ep, slot=slot: lambda v: _sqli_request(ep, slot, v))()
-                try:
-                    err, err_pay = _tech_error(c, method, reqfn)
-                    if err or _tech_boolean(c, method, reqfn):
-                        pay = err_pay if err else _SQLI_TRUE   # the injected value that ACTUALLY revealed it
-                        ctx.evidence.update(injectable=True, via=("error" if err else "boolean"), param=slot,
-                                            endpoint=ep.raw_path, sql_error=err, techniques_tried=techs,
-                                            repro=_sqli_repro(ctx, method, reqfn, pay, matched=err))
-                        return True
-                except (httpx.HTTPError, httpx.InvalidURL):
-                    continue
-                if len(deep) < _DEEP_SLOTS:
-                    deep.append((method, reqfn, ep.raw_path, slot))
             if budget <= 0:
                 break
+            # DETERMINISTIC error + boolean per slot: both are pure CONTENT differentials (no latency), so the
+            # slots fan out concurrently and stop on the first confirmed injection. The blind TIME technique is
+            # NOT here -- it stays in the sequential `deep` pass below, where concurrent requests can't confound
+            # the latency it measures. A no-hit endpoint's slots are deferred to that time pass (advisory).
+            slots = list(_sqli_slots(ep))[:budget]
+            budget -= len(slots)
+            if slots:
+                tested = True
+                slots_tested += len(slots)
+
+                def _sqli_send(slot, ep=ep, method=method):
+                    reqfn = lambda v: _sqli_request(ep, slot, v)
+                    try:
+                        err, err_pay = _tech_error(c, method, reqfn)
+                        if err or _tech_boolean(c, method, reqfn):
+                            return slot, {"via": "error" if err else "boolean", "err": err,
+                                          "pay": err_pay if err else _SQLI_TRUE, "reqfn": reqfn,
+                                          "method": method, "path": ep.raw_path}
+                    except (httpx.HTTPError, httpx.InvalidURL):
+                        return slot, None
+                    return slot, None
+                got = _fan_out_first(_sqli_send, slots, lambda s, r: r is not None, cap_check=capped)
+                if got is not None:
+                    slot, info = got
+                    ctx.evidence.update(injectable=True, via=info["via"], param=slot, endpoint=info["path"],
+                                        sql_error=info["err"], techniques_tried=techs,
+                                        repro=_sqli_repro(ctx, info["method"], info["reqfn"], info["pay"],
+                                                          matched=info["err"]))
+                    return True
+                for slot in slots:   # no deterministic hit -> defer these to the blind TIME pass (advisory, off-score)
+                    if len(deep) < _DEEP_SLOTS:
+                        deep.append((method, (lambda v, ep=ep, slot=slot: _sqli_request(ep, slot, v)),
+                                     ep.raw_path, slot))
+            if capped():
+                break
         for method, reqfn, path, slot in deep:   # blind TIME pass -> ADVISORY only, never scored
+            if capped():
+                break
             try:
                 if _tech_time(c, method, reqfn, delay):
                     ctx.evidence.setdefault("advisory", "possible blind sqli (time-based, unverified — human review)")
@@ -785,7 +839,7 @@ def xss_injectable(ctx, probe) -> bool | None:
     tested = False
     checked = 0
     get_candidates: list[tuple[str, str]] = []   # (action, field) GET reflections to confirm by execution
-    with make_client(ctx.base_url, ctx.headers, timeout=10.0, follow_redirects=True) as c:
+    with make_client(ctx.base_url, _authed_headers(ctx), timeout=10.0, follow_redirects=True) as c:
         for action, method, fields in targets:
             for field in fields:
                 if budget <= 0:
@@ -828,7 +882,7 @@ def xss_injectable(ctx, probe) -> bool | None:
                 try:
                     sent = _xss_send(c, "post", action, {fn: inject for fn in fields})
                     if _reflects(c.get(action), detect):
-                        ctx.evidence.update(injectable=True, kind="stored", via="reflection",
+                        ctx.evidence.update(injectable=True, kind="stored", stored=True, via="reflection",
                                             target=action, payload=inject,
                                             repro=_repro_from_resp(sent, matched="payload persists; GET %s reflects it" % action))
                         return True  # persisted across a fresh request -> stored XSS
@@ -845,13 +899,186 @@ def xss_injectable(ctx, probe) -> bool | None:
             if browser.dom_xss_executes(ctx.base_url, [action], params=tuple(gfields),
                                         payloads=browser._XSS_EXEC_PAYLOADS, headers=ctx.headers):
                 exurl = ctx.base_url.rstrip("/") + action + "?" + urllib.parse.urlencode({gfields[0]: browser._XSS_PAYLOAD})
-                ctx.evidence.update(injectable=True, kind="reflected", via="execution",
+                ctx.evidence.update(injectable=True, kind="reflected", execution_confirmed=True, via="execution",
                                     target=action, fields=gfields,   # executed in a real DOM -> provable XSS
                                     repro=_repro("GET", exurl, matched="payload executed in a headless browser"))
                 return True
     ctx.evidence.update(injectable=False, fields_tested=checked, payload_shapes=len(payloads),
                         get_candidates_unconfirmed=len(get_candidates))
     return False if tested else None
+
+
+# --- qa-input-002: international / multibyte input robustness ------------------------------------------------
+# Submit real-world non-ASCII text (emoji, CJK, Arabic, combining marks, full-width, astral-plane) to a writable
+# field and watch the round trip. Two failure modes a MEANINGFUL fraction of apps ship (a MySQL `utf8` 3-byte
+# column, a latin1 table, a form-charset mismatch, a naive byte-slice): the value comes back CORRUPTED (mojibake
+# / replacement char / `?` substitution) -> data silently mangled (32); or the request 500s -> the app crashes on
+# real user data (72). Intent-independent + deterministic: a UTF-8-clean stack round-trips every string untouched.
+_ENC_PROBES = [
+    ("emoji", "\U0001F468‍\U0001F469‍\U0001F467\U0001F9D1\U0001F3FD"),  # ZWJ family + skin tone: 4-byte utf8mb4
+    ("cjk", "日本語한국어中文"),          # JP/KR/CN (breaks a latin1 table)
+    ("arabic", "مرحبا"),          # RTL Arabic
+    ("fullwidth", "ＡＢＣ１２"),       # full-width double-byte forms (3-byte)
+    ("astral", "\U0001D54F\U0001F004\U0001D7D9"),          # astral-plane 4-byte (math + mahjong)
+]
+# every probe char is > U+00FF, so a surviving char never collides with the U+00C0-U+00FF mojibake signature.
+_MOJIBAKE_LEAD = tuple(chr(c) for c in range(0xC0, 0x100))  # utf-8 lead bytes (0xC2-0xF4) as latin-1
+
+
+def _encoding_corrupted(text: str, sentinel: str, expected: str):
+    """Did our non-ASCII value come back mangled? True (corrupted) / False (survived) / None (can't judge -- not
+    reflected, or ambiguous). Locates the ASCII sentinel, isolates the reflected value up to the next structural
+    delimiter, and decodes HTML entities (so `&#26085;` counts as CORRECT handling, not corruption). Fires only on
+    a POSITIVE loss marker -- a U+FFFD replacement char, a `?` substitution, or utf-8-as-latin-1 mojibake (a
+    U+00C0-U+00FF lead-byte run) where our (all > U+00FF) chars were -- never on mere absence (%-encoding, a JSON
+    \\u escape, a value the app didn't echo), which would false-positive."""
+    i = text.find(sentinel)
+    if i < 0:
+        return None                                        # value not reflected -> this probe can't judge round-trip
+    raw = text[i + len(sentinel): i + len(sentinel) + max(64, len(expected) * 8)]
+    cut = len(raw)
+    for d in ('"', "<", "\n", "\r", "'", "}", "\\"):       # the reflected value ends at the first HTML/JSON delimiter
+        j = raw.find(d)
+        if 0 <= j < cut:
+            cut = j
+    window = raw[:cut]
+    if not window:
+        return None                                        # value stripped / not echoed after the sentinel -> abstain
+    decoded = html.unescape(window)
+    if any(ch in decoded for ch in expected):
+        return False                                       # any expected char survived (raw or entity-encoded) -> clean
+    if "�" in window:
+        return True                                        # U+FFFD replacement char -> definitive loss
+    if "?" in window:
+        return True                                        # `?` where our multibyte chars were -> charset substitution
+    if any(ch in window for ch in _MOJIBAKE_LEAD):
+        return True                                        # utf-8-as-latin-1 mojibake (double-encoding)
+    return None                                            # reflected but ambiguous (stripped / %-encoded) -> abstain
+
+
+def _submit_and_observe(c, method, action, fields, field, sentinel, value):
+    """Submit `value` in `field` and return (observed_text, status) -- the text where the sentinel round-trips:
+    the POST/GET response itself (an echoing endpoint), ELSE a READ-BACK GET of the endpoint (a REST create that
+    returns {id} but whose listing shows the stored value -- the SPA-sink recall lane). observed_text is None
+    when the value isn't observable anywhere; status is the submit status (for the 5xx check)."""
+    try:
+        rr = _xss_send(c, method, action, {fn: (value if fn == field else "hl") for fn in fields})
+    except (httpx.HTTPError, httpx.InvalidURL):
+        return None, None
+    if sentinel in rr.text:
+        return rr.text, rr.status_code
+    if (method or "get").lower() in ("post", "postjson", "put", "patch"):
+        try:
+            rb = c.request("GET", action.split("?")[0])          # read the value back from the endpoint/listing
+            if sentinel in rb.text:
+                return rb.text, rr.status_code
+        except (httpx.HTTPError, httpx.InvalidURL):
+            pass
+    return None, rr.status_code
+
+
+def international_input_breaks(ctx, probe) -> bool | None:
+    """qa-input-002: the app corrupts (32) or 500s (72) on international / multibyte input. Baselines each field
+    with an ASCII marker first, so a generally-broken endpoint is never blamed on encoding, and only credits the
+    500 rung when ASCII returns 2xx but the unicode payload 5xxs. Observes the round trip via the response echo
+    OR a READ-BACK GET (a JSON create that doesn't echo but whose listing shows the value -- the SPA sink).
+    Uses the register-lane session (reach fields behind login). N/A when there's no writable text surface."""
+    targets = _injectable_targets(ctx.profile) + _json_body_targets(ctx.profile)
+    caps = getattr(getattr(ctx, "profile", None), "capabilities", None) or {}
+    # No discovered httpx text target: on an SPA the text input is client-rendered, so fall THROUGH to the browser
+    # read-back lane below (a create almost always lives behind login, so gate on browser + auth). A hard N/A here
+    # pre-empted that lane -- the reason 68 apps read 'requires unmet' / 'no writable text surface' on the corpus.
+    if not targets and not (caps.get("browser") and caps.get("has_auth_entrypoint")):
+        ctx.evidence["na_reason"] = "no writable text surface (no discovered text endpoint, no auth-gated create)"
+        return None
+    budget = probe.probe.get("max_attempts", 60)
+    tested = False
+    corrupted_hit = None
+    # OBSERVABILITY instrumentation: a "clean" is only meaningful if we actually SAW a round trip. Count the
+    # observable denominator (echo OR read-back) so a genuine clean (survived intact) is distinguishable from a
+    # vacuous one (nothing observable). Drives the tail-vs-recall read.
+    fields_tested = fields_reflecting = survived = abstained = 0
+    with make_client(ctx.base_url, _authed_headers(ctx), timeout=10.0, follow_redirects=True) as c:
+        for action, method, fields in targets:
+            for field in fields:
+                if budget <= 0:
+                    break
+                budget -= 1
+                sentinel = "HLenc" + secrets.token_hex(3)
+                # BASELINE: an ASCII value must round-trip 2xx first, else this endpoint is broken regardless of
+                # encoding (a 500 on ascii, a dead route) -> skip; never blame encoding for a generally-broken field.
+                btext, bstatus = _submit_and_observe(c, method, action, fields, field, sentinel, sentinel)
+                if bstatus is None or bstatus >= 500:
+                    continue
+                tested = True
+                fields_tested += 1
+                observable = btext is not None                   # echo OR read-back showed the value
+                if observable:
+                    fields_reflecting += 1
+                for script, payload in _ENC_PROBES:
+                    if budget <= 0:
+                        break
+                    budget -= 1
+                    ptext, pstatus = _submit_and_observe(c, method, action, fields, field, sentinel, sentinel + payload)
+                    if pstatus is not None and pstatus >= 500:   # ASCII was fine (baseline<500) -> the unicode 500s it
+                        ctx.evidence.update(broke=True, server_error=True, kind="500", script=script,
+                                            target=action, field=field, status=pstatus,
+                                            fields_tested=fields_tested, fields_reflecting=fields_reflecting,
+                                            repro=_repro("POST", ctx.base_url.rstrip("/") + action,
+                                                         matched="HTTP %d on %s input" % (pstatus, script)))
+                        return True                              # the 72 rung: crashes on real user data
+                    if observable and ptext is not None:
+                        verdict = _encoding_corrupted(ptext, sentinel, payload)
+                        if verdict is True and corrupted_hit is None:
+                            corrupted_hit = (action, field, script)
+                        elif verdict is False:
+                            survived += 1                        # international chars came back intact
+                        elif verdict is None:
+                            abstained += 1                       # observed but couldn't judge (%-encoded / JSON \u)
+            if budget <= 0:
+                break
+    obs = dict(fields_tested=fields_tested, fields_reflecting=fields_reflecting, survived=survived, abstained=abstained)
+    if corrupted_hit is not None:                            # the 32 rung: value silently mangled on round trip
+        action, field, script = corrupted_hit
+        ctx.evidence.update(broke=True, corrupted=True, kind="corruption", script=script, target=action, field=field,
+                            **obs,
+                            repro=_repro("POST", ctx.base_url.rstrip("/") + action,
+                                         matched="%s input round-tripped corrupted (mojibake / ? / U+FFFD)" % script))
+        return True
+    if survived > 0:
+        ctx.evidence.update(broke=False, **obs)
+        return False                                         # observed >=1 international round trip survive -> clean
+    # BROWSER READ-BACK lane: httpx saw no round trip (an SPA JSON sink / client-rendered create), so drive a
+    # content form in a browser (carrying the session), submit an international value, re-render, and read it back
+    # from the CLIENT-RENDERED DOM -- the SPA write round trip httpx structurally can't observe. One launch, the
+    # most fragile payload (4-byte emoji: if it survives, the narrower scripts do too). Gated on a real browser.
+    if getattr(ctx, "profile", None) is not None and ctx.profile.capabilities.get("browser"):
+        script, payload = _ENC_PROBES[0]                     # emoji (4-byte utf8mb4 -> breaks a 3-byte utf8 column)
+        sentinel = "HLenc" + secrets.token_hex(3)
+        try:
+            rendered = browser.create_and_read_back(ctx.base_url, sentinel + payload, sentinel,
+                                                    headers=_authed_headers(ctx))
+        except Exception:
+            rendered = None
+        if rendered is not None:
+            obs["fields_reflecting"] = obs.get("fields_reflecting", 0) + 1
+            verdict = _encoding_corrupted(rendered, sentinel, payload)
+            if verdict is True:                              # the 32 rung, observed via the browser read-back
+                ctx.evidence.update(broke=True, corrupted=True, kind="corruption", script=script, via="browser",
+                                    target="(browser create)", **obs,
+                                    repro=_repro("POST", ctx.base_url,
+                                                 matched="%s round-tripped corrupted via browser read-back" % script))
+                return True
+            if verdict is False:
+                ctx.evidence.update(broke=False, via="browser", **obs)
+                return False                                 # observed a CLEAN browser round trip -> handles unicode
+    ctx.evidence.update(broke=False, **obs)
+    # tested fields, but none reflected their value (SPA JSON sink / non-echoing form) -> we never SAW a round
+    # trip, so a "clean" here would be false. Honest N/A: the recall gap the browser read-back lane closes.
+    ctx.evidence["na_reason"] = (
+        "no observable international round-trip (%d field(s) tested, none reflected the value)" % fields_tested
+        if tested else "no writable text surface to test")
+    return None
 
 
 def stored_xss_api(ctx, probe) -> bool | None:
@@ -862,7 +1089,26 @@ def stored_xss_api(ctx, probe) -> bool | None:
     app that escapes on output — React {value} — never fires). The text analog of upload-002 (stored XSS via
     file). N/A without a JSON create endpoint, a browser, or (when the create is gated) a session."""
     creates = [e for e in ctx.profile.endpoints if e.method.lower() in ("post", "put", "patch") and e.body_fields]
+
+    def _browser_create_fallback():
+        """When the httpx create can't store (auth-gated, or the SPA form action is a placeholder so the real
+        create is a JS fetch), drive the create IN THE BROWSER with the session and check execution on the
+        re-render. Only ever CONFIRMS execution (True) -> never a false clean/fire; None = couldn't confirm."""
+        if not (getattr(ctx, "profile", None) is not None and ctx.profile.capabilities.get("browser")):
+            return None
+        marker = "hlsx" + secrets.token_hex(3)
+        xss = "<img src=x onerror=\"window.__hl_domxss='%s'\">" % marker
+        try:
+            if browser.create_and_check_execution(ctx.base_url, xss, marker, headers=_authed_headers(ctx)):
+                ctx.evidence.update(stored_xss=True, stored=True, execution_confirmed=True, via="browser-create")
+                return True
+        except Exception:
+            pass
+        return None
+
     if not creates:
+        if _browser_create_fallback():                     # no JSON create endpoint, but maybe a browser content form
+            return True
         ctx.evidence["na_reason"] = "no JSON create endpoint to store an XSS payload through"
         return None
     account = ctx.register()   # the create is usually auth-gated; a provided --header/--login session is used directly
@@ -879,6 +1125,8 @@ def stored_xss_api(ctx, probe) -> bool | None:
             except (httpx.HTTPError, httpx.InvalidURL):
                 continue
         if not stored:
+            if _browser_create_fallback():                 # httpx couldn't POST (auth-gated / JS-fetch create) -> browser
+                return True
             ctx.evidence["na_reason"] = "no create accepted the stored-XSS write to render back"
             return None
         hdrs = dict(ctx.headers or {})   # render as the SAME identity so the stored item is on the authed feed
@@ -893,7 +1141,7 @@ def stored_xss_api(ctx, probe) -> bool | None:
                   if not r.startswith("/_next/") and not r.split("?")[0].endswith((".js", ".css", ".png",
                                                                                     ".svg", ".ico", ".woff2"))][:20] or ["/"]
         if browser.stored_xss_executes(ctx.base_url, routes, headers=hdrs or None):
-            ctx.evidence.update(stored_xss=True, endpoints=[e.path for e in creates][:5])
+            ctx.evidence.update(stored_xss=True, stored=True, execution_confirmed=True, endpoints=[e.path for e in creates][:5])
             return True   # a stored API value executed unescaped in the DOM -> stored XSS
         ctx.evidence.update(stored_xss=False, creates_tested=len(creates))
         return False
@@ -918,6 +1166,20 @@ def back_nav_broken(ctx, probe) -> bool | None:
 
 
 _SCRIPT_SRC = re.compile(r"""<script\b[^>]*\bsrc=["']([^"']+)["']""", re.I)
+# dev-server / HMR / build-tool script references that a prod deploy shouldn't have. Their absence (404) does
+# NOT stop the app rendering, so they are not a "dead bundle" -- unlike the app's real hashed bundle.
+_DEV_SCRIPT = re.compile(r"livereload|/@vite/|/@react-refresh|hot-update|webpack-dev-server|__vite|/@id/|"
+                         r"\.local\.js\b|/node_modules/", re.I)
+
+
+def _registrable(netloc: str) -> str:
+    """The registrable domain (last two labels ~ eTLD+1) of a netloc, so an apex<->www canonical redirect reads
+    as the SAME site (foo.com == www.foo.com) while a move to a DIFFERENT domain does not (basementhost.com !=
+    tensordock.com). IPs and single-label hosts compare whole (port stripped)."""
+    h = (netloc or "").split(":")[0].lower().rstrip(".")
+    if re.match(r"^\d+(?:\.\d+)*$", h) or len(h.split(".")) < 3:
+        return h                          # IPv4 / apex domain / single label -> compare the whole host
+    return ".".join(h.split(".")[-2:])    # www.foo.com / a.b.foo.com -> foo.com
 
 
 # DEVELOPMENT BUILD SHIPPED TO PRODUCTION — the HMR client is the categorical tell.
@@ -1038,10 +1300,18 @@ def dead_bundle_chunk(ctx, probe) -> bool | None:
             pu = urllib.parse.urlparse(urllib.parse.urljoin(ctx.base_url.rstrip("/") + "/", src.strip()))
             if pu.netloc and pu.netloc != host:
                 continue   # a CDN/vendor script -> not the app's own bundle
+            if _DEV_SCRIPT.search(pu.path):
+                continue   # a dev-server / HMR / node_modules artifact (livereload, /@vite/, *.local.js) -> not
+                #            the app's prod bundle; its 404 in a static deploy doesn't stop the app rendering
             try:
                 r = c.get(pu.path)
             except (httpx.HTTPError, httpx.InvalidURL):
                 continue
+            final = urllib.parse.urlparse(str(r.url)).netloc
+            if final and _registrable(final) != _registrable(host):
+                continue   # the fetch redirected to a DIFFERENT registrable domain (a parked/moved site's HTML,
+                #            basementhost -> tensordock) -> not a dead chunk of THIS app. An apex<->www canonical
+                #            redirect stays SAME-site, so a real dead chunk on a www-canonical app still fires.
             checked += 1
             ct = r.headers.get("content-type", "").lower()
             # dead = an honest 404/410/5xx, OR a catch-all host serving the HTML shell where JS should be
@@ -1080,6 +1350,8 @@ def deep_link_shell(ctx, probe) -> bool | None:
     routes = [r for r in ctx.profile.routes
               if r not in ("/", "") and not r.startswith(("/_next/", "/static/", "/assets/"))
               and not _DL_API_ROUTE.search(r)                              # /api,/v1,/graphql,... = endpoint, not a view
+              and "/api/" not in r.lower()                                 # a MID-PATH api call (/x/api/feedback) too
+              and "index.htm" not in r.split("?")[0].lower()               # the entry alias, not a deep-link sub-view
               and r.split("?")[0].rstrip("/") not in endpoint_paths        # discovered as an API endpoint -> not a view
               and not r.split("?")[0].lower().endswith(_DL_NONVIEW_EXT)]    # a JS/media/doc asset, not a view
     if not routes:
@@ -1103,8 +1375,13 @@ def no_error_state(ctx, probe) -> bool | None:
     The forced failure makes the OUTCOME definitively failed, so a silent-retry-that-succeeds can't confuse it;
     ANY indication (message / red field / toast) counts as handled — we grade that an apology exists, not its
     quality. N/A without a browser or a create form whose submit fires a mutating request."""
-    if auth.create_form(ctx.profile.forms) is None:
-        ctx.evidence["na_reason"] = "no create/save form to submit-and-fail"
+    form = auth.create_form(ctx.profile.forms)
+    caps = getattr(getattr(ctx, "profile", None), "capabilities", None) or {}
+    # No discovered <form> create: a FORMLESS SPA create (bare input + button) never lands in the form list, but
+    # the browser lane's _fill_create_form drives it anyway. Only bother when an auth surface exists -- a create
+    # almost always lives behind login -- so we don't launch a browser on every static no-form page.
+    if form is None and not caps.get("has_auth_entrypoint"):
+        ctx.evidence["na_reason"] = "no create/save form to submit-and-fail (and no auth surface hiding a formless one)"
         return None
     hdrs = dict(ctx.headers or {})   # authenticate the page if we hold a session (the form is usually gated)
     account = ctx.register(suffix="_noerr")
@@ -1120,12 +1397,17 @@ def no_error_state(ctx, probe) -> bool | None:
     finally:
         if account is not None:
             account.client.close()
-    ctx.evidence.update(verdict=verdict)
+    action = form.action if form else "a browser-discovered create"
+    ctx.evidence.update(verdict=verdict, action=action)
     if verdict == "silent":
+        ctx.evidence["matched"] = ("forced the submit of %s to fail; the app showed no error/failure "
+                                   "indication (silent data loss)" % action)
         return True   # the action's request failed and the app showed the user nothing -> silent data loss
     if verdict == "handled":
         return False
-    ctx.evidence["na_reason"] = "no create form submitted a mutating request to fail (client-only / no browser)"
+    ctx.evidence["na_reason"] = ("no create form the browser could submit-and-fail (formless lane found none)"
+                                 if form is None else
+                                 "no create form submitted a mutating request to fail (client-only / no browser)")
     return None
 
 
@@ -1144,6 +1426,148 @@ def no_error_state(ctx, probe) -> bool | None:
 _CMD_HASH = ("printf {s} | sha256sum", "printf {s} | md5sum")
 _CMD_SEPS = (";%s", "|%s", "||%s", "&&%s", "\n%s", "$(%s)", "`%s`")
 _CMD_TIME = (";sleep {d}", "$(sleep {d})", "`sleep {d}`", "&&sleep {d}", "|sleep {d}")
+
+# The injection fan-out probes follow redirects (to see a PRG result page carrying the oracle), but httpx fires
+# the response hook PER HOP, so a redirect-heavy origin multiplies BOTH the wire traffic and the request tally
+# (the 1626-request cmdi / 504-request ssti outliers -- both far above their payload budgets -- are hop-
+# inflated, not extra payloads). A genuine injection result is <=1-2 hops away (POST->302->GET), so cap the
+# chain: bounds the amplification and fails fast on a redirect loop (which is dinged elsewhere anyway). Cut 4->2:
+# the legit case is one POST-redirect-GET; more just let a /login chain balloon the request tally.
+_INJECT_MAX_REDIRECTS = 2
+# INJECTION TOTAL-request cap (shared by cmdi/ssti/lfi). The payload budgets count logical ATTEMPTS, but the
+# per-target baseline/liveness fan-out + redirect HOPS (each one a request the WAF sees, tallied by
+# net.request_counts) let a redirecting app reach ~900 requests (v21 ssti hit 991). Bound the ACTUAL request
+# count so no app exceeds this. cmdi had this cap; ssti/lfi never got it despite the same hop inflation (their
+# budgets are attempts, not requests) -- hence the runaway tail. It's near-lossless: a real injection is found in
+# the first handful of attempts, and the score collapses all instances to ONE finding, so the deep tail only
+# buys marginal confidence in a CLEAN verdict, which saturates well below this cap.
+_INJECT_MAX_REQUESTS = 150
+_CMDI_MAX_REQUESTS = _INJECT_MAX_REQUESTS   # kept for the cmdi reference below; same value
+
+# Per-app HTTP concurrency for the DETERMINISTIC injection payloads. Injection is I/O-bound (waiting on the
+# remote origin), so firing N at once is ~free on CPU and doesn't compete for the grade box's cores -- it just
+# fills the network wait. N IS the per-origin burst rate, so keep it modest: a per-origin rate-limit it trips is
+# salvaged by retry_blocked's low-traffic subset re-grade. Score-safe: same payloads + same oracle, only the
+# ORDER/TIMING changes, so the deterministic verdict is identical. TIME-BASED oracles (dose-response sleep, blind
+# SQLi timing) must NEVER use this -- concurrent requests confound the latency they measure. Env-tunable so the
+# burst can be dialed on a flaky corpus without a code change.
+_INJECT_POOL = max(1, int(os.environ.get("SLOPTIC_INJECT_POOL", "6")))
+# Separate, LOWER default for the sensitive-file path scan: the enumeration probes are where the per-origin WAF
+# challenge onsets first (measured: sec-exposure-007 is the #1 challenge trigger), because they spray many paths
+# at one origin. A smaller pool keeps that burst gentler; retry_blocked still salvages anything it trips.
+_EXPOSURE_POOL = max(1, int(os.environ.get("SLOPTIC_EXPOSURE_POOL", "4")))
+
+
+def _fan_out_first(send, specs, oracle, pool=_INJECT_POOL, cap_check=None):
+    """Fire `specs` through a bounded thread pool and return the FIRST (spec, resp) whose oracle(spec, resp) is
+    truthy, then STOP submitting (short-circuit -- an injection probe wants one confirmed hit, not all of them).
+    `send(spec) -> (spec, resp_or_None)`; a spec that errors should return (spec, None). `cap_check() is True`
+    stops further submission (the request budget). Returns None if nothing hit. A single httpx.Client is
+    thread-safe for concurrent requests, so callers share one client across the pool.
+
+    DETERMINISTIC oracles ONLY. A latency/time oracle is invalid here -- concurrent requests contend and inflate
+    each other's measured response time into false positives; those probes keep their sequential path."""
+    it = iter(specs)
+    hit = None
+    with ThreadPoolExecutor(max_workers=max(1, pool)) as ex:
+        pending = set()
+
+        def _refill():
+            while len(pending) < max(1, pool):
+                if cap_check is not None and cap_check():
+                    return
+                nxt = next(it, None)
+                if nxt is None:
+                    return
+                pending.add(ex.submit(send, nxt))
+        _refill()
+        while pending and hit is None:
+            done, keep = wait(pending, return_when=FIRST_COMPLETED)
+            pending = keep
+            for fut in done:
+                try:
+                    spec, resp = fut.result()
+                except Exception:              # a worker that raised past its own guards -> treat as a miss
+                    spec, resp = None, None
+                if resp is not None and oracle(spec, resp):
+                    hit = (spec, resp)
+                    break
+            if hit is None:
+                _refill()
+        for fut in pending:                    # short-circuit: cancel whatever hasn't started (running ones drain)
+            fut.cancel()
+    return hit
+
+
+def _request_capped(probe, default: int = _INJECT_MAX_REQUESTS):
+    """Return a no-arg predicate that's True once THIS probe has sent `max_requests` ACTUAL requests (every
+    redirect hop counted, via net.request_counts) -- the hard stop against a redirecting app amplifying
+    attempts x hops into a WAF-tripping, timeout-blowing burst. A unit-test mock probe with no .id is never
+    capped (no request_counts entry)."""
+    pid = getattr(probe, "id", "")
+    max_req = probe.probe.get("max_requests", default)
+
+    def capped() -> bool:
+        rc = request_counts()
+        return rc is not None and rc.get(pid, 0) >= max_req
+    return capped
+
+
+# An auth route a target gets 302'd to when it's behind a session we don't hold. Injecting such a target
+# unauthenticated just bounces off the login page: every attempt is WASTED (no sink reached) and redirect-
+# amplified. So skip it -- the fix that STOPS the waste, vs the cap which only bounds it. (Authenticated
+# injection, which actually reaches the surface, is the register lane's job -- the point of email verification.)
+_AUTH_REDIRECT = re.compile(r"/(?:log-?in|sign-?in|sign-?up|register|auth(?:enticate)?|account|session|oauth)"
+                            r"(?:[/?#]|$)", re.I)
+
+
+def _redirects_to_auth(resp) -> bool:
+    """True when a target is 302'd to an auth route -- login-gated, not testable without a session, so injection
+    just fuzzes the /login redirect. Handles BOTH a direct 3xx (follow_redirects=False -> the Location is the auth
+    route) AND a followed chain (follow_redirects=True -> the final URL / any hop's Location is an auth route)."""
+    try:
+        if resp.is_redirect and _AUTH_REDIRECT.search(resp.headers.get("location", "")):
+            return True
+        if resp.history:
+            if _AUTH_REDIRECT.search(str(getattr(resp.url, "path", "") or "")):
+                return True
+            return any(_AUTH_REDIRECT.search(h.headers.get("location", "")) for h in resp.history)
+    except Exception:
+        pass
+    return False
+
+
+def _authed_headers(ctx):
+    """The session headers the injection probes should inject WITH, so they reach the AUTHED surface instead of
+    bouncing off /login (the whole point of the register lane / email verification -- injecting anonymously is
+    blind to everything behind login). A caller-supplied --header session wins; otherwise the register-lane
+    session (self-registered / email-verified, memoized on ctx). Falls back to ctx.headers (anonymous) when no
+    session can be established -- and _redirects_to_auth then skips the login-gated targets. Merged onto
+    ctx.headers so a UA / provided header survives. Memoized on ctx (one registration shared across the injection
+    probes, not one each)."""
+    if auth._provided_session(getattr(ctx, "headers", None)):
+        return ctx.headers                                   # the caller's session is already carried
+    cache = getattr(ctx, "_email_cache", None)
+    if isinstance(cache, dict) and "_authed_headers" in cache:
+        return cache["_authed_headers"]
+    result = getattr(ctx, "headers", None)                   # anonymous fallback (the auth-redirect skip handles /login)
+    reg = getattr(ctx, "register", None)
+    if callable(reg):
+        try:
+            acct = reg()                                     # establish the register-lane session (once)
+        except Exception:
+            acct = None
+        if acct is not None:
+            try:
+                session = _snapshot_session(acct).get("headers") or {}   # Cookie / Bearer / apikey, replayable
+            finally:
+                with contextlib.suppress(Exception):
+                    acct.client.close()
+            if session:
+                result = {**(ctx.headers or {}), **session}
+    if isinstance(cache, dict):
+        cache["_authed_headers"] = result
+    return result
 
 
 def _elapsed(c, method, action, data) -> float:
@@ -1191,51 +1615,72 @@ def command_injection(ctx, probe) -> bool | None:
     targets = _injectable_targets(ctx.profile) + _json_body_targets(ctx.profile)
     if not targets:
         return None
-    budget = probe.probe.get("max_attempts", 120)
+    targets = targets[: probe.probe.get("max_targets", 40)]   # cap the per-target baseline/liveness fan-out
+    budget = probe.probe.get("max_attempts", 100)             # payload cap (100 seps x 2 hashes); modest trim
+    max_req = probe.probe.get("max_requests", _CMDI_MAX_REQUESTS)   # hard cap on ACTUAL WAF-visible requests (hops incl.)
     delay = probe.probe.get("time_delay", 3)
     salt = "hlci" + secrets.token_hex(6)
     wanted = (hashlib.sha256(salt.encode()).hexdigest(), hashlib.md5(salt.encode()).hexdigest())
     tested = False
     checked = 0
     deep: list = []
-    with make_client(ctx.base_url, ctx.headers, timeout=max(15.0, delay * 3 + 8), follow_redirects=True) as c:
+
+    _pid = getattr(probe, "id", "")   # a unit-test mock probe may lack .id -> no request_counts entry -> uncapped
+    def _capped():   # ACTUAL requests this probe has already sent (net.request_counts tallies every hop)
+        rc = request_counts()
+        return rc is not None and rc.get(_pid, 0) >= max_req
+    with make_client(ctx.base_url, _authed_headers(ctx), timeout=max(15.0, delay * 3 + 8),
+                     follow_redirects=True, max_redirects=_INJECT_MAX_REDIRECTS) as c:
         for action, method, fields in targets:
-            if budget <= 0:
+            if budget <= 0 or _capped():
                 break
             filler = {fn: _XSS_FILLER for fn in fields}
             try:
                 base = _xss_send(c, method, action, filler)
             except (httpx.HTTPError, httpx.InvalidURL):
                 continue
+            if _redirects_to_auth(base):
+                continue  # login-gated target -> not testable without a session; skip (don't fuzz the redirect)
             if any(w in base.text for w in wanted):
                 continue  # digest already present (impossible for a random salt, but cheap) -> unattributable
             if _UPSTREAM_ERROR.search(base.text):
                 continue  # proxies a third-party API -> latency/output track the upstream, not a shell
             if not _endpoint_is_live(ctx, c, action, method, base):
                 continue  # catch-all / soft-404 shell -> phantom endpoint, not a real command sink
-            for field in fields:
-                if budget <= 0:
-                    break
-                checked += 1
-                for sep in _CMD_SEPS:
-                    if budget <= 0:
-                        break
-                    budget -= 1
-                    tested = True
+            # DETERMINISTIC in-band hash oracle across (field x separator): the requests are independent and the
+            # oracle is a fixed digest, so fire them CONCURRENTLY (I/O-bound, ~free on CPU) and stop on the first
+            # shell that hashes the salt. Each (field, sep) spec = 1 attempt = the 2 hash-template hops. The
+            # time-based dose-response stays sequential (deep), below -- concurrency would confound its latency.
+            if budget > 0 and not _capped():
+                pairs = [(fld, sep) for fld in fields for sep in _CMD_SEPS][:budget]  # respect the attempt budget
+                budget -= len(pairs)
+                checked += len(fields)
+                tested = True
+
+                def _cmd_send(spec):
+                    fld, sep = spec
                     for htmpl in _CMD_HASH:
-                        data = {fn: (sep % htmpl.format(s=salt) if fn == field else _XSS_FILLER) for fn in fields}
+                        data = {fn: (sep % htmpl.format(s=salt) if fn == fld else _XSS_FILLER) for fn in fields}
                         try:
-                            if any(w in _xss_send(c, method, action, data).text for w in wanted):
-                                ctx.evidence.update(injectable=True, via="in-band hash",
-                                                    target=action, field=field)
-                                return True  # a shell hashed the salt to its exact digest -> real injection
+                            resp = _xss_send(c, method, action, data)
                         except (httpx.HTTPError, httpx.InvalidURL):
                             continue
+                        if any(w in resp.text for w in wanted):
+                            return spec, resp        # a shell hashed the salt to its exact digest -> real injection
+                    return spec, None
+                got = _fan_out_first(_cmd_send, pairs, lambda s, r: r is not None, cap_check=_capped)
+                if got is not None:
+                    ctx.evidence.update(injectable=True, execution_confirmed=True, via="in-band hash",
+                                        target=action, field=got[0][0])
+                    return True
+            for fld in fields:
                 if len(deep) < _DEEP_SLOTS and method != "postjson":
                     # blind time-based stays OFF JSON API sinks (a slow JSON endpoint's latency variance ~= the
                     # FP failure mode); the deterministic hard-product oracle still runs on them and IS specific.
-                    deep.append((action, method, fields, field))
+                    deep.append((action, method, fields, fld))
         for action, method, fields, field in deep:  # blind: DOSE-RESPONSE sleep (delay must scale with the dose)
+            if _capped():
+                break
             if _cmd_time_scales(c, method, action, fields, field, delay):
                 data = {fn: (_CMD_TIME[0].format(d=delay) if fn == field else _XSS_FILLER) for fn in fields}
                 ctx.evidence.update(injectable=True, via="time-based", target=action, field=field,
@@ -1259,13 +1704,17 @@ def command_injection(ctx, probe) -> bool | None:
 # hashing app hashes the wrong bytes -> no LLM / reflection / echo FP. `{S}` is the salt placeholder (replaced,
 # not %-formatted, so the engine braces survive). BARE-ARITHMETIC template eval (no eval / RCE / hash reachable)
 # is deliberately NOT probed: a computed value is LLM-fakeable and therefore cannot be an execution oracle.
+# (engine, template): the gadget is engine-specific, so the payload that yields the digest also NAMES the
+# engine that executed it — an execution-PROVEN fingerprint, recorded as evidence (no extra round-trip, and
+# more granular than a bare {{7*'7'}} arithmetic probe). The hash still does the firing; the engine only labels.
 _SSTI_HASH_TMPL = (
-    "<?php echo hash('sha256','{S}');?>", "<?php echo md5('{S}');?>",                              # PHP eval
-    ";print(__import__('hashlib').sha256(b'{S}').hexdigest())#",                                   # Python eval
-    "{{cycler.__init__.__globals__.os.popen('printf {S}|sha256sum').read()}}",                     # Jinja2 (Python)
-    "{{['printf {S}|sha256sum']|map('system')|join('')}}",                                         # Twig (PHP)
-    "<%= `printf {S}|sha256sum` %>",                                                               # ERB (Ruby)
-    '<#assign x="freemarker.template.utility.Execute"?new()>${x("printf {S}|sha256sum")}',         # Freemarker (Java)
+    ("php-eval",    "<?php echo hash('sha256','{S}');?>"),                                          # PHP eval
+    ("php-eval",    "<?php echo md5('{S}');?>"),                                                    # PHP eval
+    ("python-eval", ";print(__import__('hashlib').sha256(b'{S}').hexdigest())#"),                   # Python eval
+    ("jinja2",      "{{cycler.__init__.__globals__.os.popen('printf {S}|sha256sum').read()}}"),     # Jinja2 (Python)
+    ("twig",        "{{['printf {S}|sha256sum']|map('system')|join('')}}"),                         # Twig (PHP)
+    ("erb",         "<%= `printf {S}|sha256sum` %>"),                                               # ERB (Ruby)
+    ("freemarker",  '<#assign x="freemarker.template.utility.Execute"?new()>${x("printf {S}|sha256sum")}'),  # Java
 )
 
 
@@ -1274,7 +1723,9 @@ def ssti_injectable(ctx, probe) -> bool | None:
     eval shape (PHP/Python eval, Jinja2/Twig/ERB/Freemarker RCE gadget); fires when the salt's exact digest
     reflects — a value only genuine server-side execution produces, which an LLM cannot fake (unlike the old
     arithmetic marker, which a capable model just computes). N/A when no input surface. Query params are tested
-    before forms (template/render sinks are usually GET params)."""
+    before forms (template/render sinks are usually GET params). On a fire, evidence records `engine` — the
+    gadget that produced the digest names the engine that executed it (jinja2/twig/erb/freemarker/php/python-eval),
+    an execution-proven fingerprint (the v2.0 LLM-echo foundation, item 4)."""
     q = [(e.raw_path, "get", list(e.query_params)) for e in ctx.profile.endpoints
          if e.method.lower() == "get" and e.query_params]
     forms = [(f.action, (f.method or "get").lower(), list(f.fields)) for f in ctx.profile.forms if f.fields]
@@ -1284,31 +1735,51 @@ def ssti_injectable(ctx, probe) -> bool | None:
     targets = q + forms + s + _json_body_targets(ctx.profile)   # + JSON API bodies (SPA sink)
     if not targets:
         return None
+    targets = targets[: probe.probe.get("max_targets", 40)]   # cap the per-target fan-out
     salt = "hlssti" + secrets.token_hex(6)
     wanted = (hashlib.sha256(salt.encode()).hexdigest(), hashlib.md5(salt.encode()).hexdigest())
-    payloads = [t.replace("{S}", salt) for t in _SSTI_HASH_TMPL]
+    payloads = [(engine, t.replace("{S}", salt)) for engine, t in _SSTI_HASH_TMPL]
     budget = probe.probe.get("max_attempts", 160)
+    capped = _request_capped(probe)   # hard ACTUAL-request ceiling (hops incl.) -> no redirect-amplified runaway
     tested = False
     fields_seen = set()
-    with make_client(ctx.base_url, ctx.headers, timeout=10.0, follow_redirects=True) as c:
+    with make_client(ctx.base_url, _authed_headers(ctx), timeout=10.0,
+                     follow_redirects=True, max_redirects=_INJECT_MAX_REDIRECTS) as c:
         for action, method, fields in targets:
-            for field in fields:
-                for p in payloads:
-                    if budget <= 0:
-                        break
-                    budget -= 1
-                    tested = True
-                    fields_seen.add((action, field))
-                    data = {fn: (p if fn == field else _XSS_FILLER) for fn in fields}
-                    try:
-                        if any(w in _xss_send(c, method, action, data).text for w in wanted):
-                            ctx.evidence.update(injectable=True, via="hash oracle", target=action, field=field)
-                            return True  # the engine hashed the salt to its exact digest -> real injection
-                    except (httpx.HTTPError, httpx.InvalidURL):
-                        continue
-                if budget <= 0:
-                    break
+            if capped():
+                break
+            try:   # one cheap baseline: a login-gated target just fuzzes the /login redirect -> skip it
+                if _redirects_to_auth(_xss_send(c, method, action, {fn: _XSS_FILLER for fn in fields})):
+                    continue
+            except (httpx.HTTPError, httpx.InvalidURL):
+                continue
             if budget <= 0:
+                break
+            # DETERMINISTIC hash oracle across (field x engine-gadget): independent requests, so fan them out
+            # concurrently and stop on the first engine that hashes the salt. The winning spec carries the engine
+            # that executed it (the execution-proven fingerprint), so attribution is unchanged.
+            specs = [(fld, engine, p) for fld in fields for engine, p in payloads][:budget]
+            budget -= len(specs)
+            if specs:
+                tested = True
+                for fld in fields:
+                    fields_seen.add((action, fld))
+
+                def _ssti_send(spec):
+                    fld, _engine, p = spec
+                    data = {fn: (p if fn == fld else _XSS_FILLER) for fn in fields}
+                    try:
+                        resp = _xss_send(c, method, action, data)
+                    except (httpx.HTTPError, httpx.InvalidURL):
+                        return spec, None
+                    return (spec, resp) if any(w in resp.text for w in wanted) else (spec, None)
+                got = _fan_out_first(_ssti_send, specs, lambda s, r: r is not None, cap_check=capped)
+                if got is not None:
+                    fld, engine, _p = got[0]
+                    ctx.evidence.update(injectable=True, execution_confirmed=True, via="hash oracle",
+                                        engine=engine, target=action, field=fld)
+                    return True  # the engine hashed the salt to its exact digest -> real injection
+            if capped():
                 break
     ctx.evidence.update(injectable=False, fields_tested=len(fields_seen), expr_shapes=len(_SSTI_HASH_TMPL))
     return False if tested else None
@@ -1384,12 +1855,12 @@ def ssrf(ctx, probe) -> bool | None:
         fired = any(collab.received(t) for t in tokens)
         url_params = sorted({f for _, _, uf, _ in targets for f in uf})
         if fired:
-            ctx.evidence.update(callback_received=True, via="oast", url_params=url_params,
+            ctx.evidence.update(callback_received=True, via="oast", internal_reached=True, url_params=url_params,
                                 probes_sent=len(tokens))
             return True
         inband = _ssrf_inband(ctx, targets)
         if inband is not None:
-            ctx.evidence.update(callback_received=False, via="in-band", url_params=url_params, **inband)
+            ctx.evidence.update(callback_received=False, via="in-band", internal_reached=True, url_params=url_params, **inband)
             return True
         ctx.evidence.update(callback_received=False, url_params=url_params, probes_sent=len(tokens))
         return False
@@ -1448,7 +1919,7 @@ def xxe(ctx, probe) -> bool | None:
                     except (httpx.HTTPError, httpx.InvalidURL):
                         continue
                     if _LFI_SIG.search(r.text):
-                        ctx.evidence.update(via="in-band file read", target=action)
+                        ctx.evidence.update(via="in-band file read", sensitive_fields=True, target=action)   # read a system file
                         return True  # the parser resolved file:///etc/passwd and reflected it -> XXE
     # OOB: a callback to our one-time URL proves the server fetched it (definitive, but dark on egress-blocked hosts).
     hosts = oob.callback_hosts()
@@ -1468,7 +1939,7 @@ def xxe(ctx, probe) -> bool | None:
                             continue
         _await_callback(collab, tokens, probe)
         fired = any(collab.received(t) for t in tokens)
-        ctx.evidence.update(callback_received=fired, via=("oob callback" if fired else None),
+        ctx.evidence.update(callback_received=fired, internal_reached=fired, via=("oob callback" if fired else None),
                             post_endpoints=len(posts), probes_sent=len(tokens))
         return True if fired else False
     finally:
@@ -1494,6 +1965,17 @@ _LFI_PAYLOADS = (
     "php://filter/convert.base64-encode/resource=/etc/passwd",
 )
 
+# PAIRED CANARY (v2.0 foundation #2): the firing payload with traversal/absolute/encoded/null-byte/php-wrapper
+# SYNTAX stripped -> a bare RELATIVE filename. A genuine include resolves it to a nonexistent local path (./etc/
+# passwd), so the file signature vanishes; an endpoint that REFLECTS or HALLUCINATES the signature keys on the
+# filename token and emits it again for the bare literal -> the canary reproduces the signature -> suppress.
+_LFI_SYNTAX = re.compile(r"\.\.\.\.//|\.\.[\\/]|\.\.%2f|%00.*$|php://filter/[^=]*resource=", re.I)
+
+
+def _lfi_canary(payload: str) -> str:
+    bare = _LFI_SYNTAX.sub("", payload).lstrip("/\\").replace("\\", "/")
+    return re.sub(r"(?i)^[a-z]:/", "", bare) or "etc/passwd"   # drop a leading drive letter (C:/)
+
 
 def path_traversal(ctx, probe) -> bool | None:
     """Path traversal / LFI across forms, discovered query params, common filename params on
@@ -1508,42 +1990,69 @@ def path_traversal(ctx, probe) -> bool | None:
     targets = q + incl + forms + _json_body_targets(ctx.profile)   # + JSON API bodies (SPA sink)
     if not targets:
         return None
+    targets = targets[: probe.probe.get("max_targets", 40)]   # cap the per-target baseline/liveness fan-out
     budget = probe.probe.get("max_attempts", 200)
+    capped = _request_capped(probe)   # hard ACTUAL-request ceiling (hops incl.) -> no redirect-amplified runaway
     tested = False
     fields_seen = set()
-    with make_client(ctx.base_url, ctx.headers, timeout=10.0, follow_redirects=True) as c:
+    with make_client(ctx.base_url, _authed_headers(ctx), timeout=10.0,
+                     follow_redirects=True, max_redirects=_INJECT_MAX_REDIRECTS) as c:
         for action, method, fields in targets:
+            if capped():
+                break
             filler = {fn: _XSS_FILLER for fn in fields}
             try:
                 base = _xss_send(c, method, action, filler)
             except (httpx.HTTPError, httpx.InvalidURL):
                 continue
+            if _redirects_to_auth(base):
+                continue  # login-gated target -> injecting it just fuzzes the /login redirect (wasted + amplified)
             if method != "postjson" and not _endpoint_is_live(ctx, c, action, method, base):
                 continue  # catch-all / soft-404 shell -> phantom endpoint, not a real file sink; a fabricated
                 #           /etc/passwd (an LLM handed ?file=/etc/passwd can invent one) fails this gate too
-            for field in fields:
-                for payload in _LFI_PAYLOADS:
-                    if budget <= 0:
-                        break
-                    budget -= 1
-                    tested = True
-                    fields_seen.add((action, field))
-                    data = {fn: (payload if fn == field else _XSS_FILLER) for fn in fields}
+            if budget <= 0:
+                break
+            # DETERMINISTIC content-signature oracle over (field x payload): independent requests, so fan them
+            # out concurrently and stop on the first CONFIRMED read. The signature match's paired-canary +
+            # reproduces verification runs INSIDE the worker, so a returned hit is already precision-checked (the
+            # same reflection / hallucination / nondeterminism guards, just per-candidate in parallel).
+            specs = [(fld, payload) for fld in fields for payload in _LFI_PAYLOADS][:budget]
+            budget -= len(specs)
+            if specs:
+                tested = True
+                for fld in fields:
+                    fields_seen.add((action, fld))
+
+                def _lfi_send(spec):
+                    fld, payload = spec
+                    data = {fn: (payload if fn == fld else _XSS_FILLER) for fn in fields}
                     try:
                         r = _xss_send(c, method, action, data)
-                        ct = r.headers.get("content-type", "").lower()
-                        # a served /etc/passwd or win.ini is text/plain or octet-stream, NEVER the app's own
-                        # bundle — skip js/css so a signature can't match noise inside a minified script.
-                        if "javascript" in ct or "css" in ct:
-                            continue
-                        if _LFI_SIG.search(r.text):
-                            ctx.evidence.update(found=True, target=action, field=field)
-                            return True  # returned the contents of a system file -> traversal/LFI
                     except (httpx.HTTPError, httpx.InvalidURL):
-                        continue
-                if budget <= 0:
-                    break
-            if budget <= 0:
+                        return spec, None
+                    ct = r.headers.get("content-type", "").lower()
+                    # a served /etc/passwd or win.ini is text/plain or octet-stream, NEVER the app's own bundle —
+                    # skip js/css so a signature can't match noise inside a minified script.
+                    if "javascript" in ct or "css" in ct or not _LFI_SIG.search(r.text):
+                        return spec, None
+                    # paired canary: the bare filename (traversal stripped) must NOT also return the file
+                    # signature; if it does, the content is reflected/hallucinated, not traversed.
+                    cdata = {fn: (_lfi_canary(payload) if fn == fld else _XSS_FILLER) for fn in fields}
+                    try:
+                        if _LFI_SIG.search(_xss_send(c, method, action, cdata).text):
+                            return spec, None   # reflection/hallucination -> suppress (#2)
+                        if not _reproduces(lambda: _xss_send(c, method, action, data),
+                                           lambda rr: _LFI_SIG.search(rr.text)):
+                            return spec, None   # signature doesn't reproduce -> nondeterministic (#1)
+                    except (httpx.HTTPError, httpx.InvalidURL):
+                        pass                    # control probe unreachable -> fire on the direct evidence
+                    return spec, r              # returned the contents of a system file -> traversal/LFI
+                got = _fan_out_first(_lfi_send, specs, lambda s, r: r is not None, cap_check=capped)
+                if got is not None:
+                    ctx.evidence.update(found=True, sensitive_fields=True, target=action,
+                                        field=got[0][0], canary_clean=True)
+                    return True
+            if capped():
                 break
     ctx.evidence.update(found=False, fields_tested=len(fields_seen), payloads=len(_LFI_PAYLOADS))
     return False if tested else None
@@ -1568,8 +2077,12 @@ def _upload_shells(salt: str) -> tuple[bytes, bytes, bytes]:
 
 
 _GIF_MAGIC = b"GIF89a"                     # a real image magic header to defeat content-sniffing
-_UPLOAD_DIRS = ("", "uploads/", "upload/", "files/", "file/", "images/", "img/", "media/",
-                "hackable/uploads/", "assets/uploads/", "static/uploads/", "tmp/", "data/uploads/")
+_UPLOAD_DIRS = ("", "uploads/", "upload/", "files/", "images/", "media/", "static/uploads/")
+# Total-request budget for the upload probe. Its fan-out (forms x 10 bypass variants x [1 upload + N
+# dir-fetches]) hit ~140 requests/app, tripping the WAF on 87 v17 apps for 0 fires — the #2 re-challenge
+# straw (after cmdi). Bound it: the top bypass shapes x the common dirs catch a real upload-RCE; the long
+# speculative tail was only re-antagonizing the WAF. Matches the cmdi/lfi/ssti/xxe fan-out caps.
+_UPLOAD_BUDGET = 40
 
 
 def _upload_variants(salt: str):
@@ -1617,26 +2130,35 @@ def file_upload(ctx, probe) -> bool | None:
     want = hashlib.sha256(salt.encode()).hexdigest()   # only genuine execution of the uploaded code yields this
     variants = _upload_variants(salt)
     tested = False
-    with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
+    sent = 0
+    with make_client(ctx.base_url, _authed_headers(ctx), timeout=15.0, follow_redirects=True) as c:
         for f in forms:
             for filename, ctype, body in variants:
+                if sent >= _UPLOAD_BUDGET:
+                    break
                 tested = True
                 files = {ff: (filename, body, ctype) for ff in f.file_fields}
                 data = {fn: _XSS_FILLER for fn in f.fields if fn not in f.file_fields}
+                sent += 1
                 try:
                     resp = c.request((f.method or "post").upper(), f.action, files=files, data=data)
                 except (httpx.HTTPError, httpx.InvalidURL):
                     continue
                 for url in _locate_upload(resp.text, filename):
+                    if sent >= _UPLOAD_BUDGET:
+                        break
+                    sent += 1
                     try:
                         got = c.get(url)
                         if want in got.text:
-                            ctx.evidence.update(rce=True, form=f.action, filename=filename,
+                            ctx.evidence.update(rce=True, execution_confirmed=True, form=f.action, filename=filename,
                                                 repro=_repro_from_resp(got, matched="uploaded script executed server-side (salt digest returned)"))
                             return True  # the uploaded webshell hashed the salt server-side -> RCE via upload
                     except (httpx.HTTPError, httpx.InvalidURL):
                         continue
-    ctx.evidence.update(rce=False, forms=len(forms), variants=len(variants))
+            if sent >= _UPLOAD_BUDGET:
+                break
+    ctx.evidence.update(rce=False, forms=len(forms), variants=len(variants), requests=sent)
     return False if tested else None
 
 
@@ -1687,28 +2209,37 @@ def upload_stored_xss(ctx, probe) -> bool | None:
         ctx.evidence["na_reason"] = (NO_UPLOAD_FORM % len(ctx.profile.forms or []))
         return None
     tested = False
-    with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
+    sent = 0
+    with make_client(ctx.base_url, _authed_headers(ctx), timeout=15.0, follow_redirects=True) as c:
         for f in forms:
             for filename, ctype, body in _upload_xss_variants():
+                if sent >= _UPLOAD_BUDGET:
+                    break
                 tested = True
                 files = {ff: (filename, body, ctype) for ff in f.file_fields}
                 data = {fn: _XSS_FILLER for fn in f.fields if fn not in f.file_fields}
+                sent += 1
                 try:
                     resp = c.request((f.method or "post").upper(), f.action, files=files, data=data)
                 except (httpx.HTTPError, httpx.InvalidURL):
                     continue
                 for url in _locate_upload(resp.text, filename):
+                    if sent >= _UPLOAD_BUDGET:
+                        break
+                    sent += 1
                     try:
                         got = c.get(url)
                     except (httpx.HTTPError, httpx.InvalidURL):
                         continue
                     if _served_executable_inline(got):
-                        ctx.evidence.update(stored_xss=True, form=f.action, filename=filename,
+                        ctx.evidence.update(stored_xss=True, stored=True, execution_confirmed=True, form=f.action, filename=filename,
                                             served_as=got.headers.get("content-type", ""),
                                             repro=_repro_from_resp(got, matched="served %s inline (not attachment)"
                                                                    % got.headers.get("content-type", "")))
                         return True  # user-uploaded active content served executable in-origin -> stored XSS
-    ctx.evidence.update(stored_xss=False, forms=len(forms))
+            if sent >= _UPLOAD_BUDGET:
+                break
+    ctx.evidence.update(stored_xss=False, forms=len(forms), requests=sent)
     return False if tested else None
 
 
@@ -1918,7 +2449,8 @@ def api_bola(ctx, probe) -> bool | None:
                 except (httpx.HTTPError, httpx.InvalidURL):
                     continue
                 if b_read.status_code == 200 and secret_value in b_read.text:
-                    ctx.evidence.update(cross_read=True, endpoint=read_path)
+                    # v2 severity: the crossed object carried the canary in a SENSITIVE field (pair-selected)
+                    ctx.evidence.update(cross_read=True, cross_user_read=True, sensitive_fields=True, endpoint=read_path)
                     return True  # B read A's object AND saw A's planted secret -> broken object auth
         ctx.evidence.update(cross_read=False, pairs_tested=len(pairs))
         return False if tested else None
@@ -2000,7 +2532,8 @@ def api_bola_collection(ctx, probe) -> bool | None:
     private-by-declaration contract) yet leaks cross-user objects. N/A when there's no auth-gated JSON
     collection or two accounts can't be minted."""
     paths = _collection_paths(ctx.profile.endpoints)
-    if not paths:
+    has_browser = bool(getattr(ctx, "profile", None) is not None and ctx.profile.capabilities.get("browser"))
+    if not paths and not has_browser:
         ctx.evidence["na_reason"] = "no non-templated collection endpoint to test for cross-user leakage"
         return None
     a, b = _two_accounts(ctx)
@@ -2025,11 +2558,27 @@ def api_bola_collection(ctx, probe) -> bool | None:
                 shared = ({_obj_id(o) for o in oa} & {_obj_id(o) for o in ob}) - {None}
                 # not owner-scoped: each unrelated account sees >=2 owners AND they share a real object
                 if len(owners_a) >= 2 and len(owners_b) >= 2 and shared:
-                    ctx.evidence.update(bola_collection=True, endpoint=path,
+                    # v2 severity: an auth-gated collection leaking >=2 owners = bulk cross-user read
+                    ctx.evidence.update(bola_collection=True, cross_user_read=True, bulk_read=True, endpoint=path,
                                         distinct_owners=len(owners_a), shared_objects=len(shared),
                                         repro=_repro_from_resp(rb, matched="%d distinct owners / %d shared objects visible to a 2nd account"
                                                                % (len(owners_a), len(shared))))
                     return True   # a private-by-declaration list returns >=2 owners' objects to strangers
+        # BROWSER cross-user fallback: the SPA client-render case the httpx collection scan is blind to -- A
+        # creates a gated canary in a browser, and if an independent identity B sees it (anon does NOT), that's a
+        # cross-user read. The primitive carries the private-by-observation (anon) + A-confirm precision guards.
+        if has_browser:
+            a_sess = {**(ctx.headers or {}), **(_snapshot_session(a).get("headers") or {})}
+            b_sess = {**(ctx.headers or {}), **(_snapshot_session(b).get("headers") or {})}
+            canary = "hlxidor" + secrets.token_hex(6)
+            verdict = browser.cross_user_read_back(ctx.base_url, canary, canary, a_sess, b_sess)
+            if verdict is True:
+                ctx.evidence.update(bola_collection=True, cross_user_read=True, via="browser",
+                                    verified_by="two-session-read-back")
+                return True    # B, an independent identity, saw A's gated created value -> broken object auth
+            if verdict is False:
+                ctx.evidence.update(bola_collection=False, via="browser")
+                return False   # A saw it, anon+B did not -> owner-scoped (an OBSERVED clean, not a vacuous N/A)
         ctx.evidence.update(bola_collection=False, paths_tested=len(paths))
         return False if tested else None
     finally:
@@ -2076,7 +2625,8 @@ def idor_user_record(ctx, probe) -> bool | None:
                 except (httpx.HTTPError, httpx.InvalidURL):
                     continue
                 if as_b.status_code == 200 and canary in as_b.text:
-                    ctx.evidence.update(cross_read=True, endpoint=path)
+                    # v2 severity: a user/account record is PII by nature -> sensitive_fields
+                    ctx.evidence.update(cross_read=True, cross_user_read=True, sensitive_fields=True, endpoint=path)
                     return True                    # B read A's own account record -> horizontal IDOR
         ctx.evidence.update(cross_read=False, reads_tested=len(reads))
         return False if tested else None
@@ -2154,7 +2704,8 @@ def bola_managed_backend(ctx, probe) -> bool | None:
                 except (httpx.HTTPError, httpx.InvalidURL):
                     continue
                 if as_b.status_code == 200 and canary in as_b.text:
-                    ctx.evidence.update(cross_read=True, endpoint=url.split("?")[0])
+                    # v2 severity: cross-user read PROVEN; leave sensitive_fields unset (row content not classified)
+                    ctx.evidence.update(cross_read=True, cross_user_read=True, endpoint=url.split("?")[0])
                     return True   # B read A's private backend record -> broken per-user RLS
         ctx.evidence.update(cross_read=False, reads_tested=len(reads))
         return False if tested else None
@@ -2327,6 +2878,39 @@ def _create_collection(path: str) -> str:
     return clean
 
 
+def _is_record_list(v) -> bool:
+    """A list of records: empty (a legitimately-empty collection) or holding objects. A list of scalars
+    ({"tags":["a"]}) is config, not a resource collection."""
+    return isinstance(v, list) and (not v or isinstance(v[0], dict))
+
+
+def _has_record_array(resp) -> bool:
+    """The read-back body is an actual resource COLLECTION -- a top-level record array, or an envelope object
+    carrying one ({"submissions":[...]}, {"data":[...]}). A stateless RPC result, a status/config doc or an API
+    index ({"encounterId":""}, {"hasApiKey":false}) is NOT a collection, so 'it did not change after a 2xx' is
+    not data loss -- nothing was ever persisted there. This is what made 3 of 4 v18 fires false."""
+    try:
+        doc = resp.json()
+    except ValueError:
+        return False
+    if _is_record_list(doc):
+        return True
+    return isinstance(doc, dict) and any(_is_record_list(v) for v in doc.values())
+
+
+_AUTH_FIELD = re.compile(r"pass(?:word|wd)?|pwd", re.I)
+_AUTH_PATH = re.compile(r"/(?:auth|login|signin|sign-in|signup|sign-up|register|token|session|oauth|logout)\b", re.I)
+
+
+def _is_auth_endpoint(e) -> bool:
+    """A login / register / token endpoint. Its 'collection' is not a public data list (you cannot list users
+    anonymously), so 'the record is absent from a list' is meaningless here -- fahimni's /backend/auth.php fired
+    exactly this way. A password-family field or an auth-verb path is the tell."""
+    if any(_AUTH_FIELD.search(f) for f in (e.body_fields or [])):
+        return True
+    return bool(_AUTH_PATH.search(e.raw_path or e.path or ""))
+
+
 def data_integrity_list_roundtrip(ctx, probe) -> bool | None:
     """Persistence correctness on a JSON API with NO read-by-{id} route — the common SPA shape
     data_integrity_roundtrip can't test (UUID keys / list-only API). Create an object carrying a unique
@@ -2334,8 +2918,31 @@ def data_integrity_list_roundtrip(ctx, probe) -> bool | None:
     a create reports success (2xx) but the object is absent from its own list -> silent data loss. N/A when
     there's no JSON create endpoint whose collection returns an array, or no create succeeds. Variant group
     data-durability with qa-integrity-001 (read-by-id) -> the two collapse to one data-loss finding."""
-    creates = [e for e in ctx.profile.endpoints if e.method.lower() == "post" and e.body_fields]
+    creates = [e for e in ctx.profile.endpoints if e.method.lower() == "post" and e.body_fields
+               and not _is_auth_endpoint(e)]   # a login/register POST is not a listable-data create
+
+    def _browser_persist_confirm():
+        """SPA fallback for the N/A cases (auth-gated / JS-fetch create the httpx round-trip can't see): drive the
+        create in a browser and read the canary back from the client-rendered DOM. ONE-DIRECTIONAL by design --
+        a canary that reads back CONFIRMS durability (clean, via browser); ABSENCE is ambiguous (form not found /
+        not submitted / render lag), so we never fire loss from the browser -- that stays N/A. So this only ever
+        turns an N/A into a confirmed clean, never into a false data-loss."""
+        if not (getattr(ctx, "profile", None) is not None and ctx.profile.capabilities.get("browser")):
+            return None
+        canary = "hldb" + secrets.token_hex(5)
+        try:
+            rendered = browser.create_and_read_back(ctx.base_url, canary, canary, headers=_authed_headers(ctx))
+        except Exception:
+            rendered = None
+        if rendered and canary in rendered:
+            ctx.evidence.update(tested=True, durable=True, via="browser", verified_by="browser-read-back")
+            return False                                     # the created canary rendered back -> write persisted
+        return None                                          # absent in the DOM is ambiguous -> stay N/A, never fire
+
     if not creates:
+        confirmed = _browser_persist_confirm()               # no JSON create endpoint, but maybe a browser content form
+        if confirmed is not None:
+            return confirmed
         ctx.evidence["na_reason"] = "no JSON create endpoint to round-trip through its collection"
         return None
     account = ctx.register()   # some creates are auth-gated; None -> fall back to an anon client
@@ -2355,6 +2962,8 @@ def data_integrity_list_roundtrip(ctx, probe) -> bool | None:
                 before = client.get(collection)
                 if not _is_json_ok(before):
                     continue      # the collection isn't a readable JSON resource -> can't verify here
+                if not _has_record_array(before):
+                    continue      # sibling is an RPC result / status / index, not a resource list -> not durable-testable
                 created, body = _accepted_create(client, c, marker, ctx.profile.endpoints)
                 if created is None or created.status_code not in (200, 201):
                     continue   # create didn't succeed -> nothing durable to read back on this endpoint
@@ -2375,7 +2984,10 @@ def data_integrity_list_roundtrip(ctx, probe) -> bool | None:
             except (httpx.HTTPError, httpx.InvalidURL):
                 continue
         if not tested:
-            ctx.evidence["na_reason"] = "no create accepted a write whose collection could be read back"
+            confirmed = _browser_persist_confirm()           # httpx couldn't round-trip -> try the browser data plane
+            if confirmed is not None:
+                return confirmed
+            ctx.evidence["na_reason"] = "no create round-tripped through a readable record collection"
             return None
         ctx.evidence.update(tested=True, durable=True)
         return False
@@ -2391,8 +3003,11 @@ def stale_ui_after_create(ctx, probe) -> bool | None:
     but a refresh shows it saved' — the UI lied). N/A without a create form or a browser; clean when the item
     showed live (reflected) or never persisted (not_saved -> that's data-integrity's finding, not this one)."""
     form = auth.create_form(ctx.profile.forms)
-    if form is None:
-        ctx.evidence["na_reason"] = "no create form to submit-and-observe"
+    caps = getattr(getattr(ctx, "profile", None), "capabilities", None) or {}
+    # formless SPA create: not in the form list, but check_create_reflection's _fill_create_form drives it. Gate
+    # the no-form case on an auth surface (a create lives behind login), so no launch on a static no-form page.
+    if form is None and not caps.get("has_auth_entrypoint"):
+        ctx.evidence["na_reason"] = "no create form to submit-and-observe (and no auth surface hiding a formless one)"
         return None
     account = ctx.register(suffix="_sui")   # the create form usually lives behind login -> authenticate the page
     hdrs = dict(ctx.headers or {})
@@ -2409,7 +3024,7 @@ def stale_ui_after_create(ctx, probe) -> bool | None:
     finally:
         if account is not None:
             account.client.close()
-    ctx.evidence.update(verdict=verdict, marker=marker, form=form.action)
+    ctx.evidence.update(verdict=verdict, marker=marker, form=(form.action if form else "browser-discovered create"))
     if verdict == "stale":
         return True
     if verdict in ("reflected", "not_saved"):
@@ -2514,7 +3129,7 @@ def debug_mode_enabled(ctx, probe) -> bool | None:
     for r in _induce_error_responses(ctx):
         inspected = True
         if _DEBUG_FINGERPRINT.search(r.text):
-            ctx.evidence.update(status=r.status_code, debug_ui=True,
+            ctx.evidence.update(status=r.status_code, debug_ui=True, execution_confirmed="werkzeug" in r.text.lower(),
                                 repro=_repro_from_resp(r, matched="framework debug UI fingerprint"))
             return True
     # Werkzeug/Flask debug ships an interactive debugger reachable WITHOUT an error: it serves its own JS
@@ -2526,7 +3141,7 @@ def debug_mode_enabled(ctx, probe) -> bool | None:
         inspected = True
         if (r.status_code == 200 and "javascript" in r.headers.get("content-type", "").lower()
                 and "werkzeug" in r.text.lower()):
-            ctx.evidence.update(endpoint="/?__debugger__=yes", debug_ui=True, framework="werkzeug")
+            ctx.evidence.update(endpoint="/?__debugger__=yes", debug_ui=True, framework="werkzeug", execution_confirmed=True)
             return True
     except (httpx.HTTPError, httpx.InvalidURL):
         pass
@@ -2590,7 +3205,7 @@ _SUPABASE_COMMON = ("users", "profiles", "accounts", "posts", "orders", "message
 _SENSITIVE_TABLE = re.compile(r"user|account|profile|payment|order|customer|subscription|transaction|"
                               r"credential|session|contact|booking|member|billing|invoice|message", re.I)
 _SENSITIVE_COLUMN = re.compile(r"email|password|passwd|phone|token|api_?key|secret|stripe|address|ssn|"
-                               r"credit|dob|birth|first_?name|last_?name|full_?name|access_?token", re.I)
+                               r"credit_?card|dob|birth|first_?name|last_?name|full_?name|access_?token", re.I)
 
 
 def _client_bundle(ctx, cap: int = 2_000_000) -> str:
@@ -2623,10 +3238,243 @@ def bundle_leaks_secret(ctx, probe) -> bool | None:
         return None
     kinds = secretscan.scan_blob(blob)
     if kinds:
-        ctx.evidence.update(secret_kinds=kinds, source="client-bundle")
+        ctx.evidence.update(secret_kinds=kinds, high_privilege=True, source="client-bundle")   # server keys = takeover
         return True
     ctx.evidence.update(secret_kinds=[], scanned_bytes=len(blob))
     return False
+
+
+# v2.0 FAMILY 1 -- deploy-time "works on my machine" failure. A dev host / private IP / unset env var stringified
+# into a backend URL: the page renders but its data layer is dead for every visitor, invisible to a "does it
+# load" check. Requires the URL form (https?://...), so a bare `("0.0.0.0", PORT)` bind or a `hostname ===
+# 'localhost'` dev-check string does NOT match; the host lookahead rejects `localhosting.com` / `undefined.io`.
+_PRIVATE_HOST = re.compile(
+    r"""https?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]|"""
+    r"""10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2})"""
+    r"""(?::\d+)?(?=[/"'\s)]|$)""", re.I)
+_UNSET_ENV_HOST = re.compile(r"""https?://(?:undefined|null)(?::\d+)?(?=[/"'\s)]|$)""", re.I)
+
+
+def _operative_private_hosts(matched_urls, opaque_hosts) -> list:
+    """Which matched private/unset backend URLs the app ACTUALLY requested at runtime -- their host was observed
+    in the opaque-host tier (an off-origin host discovery couldn't attribute, where a localhost/private fetch
+    lands, see discovery._classify_hosts). Compared by hostname (port-agnostic): a bundle localhost:9999 the app
+    fetched on :3000 is still "the data layer hit a dead private host at runtime". A match => OPERATIVE (dead in
+    prod for real visitors). No match => the address is PRESENT in the bundle but never requested (a dead
+    `env || localhost` fallback the prod override wins, a CORS/OAuth allowlist entry, a corpus-shared template
+    constant like localhost:9999) => presence != use => UNPROVEN, off-score. (opaque_hosts is capped at 10
+    upstream, so a genuine fetch beyond the 10th unattributable host reads here as presence-only -- conservative:
+    it can under-count operative fires, never invent one. A mixed-content-blocked http://localhost fetch from an
+    https page may also not reach net_sink; capturing page.on('requestfailed') would recover those -- a recall
+    follow-up, not a correctness gap: unobserved => off-score, never a false score.)"""
+    def _host(s):
+        return (urllib.parse.urlparse(s if "://" in s else "//" + s).hostname or "").lower()
+    observed = {_host(h) for h in opaque_hosts}
+    return [u for u in matched_urls if _host(u) in observed]
+
+
+def unreachable_backend_reference(ctx, probe) -> bool | None:
+    """DEPLOY-TIME "works on my machine": the shipped client bundle points its backend at a host no visitor can
+    reach -- localhost / 127.0.0.1 / 0.0.0.0 / a private RFC1918 IP (the developer's own machine), or
+    `https://undefined` / `https://null` (an unset NEXT_PUBLIC_/VITE_ build-time env var stringified into the URL).
+    SCORES only when the app is OBSERVED to actually request that host at runtime (its host shows up in the opaque
+    tier) -- an OPERATIVE dead data layer, invisible to a "does it load" check. A match that is merely PRESENT in
+    the bundle but never requested (a dead `env || localhost` fallback, a CORS/OAuth allowlist entry, a corpus-
+    shared template constant like localhost:9999) is UNPROVEN: recorded as an OFF-SCORE diagnostic (report_only),
+    never scored -- presence != use. Reads the app's OWN served bundle (ethical). N/A when there is no bundle."""
+    blob = _client_bundle(ctx)
+    if not blob.strip():
+        return None
+    private = sorted({m.group(0) for m in _PRIVATE_HOST.finditer(blob)})
+    unset = sorted({m.group(0) for m in _UNSET_ENV_HOST.finditer(blob)})
+    if not (private or unset):
+        ctx.evidence.update(private_backends=[], unset_env_backends=[], scanned_bytes=len(blob))
+        return False
+    opaque = (ctx.profile.host_tiers or {}).get("opaque_hosts", [])
+    operative = _operative_private_hosts(private + unset, opaque)
+    if operative:
+        ctx.evidence.update(private_backends=private[:5], unset_env_backends=unset[:5],
+                            operative_backends=operative[:5], observed=True, source="client-bundle")
+        return True                                     # OPERATIVE -> severity escalator `observed` -> 85
+    ctx.evidence.update(private_backends=private[:5], unset_env_backends=unset[:5], observed=False,
+                        report_only=True, penalty_override=0, source="client-bundle")
+    return True                                          # presence-only -> off-score diagnostic (UNPROVEN)
+
+
+# v2.0 -- INTERNAL-ADDRESS disclosure. A served bundle that hardcodes a genuinely-INTERNAL address (an RFC1918
+# private IP, a link-local / cloud-metadata IP, or an internal-only hostname) leaks infrastructure topology to
+# every source-viewer -- recon value (SSRF targets, internal hostnames for lateral movement). LOOPBACK is
+# deliberately EXCLUDED: localhost / 127.0.0.1 / [::1] / 0.0.0.0 disclose nothing (everyone has one), so this
+# scores them at ZERO -- that presence is qa-deploy-001's availability concern, not a disclosure. URL-form + a
+# host lookahead (same rigor as _PRIVATE_HOST): the internal TLD must be the FINAL host label, so a PUBLIC host
+# carrying the token as a middle label (api.corp.example.com) does NOT match, and a bare "10.0.0.1" in unrelated
+# numeric data (no scheme) does NOT match.
+_INTERNAL_ADDR = re.compile(
+    r"""https?://(?:"""
+    r"""10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}|"""
+    r"""169\.254(?:\.\d{1,3}){2}|"""
+    r"""[a-z0-9-]+\.(?:internal|corp|intranet|lan))"""
+    r"""(?::\d+)?(?=[/"'\s)]|$)""", re.I)
+
+
+def internal_address_disclosed(ctx, probe) -> bool | None:
+    """INFO DISCLOSURE: the served client bundle hardcodes a genuinely-INTERNAL address -- an RFC1918 private IP
+    (10 / 172.16-31 / 192.168), a link-local / cloud-metadata IP (169.254), or an internal-only hostname
+    (*.internal / *.corp / *.intranet / *.lan). Readable by any source-viewer, it leaks infra topology (recon:
+    SSRF targets, internal hostnames). LOOPBACK (localhost / 127.0.0.1 / [::1] / 0.0.0.0) is EXCLUDED -- it
+    discloses nothing, so localhost scores zero here (that presence is qa-deploy-001's availability concern, not
+    a disclosure). Reads the app's OWN served bundle (ethical). N/A when there is no bundle."""
+    blob = _client_bundle(ctx)
+    if not blob.strip():
+        return None
+    addrs = sorted({m.group(0) for m in _INTERNAL_ADDR.finditer(blob)})
+    if addrs:
+        ctx.evidence.update(internal_addresses=addrs[:5], source="client-bundle")
+        return True
+    ctx.evidence.update(internal_addresses=[], scanned_bytes=len(blob))
+    return False
+
+
+# v2.0 FAMILY 1 -- OAuth sign-in dead in prod. The app hands the browser an authorization URL whose
+# redirect_uri points at localhost / a private IP / an unset env var: after the user authenticates, the
+# provider bounces them to a host that does not exist in production, so sign-in is broken for every visitor
+# (invisible to a "does the login button render" check). HSTS / mixed-content / unreachable-backend all miss it.
+_OAUTH_PROVIDER = re.compile(
+    r"accounts\.google\.com/o/oauth2|github\.com/login/oauth/authorize|"
+    r"(?:www\.)?facebook\.com/(?:v[\d.]+/)?dialog/oauth|login\.microsoftonline\.com|"
+    r"appleid\.apple\.com/auth/authorize|[a-z0-9.-]+\.auth0\.com/authorize|"
+    r"[a-z0-9.-]+/oauth2?/(?:v\d/)?authorize|/oauth2?/authorize", re.I)
+_OAUTH_URL = re.compile(r"""https?://[^\s"'<>()]+""")
+_OAUTH_ROUTES = ("/auth/google", "/auth/github", "/login/google", "/login/github", "/api/auth/signin/google",
+                 "/api/auth/signin/github", "/oauth/google", "/oauth/authorize", "/auth/signin", "/.auth/login/google")
+_OAUTH_ROUTEHINT = re.compile(r"/(?:auth|oauth|login|signin|sso)(?:/|$|\?)", re.I)
+_REDIRECT_PARAM = ("redirect_uri", "redirect_url", "callback_url", "redirecturi")
+
+
+def _oauth_redirect_uri(url: str) -> str | None:
+    """The decoded redirect_uri of an OAuth authorization URL, if `url` looks like one (a known provider host,
+    or a redirect_uri alongside client_id / response_type). None otherwise. Unescapes &amp; so an HTML-embedded
+    href parses like a raw Location header."""
+    parsed = urllib.parse.urlparse(url.replace("&amp;", "&"))
+    q = urllib.parse.parse_qs(parsed.query)
+    ru = next((q[k][0] for k in _REDIRECT_PARAM if k in q), None)
+    if ru and (_OAUTH_PROVIDER.search(url) or "client_id" in q or "response_type" in q):
+        return ru
+    return None
+
+
+def oauth_redirect_localhost(ctx, probe) -> bool | None:
+    """DEPLOY-TIME "works on my machine" for sign-in: an OAuth authorization URL the app hands the browser sets
+    redirect_uri to localhost / a private RFC1918 IP / an unset env var (`https://undefined`). After the user
+    authenticates, the provider redirects to a host that does not exist in prod, so sign-in is dead for every
+    visitor. Finds the authorization URL in the served homepage or by following a same-origin auth route ONE hop
+    (never completing the flow, zero payload). Fires only when the redirect_uri host differs from the app's own
+    origin -- a localhost target legitimately using a localhost callback is not punished. N/A when no OAuth flow."""
+    origin_netloc = urllib.parse.urlparse(ctx.base_url).netloc.lower()
+    budget = probe.probe.get("max_attempts", 30)
+    candidates: set[str] = set()
+    with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=False) as c:
+        try:
+            candidates.update(_OAUTH_URL.findall(c.get(_home_path(ctx, probe)).text))
+        except (httpx.HTTPError, httpx.InvalidURL):
+            pass
+        routes = list(dict.fromkeys(list(_OAUTH_ROUTES)
+                                    + [r for r in ctx.profile.routes if _OAUTH_ROUTEHINT.search(r)]))
+        for route in routes[:budget]:
+            try:
+                loc = c.get(route).headers.get("location", "")
+            except (httpx.HTTPError, httpx.InvalidURL):
+                continue
+            if loc:
+                candidates.add(loc)
+    found = False
+    for url in candidates:
+        ru = _oauth_redirect_uri(url)
+        if not ru:
+            continue
+        found = True
+        if (_PRIVATE_HOST.search(ru) or _UNSET_ENV_HOST.search(ru)) \
+                and urllib.parse.urlparse(ru).netloc.lower() != origin_netloc:
+            ctx.evidence.update(oauth_redirect_uri=ru, authorize_url=url[:160], origin=ctx.base_url)
+            return True
+    if not found:
+        # No SERVER-emitted authorize URL. On the SPA/BaaS corpus SSO is SDK-initiated (Supabase/Firebase/NextAuth/
+        # Auth0/Clerk build the authorize URL -- redirect_uri and all -- in JS at click time), so it never appears
+        # server-side. DRIVE the app's own 'Sign in with <provider>' click to reveal it. Gated on browser + an SSO
+        # signal, so only the ~SSO apps pay a launch (never the no-auth majority).
+        caps = getattr(getattr(ctx, "profile", None), "capabilities", None) or {}
+        if caps.get("browser") and caps.get("sso_providers"):
+            for url in browser.capture_sso_authorize(ctx.base_url, headers=ctx.headers):
+                ru = _oauth_redirect_uri(url)
+                if not ru:
+                    continue
+                found = True
+                if (_PRIVATE_HOST.search(ru) or _UNSET_ENV_HOST.search(ru)) \
+                        and urllib.parse.urlparse(ru).netloc.lower() != origin_netloc:
+                    ctx.evidence.update(oauth_redirect_uri=ru, authorize_url=url[:160], origin=ctx.base_url,
+                                        via="browser sso click")
+                    return True
+    if not found:
+        # still nothing after the click (or no browser / no SSO signal): an app CAN show a 'Sign in with Google'
+        # button and land here -- the redirect_uri is unobservable without driving the SDK-built authorize request.
+        ctx.evidence["na_reason"] = ("no OAuth authorization URL found (homepage + one auth-route hop"
+                                     + (" + driven SSO click" if caps.get("browser") and caps.get("sso_providers")
+                                        else "; SSO is SDK-initiated client-side, needs --browser + an SSO signal")
+                                     + ")")
+        return None
+    return False
+
+
+# v2.0 FAMILY 1 -- a PUBLIC origin served over plain http:// with no upgrade to TLS: every visitor's
+# credentials and session cookies cross the network in the clear. HSTS (sec-headers-003) and mixed-content
+# (sec-mixed-001) both assume https and miss a no-TLS origin entirely. A localhost / private-IP / *.local dev
+# or preview target is http by nature, so it is exempt (the "gate to public origins" caveat).
+_LOCAL_HOST = re.compile(
+    r"^(?:localhost|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|0\.0\.0\.0|\[?::1\]?|"
+    r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|"
+    r"172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|"
+    r"[^.]+\.(?:local|test|localhost))$", re.I)
+
+
+def _is_local_host(host: str) -> bool:
+    return bool(_LOCAL_HOST.match(host or ""))
+
+
+def _no_tls_decision(base_url: str, status: int | None, location: str) -> bool | None:
+    """Verdict from the origin + the homepage response, factored out for testing. None = not applicable (already
+    https, or a local/preview host); False = http that upgrades to https (TLS enforced); True = a public origin
+    that serves cleartext http with no upgrade."""
+    o = urllib.parse.urlparse(base_url)
+    if o.scheme != "http" or _is_local_host(o.hostname or ""):
+        return None
+    if status is None:
+        return None
+    if 300 <= status < 400:
+        # -> https = the origin upgrades (TLS enforced, clean); -> http = redirects but stays cleartext (fires)
+        return not (location or "").lower().startswith("https://")
+    if 200 <= status < 300:
+        return True                          # serves cleartext content over http with no upgrade -> no TLS
+    return None   # 401/403/404/429/5xx: a WAF / auth / rate-limit / error / not-found MASKED the real TLS
+    #               behavior (e.g. netlify http->https 301 seen as a 403) -> can't assess -> N/A, not a false fire
+
+
+def no_tls_origin(ctx, probe) -> bool | None:
+    """DEPLOY-TIME cleartext transport: a PUBLIC origin reached over plain http:// that does not upgrade to
+    https, so credentials / session cookies transit unencrypted. N/A for an https origin (HSTS / mixed-content
+    cover those) or a localhost / private-IP / *.local dev target (http is expected there). Clean when the
+    http origin redirects to https."""
+    o = urllib.parse.urlparse(ctx.base_url)
+    if o.scheme != "http" or _is_local_host(o.hostname or ""):
+        return None                          # fast path: no network for an https or local/preview target
+    with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=False) as c:
+        try:
+            r = c.get(_home_path(ctx, probe))
+        except (httpx.HTTPError, httpx.InvalidURL):
+            return None                      # unreachable -> can't assess
+    verdict = _no_tls_decision(ctx.base_url, r.status_code, r.headers.get("location", ""))
+    ctx.evidence.update(no_tls=(verdict is True), status=r.status_code, upgrades_to_https=(verdict is False),
+                        origin=ctx.base_url)
+    return verdict
 
 
 def vulnerable_dependency(ctx, probe) -> bool | None:
@@ -2640,7 +3488,8 @@ def vulnerable_dependency(ctx, probe) -> bool | None:
         return None
     vulns = depscan.scan_deps(blob)
     if vulns:
-        ctx.evidence.update(vulnerable_deps=vulns, count=len(vulns))
+        worst = max(v["cvss"] for v in vulns)   # OWASP A03: the finding IS a CVE -> score its own NVD CVSS x 10
+        ctx.evidence.update(vulnerable_deps=vulns, count=len(vulns), penalty_override=round(worst * 10))
         return True
     ctx.evidence.update(vulnerable_deps=[], scanned_bytes=len(blob))
     return False
@@ -2649,12 +3498,37 @@ def vulnerable_dependency(ctx, probe) -> bool | None:
 _SOURCEMAP_URL = re.compile(r"//[#@]\s*sourceMappingURL=(\S+)")
 
 
+# A .map that reconstructs only VENDORED source (React, Next's polyfills, axios) is not a disclosure: that code
+# is already public on npm and carries none of the app's business logic or secrets. In the v18 corpus 114 of 164
+# fires (69%) were exactly this -- 104 the identical Next.js chunk `a6dad97d9634a72d.js.map` (one source, a
+# node_modules polyfill) and 10 the base44 platform `badge.js` widget (one app file, `src/badge/badge.ts`). The
+# finding must key on the app's OWN source, so exclude vendored paths and require >= 2 app-authored code files.
+_VENDOR_SOURCE = ("node_modules/", "/webpack/runtime/", "webpack://webpack/", "/dist/build/polyfills/")
+_SOURCE_CODE_EXT = (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue", ".svelte", ".coffee")
+_MIN_APP_SOURCES = 2   # the badge widget exposes exactly 1 app file; the smallest real leak in v18 exposed 3
+
+
+def _app_source_files(sources) -> list[str]:
+    """The app-authored CODE files in a sourcemap's `sources`: not under node_modules / a bundler runtime /
+    a framework polyfill, and an actual source extension (a .png/.css asset is not a business-logic leak)."""
+    out = []
+    for s in sources or []:
+        if not isinstance(s, str):
+            continue
+        low = s.lower()
+        if any(v in low for v in _VENDOR_SOURCE):
+            continue
+        if low.rsplit("?", 1)[0].endswith(_SOURCE_CODE_EXT):
+            out.append(s)
+    return out
+
+
 def source_map_exposed(ctx, probe) -> bool | None:
     """SPA-native info-disclosure: a production bundle ships its .map, so anyone can reconstruct the ORIGINAL
     source — business logic, hidden endpoints, and (the real risk) hardcoded secrets a minified scan misses.
     For each same-origin .js bundle, fetch the //# sourceMappingURL target (or the conventional <bundle>.map);
-    fire only on a REAL sourcemap (JSON with sources/sourcesContent), never a soft-404 shell (innocence check).
-    N/A when there are no .js bundles to check."""
+    fire only on a REAL sourcemap (JSON with sources/sourcesContent) that reconstructs the APP's OWN source, never
+    a soft-404 shell or a purely-vendored map (React/Next/a platform widget). N/A when there are no .js bundles."""
     js = [r for r in (["/"] + ctx.profile.routes) if r.split("?")[0].endswith(".js")]
     if not js:
         return None
@@ -2675,10 +3549,15 @@ def source_map_exposed(ctx, probe) -> bool | None:
                 sm = r.json()
             except ValueError:
                 continue
-            if isinstance(sm, dict) and sm.get("version") and ("sources" in sm or "sourcesContent" in sm):
-                ctx.evidence.update(bundle=path, source_map=mp, sources=len(sm.get("sources") or []),
-                                    reconstructable=bool(sm.get("sourcesContent")))
-                return True
+            if not (isinstance(sm, dict) and sm.get("version") and ("sources" in sm or "sourcesContent" in sm)):
+                continue
+            app = _app_source_files(sm.get("sources"))
+            if len(app) < _MIN_APP_SOURCES:
+                continue                      # vendored-only (React/Next) or a platform widget -> not app source
+            ctx.evidence.update(bundle=path, source_map=mp, sources=len(sm.get("sources") or []),
+                                app_sources=len(app), app_source_sample=app[:6],
+                                reconstructable=bool(sm.get("sourcesContent")))
+            return True
     return False
 
 
@@ -2791,7 +3670,6 @@ def exposed_sensitive_file(ctx, probe) -> bool | None:
     resolved under the app root (_at), because a sub-path deployment's files live there and not at the origin.
     N/A when nothing matched AND nothing was even reachable, so a host that refused every request isn't scored
     as clean."""
-    reached = False
     # Dedup is CONTENT-based, not path-based. Skipping every path discovery happened to list was backwards:
     # measured on the repro, the SAME bytes on the SAME server flipped True -> False purely because the crawl
     # named the file, so an app whose sitemap exposes /.docker/config.json got a free pass while one that hid
@@ -2800,25 +3678,33 @@ def exposed_sensitive_file(ctx, probe) -> bool | None:
     # case that moved the anchor 664 -> 673) and sec-exposure-005 claims it when the body carries credential
     # material. Absent both, no other probe fires on this file and skipping it just loses the finding.
     known = {(r or "").split("?")[0].rstrip("/") for r in getattr(ctx.profile, "routes", None) or []}
+    seen = [False]   # monotonic False->True 'any path was reachable' flag; safe under the pool (idempotent set)
     with make_client(ctx.base_url, ctx.headers, timeout=8.0, follow_redirects=True) as c:
-        for path, check in _SENSITIVE_FILES:
+        # INDEPENDENT candidate GETs with a CONTENT oracle -> fan out (lower pool: this scan is the #1 per-origin
+        # challenge trigger) and stop on the FIRST proven file, so a repo leaking three files is still one finding.
+        def _send(spec):
+            path, check = spec
             try:
                 r = c.get(_at(ctx, path))
             except (httpx.HTTPError, httpx.InvalidURL):
-                continue
-            reached = True
+                return spec, None
+            seen[0] = True
             if _is_phantom_shell(ctx, r):
-                continue          # catch-all host echoing its shell -> not a served file
+                return spec, None          # catch-all host echoing its shell -> not a served file
             if path.rstrip("/") in known and _claimed_by_a_routes_probe(r):
-                continue          # a discovered path another probe already bills -> theirs, not ours
+                return spec, None          # a discovered path another probe already bills -> theirs, not ours
             with contextlib.suppress(Exception):
                 if check(r):
-                    ctx.evidence.update(exposed=True, path=path, status=r.status_code,
-                                        bytes=len(r.content or b""),
-                                        repro=_repro("GET", str(r.url), status=r.status_code,
-                                                     matched=f"served {path}"))
-                    return True
-    if not reached:
+                    return spec, r
+            return spec, None
+        got = _fan_out_first(_send, _SENSITIVE_FILES, lambda s, r: r is not None, pool=_EXPOSURE_POOL)
+        if got is not None:
+            path, r = got[0][0], got[1]
+            ctx.evidence.update(exposed=True, high_privilege=True, path=path, status=r.status_code,
+                                bytes=len(r.content or b""),
+                                repro=_repro("GET", str(r.url), status=r.status_code, matched=f"served {path}"))
+            return True
+    if not seen[0]:
         ctx.evidence["na_reason"] = "no candidate path was reachable (host refused every request)"
         return None
     ctx.evidence.update(exposed=False, paths_checked=len(_SENSITIVE_FILES))
@@ -2936,6 +3822,68 @@ def _record_collections(resp):
     return [(k, rows) for k, rows in out if rows]
 
 
+_ANON_BULK_VALUE_SAMPLE = 25   # rows to sample for value-type + variance checks (JSON collections are homogeneous)
+
+# A curated listing of PUBLIC entities (places / orgs / resources) returns bulk records with an address, a phone
+# or an org email, and that is not a personal-data leak: those contacts are meant to be published. The tell is a
+# place/listing column (a Google Places id, a scrape `dataSource`, opening `hours`, a `category`) AND the ABSENCE
+# of any per-user ownership column. If a row is owned by a user (uid / created_by / candidate / patient /
+# submitted_by ...), it is user data whatever else it carries, so an ownership column VETOES the directory verdict.
+_DIRECTORY_MARKERS = {"googleplaceid", "googlemapsurl", "mapsurl", "placeid", "datasource", "website", "hours",
+                      "openinghours", "category", "categories", "rating", "googlerating", "verified",
+                      "departments", "services", "eligibility", "amenities", "cuisine"}
+_OWNERSHIP_MARKERS = {"uid", "userid", "owner", "ownerid", "createdby", "createdbyid", "account", "accountid",
+                      "customer", "customerid", "candidate", "candidateid", "patient", "patientid", "submittedby",
+                      "submittedbyuid", "submittedbyid", "author", "authorid", "member", "memberid"}
+
+
+def _norm_col(c: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", c.lower())
+
+
+def _is_public_directory(cols: list[str]) -> bool:
+    """True when the collection reads as a published listing of public entities, not a dump of user records: a
+    directory-marker column is present and NO per-user ownership column is (ownership vetoes -> it is user data)."""
+    norm = {_norm_col(c) for c in cols}
+    if norm & _OWNERSHIP_MARKERS:
+        return False
+    return bool(norm & _DIRECTORY_MARKERS)
+
+
+def _values_match_sensitive_type(col: str, vals: list) -> bool:
+    """The column NAME matched `_SENSITIVE_COLUMN`; confirm at least one VALUE is actually of that type. A column
+    merely NAMED like PII is not a leak: `tokens_total` holds LLM token COUNTS (ints), `phones` holds ARPAbet
+    phonemes (['Y','AE1']), `phone_bedtime_habit` holds a survey enum. Value-level is provable; name-level is a
+    guess -- and the whole probe bills 40 points, so it must key on the evidence, not the label."""
+    c = col.lower()
+    scalars = [v for v in vals if isinstance(v, (str, int, float)) and not isinstance(v, bool)]
+    if not scalars:
+        return False        # values are lists / dicts / bools / null -> not a scalar identifier (phones=['Y','AE1'])
+    strs = [str(v) for v in scalars]
+    if "email" in c or "mail" in c:
+        return any("@" in s and "." in s.split("@")[-1] for s in strs)
+    if re.search(r"ssn|social", c):
+        return any(sum(ch.isdigit() for ch in s) == 9 for s in strs)
+    if "credit" in c or "card" in c:
+        return any(13 <= sum(ch.isdigit() for ch in s) <= 19 for s in strs)
+    if "phone" in c:
+        def _phoneish(s: str) -> bool:
+            digits = sum(ch.isdigit() for ch in s)
+            body = re.sub(r"[\s()+.-]", "", s)          # a real number is mostly digits after formatting chars
+            return 7 <= digits <= 15 and digits >= len(body) - 1
+        return any(_phoneish(s) for s in strs)
+    if "token" in c or "secret" in c or "key" in c or "stripe" in c:
+        # an opaque credential (a JWT, an sk_live_..., a UUID), not a counter: a mixed-alnum string >= 12 chars,
+        # never a plain integer -- this is what separates `access_token` from `tokens_total`
+        return any(isinstance(v, str) and len(v) >= 12 and any(ch.isdigit() for ch in v)
+                   and any(ch.isalpha() for ch in v) for v in scalars)
+    if "dob" in c or "birth" in c:
+        return any(sum(ch.isdigit() for ch in s) >= 4 and any(sep in s for sep in "-/.") for s in strs)
+    # name / address / password: type-validation is weak (any string looks valid), so accept a non-empty string
+    # here and let `_is_public_directory` handle the public-address / public-org-contact case.
+    return any(isinstance(v, str) and v.strip() for v in scalars)
+
+
 def anon_bulk_data_exposed(ctx, probe) -> bool | None:
     """An ANONYMOUS request returning bulk records with PII / financial / credential columns.
 
@@ -2969,11 +3917,23 @@ def anon_bulk_data_exposed(ctx, probe) -> bool | None:
             for key, rows in collections:
                 if len(rows) < _ANON_BULK_MIN_RECORDS:
                     continue
-                cols = sorted({c for row in rows[:5] for c in row})
-                hits = [c for c in cols if _SENSITIVE_COLUMN.search(c)]
+                sample = rows[:_ANON_BULK_VALUE_SAMPLE]
+                cols = sorted({c for row in sample for c in row})
+                if _is_public_directory(cols):
+                    continue      # a published listing of public places/orgs, not a dump of personal records
+                hits = []
+                for c in cols:
+                    if not _SENSITIVE_COLUMN.search(c):
+                        continue
+                    vals = [row[c] for row in sample if row.get(c) not in (None, "")]
+                    if not _values_match_sensitive_type(c, vals):
+                        continue  # named like PII, but the values are not (tokens_total=ints, phones=phonemes)
+                    if len({str(v).strip().lower() for v in vals}) < 2:
+                        continue  # one value shared across every row = a config / org contact, not per-user data
+                    hits.append(c)
                 if not hits:
                     continue      # bulk but not sensitive: a catalog, an index, a public profile list
-                ctx.evidence.update(anon_readable=True, endpoint=path, collection=key or "(top level)",
+                ctx.evidence.update(anon_readable=True, sensitive_fields=True, bulk_read=True, endpoint=path, collection=key or "(top level)",
                                     records=len(rows), sensitive_columns=hits[:6], columns=cols[:10],
                                     repro=_repro_from_resp(
                                         r, matched="%d records with %s readable to an anonymous request"
@@ -3174,6 +4134,32 @@ def _firebase_readable(client, json_url: str):
     return None
 
 
+def _rtdb_sensitive_names(data) -> list[str]:
+    """Sensitive node/field names in a world-readable RTDB tree. RTDB `.read:true` exposes the WHOLE tree
+    with no per-path rules, so the leak is a top-level node named like a private table (users/payments/...)
+    OR a nested field named like PII/secret (email/token/...); a public-by-design tree (config, or a
+    leaderboard of name+score) is not. Scans every top-level node and ONE sampled leaf per node -- RTDB
+    nodes are homogeneous, so a sample suffices -- and is bounded by a node budget regardless of row count.
+    This brings the RTDB path to parity with the Supabase read path's column-sensitivity gate."""
+    names: list[str] = []
+    budget = [400]
+
+    def _walk(node, level):
+        if budget[0] <= 0 or level > 2 or not isinstance(node, dict):
+            return
+        for i, (k, v) in enumerate(node.items()):
+            if budget[0] <= 0:
+                return
+            budget[0] -= 1
+            if isinstance(k, str) and (_SENSITIVE_COLUMN.search(k) or (level == 0 and _SENSITIVE_TABLE.search(k))):
+                names.append(k)
+            if level == 0 or i == 0:      # all top-level nodes; then one homogeneous sample per node
+                _walk(v, level + 1)
+
+    _walk(data, 0)
+    return names
+
+
 def _firestore_collections(blob: str, observed: list[str] | None = None) -> list[str]:
     """Collections to test for public readability, strongest signal first: OBSERVED at runtime (survives
     minification/dynamic queries), then the app's own code (`collection(db, 'name')`), then a small
@@ -3201,9 +4187,16 @@ def _firestore_readable(client, base: str, project: str, api_key: str, collectio
             except (ValueError, AttributeError):
                 continue
             if isinstance(docs, list) and docs:   # real documents to the public key -> world-readable rules
-                fields = sorted((docs[0].get("fields") or {}).keys())[:8]
-                return {"collection": coll, "documents": len(docs), "fields": fields,
-                        "repro": _repro_from_resp(r, matched="%d document(s) readable" % len(docs))}
+                fields = sorted((docs[0].get("fields") or {}).keys())
+                sensitive = _sensitive_columns(fields)
+                if not sensitive:
+                    continue                       # public-by-design collection (no PII/secret field): NOT a leak,
+                                                   # the same column-sensitivity gate the Supabase read path applies
+                return {"collection": coll, "documents": len(docs), "fields": fields[:8],
+                        "sensitive_fields": sensitive[:6],
+                        "repro": _repro_from_resp(
+                            r, matched="%d document(s) readable to anon, carrying %s"
+                                       % (len(docs), ", ".join(sensitive[:3])))}
     return None if reached else "unreachable"
 
 
@@ -3230,31 +4223,37 @@ def exposed_backend_readable(ctx, probe) -> bool | None:
             w = _supabase_anon_writable(ext, base, keys, tables)
             if isinstance(w, dict):
                 ctx.evidence.update(backend="supabase", host=base, table=w["table"], anon_writable=True,
-                                    sqlstate=w["sqlstate"], repro=w["repro"])
+                                    write_confirmed=True, sqlstate=w["sqlstate"], repro=w["repro"])
                 return True
             hit = _supabase_readable(ext, base, keys, tables)
             if isinstance(hit, dict):
                 ctx.evidence.update(backend="supabase", host=base, table=hit["table"],
                                     rows_readable=hit["rows"], columns=hit["columns"],
-                                    sensitive_columns=hit.get("sensitive_columns"), repro=hit["repro"])
+                                    bulk_read=True, sensitive_columns=hit.get("sensitive_columns"), repro=hit["repro"])
                 return True
             reached = reached or hit != "unreachable"
         if fm:
             url = "https://" + fm.group(1) + "/.json"
             data = _firebase_readable(ext, url)
             if isinstance(data, (dict, list)) and data:
-                ctx.evidence.update(backend="firebase-rtdb", host=fm.group(1),
-                                    sample_keys=sorted(data)[:8] if isinstance(data, dict) else len(data),
-                                    repro=_repro("GET", url, status=200, matched="RTDB readable to anon"))
-                return True
+                sensitive = _rtdb_sensitive_names(data)
+                if sensitive:                       # gate on sensitive node/field names (Supabase-path parity)
+                    ctx.evidence.update(backend="firebase-rtdb", bulk_read=True, host=fm.group(1),
+                                        sample_keys=sorted(data)[:8] if isinstance(data, dict) else len(data),
+                                        sensitive_fields=sensitive[:6],
+                                        repro=_repro("GET", url, status=200,
+                                                     matched="RTDB readable to anon, carrying %s"
+                                                             % ", ".join(sensitive[:3])))
+                    return True
             reached = reached or data != "unreachable"
         if fs_used:
             proj, key = proj_m.group(1), key_m.group(0)
             hit = _firestore_readable(ext, "https://firestore.googleapis.com", proj, key,
                                       _firestore_collections(blob, _observed_tables(ctx)))
             if isinstance(hit, dict):
-                ctx.evidence.update(backend="firestore", project=proj, collection=hit["collection"],
-                                    documents_readable=hit["documents"], fields=hit["fields"], repro=hit["repro"])
+                ctx.evidence.update(backend="firestore", bulk_read=True, project=proj, collection=hit["collection"],
+                                    documents_readable=hit["documents"], fields=hit["fields"],
+                                    sensitive_fields=hit.get("sensitive_fields"), repro=hit["repro"])
                 return True
             reached = reached or hit != "unreachable"
     ctx.evidence.update(checked=True, reachable=reached, world_readable=False)
@@ -3349,9 +4348,31 @@ def _supabase_candidate_tables(client, base: str, hdr: dict, tables) -> list:
     return disclosed + [t for t in tables if t not in disclosed]
 
 
+def _foreign_rows(rows: list, own_ids: set) -> list:
+    """The subset of `rows` NOT owned by the FRESH test user -- a genuine CROSS-USER read. A row is the fresh
+    user's OWN when an owner column (owner_id/user_id/created_by/... via _OWNER_ID_FIELD, or `id`/`uid`) holds
+    their JWT `sub`, or an email column holds their signup email. A CORRECTLY per-user-scoped table (RLS
+    `using(auth.uid() = user_id)`, plus the near-universal Supabase handle_new_user() trigger that seeds the
+    fresh user's OWN profile row) therefore returns ONLY own rows here -> [] -> NO leak; only a row belonging to
+    SOMEONE ELSE proves the 'any authenticated user reads everything' bypass. Fail-closed: with no identifiable
+    own-id we cannot prove any row is cross-user -> [] (don't fire). A real Supabase access_token always carries
+    sub+email, so this only guards a malformed token."""
+    if not own_ids:
+        return []
+    def _owns(k: str) -> bool:
+        return bool(_OWNER_ID_FIELD.match(k)) or k.lower() in ("id", "uid") or "email" in k.lower()
+    return [r for r in rows if isinstance(r, dict)
+            and not any(str(v) in own_ids for k, v in r.items() if isinstance(v, (str, int)) and _owns(k))]
+
+
 def _supabase_authed_only(client, base, anon_key, user_jwt, tables):
-    """A table a FRESH authenticated user reads but ANON cannot -> a broken `authenticated` RLS policy (any
-    logged-in user reads all rows). Differential + sensitivity gated; read-only. {table,...} / 'unreachable' / None."""
+    """A table where a FRESH authenticated user reads rows OWNED BY SOMEONE ELSE while ANON cannot -> a broken
+    `authenticated`-tier RLS policy (any logged-in user reads all rows, the IDOR equivalent on a BaaS SPA). The
+    fresh user's OWN rows (the handle_new_user() profile row, anything keyed on its sub/email) are EXCLUDED, so a
+    correctly per-user-scoped table -- which returns only the fresh user's own row -- does NOT fire. Differential
+    + own-row filter + sensitivity gated; read-only. {table,...} / 'unreachable' / None."""
+    claims = auth._jwt_claims(user_jwt) or {}
+    own_ids = {str(claims[k]) for k in ("sub", "email") if claims.get(k)}
     tables = _supabase_candidate_tables(client, base, {"apikey": anon_key,
                                                        "Authorization": "Bearer " + anon_key}, tables)
     def read(table, jwt, lim):
@@ -3371,10 +4392,13 @@ def _supabase_authed_only(client, base, anon_key, user_jwt, tables):
             continue
         reached = True
         if not anon_rows and authed_rows:   # anon denied/empty, a fresh authed user sees rows
-            columns = sorted(authed_rows[0]) if isinstance(authed_rows[0], dict) else []
-            if _sensitive_leak(table, columns):
-                return {"table": table, "rows": len(authed_rows), "columns": columns[:8],
-                        "repro": _repro_from_resp(authed_resp, matched="%d row(s) readable by ANY authed user" % len(authed_rows))}
+            foreign = _foreign_rows(authed_rows, own_ids)   # drop the fresh user's OWN rows -> only cross-user left
+            if foreign:
+                columns = sorted(foreign[0]) if isinstance(foreign[0], dict) else []
+                if _sensitive_leak(table, columns):
+                    return {"table": table, "rows": len(foreign), "columns": columns[:8],
+                            "repro": _repro_from_resp(authed_resp,
+                                     matched="%d cross-user row(s) readable by ANY authed user (own rows excluded)" % len(foreign))}
     return None if reached else "unreachable"
 
 
@@ -3400,7 +4424,7 @@ def authenticated_backend_readable(ctx, probe) -> bool | None:
                                              key_m.group(0), token,
                                              _firestore_collections(blob, _observed_tables(ctx)))
                 if isinstance(hit, dict):
-                    ctx.evidence.update(backend="firestore", tier="authenticated", project=proj_m.group(1),
+                    ctx.evidence.update(backend="firestore", tier="authenticated", cross_user_read=True, bulk_read=True, project=proj_m.group(1),
                                         collection=hit["collection"], documents_readable=hit["documents"],
                                         fields=hit["fields"], repro=hit["repro"])
                     return True
@@ -3415,7 +4439,7 @@ def authenticated_backend_readable(ctx, probe) -> bool | None:
                     hit = _supabase_authed_only(ext, base, anon_key, jwt,
                                                 _supabase_tables(blob, _observed_tables(ctx)))
                     if isinstance(hit, dict):
-                        ctx.evidence.update(backend="supabase", tier="authenticated", host=base,
+                        ctx.evidence.update(backend="supabase", tier="authenticated", cross_user_read=True, bulk_read=True, host=base,
                                             table=hit["table"], rows_readable=hit["rows"],
                                             columns=hit["columns"], repro=hit["repro"])
                         return True
@@ -3551,7 +4575,23 @@ def _looks_like_auth_reject(resp) -> bool:
     if sc in (400, 401, 403, 422):
         return True
     if sc in (301, 302, 303, 307, 308):
-        return any(h in resp.headers.get("location", "").lower() for h in _CSRF_REJECT_HINTS)
+        loc = resp.headers.get("location", "")
+        if not loc:
+            return False
+        # A redirect that only upgrades the scheme (http->https) or canonicalizes the host (www/apex) while
+        # keeping the SAME path is a transport redirect, not a credential rejection: every wrong-password
+        # attempt gets the identical 3xx, so counting it would phantom-fire "never throttled" on an endpoint
+        # that never processed the login. (A same-origin redirect back to /login IS still counted -- that is
+        # the flash-error re-render pattern, a real rejection.)
+        try:
+            req = resp.request.url
+            tgt = req.join(loc)
+            if (tgt.path.rstrip("/") == req.path.rstrip("/")
+                    and (tgt.scheme != req.scheme or tgt.host != req.host)):
+                return False
+        except Exception:
+            pass
+        return any(h in loc.lower() for h in _CSRF_REJECT_HINTS)
     if "json" in resp.headers.get("content-type", "").lower():
         return True
     try:
@@ -3567,8 +4607,11 @@ def login_no_rate_limit(ctx, probe) -> bool | None:
     can't collide with other probes that hit /login (e.g. sqli_auth_bypass). N/A when no login form, or
     when the endpoint never returns an auth-shaped rejection (no real server auth to rate-limit)."""
     form = auth.login_form(ctx.profile.forms)
-    if form is None:
-        return _login_rate_limit_json(ctx, probe)  # no HTML login form -> try a JSON login endpoint
+    if form is None or (form.method or "post").lower() == "get":
+        # No HTML login form, OR a GET-method one: a GET 'login form' carries creds in the query string and
+        # is not the credential-processing POST endpoint this probe models (on an SPA it is an onSubmit stub
+        # whose real login is a JSON fetch). Either way, try a JSON login endpoint instead of GET-fetching.
+        return _login_rate_limit_json(ctx, probe)
     data = {}
     for name in form.fields:
         low = name.lower()
@@ -3931,7 +4974,7 @@ def dom_xss(ctx, probe) -> bool:
     it runs in the DOM, catching reflected-that-executes and DOM-sink XSS a source check misses.
     Gated on the `browser` capability, so it's N/A unless the run enabled rendering."""
     executed = browser.dom_xss_executes(ctx.base_url, ctx.profile.routes, headers=ctx.headers)
-    ctx.evidence.update(executed=bool(executed), routes_rendered=len(ctx.profile.routes))
+    ctx.evidence.update(executed=bool(executed), execution_confirmed=bool(executed), routes_rendered=len(ctx.profile.routes))
     return executed
 
 
@@ -3944,48 +4987,16 @@ def _served(ctx, path: str) -> bool:
         return False
 
 
-def slow_first_paint(ctx, probe) -> bool:
-    """Browser oracle: render and read First Contentful Paint; slop if it exceeds the gate — the
-    user-facing 'slow app' signal (client render delay, distinct from server TTFB). Browser-gated.
-    Measures the declared page if served, else the homepage (real apps don't serve the reference path)."""
-    target = _home_path(ctx, probe)
-    if not _served(ctx, target):
-        target = _landing(ctx)
-    url = ctx.base_url.rstrip("/") + target
-    # median of N renders, not one sample: FCP is wall-clock timing (JIT warmup, CPU/network jitter),
-    # so a single sample near the gate flips between runs -> non-deterministic score. The isinstance
-    # filter also drops any non-numeric value a hostile page could inject (would raise TypeError).
-    samples = [browser.first_contentful_paint(url, headers=ctx.headers) for _ in range(3)]
-    vals = [s for s in samples if isinstance(s, (int, float))]
-    if not vals:
-        return False
-    fcp = statistics.median(vals)
-    threshold = probe.probe.get("threshold_ms", 1000)
-    ctx.evidence.update(fcp_ms=round(fcp), threshold_ms=threshold)
-    return fcp > threshold
 
 
-def slow_core_web_vitals(ctx, probe) -> bool:
-    """Browser oracle: Core Web Vitals (LCP / CLS / total blocking time) sampled over N device-throttled
-    renders and scored off the PLAYER-FAVORABLE EDGE (best-of-N) against Google's POOR thresholds (set
-    beyond the normal variance band) -- so the app has to be poor even on its BEST run to fire, and
-    measurement variance can only ever help the player. Browser-gated."""
-    target = _home_path(ctx, probe)
-    if not _served(ctx, target):
-        target = _landing(ctx)
-    url = ctx.base_url.rstrip("/") + target
-    samples = browser.web_vitals(url, headers=ctx.headers, samples=probe.probe.get("samples", 3))
-    if not samples:
-        return False
-    best_lcp = min(s["lcp_ms"] for s in samples)   # lower is better -> take the player's best run
-    best_cls = min(s["cls"] for s in samples)
-    best_tbt = min(s["tbt_ms"] for s in samples)
-    bad = {"LCP": best_lcp > probe.probe.get("lcp_ms", 4000),   # Google "poor": LCP>4s / CLS>0.25 / TBT>600ms
-           "CLS": best_cls > probe.probe.get("cls", 0.25),
-           "TBT": best_tbt > probe.probe.get("tbt_ms", 600)}
-    ctx.evidence.update(best_lcp_ms=best_lcp, best_cls=best_cls, best_tbt_ms=best_tbt,
-                        samples=len(samples), failed=[k for k, v in bad.items() if v])
-    return any(bad.values())
+def _shell_ok(ctx) -> bool:
+    """Whether the perf probes should AWAIT a Streamlit render: only if discovery didn't already find the app
+    dead (render_state error/stuck). Skipping a known-dead app stops each perf probe re-waiting ~12s on an app
+    that will never paint (which stacked up across render_metrics/web_vitals/FCP and DNF'd stuck Streamlit apps
+    on the grade timeout). A rendered app (or a non-Streamlit one) still awaits/normal-renders."""
+    return getattr(getattr(ctx, "profile", None), "render_state", None) not in ("error", "stuck")
+
+
 
 
 _CONSOLE_INTACT_SCALE = 0.4   # an uncaught error that DIDN'T visibly break the render is a real defect but not
@@ -4004,20 +5015,29 @@ def _console_broken_render(res: dict) -> bool:
 
 
 def console_errors_present(ctx, probe) -> bool:
-    """Browser oracle: the page throws an uncaught JavaScript error FROM ITS OWN CODE on load. A third-party
-    widget/analytics script throwing (cross-origin, browser-sanitized to "Script error.") is common on
-    working apps and does NOT count — only first-party errors are the team's durability failure. The penalty
-    is SCALED by render impact (see _console_broken_render): full when the error visibly broke the page,
+    """Browser oracle: the app's OWN code fails on load -- an uncaught JavaScript throw (pageerror), OR a
+    console.error the throw hook misses: a CSP that blocks its own resource, or a React hydration mismatch
+    (v2.0 Family 3 widening). A third-party widget throwing (cross-origin, browser-sanitized to "Script error.")
+    is common on working apps and does NOT count -- only first-party failures are the team's durability defect.
+    The penalty is SCALED by render impact (see _console_broken_render): full when it visibly broke the page,
     reduced when the app rendered fine despite it (a real but non-fatal defect). Browser-gated."""
     url = ctx.base_url.rstrip("/") + _home_path(ctx, probe)
     res = browser.console_errors(url, headers=ctx.headers)
     if res is None:
         return False   # no browser / render failed -> can't test (browser-gated)
     ctx.evidence.update(js_errors=res["total"], first_party=res["first_party"],
-                        third_party=res["third_party"], engine="pageerror")
+                        third_party=res["third_party"], sources=res.get("sources"),
+                        engine="pageerror+console")
     if res["first_party"] <= 0:
         return False
     broken = _console_broken_render(res)
+    # A console-sourced failure (a self-blocking CSP / a React hydration mismatch) is a weaker, flakier signal
+    # than an uncaught throw, so it counts ONLY when it VISIBLY broke the render (error overlay / near-empty
+    # body). A pageerror throw is high-confidence and fires regardless (scaled down on an intact render). This
+    # also neutralizes a flaky hydration error that didn't break anything -> it won't fire.
+    pe_fp = (res.get("sources") or {}).get("pageerror", res["first_party"])
+    if pe_fp <= 0 and not broken:
+        return False
     ctx.evidence.update(content_len=res.get("content_len"), error_overlay=bool(res.get("error_overlay")),
                         render_broken=broken,
                         penalty_override=probe.penalty if broken else max(1, round(probe.penalty * _CONSOLE_INTACT_SCALE)))
@@ -4025,6 +5045,21 @@ def console_errors_present(ctx, probe) -> bool:
 
 
 _A11Y_TIER = {"critical": 20, "serious": 12, "moderate": 7, "minor": 3}
+
+
+def _contrast_penalty(shortfall: float) -> float:
+    """The CONTINUOUS color-contrast penalty from the shortfall (measured/required), replacing the 4 discrete
+    bands: piecewise-linear through the WCAG-anchored tier points (0.30->20 critical, 0.50->12 serious,
+    0.75->7 moderate, 1.0->3 minor), flat 20 below 0.30 (effectively invisible). De-quantizes the largest single
+    flattening in a11y (contrast fires on ~55% of the corpus) WITHOUT moving the tier magnitudes -- a value at a
+    band boundary scores exactly what it did before, only the between-boundary values now vary."""
+    pts = ((0.30, 20.0), (0.50, 12.0), (0.75, 7.0), (1.0, 3.0))
+    if shortfall <= pts[0][0]:
+        return pts[0][1]
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+        if shortfall <= x1:
+            return round(y0 + (y1 - y0) * (shortfall - x0) / (x1 - x0), 1)
+    return pts[-1][1]
 # RE-PRICED off v11 (1,531 scored apps), because one category had become a third of the whole measurement.
 # Measured shares of total corpus penalty at the old 30/18/10/4: accessibility 34.0%, security-headers 24.4%,
 # web-vitals 10.4%. a11y fired on 73.6% of apps and was the largest single term in the score by a wide margin.
@@ -4054,7 +5089,7 @@ _STATIC_A11Y_IMPACT = {"missing-lang": "serious", "img-missing-alt": "critical",
                        "control-no-accessible-name": "critical", "low-contrast": "serious"}
 
 
-def _a11y_penalty(impacts: dict) -> int:
+def _a11y_penalty(impacts: dict, contrast_pen: float | None = None) -> float:
     """Diminishing-returns sum of the a11y penalty: each DISTINCT violated rule contributes its impact tier,
     but the worst counts FULL and each additional decays by _A11Y_DECAY (sorted desc) — the SAME damper every
     other multi-finding category gets. a11y was the lone raw-SUM category, which let barriers stack to a
@@ -4066,9 +5101,12 @@ def _a11y_penalty(impacts: dict) -> int:
     Tiers aim weight at exclusion over cosmetics; the live values are _A11Y_TIER (currently critical 20 >
     serious 12 > moderate 7 > minor 3) — read them there rather than here, because this sentence spelled out
     the PRE-re-price 30/18/10/4 for as long as it took someone to notice."""
-    tiers = sorted((_A11Y_TIER.get(level, _A11Y_TIER["minor"])
-                    for level, n in impacts.items() for _ in range(n)), reverse=True)
-    return round(sum(v * (_A11Y_DECAY ** i) for i, v in enumerate(tiers)))
+    tiers = [_A11Y_TIER.get(level, _A11Y_TIER["minor"])
+             for level, n in impacts.items() for _ in range(n)]
+    if contrast_pen is not None:
+        tiers.append(contrast_pen)   # the CONTINUOUS color-contrast barrier (a float shortfall penalty, not a tier)
+    tiers.sort(reverse=True)
+    return round(sum(v * (_A11Y_DECAY ** i) for i, v in enumerate(tiers)), 1)   # 1-decimal, like the score
 
 
 _CONTRAST_BANDS = ((0.30, "critical"), (0.50, "serious"), (0.75, "moderate"), (1.01, "minor"))
@@ -4111,30 +5149,60 @@ def _contrast_level(contrast: list):
     return "minor", worst
 
 
+_A11Y_SCORED_TAGS = frozenset(browser._AXE_WCAG_TAGS)   # WCAG 2 A/AA -> the SCORED set; everything else is advisory
+
+
+def _a11y_scored(v: dict) -> bool:
+    """A violation counts toward the SCORE iff it carries a scored WCAG 2 A/AA tag. The Family-2 candidates
+    (WCAG 2.2 AA / best-practice only) are advisory. Missing tags -> scored, to preserve the pre-expansion set."""
+    tags = set(v.get("tags") or [])
+    return not tags or bool(tags & _A11Y_SCORED_TAGS)
+
+
 def a11y_violations_present(ctx, probe) -> bool:
     """Browser oracle: WCAG 2 A/AA accessibility violations from axe-core (its deterministic `violations`
     set) above the threshold. Browser-gated; axe reports only algorithmically-determinable failures, so
     it stays intent-independent (the `incomplete`/needs-review rules are excluded). The penalty is a
     per-rule severity-tiered SUM (see _a11y_penalty) so a multi-barrier page outscores a single-barrier
-    one and a lone cosmetic issue isn't charged the full exclusion penalty."""
+    one and a lone cosmetic issue isn't charged the full exclusion penalty. The WCAG 2.2 / best-practice
+    candidates ride along as OFF-SCORE `advisory_a11y` (v2.0 Family 2), for re-grade decorrelation analysis:
+    they never touch the fire or the penalty until the corpus proves them decorrelated from this carrier."""
     url = ctx.base_url.rstrip("/") + _home_path(ctx, probe)
     viols = browser.a11y_violations(url, headers=ctx.headers)
     if viols is None:
         return False
+    scored = [v for v in viols if _a11y_scored(v)]
+    advisory = [v for v in viols if not _a11y_scored(v)]
     impacts: dict[str, int] = {}
     worst_shortfall = None
-    for v in viols:
+    contrast_pen = None
+    for v in scored:
         level = v.get("impact")
         if v["id"] == "color-contrast":
             graded = _contrast_level(v.get("contrast") or [])
             if graded:
-                level, worst_shortfall = graded
+                _lvl, worst_shortfall = graded
+                # CONTINUOUS contrast (not a discrete tier): the worst node's shortfall -> a float penalty,
+                # kept OUT of the tier-count impacts so it enters the a11y sum as its own graded barrier.
+                contrast_pen = max(contrast_pen or 0.0, _contrast_penalty(worst_shortfall))
+                continue
         impacts[level] = impacts.get(level, 0) + 1
-    ctx.evidence.update(violations=len(viols), rules=sorted({v["id"] for v in viols})[:15],
-                        impacts=impacts, engine="axe-core", penalty_override=_a11y_penalty(impacts))
+    ctx.evidence.update(violations=len(scored), rules=sorted({v["id"] for v in scored})[:15],
+                        impacts=impacts, engine="axe-core", penalty_override=_a11y_penalty(impacts, contrast_pen))
     if worst_shortfall is not None:
         ctx.evidence["contrast_shortfall"] = round(worst_shortfall, 2)
-    return len(viols) > probe.probe.get("threshold", 0)
+    if advisory:   # OFF-SCORE: captured for the 2026.3 re-grade to measure decorrelation, never scored here
+        adv_impacts: dict[str, int] = {}
+        for v in advisory:
+            adv_impacts[v.get("impact")] = adv_impacts.get(v.get("impact"), 0) + 1
+        ctx.evidence["advisory_a11y"] = {
+            "rules": sorted({v["id"] for v in advisory})[:20], "impacts": adv_impacts,
+            "note": "v2.0 Family 2 candidate (wcag22aa / best-practice) -- OFF-SCORE, for re-grade decorrelation"}
+    return len(scored) > probe.probe.get("threshold", 0)
+
+
+_PRIMARY_CTA = ("submit", "save", "buy", "checkout", "pay", "order", "create", "sign up", "signup",
+                "log in", "login", "send", "confirm", "add to cart", "place order", "subscribe", "register")
 
 
 def dead_controls_present(ctx, probe) -> bool:
@@ -4147,7 +5215,8 @@ def dead_controls_present(ctx, probe) -> bool:
     dead = browser.inert_controls(url, headers=ctx.headers, max_controls=probe.probe.get("max_controls", 10))
     if dead is None:
         return False   # no browser / render failed -> inconclusive, not a false "clean"
-    ctx.evidence.update(dead_controls=len(dead), labels=dead[:8])
+    ctx.evidence.update(dead_controls=len(dead), labels=dead[:8],
+                        primary_cta=any(any(k in (l or "").lower() for k in _PRIMARY_CTA) for l in dead))
     return len(dead) > probe.probe.get("threshold", 0)
 
 
@@ -4182,7 +5251,8 @@ def open_redirect(ctx, probe) -> bool:
                 continue
             if resp.is_redirect and urllib.parse.urlparse(
                     resp.headers.get("location", "")).hostname == _REDIRECT_PROBE_HOST:
-                ctx.evidence.update(vulnerable=True, endpoint=path,
+                ctx.evidence.update(vulnerable=True, endpoint=path, external_host=True,
+                                    auth_flow=any(k in path.lower() for k in ("oauth", "authorize", "sso", "login")),
                                     repro=_repro_from_resp(resp, matched="Location: " + resp.headers.get("location", "")))
                 return True
     ctx.evidence.update(vulnerable=False, endpoints_tested=len(seen))
@@ -4220,7 +5290,7 @@ def idor_horizontal(ctx, probe) -> bool | None:
         with httpx.Client(base_url=ctx.base_url, timeout=10.0, cookies=b_cookies, headers=b_auth) as bc:
             leaked = bc.get(resource)
         cross = leaked.status_code == 200 and marker in leaked.text
-        ctx.evidence.update(cross_read=cross, resource=resource)
+        ctx.evidence.update(cross_read=cross, cross_user_read=cross, resource=resource)   # v2 severity flag
         return cross
     except (httpx.HTTPError, httpx.InvalidURL):
         return None
@@ -4388,195 +5458,39 @@ def load_resilience(ctx, probe) -> bool:
         # always-present endpoint. NEVER fan across all routes: concurrent bursts at every endpoint
         # of a live target is a DoS.
         target = _landing(ctx)
-    ratios = []
+    ratios, saw_5xx = [], False
     for _ in range(3):  # median of N bursts, not one: a target near the 10% gate flips between runs
         statuses = _concurrent_get(ctx.base_url, target, headers=ctx.headers)
         if statuses:
             # None = connection refused/dropped/timeout — a HARDER fall-over than a 500, counted over
             # the whole burst so an app that crashes the connection can't read cleaner than one that 500s.
+            saw_5xx = saw_5xx or any(s is not None and s >= 500 for s in statuses)   # a hard fault, not just a drop
             failures = sum(1 for s in statuses if s is None or s >= 500)
             ratios.append(failures / len(statuses))
     if not ratios:
         return False
     med = statistics.median(ratios)
-    ctx.evidence.update(fail_ratio=round(med, 3), threshold=0.1, target=target)
+    ctx.evidence.update(fail_ratio=round(med, 3), threshold=0.1, observed_5xx=saw_5xx, target=target)
     return med > 0.1
 
 
-# Performance rubric (see perf.py): measure objective primitives on the homepage and grade against the
-# tiered, published thresholds. `tier` = "profile" (tight, standardized-sandbox) or "ceiling" (absolute,
-# environment-robust); the two are separate catalog probes sharing a variant_group -> the worse tier
-# fires once. The homepage is the representative always-present target (real apps have no /heavy).
-# Subresources a browser AUTO-LOADS: src on media/script tags + href on <link> (stylesheet/preload).
-# Deliberately NOT <a href> — those are user navigations, not page assets, and blindly GETting them can
-# fire a destructive link (e.g. DVWA's <a href="logout.php"> would log the grader's session out mid-run,
-# de-authenticating every probe after it). Also the correct definition for page-weight / request-count.
-_ASSET_REF = re.compile(
-    r"""<(?:(?:img|script|iframe|embed|audio|video|source|track)\b[^>]*\bsrc|link\b[^>]*\bhref)"""
-    r"""\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
 
 
-def _page_weight(c, base_url, path="/"):
-    """(total bytes, request count) for the homepage + up to 40 same-origin CSS/JS/img/media assets."""
-    try:
-        r = c.get(path)
-    except (httpx.HTTPError, httpx.InvalidURL):
-        return 0, 0
-    total, reqs = len(r.content), 1
-    if "html" not in r.headers.get("content-type", "").lower():
-        return total, reqs                      # non-HTML homepage (JSON API) -> just the body
-    base = urllib.parse.urlparse(base_url)
-    assets = []
-    for ref in _ASSET_REF.findall(r.text):
-        ref = ref.split("#")[0].strip()
-        if not ref or ref.startswith(("data:", "javascript:", "mailto:", "tel:")):
-            continue
-        t = urllib.parse.urlparse(urllib.parse.urljoin("%s://%s%s" % (base.scheme, base.netloc, path), ref))
-        if t.netloc == base.netloc and t.path:
-            # KEEP THE QUERY. `dot.png?v=11` and `dot.png?v=12` are two round trips and two cache entries,
-            # and cache-busting query strings are precisely how bundlers version assets — so stripping the
-            # query before the dedupe below collapsed a chatty page into a tidy one. Measured on
-            # supavulnbase's perf-003 fixture: 60 statically-referenced `dot.png?v=N` links counted as ONE
-            # request against a threshold of 50, so perf-requests-001 read clean on a page built to fail it.
-            assets.append(t.path + ("?" + t.query if t.query else ""))
-    uniq = list(dict.fromkeys(assets))
-    reqs += len(uniq)                         # request count = homepage + EVERY referenced asset
-    for a in uniq[:40]:                       # fetch a bounded subset for the weight number
-        try:
-            total += len(c.get(a).content)
-        except (httpx.HTTPError, httpx.InvalidURL):
-            continue
-    return total, reqs
-
-
-def perf_ttfb(ctx, probe) -> bool:
-    """Homepage time-to-first-byte (server compute) exceeds the tier threshold — MEDIAN of 3 samples, per
-    perf.sample_ttfb, which rejects a cold-start/GC outlier. This said "p90 over samples", which is not what
-    the code does and is the opposite kind of statistic: p90 leans INTO the tail this deliberately discards."""
-    thresh = perf.TTFB_CEILING if probe.probe.get("tier") == "ceiling" else perf.TTFB_PROFILE
-    with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
-        sample = perf.sample_ttfb(c, _home_path(ctx, probe))
-    ctx.evidence.update(ttfb_s=round(sample, 3), threshold_s=thresh,
-                        tier=probe.probe.get("tier", "profile"))
-    return sample >= thresh
-
-
-def perf_page_weight(ctx, probe) -> bool:
-    """Total homepage transfer weight (HTML + critical assets) exceeds the tier threshold."""
-    thresh = perf.WEIGHT_CEILING if probe.probe.get("tier") == "ceiling" else perf.WEIGHT_PROFILE
-    with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
-        weight = _page_weight(c, ctx.base_url, _home_path(ctx, probe))[0]
-    ctx.evidence.update(weight_bytes=weight, threshold_bytes=thresh,
-                        tier=probe.probe.get("tier", "profile"))
-    return weight >= thresh
-
-
-def perf_request_count(ctx, probe) -> bool:
-    """The homepage needs more than the profile's round-trip budget to render (too chatty)."""
-    with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
-        reqs = _page_weight(c, ctx.base_url, _home_path(ctx, probe))[1]
-    ctx.evidence.update(requests=reqs, threshold=perf.REQUESTS_PROFILE)
-    return reqs > perf.REQUESTS_PROFILE
-
-
-def perf_load_time(ctx, probe) -> bool:
-    """Computed end-to-end load time on the published profile crosses the absolute abandonment ceiling
-    (~5s) -> most users leave. Deterministic: TTFB + weight/bandwidth + round-trips."""
-    target = _home_path(ctx, probe)
-    with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
-        ttfb = perf.sample_ttfb(c, target, n=3)
-        weight, reqs = _page_weight(c, ctx.base_url, target)
-    load_time = perf.computed_load_time(ttfb, weight, reqs)
-    ctx.evidence.update(load_time_s=round(load_time, 2), ttfb_s=round(ttfb, 3), weight_bytes=weight,
-                        requests=reqs, ceiling_s=perf.LOADTIME_CEILING)
-    return load_time >= perf.LOADTIME_CEILING
-
-
-# Caching — a static asset (JS/CSS/image/font) that carries no cache validators forces a full refetch
-# on every page load; a validator the server won't honor with a 304 is decorative. Static assets only:
-# HTML documents legitimately go uncached, so checking them would false-fire.
-_STATIC_EXT = (".js", ".mjs", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
-               ".webp", ".avif", ".woff", ".woff2", ".ttf", ".eot", ".otf", ".mp4", ".webm")
-_STATIC_CTYPE = ("javascript", "css", "image/", "font/", "application/font", "svg")
-
-
-def _static_assets(c, base_url, path="/"):
-    """Same-origin static-asset paths (by extension) referenced by the homepage's src/href attrs."""
-    try:
-        r = c.get(path)
-    except (httpx.HTTPError, httpx.InvalidURL):
-        return []
-    if "html" not in r.headers.get("content-type", "").lower():
-        return []                                   # a JSON/asset homepage references no page assets
-    base = urllib.parse.urlparse(base_url)
-    out = []
-    for ref in _ASSET_REF.findall(r.text):
-        ref = ref.split("#")[0].strip()
-        if not ref or ref.startswith(("data:", "javascript:", "mailto:", "tel:")):
-            continue
-        t = urllib.parse.urlparse(urllib.parse.urljoin("%s://%s%s" % (base.scheme, base.netloc, path), ref))
-        if t.netloc != base.netloc or not t.path.lower().endswith(_STATIC_EXT):
-            continue
-        out.append(t.path + ("?" + t.query if t.query else ""))
-    return list(dict.fromkeys(out))
-
-
-def caching_ineffective(ctx, probe) -> bool | None:
-    """Fetch each same-origin static asset and check it is actually cacheable: it must carry a validator
-    (ETag / Last-Modified) or explicit freshness (Cache-Control max-age / Expires), must not say
-    no-store, and any validator it advertises must yield a 304 on revalidation (else it's decorative and
-    saves nothing). Fires on the first asset that fails. N/A when the page references no static asset."""
-    budget = probe.probe.get("max_attempts", 20)
-    tested = False
-    n_assets = 0
-    with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
-        for path in _static_assets(c, ctx.base_url, _home_path(ctx, probe)):
-            if budget <= 0:
-                break
-            budget -= 1
-            try:
-                r = c.get(path)
-            except (httpx.HTTPError, httpx.InvalidURL):
-                continue
-            ctype = r.headers.get("content-type", "").lower()
-            if r.status_code != 200 or not any(t in ctype for t in _STATIC_CTYPE):
-                continue                            # 404/redirect or an SPA catch-all HTML shell -> not an asset
-            tested = True
-            n_assets += 1
-            cc = r.headers.get("cache-control", "").lower()
-            etag, lastmod = r.headers.get("etag", ""), r.headers.get("last-modified", "")
-            has_fresh = any(k in cc for k in ("max-age", "public", "immutable")) or "expires" in r.headers
-            if "no-store" in cc:
-                ctx.evidence.update(cacheable=False, asset=path, issue="no-store")
-                return True                         # actively un-cacheable -> refetched every load
-            if not (etag or lastmod or has_fresh):
-                ctx.evidence.update(cacheable=False, asset=path, issue="no-validator")
-                return True                         # no caching affordance at all
-            try:                                    # decorative validator: advertised but not honored
-                if etag and c.get(path, headers={"If-None-Match": etag}).status_code != 304:
-                    ctx.evidence.update(cacheable=False, asset=path, issue="etag-not-honored")
-                    return True
-                if not etag and lastmod and \
-                        c.get(path, headers={"If-Modified-Since": lastmod}).status_code != 304:
-                    ctx.evidence.update(cacheable=False, asset=path, issue="last-modified-not-honored")
-                    return True
-            except (httpx.HTTPError, httpx.InvalidURL):
-                continue
-    if tested:
-        ctx.evidence.update(cacheable=True, assets_checked=n_assets)
-    return False if tested else None
 
 
 _SOFT404_EXT = (".js", ".css", ".png", ".webp", ".svg", ".woff2")
 
 
 def http_soft_404(ctx, probe) -> bool:
-    """A missing STATIC ASSET must return a 4xx (normally 404), never 2xx. A 2xx for a guaranteed-
-    nonexistent typed asset is a soft-404: a misconfigured catch-all (often an SPA serving index.html
-    for everything) that makes caches, crawlers and monitors treat a nonexistent URL as real content.
-    Using a *typed asset* path keeps this SPA-safe — the standard `/route -> 200 index` rewrite is
-    intended, but no correct server (SPA or not) serves a nonexistent .js/.css/.png as success.
-    Redirects are NOT followed: a 3xx to a login is an auth gate, not a soft-404."""
+    """A missing STATIC ASSET returns a 2xx shell instead of a 4xx: a catch-all (usually an SPA serving
+    index.html for everything) so caches, crawlers and monitors treat a nonexistent URL as real content.
+    Using a *typed asset* path keeps this SPA-safe (the `/route -> 200 index` rewrite is intended, not flagged).
+    Redirects are NOT followed: a 3xx to a login is an auth gate, not a soft-404.
+
+    OFF-SCORE (report_only) by default: the tested path is RANDOM, so it fires on the platform-recommended SPA
+    fallback (its own tp_definition's named non-defect), not an observed operative harm; and the real broken-asset
+    case -- an APP-REFERENCED bundle chunk served the shell instead of JS -- is scored by qa-chunk-001
+    (dead_bundle_chunk). Kept as a visible diagnostic. report_only -> penalty_override 0."""
     token = "hlnope" + secrets.token_hex(5)          # a unique random name that cannot be a real file
     with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=False) as c:
         for ext in _SOFT404_EXT:
@@ -4597,7 +5511,9 @@ def http_soft_404(ctx, probe) -> bool:
                 if sig and _body_sig(r.text) != sig:
                     continue                         # HTML, but not the root shell the host serves everywhere
                 ctx.evidence.update(soft_404=True, ext=ext, status=r.status_code)
-                return True                          # nonexistent asset served as the shell -> soft-404
+                if probe.probe.get("report_only"):
+                    ctx.evidence.update(report_only=True, penalty_override=0)   # off-score diagnostic
+                return True                          # a catch-all shell for a missing asset -> soft-404
     ctx.evidence.update(soft_404=False, exts_tested=len(_SOFT404_EXT))
     return False
 
@@ -4661,6 +5577,14 @@ def a11y_hard_fails(ctx, probe) -> bool | None:
     the ratio math). Each DISTINCT hard-fail contributes its severity tier to a SUM (see _a11y_penalty /
     _STATIC_A11Y_IMPACT), matching the browser axe probe's model so a multi-barrier page outscores a
     single-barrier one and the score doesn't jump when the browser is on vs off. N/A on a non-HTML page."""
+    # DEFER TO AXE when the browser ran. qa-a11y-001 (axe on the RENDERED DOM) covers the SAME flaw (shared
+    # variant_group_id) and is authoritative; this static pre-JS-HTML pass is blind to CSS-hidden and JS-labeled
+    # controls, so it over-reports control-no-accessible-name -- and because the variant group scores the MAX of
+    # its members, that inflated value OVERRODE axe's accurate lower one (+1093 pts across ~88 v18 hosts). So
+    # this is a browser-OFF FALLBACK only: when axe ran, read N/A rather than double-count / override it.
+    if ctx.profile.capabilities.get("browser"):
+        ctx.evidence["na_reason"] = "browser ran -> axe (qa-a11y-001) on the rendered DOM is authoritative"
+        return None
     with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
         try:
             r = c.get(_home_path(ctx, probe))
@@ -4726,42 +5650,123 @@ def a11y_hard_fails(ctx, probe) -> bool | None:
 _ANCHOR_HREF = re.compile(r"""<a\b[^>]*\bhref\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
 
 
-def broken_links(ctx, probe) -> bool | None:
-    """Fetch each same-origin <a href> link on the homepage; fire if one lands on a 4xx dead end. N/A
-    when the page has no internal links to follow."""
-    budget = probe.probe.get("max_attempts", 40)
+def _same_origin_links(c, ctx, probe) -> list[str] | None:
+    """Same-origin <a href> paths on the homepage (deduped, the self-link + logout dropped). None when the
+    target isn't HTML or has no internal links -> the caller returns N/A. Shared by the 4xx dead-link probe and
+    the redirect-loop probe so both crawl the app's declared navigation identically."""
     target = _home_path(ctx, probe)
     base = urllib.parse.urlparse(ctx.base_url)
+    try:
+        r = c.get(target)
+    except (httpx.HTTPError, httpx.InvalidURL):
+        return None
+    if "html" not in r.headers.get("content-type", "").lower():
+        return None
+    links = []
+    for href in _ANCHOR_HREF.findall(r.text):
+        href = html.unescape(href.split("#")[0].strip())   # decode entities: `?a=1&amp;b=2` IS `?a=1&b=2` to a
+        #                                                     browser -- not unescaping fetched a literal &amp; -> 400
+        if not href or href.startswith(("mailto:", "tel:", "javascript:", "data:")):
+            continue
+        if "${" in href or "{{" in href:
+            continue                                   # an UNINTERPOLATED template literal leaked into the href
+            #                                            (/${s.url}, /${escapeHtml(href)}) -> a code artifact, not a link
+        if "/cdn-cgi/" in href:
+            continue                                   # Cloudflare-INJECTED (email-protection etc.) -> not the app's link
+        if re.search(r"log[-_]?out|sign[-_]?out", href, re.IGNORECASE):
+            continue                                   # never GET a logout link (would drop the session)
+        t = urllib.parse.urlparse(urllib.parse.urljoin("%s://%s%s" % (base.scheme, base.netloc, target), href))
+        if t.netloc == base.netloc and t.path:
+            links.append(t.path + ("?" + t.query if t.query else ""))
+    links = [p for p in dict.fromkeys(links) if p != target]   # dedupe, drop the self-link
+    return links or None
+
+
+def broken_links(ctx, probe) -> bool | None:
+    """Fetch each same-origin <a href> link on the homepage; fire if one lands on a 4xx dead end. N/A
+    when the page has no internal links to follow (5xx is out of scope here -> redirect_loop / crash probes)."""
+    budget = probe.probe.get("max_attempts", 40)
     with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
-        try:
-            r = c.get(target)
-        except (httpx.HTTPError, httpx.InvalidURL):
+        links = _same_origin_links(c, ctx, probe)
+        if links is None:
             return None
-        if "html" not in r.headers.get("content-type", "").lower():
-            return None
-        links = []
-        for href in _ANCHOR_HREF.findall(r.text):
-            href = href.split("#")[0].strip()
-            if not href or href.startswith(("mailto:", "tel:", "javascript:", "data:")):
-                continue
-            if re.search(r"log[-_]?out|sign[-_]?out", href, re.IGNORECASE):
-                continue                                   # never GET a logout link (would drop the session)
-            t = urllib.parse.urlparse(urllib.parse.urljoin("%s://%s%s" % (base.scheme, base.netloc, target), href))
-            if t.netloc == base.netloc and t.path:
-                links.append(t.path + ("?" + t.query if t.query else ""))
-        links = [p for p in dict.fromkeys(links) if p != target]   # dedupe, drop the self-link
-        if not links:
-            return None
-        for path in links[:budget]:
+        checked = links[:budget]
+        dead = []
+        for path in checked:
             try:
                 st = c.get(path).status_code
-                if 400 <= st < 500:
-                    ctx.evidence.update(broken=True, link=path, status=st)
-                    return True                            # dead link: an internal href leads to a 4xx
+                # a DEAD END is not-found (404/410) or a malformed request (400/414), NOT access-control:
+                # 401/403 = the page exists but is gated (a login-required nav item / deployment protection), and
+                # 429 = rate-limited -- the link WORKS, it isn't broken. So skip the access-control/limit statuses.
+                if 400 <= st < 500 and st not in (401, 403, 429):
+                    dead.append((path, st))
             except (httpx.HTTPError, httpx.InvalidURL):
                 continue
-    ctx.evidence.update(broken=False, links_checked=len(links[:budget]))
+    if not checked:
+        return None
+    if dead:
+        # SPECTRUM: score by the FRACTION of internal navigation that's a dead end -- one dead link on a big
+        # site is a smaller defect than a site where half the nav 404s. Floor ~24 (any dead link), scaling to
+        # ~48 (all nav dead). Was a flat 25 regardless of how broken.
+        frac = len(dead) / len(checked)
+        ctx.evidence.update(broken=True, dead_links=len(dead), links_checked=len(checked),
+                            dead_fraction=round(frac, 2), link=dead[0][0], status=dead[0][1],
+                            examples=[p for p, _ in dead[:5]],
+                            penalty_override=round(24 * (1 + frac), 1))
+        return True
+    ctx.evidence.update(broken=False, links_checked=len(checked))
     return False
+
+
+# ERR_TOO_MANY_REDIRECTS -- a route redirects without ever resolving (a self-loop, a cycle A->B->A, or an
+# unbounded chain), so a browser hits its ~20-hop redirect cap and shows an error page. The route is
+# unreachable for every visitor. Classic deploy causes: an auth guard that bounces / -> /login -> / when a
+# session cookie can't be set, a trailing-slash loop, or a base-URL/proxy misconfig that flips http<->https.
+_REDIRECT_CAP = 20   # matches the redirect limit real browsers enforce before ERR_TOO_MANY_REDIRECTS
+
+
+def redirect_loop(ctx, probe) -> bool | None:
+    """The homepage or a same-origin route it links to redirects endlessly (cycle or over the browser cap), so
+    a visitor gets ERR_TOO_MANY_REDIRECTS instead of the page. Follows redirects manually, same-origin only
+    (never chasing a redirect off-origin with the caller's auth headers); fires on a revisited URL (cycle) or on
+    exceeding the browser redirect cap. N/A when no reachable entry point / links. A loop is deterministic by
+    construction, so no separate reproduce gate is needed."""
+    cap = probe.probe.get("max_hops", _REDIRECT_CAP)
+    budget = probe.probe.get("max_attempts", 40)
+    base = urllib.parse.urlparse(ctx.base_url)
+    with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=False) as c:
+        home = _home_path(ctx, probe)
+        starts = [home]
+        links = _same_origin_links(c, ctx, probe)
+        if links is None and not starts:
+            return None
+        starts += (links or [])[:budget]
+        reachable = False
+        for start in dict.fromkeys(starts):
+            url = urllib.parse.urljoin(ctx.base_url, start)
+            seen: set[str] = set()
+            for _ in range(cap + 1):
+                if urllib.parse.urlparse(url).netloc not in ("", base.netloc):
+                    break                                  # left our origin -> resolves elsewhere, not our loop
+                if url in seen:                            # revisited a URL we already fetched -> cycle
+                    ctx.evidence.update(loop=True, entry=start, root_loop=(start == home), hops=len(seen),
+                                        reason="redirect cycle", cycle_to=urllib.parse.urlparse(url).path)
+                    return True
+                seen.add(url)
+                try:
+                    r = c.get(url)
+                except (httpx.HTTPError, httpx.InvalidURL):
+                    break
+                reachable = True
+                if not (300 <= r.status_code < 400 and "location" in r.headers):
+                    break                                  # resolved to a final (non-redirect) response
+                url = urllib.parse.urljoin(url, r.headers["location"])
+            else:
+                ctx.evidence.update(loop=True, entry=start, root_loop=(start == home), hops=cap + 1,
+                                    reason="exceeded the browser redirect cap (ERR_TOO_MANY_REDIRECTS)")
+                return True                                # never resolved within the cap -> unbounded chain
+    ctx.evidence.update(loop=False, routes_checked=len(dict.fromkeys(starts)))
+    return False if reachable else None
 
 
 # Mixed content — an HTTPS page that LOADS a subresource over plain http:// . A man-in-the-middle can
@@ -4801,6 +5806,125 @@ def mixed_content(ctx, probe) -> bool | None:
     return True if insecure else False
 
 
+# v2.0 FAMILY 4 -- Subresource Integrity (SRI, a W3C recommendation). A CROSS-ORIGIN, code-executing <script src>
+# / stylesheet loaded without an `integrity=` hash is an unguarded supply-chain risk: if that CDN is compromised
+# or the domain is hijacked, arbitrary code runs in the app's origin with full access to its DOM, cookies, and
+# tokens. Same-origin resources need no SRI (you already control them). Static: parsed from the served HTML.
+#
+# SRI is INAPPLICABLE to these subresource hosts, so flagging them is a false positive by DOMINANCE (not
+# prevalence): font-CSS endpoints serve DIFFERENT bytes per User-Agent (the @font-face `src` varies), so a
+# pinned integrity hash MISMATCHES for some browsers and BLOCKS the stylesheet -- the "fix" breaks the site; and
+# tag/loader endpoints (GTM / Google Identity / gapi) publish no stable hash and bootstrap further scripts SRI on
+# the loader cannot cover. Loading these WITHOUT SRI is the correct practice.
+_SRI_INAPPLICABLE_HOSTS = {
+    "fonts.googleapis.com", "api.fontshare.com", "use.typekit.net", "fonts.bunny.net", "use.fontawesome.com",
+    "www.googletagmanager.com", "accounts.google.com", "apis.google.com",
+}
+# Zero-dev-control BUILDER-INJECTED asset hosts: the platform (Lovable / Framer / Wix / Softr / Gamma / Supabase)
+# wrote the <script>/<link>, so the participant cannot add integrity= to a tag they did not author -> wrong
+# owner, an ATTRIBUTABLE false positive. Suffix-matched, so a subdomain is covered too.
+_SRI_PLATFORM_ASSET_HOSTS = {
+    "gpteng.co", "framerusercontent.com", "parastorage.com", "softr-files.com",
+    "gammahosted.com", "frontend-assets.supabase.com",
+}
+
+
+def _sri_excluded_host(host: str) -> bool:
+    """A cross-origin subresource host that is NOT a scorable SRI gap: one SRI cannot protect (per-UA font CSS /
+    a tag loader -- a hash breaks it), or a builder-injected asset host the participant does not own."""
+    if host in _SRI_INAPPLICABLE_HOSTS:
+        return True
+    return any(host == s or host.endswith("." + s) for s in _SRI_PLATFORM_ASSET_HOSTS)
+
+
+def _sri_scan(html: str, page_url: str) -> tuple[list[str], int]:
+    """(cross-origin subresource URLs that ship WITHOUT integrity=, count of ALL SRI-APPLICABLE cross-origin such
+    resources). The second value separates 'no third-party resource to protect -> N/A' from 'all protected ->
+    clean'. Counts only CODE-EXECUTING cross-origin kinds -- <script src>, <link rel=stylesheet|modulepreload>,
+    and <link rel=preload as=script|style> (a preloaded image/font/fetch does not execute) -- treats a sibling
+    subdomain of the SAME registrable domain as first-party (PSL-aware), and excludes hosts SRI cannot protect or
+    that the participant does not own (see _sri_excluded_host). <img>/<iframe> are out of scope."""
+    origin_site = _registrable_domain(urllib.parse.urlparse(page_url).netloc.split(":")[0].lower())
+    gaps: list[str] = []
+    total = 0
+    tags = [(m.group(1), "src") for m in re.finditer(r"<script\b([^>]*)>", html, re.I)]
+    for m in re.finditer(r"<link\b([^>]*)>", html, re.I):
+        attrs = m.group(1)
+        rel = re.search(r"\brel\s*=\s*[\"']?([^\"'>\s]+)", attrs, re.I)
+        if not rel:
+            continue
+        kind = rel.group(1).lower()
+        if kind in ("stylesheet", "modulepreload"):
+            tags.append((attrs, "href"))                 # a stylesheet applies / a module preload executes
+        elif kind == "preload":
+            as_ = re.search(r"\bas\s*=\s*[\"']?([^\"'>\s]+)", attrs, re.I)
+            if as_ and as_.group(1).lower() in ("script", "style"):
+                tags.append((attrs, "href"))             # a preloaded script/style executes; image/font/fetch does not
+    for attrs, urlattr in tags:
+        ref = re.search(r"\b" + urlattr + r"\s*=\s*[\"']([^\"']+)[\"']", attrs, re.I)
+        if not ref:
+            continue
+        p = urllib.parse.urlparse(urllib.parse.urljoin(page_url, ref.group(1).strip()))
+        if p.scheme not in ("http", "https") or not p.netloc:
+            continue                                     # relative / non-http
+        host = p.netloc.split(":")[0].lower()
+        if _registrable_domain(host) == origin_site:
+            continue                                     # first-party (same registrable domain, incl. a sibling subdomain)
+        if _sri_excluded_host(host):
+            continue                                     # SRI-inapplicable host / builder-injected asset -> not a gap
+        total += 1
+        if not re.search(r"\bintegrity\s*=\s*[\"']", attrs, re.I):
+            gaps.append(p.geturl())
+    return list(dict.fromkeys(gaps)), total
+
+
+def subresource_integrity_missing(ctx, probe) -> bool | None:
+    """A cross-origin <script>/<stylesheet> loaded WITHOUT Subresource Integrity. If that CDN is compromised or
+    its domain hijacked, arbitrary code runs in the app's origin -- the unguarded supply-chain risk SRI (a W3C
+    recommendation) exists to close. Same-origin resources need no SRI. N/A when the page loads no cross-origin
+    script/stylesheet at all (nothing to guard); clean when every one carries an integrity hash. Static HTML."""
+    with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
+        try:
+            r = c.get(_home_path(ctx, probe))
+        except (httpx.HTTPError, httpx.InvalidURL):
+            return None
+    if "html" not in r.headers.get("content-type", "").lower():
+        return None
+    gaps, total = _sri_scan(r.text, str(r.url))
+    if total == 0:
+        return None                                      # no cross-origin subresources -> nothing to protect
+    if gaps:
+        ctx.evidence.update(sri_missing=gaps[:8], cross_origin_subresources=total)
+        return True
+    ctx.evidence.update(sri_missing=[], cross_origin_subresources=total)
+    return False
+
+
+# v2.0 FAMILY 4 -- unminified CSS/JS shipped to production (Lighthouse unminified-css / unminified-javascript).
+# Wasted bytes + parse time on every load. Distinct from the dev-build probe (an HMR/dev-server client): this is
+# a production asset that simply wasn't minified. Same-origin only (the app's OWN build output; a third-party
+# CDN file is the vendor's concern). Size-gated so a small hand-written script isn't charged.
+_MIN_ASSET_BYTES = 8192     # below this, minification savings are negligible and the file is often hand-authored
+
+
+
+
+# v2.0 FAMILY 4 -- lazy-loading the LCP image. `loading="lazy"` on the element that DEFINES first paint makes
+# the browser defer the one image it should fetch first, delaying LCP for every visitor (~15% of sites do this;
+# Lighthouse flags it). Decorrelated from page weight -- a loading-STRATEGY mistake, not a size one.
+
+
+# v2.0 FAMILY 4 -- excessive DOM size (Lighthouse dom-size). Too many nodes slow style/layout/interaction on
+# every update, independent of transfer bytes -> decorrelated from the weight carrier. Conservative threshold.
+_DOM_NODE_LIMIT = 1400     # Lighthouse's excessive-DOM threshold; only a genuinely heavy DOM fires
+
+
+
+
+
+
+
+
 # SEO / discoverability meta — objective presence checks on best-practice head tags. Viewport is the
 # strong one (without it a mobile browser renders at desktop width -> tiny, unusable); description feeds
 # the search snippet. Canonical is deliberately NOT checked: it's correctly absent on single-URL pages.
@@ -4828,8 +5952,18 @@ def seo_meta_missing(ctx, probe) -> bool | None:
 # encoding (mojibake), and it's a UTF-7 XSS surface in old engines. (A "HEAD must not return a body"
 # check was dropped: a spec-compliant HTTP client discards the HEAD body, so it isn't observable without
 # raw-socket work — not worth it for this low-impact tail.)
+# A page declares its encoding via the Content-Type HEADER *or* a <meta charset>/<meta http-equiv=content-type>
+# in the document -- both are valid per the HTML spec, and the meta form is how virtually every HTML5 page does
+# it. The browser's encoding prescan only reads the first 1024 bytes, so a meta beyond that is not honored (still
+# a real ambiguity). Checking the header alone made this ~89% false: 57 of 64 v18 fires declared charset by meta.
+_META_CHARSET = re.compile(rb"<meta[^>]+charset", re.I)   # matches <meta charset=..> AND http-equiv content-type
+_CHARSET_PRESCAN = 1024                                   # the HTML spec's encoding-sniffing window, in bytes
+
+
 def http_conformance(ctx, probe) -> bool | None:
-    """Fire on an HTML response served without a declared charset. N/A on a non-HTML homepage."""
+    """Fire on an HTML response served with NO declared charset in EITHER the Content-Type header or a <meta>
+    in the document's first 1024 bytes (the browser's encoding-prescan window) -> the browser must GUESS the
+    encoding. N/A on a non-HTML homepage."""
     with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=True) as c:
         try:
             r = c.get(_home_path(ctx, probe))
@@ -4838,9 +5972,11 @@ def http_conformance(ctx, probe) -> bool | None:
     ctype = r.headers.get("content-type", "").lower()
     if "text/html" not in ctype:
         return None                                       # only HTML documents declare a page charset
-    has_charset = "charset=" in ctype
-    ctx.evidence.update(charset=has_charset)
-    return not has_charset
+    header_cs = "charset=" in ctype
+    meta_cs = bool(_META_CHARSET.search(r.content[:_CHARSET_PRESCAN]))
+    ctx.evidence.update(charset=header_cs or meta_cs,
+                        charset_via=("header" if header_cs else "meta" if meta_cs else None))
+    return not (header_cs or meta_cs)
 
 
 # Crash-resistance — a ROBUST app rejects malformed input with a 4xx (400/413/422); a FRAGILE one lets
@@ -4865,6 +6001,14 @@ _CRASH_JSON = (
     b'{"x": "\\ud834"}',                   # lone-surrogate escape
 )
 _CRASH_PATHS = ("/%ff%fe", "/%c0%ae%c0%ae", "/%00", "/%e0%80%80")
+# Real-server PaaS: these hosts run the PARTICIPANT's own container/function, so a catch-all there is THEIR
+# router and a decode 500 is their crash (not a static-builder edge). The decode branch is allowed to fire on a
+# catch-all host for these -- recovers the v19 railway/modal false cleans -- without re-admitting static-builder
+# (lovable/retool/netlify-static) catch-all edges.
+_REAL_SERVER_HOSTS = (".up.railway.app", ".modal.run", ".onrender.com", ".fly.dev", ".run.app")
+# Managed-BaaS PLATFORM API namespace (base44's /api/apps/<hexid>/...): a 5xx on malformed input there is the
+# VENDOR's SDK, not the participant's own endpoint -> wrong owner, skip (the v20 blind-audit malformed-JSON FP).
+_VENDOR_PLATFORM_NS = re.compile(r"/api/apps/[0-9a-f]{16,}/", re.I)
 
 
 def _induce_error_responses(ctx, budget=20):
@@ -4929,11 +6073,17 @@ def leaks_error_detail(ctx, probe) -> bool | None:
     inspected = False
     for r in _induce_error_responses(ctx):
         inspected = True
-        if _TRACE.search(r.text):
-            ctx.evidence.update(status=r.status_code, leak="stack-trace")
+        m = _TRACE.search(r.text)
+        if m:
+            ctx.evidence.update(status=r.status_code, leak="stack-trace",
+                                matched=r.text[m.start():m.start() + 200].strip(),
+                                repro=_repro_from_resp(r, matched="stack trace leaked in the error response"))
             return True
-        if _SQL_ERROR.search(r.text):
-            ctx.evidence.update(status=r.status_code, leak="db-error")
+        m = _SQL_ERROR.search(r.text)
+        if m:
+            ctx.evidence.update(status=r.status_code, leak="db-error", db_error=True,
+                                matched=r.text[m.start():m.start() + 200].strip(),
+                                repro=_repro_from_resp(r, matched="database error leaked in the error response"))
             return True
     ctx.evidence.update(inspected=inspected, leak=None)
     return False if inspected else None
@@ -5049,7 +6199,20 @@ def declared_constraint_unenforced(ctx, probe) -> bool | None:
                     r = _xss_send(c, method, form.action, bad)
                 except (httpx.HTTPError, httpx.InvalidURL):
                     continue
-                if _same_success(base, r, form.action, good, bad):   # a bare 2xx with an inline error is NOT
+                if _same_success(base, r, form.action, good, bad):
+                    # INPUT-DEPENDENCE gate (v18: this probe was ~100% FP). A static-shell SPA (action="/")
+                    # answers 200 to ANY body, and an auth-guarded form 3xx's to /login for any body -- both
+                    # read as "accepted the invalid value" though the server never processed the field. Require
+                    # the acceptance to be INPUT-DEPENDENT: an all-EMPTY submission must NOT get the same success.
+                    # If it does, the endpoint ignores the body (shell / auth-guard / catch-all) -> not this
+                    # field's enforcement -> clean. A real enforcing server rejects the empty required values.
+                    empties = {f: "" for f in form.fields}
+                    try:
+                        empty = _xss_send(c, method, form.action, empties)
+                    except (httpx.HTTPError, httpx.InvalidURL):
+                        continue
+                    if _same_success(base, empty, form.action, good, empties):
+                        continue                             # input-independent -> shell / auth-guard, not a fire
                     ctx.evidence.update(action=form.action, field=field, declared=cons.get("type"),
                                         invalid=str(invalid_val)[:40], valid_status=base.status_code,
                                         invalid_status=r.status_code)
@@ -5069,6 +6232,8 @@ def crash_resistance(ctx, probe) -> bool | None:
                   if e.method.lower() == "get" and e.query_params])
     with make_client(ctx.base_url, ctx.headers, timeout=15.0, follow_redirects=False) as c:
         for action, method, fields in targets:            # 1. malformed field values
+            if _VENDOR_PLATFORM_NS.search(action):
+                continue                                   # managed-BaaS platform API -> the vendor's handler, not the app's
             try:
                 base = _xss_send(c, method, action, {fn: "1" for fn in fields})
             except (httpx.HTTPError, httpx.InvalidURL):
@@ -5099,6 +6264,8 @@ def crash_resistance(ctx, probe) -> bool | None:
             [f.action for f in ctx.profile.forms if (f.method or "").lower() == "post"]
             + [e.path for e in ctx.profile.endpoints if e.method.lower() == "post"]))
         for path in posts:
+            if _VENDOR_PLATFORM_NS.search(path):
+                continue                                   # managed-BaaS platform API -> the vendor's handler, not the app's
             try:                                           # baseline: a WELL-FORMED empty JSON body
                 base = c.post(path, json={})
             except (httpx.HTTPError, httpx.InvalidURL):
@@ -5122,16 +6289,23 @@ def crash_resistance(ctx, probe) -> bool | None:
                         return True
                 except (httpx.HTTPError, httpx.InvalidURL):
                     continue
-        for p in _CRASH_PATHS:                             # 3. decode-crashing paths (naive router -> 500)
-            tested = True
-            try:
-                cr = c.get(p)
-                if cr.status_code >= 500 and c.get(p).status_code >= 500:
-                    ctx.evidence.update(crashed=True, via="decode-path", target=p, status=cr.status_code,
-                                        repro=_repro_from_resp(cr, matched="unhandled %d on a decode-crashing path, reproduced" % cr.status_code))
-                    return True
-            except (httpx.HTTPError, httpx.InvalidURL):
-                continue
+        # 3. decode-crashing paths: a naive SERVER ROUTER 500s trying to %-decode a malformed path. Run on an
+        # HONEST host (real 404s, a real router) OR a real-server PaaS whose catch-all IS the participant's own
+        # router (railway/modal/...) -- but NOT a static-SPA / builder catch-all, where a 5xx here is the platform
+        # EDGE choking on the URL, not the app's router. And require a 500 specifically: a 502/503/504 is the
+        # proxy/CDN rejecting the malformed URL, not the app's own unhandled exception.
+        _crash_host = urllib.parse.urlparse(ctx.base_url).netloc.split(":")[0].lower()
+        if _catch_all_sig(ctx) is None or _crash_host.endswith(_REAL_SERVER_HOSTS):
+            for p in _CRASH_PATHS:
+                tested = True
+                try:
+                    cr = c.get(p)
+                    if cr.status_code == 500 and c.get(p).status_code == 500:
+                        ctx.evidence.update(crashed=True, via="decode-path", target=p, status=cr.status_code,
+                                            repro=_repro_from_resp(cr, matched="unhandled 500 on a decode-crashing path, reproduced"))
+                        return True
+                except (httpx.HTTPError, httpx.InvalidURL):
+                    continue
     if tested:
         ctx.evidence.update(crashed=False)
     return False if tested else None
@@ -5200,7 +6374,7 @@ def decompression_bomb(ctx, probe) -> bool | None:
             try:
                 r = c.post(path, content=bomb, headers=gz_ct)
             except httpx.TimeoutException:
-                if s_small < 500:                      # 10KB fine, 50MB HUNG -> size-driven exhaustion (provable)
+                if 200 <= s_small < 300:               # 10KB ACCEPTED, 50MB HUNG -> size-driven exhaustion (provable)
                     ctx.evidence.update(decompression_capped=False, endpoint=path, signal="timeout",
                                         control_status=s_small, expanded_mb=50,
                                         repro=_dos_repro(ctx, path, "hung decompressing 50MB (10KB control -> %d)" % s_small))
@@ -5209,11 +6383,12 @@ def decompression_bomb(ctx, probe) -> bool | None:
             except (httpx.HTTPError, httpx.InvalidURL):
                 continue
             # Fire only on PROVABLE evidence. accepted (2xx): the app took a 50MB body -> no size cap <=50MB.
-            # exhausted (5xx a 10KB control doesn't trigger): the SIZE crashed it. A 4xx is NOT scored: 413 is
-            # a proven size cap (defended); a generic 400/422 is INCONCLUSIVE (a cap OR a post-decompression
-            # content failure — indistinguishable at a safe size), and we don't fire on inconclusive evidence
-            # (precision-favoring; FN is the safe error). This retires the old 413-only rule that fired on a 400.
-            exhausted = r.status_code >= 500 and s_small < 500
+            # exhausted (5xx where a 10KB control was ACCEPTED 2xx): the SIZE crashed a live handler. The 10KB
+            # control MUST be 2xx -- if it 404s/400s, the endpoint isn't a live body handler and the 50MB 500 is
+            # infra rejecting a huge upload to a dead/wrong route, not decompression exhaustion (v18: /ingest &
+            # /api/ingest 404 controls, /api/auth/login 400). A 4xx bomb is NOT scored (413 = a proven cap;
+            # 400/422 = inconclusive). Precision-favoring; FN is the safe error.
+            exhausted = r.status_code >= 500 and 200 <= s_small < 300
             accepted = 200 <= r.status_code < 400
             if exhausted or accepted:
                 ctx.evidence.update(decompression_capped=False, endpoint=path, status=r.status_code,
@@ -5302,7 +6477,874 @@ def http_response_splitting(ctx, probe) -> bool | None:
     return False if tested else None
 
 
+# ------------------------------------------------------------------ Lighthouse-backed perf (v2.0) ----------
+# The perf axis reads Lighthouse (pinned 13.4.1, throttled, median-of-N) instead of the hand-rolled probes it
+# replaces (they ran 60-90% FP). ONE generic predicate; each perf YAML names the audit(s) + mode. The per-app
+# MEDIAN report is run once by the pipeline and cached on ctx.lighthouse. Tiering (Ian: "a 0 should be hard to
+# get") reuses Lighthouse's own score bands: green (>=0.9) = pass, orange (0.5-0.9) = HALF penalty, red (<0.5) =
+# FULL, carried via penalty_override (the same per-fire override the a11y probes use; pipeline caps at 250).
+_LH_PASS, _LH_FAIL = 0.9, 0.5
+
+
+def _lh_mult(score):
+    """Deduction multiplier for a Lighthouse score: None (green/pass) | 0.5 (orange) | 1.0 (red/fail)."""
+    if score is None or score >= _LH_PASS:
+        return None
+    return 1.0 if score < _LH_FAIL else 0.5
+
+
+def lighthouse_audit(ctx, probe) -> bool | None:
+    """Generic Lighthouse-backed perf predicate. probe.probe config:
+        audit / audits : one or more Lighthouse audit ids; the WORST drives the tier
+        mode: 'score'   -> tier on Lighthouse's own 0-1 score band (green/orange/red)
+              'numeric' -> tier on numericValue vs `needs_above` / `fail_above`
+    N/A when the pipeline captured no Lighthouse result (unreachable url / run failed) or the audit does not
+    apply to the page. Fires True with a tiered penalty_override; False (clean) when the app passes."""
+    rep = getattr(ctx, "lighthouse", None)
+    if not rep:
+        ctx.evidence["na_reason"] = "no lighthouse result (url unreachable or the run failed)"
+        return None
+    spec = probe.probe
+    ids = spec.get("audits") or ([spec["audit"]] if spec.get("audit") else [])
+    au = lighthouse.audits(rep)
+    found = [(aid, au[aid]) for aid in ids if aid in au]
+    if not found:
+        ctx.evidence["na_reason"] = "lighthouse audit(s) %s not applicable to this page" % ids
+        return None
+    base, runs = probe.penalty, rep.get("runs")
+    if spec.get("mode", "score") == "score":
+        aid, a = min(found, key=lambda x: x[1].get("score") if x[1].get("score") is not None else 1.0)
+        mult = _lh_mult(a.get("score"))
+        if mult is None:
+            return False
+        ctx.evidence.update(audit=aid, score=round(a.get("score"), 2), runs=runs, versions=rep.get("versions"), display=a.get("displayValue", ""),
+                            tier=("fail" if mult == 1.0 else "needs-improvement"), report_only=bool(spec.get("report_only")),
+                            penalty_override=0 if spec.get("report_only") else max(1, round(base * mult)))
+        return True
+    aid, a = max(found, key=lambda x: x[1].get("numericValue") or 0)   # numeric: worst = the largest value
+    num = a.get("numericValue")
+    if num is None:   # count-based audit (network-requests) carries the value as the length of details.items
+        num = len((a.get("details") or {}).get("items") or [])
+    if spec.get("fail_above") is not None and num >= spec["fail_above"]:
+        mult = 1.0
+    elif spec.get("needs_above") is not None and num >= spec["needs_above"]:
+        mult = 0.5
+    else:
+        return False
+    ctx.evidence.update(audit=aid, value=round(num), runs=runs, versions=rep.get("versions"), display=a.get("displayValue", ""),
+                        tier=("fail" if mult == 1.0 else "needs-improvement"), report_only=bool(spec.get("report_only")),
+                        penalty_override=0 if spec.get("report_only") else max(1, round(base * mult)))
+    return True
+
+
+def lighthouse_perf_score(ctx, probe) -> bool | None:
+    """The perf axis's SCORING probe: slop = round(max(0, green_floor - overall_perf_score) * 100 * scale) --
+    the app's SHORTFALL below Lighthouse's own green line (0.90 = "good"). At/above green -> 0 slop, CLEAN (an
+    84 -> 6, a 50 -> 40, a 25 -> 65). Lighthouse already did the scoring off its calibrated weights; we charge
+    only the distance below its "good" threshold, rather than re-summing the per-audit tiers (which double-
+    counted metrics the headline already weighed AND penalized apps Lighthouse itself rates good). Flooring at
+    green (not a perfect 100) refuses to score the 90-100 measurement jitter and makes a clean perf sheet
+    achievable + meaningful. `green_floor` / `scale` are the dials. The metric breakdown rides along in evidence
+    as OFF-SCORE diagnostics. N/A when there is no Lighthouse result."""
+    rep = getattr(ctx, "lighthouse", None)
+    if not rep:
+        ctx.evidence["na_reason"] = "no lighthouse result (url unreachable or the run failed)"
+        return None
+    # PENALTY off the FULL-PRECISION score (recomputed from raw metric scores) -- Lighthouse's headline
+    # categories.score is 2-decimal-rounded, which quantized the penalty to whole numbers; the precise score
+    # gives a fractional shortfall so the 65%-fire perf probe actually de-clumps.
+    score = lighthouse.perf_score_precise(rep)   # 0..1, full precision
+    if score is None:
+        ctx.evidence["na_reason"] = "lighthouse produced no overall performance score"
+        return None
+    headline = lighthouse.perf_score(rep) or score   # the familiar rounded 0-100 for the human-facing display
+    scale = probe.probe.get("scale", 1.0)
+    floor = probe.probe.get("green_floor", 0.90)      # Lighthouse's green cutoff: at/above it -> no perf slop
+    slop = round(max(0.0, floor - score) * 100 * scale, 1)   # 1-decimal FLOAT: keep the continuous perf spread
+    ctx.evidence.update(performance=round(headline * 100), runs=rep.get("runs"), versions=rep.get("versions"),
+                        metrics=lighthouse.metric_breakdown(rep),
+                        tier=("good" if score >= 0.90 else "needs-improvement" if score >= 0.50 else "poor"),
+                        penalty_override=slop)
+    return slop > 0
+
+
+# --- email-verification probes (qa-email-001 / qa-email-002) ------------------------------------------------
+# Register with an address WE own (via ctx.email, the configured receiver), then watch whether a confirmation
+# email actually arrives and whether acting on its link establishes a session. Both probes read the ONE shared
+# flow result (register + poll mutate and block), memoized on ctx. They score (per the qa-email-001/002 severity
+# blocks); the report_only bring-up is over.
+_EMAIL_ANNOUNCED_TIMEOUT = 60.0    # total wait for a confirmation email the signup PROMISED
+_EMAIL_UNANNOUNCED_TIMEOUT = 8.0   # a short confirmatory poll for an opaque SPA that sends without announcing
+_EMAIL_RESEND_AT = 30.0            # halfway in, click the app's own 'resend' control (if any) for a second chance
+_RESEND_TEXT_HINTS = ("resend", "re-send", "send again", "send it again", "didn't receive", "did not receive",
+                      "resend confirmation", "resend verification", "resend email", "resend link")
+_RESEND_JSON_PATHS = ("/api/resend", "/api/resend-verification", "/api/resend-confirmation", "/api/auth/resend",
+                      "/api/verify/resend", "/api/users/resend-confirmation", "/resend", "/auth/resend",
+                      "/auth/resend-verification")
+_RESEND_LINK_RE = re.compile(r'<a\b[^>]*href="([^"]+)"[^>]*>(.*?)</a>', re.I | re.S)
+_RESEND_FORM_RE = re.compile(r'<form\b[^>]*action="([^"]*resend[^"]*)"', re.I)
+
+
+def _resp_text(resp) -> str:
+    try:
+        return resp.text
+    except Exception:
+        return ""
+
+
+def _same_app_link(link: str, base: str) -> bool:
+    """Follow a verification link only when it is SAME-HOST as the app -- never chase an off-origin link (a
+    tracker pixel, an unsubscribe) while carrying the registration's cookies."""
+    try:
+        return bool(urllib.parse.urlparse(link).hostname) and \
+            urllib.parse.urlparse(link).hostname == urllib.parse.urlparse(base).hostname
+    except Exception:
+        return False
+
+
+def _has_resend_control(register_response) -> bool:
+    """Does the confirm page offer a 'resend' option at all? Assessed independent of email timing, so a
+    fast-email app that simply lacks a resend button is still flagged (a good app lets the user re-request the
+    mail). A resend link/form, or the page text mentioning resend, counts."""
+    body = _resp_text(register_response)
+    if any(h in body.lower() for h in _RESEND_TEXT_HINTS) or _RESEND_FORM_RE.search(body):
+        return True
+    return any("resend" in href.lower() for href, _ in _RESEND_LINK_RE.findall(body))
+
+
+def _try_resend(client, register_response, email) -> bool:
+    """Best-effort: trigger the app's OWN 'resend confirmation email' control if it has one, giving a flaky
+    first send a second chance. httpx-only (a JS-only button on an SPA is out of reach, but such apps don't
+    register via httpx anyway); returns True iff a resend actually fired."""
+    body = _resp_text(register_response)
+    low = body.lower()
+    for href, text in _RESEND_LINK_RE.findall(body):   # 1) a resend LINK (href or link text mentions resend)
+        if "resend" in href.lower() or any(h in text.lower() for h in _RESEND_TEXT_HINTS):
+            try:
+                if client.get(href).status_code < 400:
+                    return True
+            except (httpx.HTTPError, httpx.InvalidURL):
+                pass
+    for action in _RESEND_FORM_RE.findall(body):       # 2) a resend FORM (its action names resend)
+        try:
+            if client.post(action, data={"email": email}).status_code < 400:
+                return True
+        except (httpx.HTTPError, httpx.InvalidURL):
+            pass
+    if any(h in low for h in _RESEND_TEXT_HINTS):       # 3) common JSON endpoints, only when the page mentions
+        for path in _RESEND_JSON_PATHS:                 #    resend (a JS button we can't parse) -> no blind spraying
+            try:
+                if client.post(path, json={"email": email}).status_code in (200, 201, 202, 204):
+                    return True
+            except (httpx.HTTPError, httpx.InvalidURL):
+                pass
+    return False
+
+
+def _follow_verification(acct, msg, base, profile, email):
+    """Act on a confirmation email and decide whether the user can now get in. Follow its same-host link(s),
+    then EITHER the link auto-logged us in (some apps) OR -- the common 'verify then log in' pattern -- the link
+    only VERIFIES the account and a login with the registered creds now succeeds. Either way the flow WORKS;
+    qa-email-002 fires only when login STILL fails after verifying. `acted` is False for a code-only / no-link
+    email (nothing to follow) so the probe reads N/A rather than a false fire."""
+    client = acct.client
+    links = [ln for ln in msg.links if _same_app_link(ln, base)]
+    last = None
+    for link in links[:3]:
+        try:
+            last = client.get(link)
+        except (httpx.HTTPError, httpx.InvalidURL):
+            continue
+    # the link may auto-log us in (Set-Cookie on the response / a session cookie in the jar). When it carries a
+    # session cookie, PROMOTE that response to the account's register_response, so the cookie-flag probes judge
+    # the REAL session cookie's flags when the authed-surface probes reuse this account.
+    if last is not None and auth.session_cookie(last) is not None:
+        acct.register_response = last
+    session = (auth._has_session(acct)                                       # the link itself auto-logged us in
+               or any(auth._is_session_cookie(c.name) for c in client.cookies.jar))
+    if links and not session:   # 'verify then log in': the link verified the account; a login should now succeed.
+        #               Try by both identifiers (some apps key login on email, some on username), and CARRY the
+        #               returned session onto this account's client so the authed-surface probes reuse it authed.
+        for ident in (email, acct.username):
+            hdrs = auth.login_with_credentials(base, ident, acct.password, profile)
+            if hdrs:
+                client.headers.update(hdrs)   # Cookie and/or Authorization: Bearer -> now the logged-in user
+                session = True
+                break
+    # CODE lane (lane A): a 6-digit/alphanumeric CODE, not a link -> POST it to a DISCOVERED verify endpoint. The
+    # code-based sibling of the link path; runs when the link path established no session but a code arrived. It
+    # only ever ESTABLISHES a session (never claims failure), so a wrong endpoint/shape guess can't false-fire
+    # qa-email-002.
+    if not session and msg.codes:
+        session = _submit_code_httpx(acct, base, profile, email, msg.codes)
+    acted = bool(links) or bool(session)   # a code we couldn't complete -> not acted -> N/A, not a false fire
+    return email_verify.Verification(acted=acted, session=bool(session))
+
+
+_VERIFY_HINT = re.compile(r"verif|confirm|otp|activat|/code\b", re.I)
+
+
+def _submit_code_httpx(acct, base, profile, email, codes) -> bool:
+    """Complete a CODE-based email verification over httpx: POST an emailed code to a DISCOVERED verify endpoint
+    (path hints verify/confirm/otp/activate), across a few payload shapes, and return True iff a session is then
+    established (a Set-Cookie / token comes back). Gated to endpoints DISCOVERY found -- no blind path spraying --
+    and returns False (never a definitive failure) so a wrong-endpoint guess never fires qa-email-002. Bounded."""
+    eps = [e for e in (getattr(profile, "endpoints", None) or []) if _VERIFY_HINT.search(e.raw_path or e.path or "")]
+    if not eps:
+        return False
+    client = acct.client
+    for ep in eps[:3]:
+        path = ep.raw_path or ep.path
+        for code in codes[:2]:
+            for shape in ({"email": email, "code": str(code)}, {"email": email, "otp": str(code)},
+                          {"email": email, "token": str(code)}, {"code": str(code)}):
+                try:
+                    r = client.post(path, json=shape)
+                except (httpx.HTTPError, httpx.InvalidURL):
+                    continue
+                if r.status_code < 400:
+                    if auth.session_cookie(r) is not None:
+                        acct.register_response = r
+                    if auth._has_session(acct) or any(auth._is_session_cookie(c.name) for c in client.cookies.jar):
+                        return True
+    return False
+
+
+def _snapshot_session(acct) -> dict:
+    """Capture a verified account's live session as REPLAYABLE material, so ctx.register can rebuild a FRESH,
+    independently-closeable client for each authed-surface probe (a probe closing its account must never
+    invalidate the next -- the same contract the browser-cached lane keeps). Session is read as the client would
+    SEND it (an explicit Cookie header, else the jar's session cookies) plus any Bearer/apikey; register_response
+    carries Set-Cookie for the cookie-flag probes when the link auto-logged us in."""
+    hdrs: dict = {}
+    cookie = acct.client.headers.get("Cookie")
+    if not cookie:
+        jar = ([(c.name, c.value) for c in acct.client.cookies.jar if auth._is_session_cookie(c.name)]
+               or [(c.name, c.value) for c in acct.client.cookies.jar])
+        if jar:
+            cookie = "; ".join("%s=%s" % (n, v) for n, v in jar)
+    if cookie:
+        hdrs["Cookie"] = cookie
+    for h in ("Authorization", "apikey"):
+        if acct.client.headers.get(h):
+            hdrs[h] = acct.client.headers[h]
+    return {"headers": hdrs, "username": acct.username, "password": acct.password,
+            "response": acct.register_response, "storage_exposed": acct.storage_exposed}
+
+
+def _email_ctx(ctx, suffix=""):
+    """The (tag, address) for this identity (suffix), minted once on ctx so every registration lane signs up with
+    the same box and the flow polls it. Distinct suffixes get distinct addresses (the two-account IDOR case).
+    Prefers ctx.email_address(suffix) (the real _Ctx); falls back to minting locally for a duck-typed ctx."""
+    getter = getattr(ctx, "email_address", None)
+    if callable(getter):
+        getter(suffix)                             # populates ctx._email_cache tag/address for this suffix
+        return ctx._email_cache["tag" + suffix], ctx._email_cache["address" + suffix]
+    if "tag" + suffix not in ctx._email_cache:
+        ctx._email_cache["tag" + suffix] = secrets.token_hex(6)
+        ctx._email_cache["address" + suffix] = ctx.email.address(ctx._email_cache["tag" + suffix])
+    return ctx._email_cache["tag" + suffix], ctx._email_cache["address" + suffix]
+
+
+def _snapshot_browser_session(bsession, base) -> dict:
+    """Snapshot a browser-established SPA session (post email-verification) into the SAME replayable shape as the
+    httpx lane, so ctx.register rebuilds a fresh authed client for each probe. Cookies are re-encoded as
+    Set-Cookie (auth._synthesize_response) so the cookie-flag probes still judge the real session cookie."""
+    hdrs: dict = {}
+    cookies = bsession.get("cookies") or []
+    session_cookies = [c for c in cookies if auth._is_session_cookie(c.get("name", ""))] or cookies
+    if session_cookies:
+        hdrs["Cookie"] = "; ".join("%s=%s" % (c["name"], c.get("value", "")) for c in session_cookies)
+    if bsession.get("bearer"):
+        hdrs["Authorization"] = "Bearer " + bsession["bearer"]
+    return {"headers": hdrs, "username": "hl_spa", "password": "",
+            "response": auth._synthesize_response(base, cookies),
+            "storage_exposed": bool(bsession.get("storage_exposed"))}
+
+
+def _follow_verification_browser(base, msg, live) -> "email_verify.Verification":
+    """Complete a SPA verification: open the emailed same-host link IN THE BROWSER (browser.verify_in_browser) so
+    the app's own JS reads the token and establishes the session -- an httpx GET can't run that JS. Records the
+    session on `live` for the authed-surface snapshot. acted=False for a code-only / no-link email (N/A)."""
+    links = [ln for ln in msg.links if _same_app_link(ln, base)]
+    if not links:
+        return email_verify.Verification(acted=False)
+    for link in links[:3]:
+        try:
+            bsession = browser.verify_in_browser(link, base)
+        except Exception:
+            bsession = None
+        if isinstance(bsession, dict) and (bsession.get("cookies") or bsession.get("bearer")):
+            live["browser_session"] = bsession
+            return email_verify.Verification(acted=True, session=True)
+    return email_verify.Verification(acted=True, session=False)   # clicked, still no session -> inert (qa-email-002)
+
+
+def _client_blob(ctx):
+    """The app's client JS bundle, fetched once and memoized on ctx (the BaaS + Firebase lanes both read it to
+    resolve provider config). Paid only when the email flow reaches these lanes (httpx + browser produced
+    nothing)."""
+    cache = ctx._email_cache
+    if "blob" not in cache:
+        try:
+            cache["blob"] = baas.client_blob(ctx.base_url, getattr(ctx.profile, "landing_path", "") or "") or ""
+        except Exception:
+            cache["blob"] = ""
+    return cache["blob"]
+
+
+def _baas_gateway(ctx):
+    """(gateway, anon_key) for the app's managed Supabase backend, resolved from its client bundle -- or None
+    when the app has no embedded gateway/key."""
+    try:
+        blob = _client_blob(ctx)
+        if not blob:
+            return None
+        gateway = baas.resolve_gateway(blob, ctx.base_url)
+        key = baas.anon_key(blob)
+        return (gateway, key) if gateway and key else None
+    except Exception:
+        return None
+
+
+def _firebase_config(ctx):
+    """The app's Firebase Web API key from its client bundle, or None (not a Firebase-Auth app)."""
+    try:
+        blob = _client_blob(ctx)
+        return baas.firebase_api_key(blob) if blob else None
+    except Exception:
+        return None
+
+
+def _snapshot_firebase_session(sess) -> dict:
+    """Snapshot a Firebase session (idToken at signup) into the replayable shape ctx.register rebuilds from -- a
+    Bearer idToken, which is what a Firebase app's client sends to its own backend / Firestore REST."""
+    return {"headers": {"Authorization": "Bearer " + sess["idToken"]},
+            "username": sess.get("email") or sess.get("localId") or "hl_firebase",
+            "password": sess.get("_password", ""),
+            "response": httpx.Response(200, request=httpx.Request("POST", baas._IDENTITYTOOLKIT_SIGNUP)),
+            "storage_exposed": False}
+
+
+def _follow_verification_baas(msg, live) -> "email_verify.Verification":
+    """Complete a Supabase e-mail confirmation: try each emailed link through baas.verify_email_link (the confirm
+    link's host is the GATEWAY, not the app, so _same_app_link does not apply -- the token is read from the query
+    regardless of host). Records the session on `live` for the authed-surface snapshot."""
+    gateway, key = live["gateway"], live["key"]
+    for link in msg.links[:5]:
+        try:
+            session = baas.verify_email_link(gateway, key, link)
+        except Exception:
+            session = None
+        if isinstance(session, dict) and session.get("access_token"):
+            live["baas_session"] = session
+            return email_verify.Verification(acted=True, session=True)
+    # CODE lane (lane A): a Supabase EMAIL-OTP (6-digit code) -> /auth/v1/verify {type, email, token: code}. Runs
+    # when no link verified but a code arrived (the OTP confirmation shape). Establishes a session or abstains.
+    email = (live.get("baas_creds") or {}).get("_email")
+    if email and msg.codes:
+        for code in msg.codes[:3]:
+            try:
+                session = baas.verify_otp(gateway, key, email, code)
+            except Exception:
+                session = None
+            if isinstance(session, dict) and session.get("access_token"):
+                live["baas_session"] = session
+                return email_verify.Verification(acted=True, session=True)
+    return email_verify.Verification(acted=bool(msg.links), session=False)   # link(s) but none verified -> inert
+
+
+def _snapshot_baas_session(session, gateway, key, creds) -> dict:
+    """Snapshot a Supabase session (post e-mail confirmation) into the replayable shape ctx.register rebuilds
+    from: the gateway Bearer + apikey, and the `sb-<ref>-auth-token` cookie the app reads to render authed. The
+    cookie is set by us (no Set-Cookie observed), so the cookie-flag probes read N/A here -- same as the
+    existing BaaS register lane."""
+    hdrs = {"Authorization": "Bearer " + session["access_token"], "apikey": key,
+            "Cookie": baas.cookie_name(gateway) + "=" + baas.cookie_value(session)}
+    return {"headers": hdrs,
+            "username": session.get("_email") or creds.get("_email") or "hl_baas",
+            "password": session.get("_password") or creds.get("_password") or "",
+            "response": auth._synthesize_response(gateway, []), "storage_exposed": False}
+
+
+def _email_register_once(ctx, suffix=""):
+    """Register with our controlled address for one identity and TRIGGER the confirmation email -- the FAST half of
+    the flow, split out so it can run EARLY (grade start, via _prime_email) while the poll runs late. Memoized on
+    ctx (sends exactly once); populates the persisted `live` state the follow reads. Lanes in order: httpx (server
+    form/JSON) -> browser (SPA) -> BaaS (Supabase) -> Firebase. Returns the RegistrationOutcome (also cached)."""
+    cache = ctx._email_cache
+    rkey = "_reg" + suffix
+    if rkey in cache:
+        return cache[rkey]
+    tag, address = _email_ctx(ctx, suffix)
+    base = ctx.base_url
+    live = cache.setdefault("_live" + suffix, {})
+
+    def _done(outcome):
+        cache[rkey] = outcome
+        return outcome
+
+    # 1) httpx (server-rendered form / JSON API) with OUR address
+    acct = auth._register_httpx(base, ctx.profile, "_e" + tag[:4], email=address)
+    if acct is not None:
+        live["acct"] = acct
+        has_session = auth._has_session(acct)
+        announced = email_verify.announces_pending_email(_resp_text(acct.register_response))
+        if has_session or announced:
+            live["lane"] = "httpx"
+            return _done(email_verify.RegistrationOutcome(
+                submitted=True, has_session=has_session, announces_email=announced,
+                has_resend_control=_has_resend_control(acct.register_response), handle=acct))
+    # 1b) MAGIC-LINK (server-rendered passwordless): an email-only auth form -> POST our address, the app mails a
+    #     login link, and the EXISTING httpx follow clicks it (_follow_verification auto-logs us in). Reached only
+    #     when the password httpx lane above found nothing (no email-only form -> None -> fall through).
+    macct = auth._register_passwordless(base, ctx.profile, "_m" + tag[:4], email=address)
+    if macct is not None:
+        m_session = auth._has_session(macct)
+        m_announced = email_verify.announces_pending_email(_resp_text(macct.register_response))
+        if m_session or m_announced:                         # only WIN when the POST observably did something --
+            if acct is not None:                             # else an SPA's placeholder form would shadow lane 2/3
+                with contextlib.suppress(Exception):
+                    acct.client.close()                      # the unproductive password attempt -> don't leak it
+            live["acct"] = macct
+            live["lane"] = "httpx"
+            return _done(email_verify.RegistrationOutcome(
+                submitted=True, has_session=m_session, announces_email=m_announced,
+                has_resend_control=_has_resend_control(macct.register_response), handle=macct))
+        with contextlib.suppress(Exception):
+            macct.client.close()                             # nothing observable -> let the browser/BaaS lanes try
+    # 2) SPA browser lane (browser mode only): the app's own JS signs up with our address -> an email-gated SPA
+    #    mails us. Reuses ctx's single memoized browser registration (shared with the auth self-oracle).
+    bres = None
+    if getattr(ctx, "browser_register", None) is not None:
+        try:
+            bres = ctx._browser_register_once(suffix, base)
+        except Exception:
+            bres = None
+    if isinstance(bres, dict):
+        if bres.get("email_pending"):
+            # email-gated ONLY when the post-submit page ANNOUNCES email (else it's just as often CAPTCHA / SSO /
+            # approval -> announces_email False routes it to the short unannounced poll, no 60s false lockout).
+            live["lane"] = "browser"
+            return _done(email_verify.RegistrationOutcome(
+                submitted=True, has_session=False,
+                announces_email=email_verify.signals_email_verification(
+                    (bres.get("signup_response") or "") + " " + (bres.get("page_text") or "")), handle=None))
+        if bres.get("cookies") or bres.get("bearer"):            # the SPA logged us in at once -> session at signup
+            live.update(lane="browser_session", browser_session=bres)
+            return _done(email_verify.RegistrationOutcome(
+                submitted=True, has_session=True, handle=None,
+                announces_email=email_verify.signals_email_verification(bres.get("signup_response") or "")))
+    # 3) BaaS lane (Supabase gateway): confirmation ON -> accepts the signup, withholds a session, mails a confirm link
+    gw = _baas_gateway(ctx)
+    if gw is not None:
+        gateway, key = gw
+        bsu = baas.email_signup(gateway, key, address)
+        if bsu.get("session"):
+            live.update(lane="baas_session", baas_session=bsu["session"], gateway=gateway, key=key)
+            return _done(email_verify.RegistrationOutcome(submitted=True, has_session=True, handle=None))
+        if bsu.get("pending"):
+            live.update(lane="baas", gateway=gateway, key=key,
+                        baas_creds={"_email": bsu.get("_email"), "_password": bsu.get("_password")})
+            return _done(email_verify.RegistrationOutcome(submitted=True, has_session=False, announces_email=True,
+                                                          handle=None))
+        # 3c) MAGIC-LINK fallback: the password /auth/v1/signup is closed but OTP is on -> request a login link
+        #     (POST /auth/v1/otp); the SAME baas follow (verify_email_link, type=magiclink) completes it.
+        mlk = baas.magic_link_signup(gateway, key, address)
+        if mlk.get("pending"):
+            live.update(lane="baas", gateway=gateway, key=key,
+                        baas_creds={"_email": address, "_password": None})
+            return _done(email_verify.RegistrationOutcome(submitted=True, has_session=False, announces_email=True,
+                                                          handle=None))
+    # 3b) Firebase lane: identitytoolkit signUp returns a session AT SIGNUP (not email-gated) -> unlocks API-only
+    #     Firebase's authed surface; the browser lane already covers Firebase SPAs (localStorage idToken).
+    fb_key = _firebase_config(ctx)
+    if fb_key:
+        fsess = baas.firebase_signup(fb_key, address)
+        if fsess is not None:
+            live.update(lane="firebase_session", firebase_session=fsess)
+            return _done(email_verify.RegistrationOutcome(submitted=True, has_session=True, handle=None))
+    # 4) fall back to the httpx submission (submitted but not announced -> the flow's short confirmatory poll)
+    if acct is not None:
+        live["lane"] = "httpx"
+        return _done(email_verify.RegistrationOutcome(
+            submitted=True, has_session=auth._has_session(acct), announces_email=False,
+            has_resend_control=_has_resend_control(acct.register_response), handle=acct))
+    return _done(email_verify.RegistrationOutcome(submitted=False))
+
+
+def _prime_email(ctx, suffix=""):
+    """Fire the email registration EARLY (grade start) so the confirmation mail is delivered by the time a probe
+    polls for it -- the up-to-60s wait then OVERLAPS the rest of the grade instead of blocking. No poll here; the
+    poll+follow stays lazy (verify_email_flow, run by the qa-email probes / the register lane). No-op without a
+    receiver or with a provided --header session; the send itself is memoized, so this is safe to call once."""
+    if getattr(ctx, "email", None) is None or auth._provided_session(getattr(ctx, "headers", None)):
+        return
+    with contextlib.suppress(Exception):
+        _email_register_once(ctx, suffix)
+
+
+def _run_email_flow(ctx, suffix=""):
+    """Register with OUR controlled address, decide whether the signup is email-gated, and if so whether the mail
+    arrives and its link logs us in -- across THREE registration lanes so SPAs aren't blind spots:
+
+      1. httpx  -- a server-rendered HTML form / JSON API (email in the body).
+      2. browser -- when browser-driven registration is on, drive the app's OWN JS signup with our address (an
+         SPA's form action is a placeholder; the real POST is a JS fetch, so httpx alone never mails us). Reuses
+         the ONE memoized browser registration ctx.register already performs, so no extra launch; the emailed
+         link is then completed in the browser too (verify_in_browser).
+
+    When a lane's verification logs us in, capture that session on ctx (once) so the authed-surface probes reuse
+    it via ctx.register -- the whole reason the receiver exists. `suffix` selects the IDENTITY (""/"_a"/"_b"),
+    each with its own address + cache slot, so the two-account IDOR probes get distinct verified users."""
+    tag, address = _email_ctx(ctx, suffix)
+    base = ctx.base_url
+    live = ctx._email_cache.setdefault("_live" + suffix, {})   # persisted so a PRIMED registration + the later
+    #     poll share one send: the email delivers while the rest of the grade runs, so the poll finds it there.
+    reg_outcome = _email_register_once(ctx, suffix)            # the send half (memoized; may already be primed)
+
+    def register(_address):
+        return reg_outcome                                     # already registered -> never re-send
+
+    def follow(reg, msg):
+        lane = live.get("lane")
+        if lane == "browser":
+            return _follow_verification_browser(base, msg, live)
+        if lane == "baas":
+            return _follow_verification_baas(msg, live)
+        if live.get("acct") is not None:
+            return _follow_verification(live["acct"], msg, base, ctx.profile, address)
+        return email_verify.Verification(acted=False)
+
+    def resend(reg):
+        acct = live.get("acct")                                  # only the httpx lane has a resend control to hit
+        if acct is None:
+            return False
+        try:
+            return _try_resend(acct.client, acct.register_response, address)
+        except Exception:
+            return False
+
+    try:
+        result = email_verify.verify_email_flow(
+            ctx.email, tag, register, follow, resend=resend,
+            announced_timeout=_EMAIL_ANNOUNCED_TIMEOUT, unannounced_timeout=_EMAIL_UNANNOUNCED_TIMEOUT,
+            resend_at=_EMAIL_RESEND_AT)
+    except Exception:
+        return email_verify.EmailVerifyResult(attempted=False, na_reason="email-verification flow errored")
+    lane = live.get("lane")
+    slot = "account_session" + suffix                          # per-identity snapshot slot
+    if lane == "firebase_session" and live.get("firebase_session"):
+        # Firebase's session is granted at SIGNUP, not after verification, so capture it directly (the app is not
+        # email-gated -> result.session_after_verify is never set for this lane).
+        ctx._email_cache[slot] = _snapshot_firebase_session(live["firebase_session"])
+    elif result.session_after_verify:                           # capture the verified session for authed reuse (once)
+        if lane == "browser" and live.get("browser_session"):
+            ctx._email_cache[slot] = _snapshot_browser_session(live["browser_session"], base)
+        elif lane == "baas" and live.get("baas_session"):
+            ctx._email_cache[slot] = _snapshot_baas_session(
+                live["baas_session"], live["gateway"], live["key"], live.get("baas_creds") or {})
+        else:
+            acct = live.get("acct")
+            if acct is not None and auth._has_session(acct):
+                ctx._email_cache[slot] = _snapshot_session(acct)   # rebuilt per call; original closed
+                with contextlib.suppress(Exception):
+                    acct.client.close()
+    # SHARPEN the N/A: when we couldn't self-register, say WHY if discovery saw an SSO door or a captcha gate
+    # (both auth we don't drive) -> "could not submit ... [SSO: google] [CAPTCHA: recaptcha]" for the audit.
+    if not result.attempted and result.na_reason:
+        caps = getattr(getattr(ctx, "profile", None), "capabilities", {}) or {}
+        if caps.get("sso_providers"):
+            result.na_reason += " [SSO: %s]" % ",".join(caps["sso_providers"])
+        if caps.get("captcha"):
+            result.na_reason += " [CAPTCHA: %s]" % caps["captcha"]
+    return result
+
+
+def _email_verify_result(ctx, suffix=""):
+    """The email-flow observation for one identity (suffix), run once and memoized. The qa-email probes read the
+    default ("") identity; the two-account IDOR probes drive "_a"/"_b"."""
+    cache = ctx._email_cache
+    key = "result" + suffix
+    if key not in cache:
+        if ctx.email is None:
+            cache[key] = email_verify.EmailVerifyResult(
+                attempted=False, na_reason="no email receiver configured (pass --email-endpoint)")
+        elif auth._provided_session(ctx.headers):
+            cache[key] = email_verify.EmailVerifyResult(
+                attempted=False, na_reason="a session was supplied (--header); the signup email flow is untestable")
+        else:
+            cache[key] = _run_email_flow(ctx, suffix)
+    return cache[key]
+
+
+def _email_account(ctx, session_less_acct=None, suffix=""):
+    """Register-lane hook (called by ctx.register): when a signup is email-verification-gated, complete the
+    emailed verification and hand back a FRESH authenticated Account for this IDENTITY (suffix), so the
+    authed-surface probes run as the verified user. Returns None when no receiver is configured, the app is not
+    email-gated, or verification set no session -> the caller falls through to the browser/BaaS lanes.
+
+    FIRST-ACCOUNT GATE (the two-account IDOR case): a SECOND identity ("_a"/"_b") is attempted only if the default
+    ("") identity already email-verified a session -- i.e. 'if we can make one, make another; if not, abandon'. So
+    a broken-email app pays the 60s poll once (for "") and then abandons IDOR instantly instead of polling twice
+    more. Cost control for the default identity: the flow runs at most once per identity (memoized); if it has NOT
+    run yet, only pay for it when this signup ANNOUNCES a pending email, or in browser mode (the SPA lane detects
+    a gate the placeholder httpx signup can't announce)."""
+    cache = ctx._email_cache
+    if suffix and not cache.get("account_session"):
+        # a second identity: only worth it if the FIRST ("") verified. Ensure "" ran, then require its session.
+        _email_verify_result(ctx, "")
+        if not cache.get("account_session"):
+            return None                                  # can't make one -> don't try to make another
+    if "result" + suffix not in cache:
+        announced = session_less_acct is not None and email_verify.announces_pending_email(
+            _resp_text(session_less_acct.register_response))
+        # In browser mode the httpx signup is a placeholder that never announces (the real signup is a JS fetch),
+        # so an email-gated SPA would slip through the announce gate; the shared flow's browser lane is what
+        # detects it. Its browser registration is memoized (shared with ctx.register), so this adds no launch.
+        browser_spa = getattr(ctx, "browser_register", None) is not None
+        if not (announced or browser_spa):
+            return None                                  # not (yet known to be) email-gated -> let browser try
+        _email_verify_result(ctx, suffix)                # run this identity's flow (captures its session, if any)
+    sess = cache.get("account_session" + suffix)
+    if not sess:
+        return None                                      # verification established no reusable session
+    return _rebuild_account(ctx.base_url, sess)
+
+
+def _rebuild_account(base_url, sess) -> "auth.Account":
+    """Rebuild a FRESH, independently-closeable Account from a session snapshot (the register lane's, or the
+    crawl auth's seeded session). A fresh httpx client per call so a probe closing its account never invalidates
+    the next -- the same contract the browser-cached lane keeps."""
+    client = httpx.Client(base_url=base_url, timeout=15.0, follow_redirects=True)
+    client.headers.update(sess["headers"])
+    return auth.Account(username=sess["username"], password=sess["password"], client=client,
+                        register_response=sess["response"], storage_exposed=sess["storage_exposed"])
+
+
+def email_never_arrives(ctx, probe) -> bool | None:
+    """qa-email-001: the email-verification signup flow is unreliable, on an evidence ladder (functional-
+    suitability, SCORING_V2_SPEC): no email within 60s even after a resend -> locked out (72); a NON-BLOCKING
+    signup that promises a confirmation email that never arrives -> dead verification (36); email only after the
+    30s checkpoint -> unreliable send (24); a working-but-no-resend-control signup -> a resilience gap (5)."""
+    res = _email_verify_result(ctx)
+    nonblocking_promise = res.session_at_signup and res.announces_email
+    if not res.attempted or not (res.email_gated or nonblocking_promise):
+        ctx.evidence["na_reason"] = res.na_reason or "signup is not email-verification-gated"
+        return None
+    if res.message is not None:
+        ctx.evidence["subject"] = (res.message.subject or "")[:120]
+    if nonblocking_promise:
+        # NON-BLOCKING verification (a session was granted at signup): access is not gated, so a late email or a
+        # missing resend control is NOT a failure here -- only a BROKEN PROMISE fires: the signup committed to a
+        # confirmation email that never arrives. One rung BELOW a lockout (the user is duped for a time but can
+        # still use the app), scored via the verification_dead_nonblocking escalator (36).
+        if not res.email_arrived:
+            ctx.evidence["verification_dead_nonblocking"] = True    # escalator -> 36
+            ctx.evidence["detail"] = res.detail
+            return True
+        return False                                                # promised AND delivered -> a working flow
+    ctx.evidence["email_gated"] = True
+    if not res.email_arrived:
+        ctx.evidence["no_email_60s"] = True            # escalator -> 72
+        ctx.evidence["detail"] = res.detail
+    elif res.first_leg_empty:
+        ctx.evidence["email_late_30s"] = True          # escalator -> 24
+    if not res.has_resend_control:
+        ctx.evidence["no_resend_button"] = True        # the base-5 fire condition (evidence for the report)
+    # FIRE on any of: no email (60s), a late email (30s), or a missing resend control. Clean only when the email
+    # is prompt (<30s) AND a resend control exists (a working app is expected to offer a resend).
+    if not res.email_arrived or res.first_leg_empty or not res.has_resend_control:
+        return True
+    return False
+
+
+def email_verification_inert(ctx, probe) -> bool | None:
+    """qa-email-002: the confirmation email arrives but acting on its link establishes no session."""
+    res = _email_verify_result(ctx)
+    if not res.attempted or not res.email_gated:
+        ctx.evidence["na_reason"] = res.na_reason or "signup is not email-verification-gated"
+        return None
+    if not res.email_arrived:
+        ctx.evidence["na_reason"] = "no confirmation email arrived (that is qa-email-001's concern)"
+        return None
+    if not res.acted_on_verification:
+        ctx.evidence["na_reason"] = res.detail or "the email carried no followable verification link"
+        return None
+    if not res.session_after_verify:
+        return True    # acted on the link, no session -> verification is inert
+    return False       # verified + a session established -> the whole flow works
+
+
+# --- password-reset probe (qa-reset-001) --------------------------------------------------------------------
+# The RECOVERY path a user hits after forgetting their password: an independent code path (different template /
+# mail call / route) that can be broken even when signup email works. We establish an account with an address WE
+# own (the register lane), request a reset for THAT address, and watch whether the email arrives and its link is
+# alive. SAFETY: only ever the hl-<tag> mailbox we own is submitted -- never a discovered/guessed user address.
+
+def _reset_result(ctx, suffix=""):
+    """The password-reset observation for one identity (suffix), run once and memoized."""
+    cache = ctx._email_cache
+    key = "reset_result" + suffix
+    if key not in cache:
+        if getattr(ctx, "email", None) is None:
+            cache[key] = email_verify.ResetResult(
+                attempted=False, na_reason="no email receiver configured (pass --email-endpoint)")
+        elif auth._provided_session(getattr(ctx, "headers", None)):
+            cache[key] = email_verify.ResetResult(
+                attempted=False, na_reason="a session was supplied (--header); the reset flow is untestable")
+        else:
+            cache[key] = _run_reset_flow(ctx, suffix)
+    return cache[key]
+
+
+# A SPA's forgot-password is a JS fetch to a JSON endpoint, not a server-rendered <form> -- so the form lane
+# (_forgot_form) and the Supabase lane both miss it, and qa-reset reads N/A on an app that has a perfectly good
+# recovery endpoint. Match a REQUEST-side reset trigger (emails a link) and, to keep the fire honest, require it
+# take an email but NOT a token/password (that shape is the COMPLETION endpoint, which consumes a token and mails
+# nothing). Path hints alone would misfire on the completion route; the field shape is the discriminator.
+_RESET_REQUEST_PATH = re.compile(r"forgot|recover|reset", re.I)   # request-side reset hints
+_RESET_FIELD_EMAIL = re.compile(r"e?mail|^username$", re.I)
+_RESET_FIELD_SECRET = re.compile(r"token|password|otp|code|secret", re.I)
+
+
+def _json_reset_endpoints(endpoints):
+    """Discovered JSON endpoints that REQUEST a password reset (email in, no token/password) -- the SPA analog of
+    a forgot-password form. Excludes the completion endpoint (consumes a token, mails nothing) by field shape."""
+    out = []
+    for e in endpoints or []:
+        if (e.method or "get").lower() not in ("post", "put"):
+            continue
+        path = (e.raw_path or e.path or "").lower()
+        if not _RESET_REQUEST_PATH.search(path):
+            continue
+        fields = list(e.body_fields or [])
+        has_email = any(_RESET_FIELD_EMAIL.search(f) for f in fields)
+        has_secret = any(_RESET_FIELD_SECRET.search(f) for f in fields)
+        if has_secret:
+            continue                                          # a token/password body -> the completion route, not the request
+        if has_email or (not fields and ("forgot" in path or "recover" in path)):
+            out.append(e)
+    return out
+
+
+def _trigger_reset_json(client, base, endpoint, email) -> bool:
+    """POST a discovered JSON forgot/recover endpoint with OUR controlled address so the app mails a reset link.
+    Uses the endpoint's own body_fields (the email-ish field <- our address, others benign), else a couple of
+    common shapes. True when accepted (<400). Reset endpoints intentionally 200 regardless (enumeration-safe), so
+    'accepted' just means the request took; the EMAIL's arrival is what the probe judges. Address is ALWAYS ours."""
+    if endpoint.body_fields:
+        bodies = [{f: (email if _RESET_FIELD_EMAIL.search(f) else "hl_reset") for f in endpoint.body_fields}]
+    else:
+        bodies = [{"email": email}, {"username": email}]
+    for body in bodies:
+        try:
+            if client.post(endpoint.path, json=body).status_code < 400:
+                return True
+        except (httpx.HTTPError, httpx.InvalidURL):
+            continue
+    return False
+
+
+def _run_reset_flow(ctx, suffix=""):
+    """Request a password reset for an account WE established (our controlled address) and judge whether the
+    recovery path works. PRECONDITION: an account with our address must plausibly exist -- else a reset request
+    sends nothing (enumeration-silence) and 'no email' would be a false lockout. Two trigger lanes: a
+    server-rendered forgot-password form (driven with the account's own client), and Supabase /auth/v1/recover
+    when the signup lane created the account at the gateway."""
+    _email_register_once(ctx, suffix)                     # ensure an account with our address exists (memoized)
+    tag, address = _email_ctx(ctx, suffix)
+    base = ctx.base_url
+    live = ctx._email_cache.get("_live" + suffix, {})
+    acct = live.get("acct")
+    lane = live.get("lane", "")
+    profile = getattr(ctx, "profile", None)
+    # PRECONDITION -- an account with our address plausibly EXISTS via ANY register lane (else a reset sends
+    # nothing -> false lockout). Broadened past httpx+Supabase: an httpx session/announce, a Supabase signup, a
+    # captured session snapshot (email-verified / browser / Firebase), or an immediate-session lane all mean the
+    # signup with our address took. (Was httpx+baas only, which N/A'd the ~10%+ where the browser/Firebase/
+    # immediate lanes DID establish a session.)
+    httpx_account = acct is not None and (auth._has_session(acct) or
+                    email_verify.announces_pending_email(_resp_text(acct.register_response)))
+    account_exists = (httpx_account
+                      or lane.startswith("baas")
+                      or bool(ctx._email_cache.get("account_session" + suffix))
+                      or lane in ("browser_session", "firebase_session", "baas_session"))
+    forgot = auth._forgot_form(profile.forms) if profile is not None else None
+    if not account_exists:
+        return email_verify.ResetResult(
+            attempted=False, na_reason="no established account with a controlled address to request a reset for")
+    # the forgot-password endpoint takes an EMAIL, not the account's session, so a fresh client works when the
+    # session came from the browser/Firebase lane (no httpx acct); reuse the account's client when we have one.
+    own_client = acct.client if acct is not None else None
+    forgot_client = own_client or httpx.Client(base_url=base, timeout=15.0, follow_redirects=True)
+    used: dict = {}
+
+    def trigger(addr):
+        if forgot is not None and auth._trigger_reset_httpx(forgot_client, base, forgot, addr):
+            used["lane"] = "form"
+            return True
+        gw = _baas_gateway(ctx)                              # Supabase recover, gated on the gateway existing
+        if gw is not None and baas.recover(gw[0], gw[1], addr):
+            used["lane"] = "baas"
+            return True
+        for e in _json_reset_endpoints(profile.endpoints if profile is not None else []):
+            if _trigger_reset_json(forgot_client, base, e, addr):   # SPA JSON forgot/recover endpoint
+                used["lane"] = "json"
+                used["endpoint"] = e.path
+                return True
+        return False
+
+    def follow(msg):
+        # only the app-hosted reset link (form lane) is a GET-able page; a Supabase recover link is a gateway
+        # endpoint a bare GET can't judge, so leave link_alive None there (delivery is still judged).
+        if used.get("lane") not in ("form", "json"):        # app-hosted reset link is GET-able (form + SPA-JSON lanes)
+            return None
+        for link in [ln for ln in msg.links if _same_app_link(ln, base)][:3]:
+            try:
+                r = forgot_client.get(link)
+            except (httpx.HTTPError, httpx.InvalidURL):
+                continue
+            return 200 <= r.status_code < 400
+        return None
+
+    try:
+        return email_verify.reset_email_flow(ctx.email, tag, trigger, follow, timeout=_EMAIL_ANNOUNCED_TIMEOUT)
+    finally:
+        if own_client is None:                              # close the fresh client we made (never the account's)
+            with contextlib.suppress(Exception):
+                forgot_client.close()
+
+
+def reset_email_unreliable(ctx, probe) -> bool | None:
+    """qa-reset-001: an account we established cannot be recovered -- the password-reset email never arrives (the
+    user is locked out of recovery), or it arrives but its link is dead. SCORES per the qa-reset-001 severity
+    block (no reset email in 60s -> 60; a dead reset link -> 24)."""
+    res = _reset_result(ctx)
+    if not res.attempted or not res.reset_available:
+        ctx.evidence["na_reason"] = res.na_reason or "no testable password-reset flow"
+        return None
+    ctx.evidence["reset_available"] = True
+    if res.message is not None:
+        ctx.evidence["subject"] = (res.message.subject or "")[:120]
+    if not res.email_arrived:
+        ctx.evidence["no_reset_email_60s"] = True         # escalator -> top rung (locked out of recovery)
+        ctx.evidence["detail"] = res.detail
+        return True
+    if res.link_alive is False:
+        ctx.evidence["reset_link_dead"] = True            # escalator -> mid rung (broken reset page)
+        ctx.evidence["detail"] = res.detail
+        return True
+    return False    # reset email arrived and (link alive, or not GET-followable) -> recovery works
+
+
 PREDICATES = {
+    "lighthouse_audit": lighthouse_audit,
+    "email_never_arrives": email_never_arrives,
+    "email_verification_inert": email_verification_inert,
+    "reset_email_unreliable": reset_email_unreliable,
+    "international_input_breaks": international_input_breaks,
+    "lighthouse_perf_score": lighthouse_perf_score,
     "sqli_auth_bypass": sqli_auth_bypass,
     "api_sqli": api_sqli,
     "xss_injectable": xss_injectable,
@@ -5337,6 +7379,10 @@ PREDICATES = {
     "backend_schema_disclosed": backend_schema_disclosed,
     "authenticated_backend_readable": authenticated_backend_readable,
     "bundle_leaks_secret": bundle_leaks_secret,
+    "unreachable_backend_reference": unreachable_backend_reference,
+    "internal_address_disclosed": internal_address_disclosed,
+    "oauth_redirect_localhost": oauth_redirect_localhost,
+    "no_tls_origin": no_tls_origin,
     "vulnerable_dependency": vulnerable_dependency,
     "source_map_exposed": source_map_exposed,
     "session_cookie_missing_flag": session_cookie_missing_flag,
@@ -5351,19 +7397,14 @@ PREDICATES = {
     "load_resilience": load_resilience,
     "crash_resistance": crash_resistance,
     "declared_constraint_unenforced": declared_constraint_unenforced,
-    "perf_ttfb": perf_ttfb,
-    "perf_page_weight": perf_page_weight,
-    "perf_request_count": perf_request_count,
-    "perf_load_time": perf_load_time,
-    "caching_ineffective": caching_ineffective,
     "http_soft_404": http_soft_404,
     "a11y_hard_fails": a11y_hard_fails,
     "broken_links": broken_links,
+    "redirect_loop": redirect_loop,
     "mixed_content": mixed_content,
+    "subresource_integrity_missing": subresource_integrity_missing,
     "seo_meta_missing": seo_meta_missing,
     "http_conformance": http_conformance,
-    "slow_first_paint": slow_first_paint,
-    "slow_core_web_vitals": slow_core_web_vitals,
     "console_errors_present": console_errors_present,
     "a11y_violations_present": a11y_violations_present,
     "dead_controls_present": dead_controls_present,
@@ -5376,14 +7417,12 @@ PREDICATES = {
 
 # Human-readable "why it fired" reasons for verbose / --failed output, derived from the probe's check.
 _MATCHER_REASONS = {
-    "ttfb_at_least": "slow time-to-first-byte (>{arg}s)",
     "response_contains": "reflected the probe payload unescaped",
     "response_missing_header": "missing header: {arg}",
     "response_missing_clickjacking_defense": "no clickjacking defense (X-Frame-Options / CSP frame-ancestors)",
     "response_csp_weak": "the Content-Security-Policy is present but toothless against XSS ('unsafe-inline' / wildcard script source with no nonce/hash) -> a false sense of safety",
     "response_cors_misconfigured": "reflects an arbitrary Origin with credentials (CORS)",
     "response_server_error": "returned a 5xx server error",
-    "response_uncompressed": "sizeable text served without gzip (no Content-Encoding)",
     "response_has_header": "leaks the {arg} header (stack / version disclosure)",
     "response_is_aws_credentials": "served an AWS credentials file at the webroot",
     "response_leaks_credentials": "returned password/credential material in a response body",
@@ -5394,6 +7433,12 @@ _MATCHER_REASONS = {
 }
 
 _PREDICATE_REASONS = {
+    "lighthouse_audit": "a Lighthouse performance audit is below its passing threshold",
+    "email_never_arrives": "signup is email-verification-gated but no confirmation email arrives -> the user is locked out",
+    "email_verification_inert": "the confirmation email arrives but acting on its link establishes no session -> verification is broken",
+    "reset_email_unreliable": "an account we established cannot be recovered -> the password-reset email never arrives, or its link is dead",
+    "international_input_breaks": "the app corrupts (mojibake) or 500s on international / multibyte input (emoji / CJK / Arabic / astral)",
+    "lighthouse_perf_score": "the overall Lighthouse performance score is below the green line (slop = its shortfall under 90)",
     "sqli_auth_bypass": "login bypassed by a SQL-injection payload",
     "api_sqli": "a parameter is SQL-injectable (error / boolean / UNION / time-based)",
     "xss_injectable": "an input reflects unescaped into HTML (XSS: script / img / svg / attribute / stored)",
@@ -5430,6 +7475,10 @@ _PREDICATE_REASONS = {
                                "root, or database errors naming columns)",
     "authenticated_backend_readable": "any logged-in user reads every other user's data -> broken authenticated-tier RLS/Rules (the IDOR equivalent on a BaaS app; missing per-user row filtering)",
     "bundle_leaks_secret": "a hardcoded SECRET key (Stripe sk_ / OpenAI / AWS secret / GitHub PAT / private key) is shipped in the client JS bundle -> account/DB takeover (public anon/publishable keys are not flagged)",
+    "unreachable_backend_reference": "the shipped client bundle calls a backend no visitor can reach (localhost / a private IP / an unset env var) -> the app renders but its data layer is dead in production",
+    "internal_address_disclosed": "the client bundle hardcodes an internal-only address (a private/link-local IP or an *.internal/.corp hostname) -> leaks infrastructure topology to any source-viewer (recon); loopback/localhost is not flagged",
+    "oauth_redirect_localhost": "the OAuth sign-in sets redirect_uri to localhost / a private IP / an unset env var -> after authenticating, the provider bounces the user to a host that doesn't exist in production, so login is dead for every visitor",
+    "no_tls_origin": "the public origin is served over plain http:// with no upgrade to https -> every visitor's credentials and session cookies cross the network in the clear",
     "vulnerable_dependency": "the app ships a client library with a KNOWN CVE (retire.js-style: jQuery / AngularJS / Bootstrap / Axios / Moment / Handlebars / DOMPurify) -> supply-chain risk the team chose; upgrade per the finding",
     "source_map_exposed": "a production JS bundle serves its .map -> the original source is reconstructable (business logic, hidden endpoints, and secrets a minified scan misses)",
     "session_cookie_missing_flag": "session cookie missing the {flag} flag",
@@ -5443,21 +7492,16 @@ _PREDICATE_REASONS = {
     "load_resilience": "endpoint 5xx'd under a concurrent burst",
     "crash_resistance": "malformed input caused an unhandled 5xx instead of a graceful 4xx",
     "declared_constraint_unenforced": "the server accepted a value violating the app's own declared field constraint (type=email/number/... -> client-only validation)",
-    "perf_ttfb": "slow server response (time-to-first-byte over the perf budget)",
-    "perf_page_weight": "heavy page (transfer weight over the perf budget)",
-    "perf_request_count": "too many requests to render the homepage (over the perf budget)",
-    "perf_load_time": "homepage load time crosses the ~5s user-abandonment ceiling",
-    "caching_ineffective": "static asset not cacheable (no validator / no-store / ignored revalidation) -> refetched every load",
     "http_soft_404": "a nonexistent static asset returned 2xx instead of 404 (soft-404 -> pollutes caches / crawlers / monitoring)",
     "a11y_hard_fails": "accessibility hard-fail (missing lang / alt / form-control name / page title, or text below the 3:1 contrast floor)",
     "broken_links": "an internal link leads to a 4xx dead end (broken navigation)",
+    "redirect_loop": "the homepage or a route it links to redirects endlessly (ERR_TOO_MANY_REDIRECTS) -- the page never loads for any visitor",
     "mixed_content": "an https page loads a subresource over plain http:// (mixed content -> MITM-tamperable; active mixed content is browser-blocked, breaking the page)",
+    "subresource_integrity_missing": "a cross-origin script/stylesheet loads without a Subresource Integrity hash -> a compromised or hijacked CDN can run arbitrary code in the app's origin (supply-chain risk)",
     "seo_meta_missing": "missing a best-practice meta tag (viewport -> unusable on mobile, or description -> no search snippet)",
     "http_conformance": "HTML response served with no declared charset (browser must guess the encoding -> mojibake / UTF-7 XSS surface)",
-    "slow_first_paint": "First Contentful Paint exceeded the gate",
-    "slow_core_web_vitals": "Core Web Vitals poor on the best of N throttled samples (slow LCP / layout shift / main-thread blocking)",
     "login_no_rate_limit": "repeated wrong-password logins were never throttled",
-    "console_errors_present": "threw an uncaught JavaScript error on load",
+    "console_errors_present": "the app's own code fails on load (an uncaught JS error, a CSP that blocks its own resource, or a React hydration mismatch)",
     "dead_controls_present": "clickable controls wired to nothing (no effect on click) — non-functional UI",
     "a11y_violations_present": "accessibility violations (missing alt / form label / lang / control name)",
     "open_redirect": "a user-controlled parameter redirects to an arbitrary external host",

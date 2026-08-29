@@ -1,0 +1,129 @@
+# Shared, authority-anchored severity blocks referenced by a probe's `severity_ref` (DRY: one block per
+# vulnerability CLASS, not copied into every probe of that class). load_catalog() reads this file (skipped by
+# the probe glob because of the leading underscore) and resolves each `severity_ref` into the probe's
+# `severity`. See docs/SCORING_V2_SPEC.md. The range is set by CVSS x Bugcrowd VRT; the point is set at
+# runtime by the probe's own evidence flags (default low, highest matched rung lifts). Rung `point`s [calib]
+# pending the re-grade; range bounds [pinned] from CVSS/VRT.
+
+access-control:                                         # OWASP A01:2025 Broken Access Control (IDOR / BOLA)
+  cvss: "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N"  # 6.5: authed low-priv reads another user's record
+  cvss_score: 6.5
+  vrt: "P1"                                             # Bugcrowd VRT: IDOR view/modify sensitive iterable = P1
+  range: [30, 85]
+  default: 30                                           # abstention; the idor probes fire on a PROVEN cross-user read
+  escalators:
+    - {evidence: cross_user_read, point: 55, vrt_variant: "BAC: cross-user read confirmed"}
+    - {evidence: sensitive_fields, point: 68, vrt_variant: "IDOR view sensitive/PII record"}
+    - {evidence: bulk_read, point: 78, vrt_variant: "BOLA collection: many owners' objects"}
+    - {evidence: cross_user_write, point: 85, vrt_variant: "IDOR modify another user's data"}
+
+sql-injection:                                          # OWASP A05:2025 Injection (SQLi / auth-bypass)
+  cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"  # 9.8: unauth, full read/write
+  cvss_score: 9.8
+  vrt: "P1"
+  range: [90, 98]
+  default: 90                                           # a confirmed injection (auth-bypass / oracle) is terminal
+  escalators:
+    - {evidence: data_extracted, point: 95, vrt_variant: "SQLi: DB rows extracted"}
+    - {evidence: write_confirmed, point: 98, vrt_variant: "SQLi: write / stacked query"}
+
+command-injection:                                      # OWASP A05 Injection (OS command injection = RCE)
+  cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+  cvss_score: 9.8
+  vrt: "P1"
+  range: [90, 98]
+  default: 90                                           # time-inferred injection
+  escalators:
+    - {evidence: execution_confirmed, point: 98, vrt_variant: "cmdi: shell executed (in-band hash oracle)"}
+
+code-injection:                                         # OWASP A05 Injection (SSTI / eval RCE)
+  cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+  cvss_score: 9.8
+  vrt: "P1"                                             # our hash oracle fires ONLY on proven execution, not VRT-basic P4
+  range: [90, 98]
+  default: 90
+  escalators:
+    - {evidence: execution_confirmed, point: 98, vrt_variant: "SSTI: engine executed the gadget (hash oracle)"}
+
+xxe:                                                    # OWASP A05/A02 (XML External Entity)
+  cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"  # 7.5: file read
+  cvss_score: 7.5
+  vrt: "P1"
+  range: [70, 91]
+  default: 70
+  escalators:
+    - {evidence: internal_reached, point: 82, vrt_variant: "XXE-SSRF: server made the OOB request"}
+    - {evidence: sensitive_fields, point: 91, vrt_variant: "XXE: read a sensitive system file"}
+
+path-traversal:                                         # OWASP A01 (LFI / path traversal)
+  cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"  # 7.5
+  cvss_score: 7.5
+  vrt: "n/a"                                            # not in Bugcrowd VRT -> CVSS-only anchored, held conservative
+  range: [50, 85]
+  default: 50
+  escalators:
+    - {evidence: sensitive_fields, point: 75, vrt_variant: "read a sensitive system file (/etc/passwd)"}
+    - {evidence: high_privilege, point: 85, vrt_variant: "read app source / secrets"}
+
+file-upload-rce:                                        # OWASP A05 (unrestricted upload -> RCE)
+  cvss: "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H"  # 9.0
+  cvss_score: 9.0
+  vrt: "P1"                                             # our probe fires ONLY on proven RCE (webshell executed), not VRT-basic P5
+  range: [90, 98]
+  default: 90
+  escalators:
+    - {evidence: execution_confirmed, point: 98, vrt_variant: "upload: webshell executed server-side"}
+
+debug-mode:                                             # OWASP A02 (debug UI in prod; Werkzeug console = RCE)
+  cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"
+  cvss_score: 5.3
+  vrt: "P4"                                             # base: a framework debug UI leaks source/settings/env
+  range: [40, 98]
+  default: 40
+  escalators:
+    - {evidence: execution_confirmed, point: 98, vrt_variant: "Werkzeug interactive debugger = RCE console"}
+
+disclosed-secret:                                       # OWASP A02/A07 (a server secret shipped to anyone)
+  cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"  # 7.5: read-only secret disclosure
+  cvss_score: 7.5
+  vrt: "P1"
+  range: [70, 98]
+  default: 70
+  escalators:
+    - {evidence: validated_live, point: 92, vrt_variant: "secret confirmed live against its provider"}
+    - {evidence: high_privilege, point: 98, vrt_variant: "server key / DB creds / private key = takeover"}
+
+anon-data-exposure:                                     # OWASP A01 (anon bulk records / world-readable DB)
+  cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"  # 7.5
+  cvss_score: 7.5
+  vrt: "P1"
+  range: [70, 98]
+  default: 70
+  escalators:
+    - {evidence: sensitive_fields, point: 80, vrt_variant: "records carry PII / financial / credential columns"}
+    - {evidence: bulk_read, point: 90, vrt_variant: "bulk records / world-readable DB exposed to anon"}
+    - {evidence: write_confirmed, point: 98, vrt_variant: "anon can WRITE the DB (no RLS) = integrity compromise"}
+
+xss:                                                    # OWASP A05 Injection (Cross-Site Scripting)
+  cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N"  # 6.1: reflected
+  cvss_score: 6.1
+  vrt: "P3->P2"                                          # reflected P3 -> stored P2
+  range: [40, 85]
+  default: 40                                            # reflected via the no-browser heuristic (unproven execution)
+  escalators:
+    - {evidence: execution_confirmed, point: 61, vrt_variant: "reflected/DOM XSS executed in a browser"}
+    - {evidence: stored, point: 85, vrt_variant: "stored XSS: runs for every viewer (VRT P2)"}
+
+# --- QA / perf classes (ISO-25010 characteristic + Nielsen 0-4 band; corpus-calibrated, see SCORING_V2_SPEC) ---
+
+race-condition:                                         # ISO-25010 reliability (concurrency)
+  iso_25010: "reliability"
+  nielsen: "3"
+  range: [50, 50]
+  default: 50                                           # concurrent creates collide on a shared id
+
+data-integrity:                                         # ISO-25010 functional suitability (data round-trip)
+  iso_25010: "functional-suitability"
+  nielsen: "3"
+  range: [69, 69]
+  default: 69                                           # a save that round-trips wrong/lost = misleading the user

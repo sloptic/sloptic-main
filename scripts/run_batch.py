@@ -239,14 +239,16 @@ def _last_record_for(results_path, target):
     return rec
 
 
-def _tldr_line(done, total, label, rec, secs, eta, tail):
-    """The compact per-app line: [i/N] label  <slop N | DNF | FAIL>  missed: kinds  · Ns ETA m:ss."""
+def _tldr_line(done, total, label, rec, secs, eta, tail, url=""):
+    """The compact per-app line: [i/N] label  <slop N | DNF | FAIL>  missed: kinds  · Ns ETA m:ss  URL."""
     prog = f"[{done}/{total}]"
     eta_s = f"ETA {int(eta) // 60}:{int(eta) % 60:02d}" if eta else ""
+    tag = f"  {url}" if url else ""             # the app's URL, appended last so it stays clickable and the
+    #                                             fixed-width columns before it don't shift with the URL length
     if tail:                                    # wedged / job error — tail carries the reason
-        return f"{prog} {label:<30} ✗ {tail.strip().lstrip('!').strip()[:50]}  ·{secs:4.0f}s {eta_s}"
+        return f"{prog} {label:<30} ✗ {tail.strip().lstrip('!').strip()[:50]}  ·{secs:4.0f}s {eta_s}{tag}"
     if rec is None:
-        return f"{prog} {label:<30} ? no record  ·{secs:4.0f}s {eta_s}"
+        return f"{prog} {label:<30} ? no record  ·{secs:4.0f}s {eta_s}{tag}"
     audit = rec.get("coverage_audit") or {}
     state = audit.get("page_state")
     if rec.get("functional") is False or state in ("broken", "not-an-app", "placeholder"):
@@ -261,7 +263,11 @@ def _tldr_line(done, total, label, rec, secs, eta, tail):
         score = "—"
     missed = audit.get("missed") or []
     miss = ("missed: " + ", ".join(dict.fromkeys(m.get("kind", "?") for m in missed))) if missed else ""
-    return f"{prog} {label:<30} {score:<20} {miss:<26} ·{secs:4.0f}s {eta_s}"
+    if rec.get("bot_challenge"):   # WAF tripped: show WHERE (onset probe) + whether the grade was kept or withheld
+        onset = rec.get("challenge_onset") or "end"
+        kept = "kept" if rec.get("challenge_stage") == "late" else "withheld"
+        miss = f"⚠ challenge@{onset} ({kept})"
+    return f"{prog} {label:<30} {score:<20} {miss:<34} ·{secs:4.0f}s {eta_s}{tag}"
 
 
 def _build_cmd(j, args, ckpt):
@@ -275,6 +281,10 @@ def _build_cmd(j, args, ckpt):
             cmd += ["--platform-host", h]
     else:
         cmd += ["--attempts", str(args.attempts), "--build-timeout", str(args.build_timeout), "--checkpoint", str(ckpt)]
+        if getattr(args, "max_repo_mb", 0):                     # repo-only throughput knobs (no-op for --url)
+            cmd += ["--max-repo-mb", str(args.max_repo_mb)]
+        if getattr(args, "retry_timeouts", False):
+            cmd += ["--retry-timeouts"]
     if not args.browser:
         cmd += ["--no-browser"]
     if args.audit_coverage:
@@ -295,6 +305,12 @@ def _build_cmd(j, args, ckpt):
         cmd += ["--llm-reasoning"]
     for h in (args.headers or []):
         cmd += ["--header", h]
+    if getattr(args, "email_domain", None):
+        cmd += ["--email-domain", args.email_domain]
+    if getattr(args, "email_endpoint", None):
+        cmd += ["--email-endpoint", args.email_endpoint]
+    if getattr(args, "email_token", None):
+        cmd += ["--email-token", args.email_token]
     if args.model:
         cmd += ["--model", args.model]
     return cmd
@@ -360,7 +376,7 @@ def _run_job(j, idx, total, args, capture, progress=None):
     if args.tldr:                          # terse: one line from the child's record, not its full dump
         rec_out = _last_record_for(args.results, target)
         with _print_lock:
-            print(_tldr_line(done, gtotal, _label(j), rec_out, secs, eta, tail), flush=True)
+            print(_tldr_line(done, gtotal, _label(j), rec_out, secs, eta, tail, url=target), flush=True)
     else:                                  # full dump -> append a batch progress + ETA footer (right after the
         foot = _eta_footer(done, gtotal, secs, eta)              # child's own timing/model line)
         if capture:
@@ -461,6 +477,14 @@ def main():
                     help="forward to deploy_and_grade (repeatable): a request header sent on the whole run — the "
                          "Option-B auth fallback (--header 'Cookie: …' or --header 'Authorization: Bearer …') so "
                          "the authed-surface probes reach the logged-in surface when self-registration can't.")
+    ap.add_argument("--email-domain", metavar="DOMAIN",
+                    help="forward to deploy_and_grade: throwaway inbox domain for the email-verification probes "
+                         "(e.g. anachron.dev); without --email-domain + --email-endpoint they read N/A")
+    ap.add_argument("--email-endpoint", metavar="URL",
+                    help="forward to deploy_and_grade: HTTP endpoint returning received mail as JSON (the "
+                         "Cloudflare Email Worker's /mail)")
+    ap.add_argument("--email-token", metavar="TOKEN", default="",
+                    help="forward to deploy_and_grade: Bearer token for --email-endpoint (the Worker's MAIL_TOKEN)")
     ap.add_argument("--llm-reasoning", dest="llm_reasoning", action="store_true", default=False,
                     help="forward to deploy_and_grade: opt the perceive+audit passes back INTO LLM thinking/CoT. "
                          "Default is OFF (no-think) — the A/B showed it holds quality while cutting the audit LLM "
@@ -470,6 +494,12 @@ def main():
     ap.add_argument("--attempts", type=int, default=3, help="deploy attempts per repo")
     ap.add_argument("--build-timeout", type=int, default=480, dest="build_timeout",
                     help="per-repo docker build timeout in seconds (default 480; lower = more throughput)")
+    ap.add_argument("--max-repo-mb", type=int, default=0, dest="max_repo_mb",
+                    help="forward to deploy_and_grade: skip repos larger than this MB (committed node_modules/"
+                         "datasets/weights), pre-clone via GitHub API. 0 = off; ~300 is a good throughput knob.")
+    ap.add_argument("--retry-timeouts", action="store_true", dest="retry_timeouts",
+                    help="forward to deploy_and_grade: retry a BUILD TIMEOUT (default: give up, it's a "
+                         "'too heavy' verdict, not a fixable error).")
     ap.add_argument("--grade-timeout", type=int, default=480, dest="grade_timeout",
                     help="grading's OWN wall-clock budget in seconds (default 480), externally enforced — "
                          "independent of deploy time so a slow 3-attempt deploy can't leave grading no room")
@@ -484,6 +514,12 @@ def main():
                          "no Docker, so 6-10 is a big overnight speedup; the results append is lock-guarded so "
                          "concurrent writes won't corrupt it. REPO jobs always run serially (fixed Docker "
                          "container names can't coexist), regardless of this value.")
+    ap.add_argument("--retry-blocked", action="store_true", dest="retry_blocked",
+                    help="AFTER the run, re-grade each WAF-blocked app's tail (the ~10-min Vercel reset is long "
+                         "elapsed by then) via retry_blocked.py and fold recovered outcomes into a "
+                         "<results>.merged.jsonl — clears the incomplete flag where the tail came back clean, "
+                         "surfaces anything that fires. Injection almost never fires, so mostly turns "
+                         "'incomplete' into 'tested clean'. The main results file is never mutated.")
     ap.add_argument("--tldr", action="store_true",
                     help="terse progress: suppress each app's full grading dump; print ONE line per app "
                          "(count · slop score / DNF / FAIL · what the coverage-audit says the fuzzer missed · "
@@ -562,9 +598,13 @@ def main():
     # concurrency, which is otherwise unrecoverable from the results and was uncheckable when it mattered.
     os.environ.setdefault("HL_RUN_ID", provenance.run_id())
     os.environ["HL_CONCURRENCY"] = str(conc)
-    if conc > 1:
+    if conc > 1:   # serialize the CPU-timing-sensitive Lighthouse trace across the concurrent (URL-phase) grade
+        os.environ.setdefault("SLOPTIC_LIGHTHOUSE_LOCK",   # processes -- N trace lanes host-wide (SLOTS)
+                              os.path.abspath(args.results) + ".lhlock")
+        slots = os.environ.get("SLOPTIC_LIGHTHOUSE_SLOTS", "1")   # display the actual Lighthouse throttle so a
+        runs = os.environ.get("SLOPTIC_LIGHTHOUSE_RUNS", "3")     # long run's perf-timing config is on the record
         note = f" · url {conc}-wide" + (f", {len(repo_jobs)} repo serial" if repo_jobs else "")
-        print(f"   concurrency: {conc}{note}", flush=True)
+        print(f"   concurrency: {conc}{note} · lighthouse: {slots} lanes, median-{runs}", flush=True)
     prog = _Progress(len(repo_jobs) + len(url_jobs))   # drives the ETA in BOTH --tldr and the full-dump footer
     cap = args.tldr        # --tldr captures (suppresses) each child's dump; we print one line from its record
     try:
@@ -594,6 +634,19 @@ def main():
     print(f"\n\n{'=' * 60}\nCROSS-STACK PARITY (is a low score clean, or were we blind?)\n{'=' * 60}",
           flush=True)
     subprocess.run(PY + [str(_HERE / "parity.py"), args.results])
+
+    # 4) (opt) retry the WAF-blocked tails now that every app's ~10-min reset has elapsed; writes a SEPARATE
+    #    <results>.merged.jsonl (main results untouched). Mirrors the run's discovery flags so the subset
+    #    grade sees the same surface (esp. --browser-auth for session-gated probes).
+    if getattr(args, "retry_blocked", False):
+        print(f"\n\n{'=' * 60}\nRETRY BLOCKED TAILS (post-run — WAF reset elapsed)\n{'=' * 60}", flush=True)
+        rcmd = PY + [str(_HERE / "retry_blocked.py"), "--results", args.results,
+                     "--concurrency", str(args.concurrency)]
+        if getattr(args, "browser_auth", False):
+            rcmd += ["--browser-auth"]
+        if not getattr(args, "browser", True):
+            rcmd += ["--no-browser"]
+        subprocess.run(rcmd)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ evidence_model: provable
 penalty: 20   # silent data loss is worse than a stale display (which a refresh fixes) — the user's data is
               # gone and they don't know. Priced like qa-staleui-001; note qa-errhyg-001 (overshare) is 14,
               # lower on purpose — the overshare hurts the owner (recon), the undershare hurts the user.
+severity: {iso_25010: "interaction-capability", nielsen: "3", range: [35, 35], default: 35}   # action failed, no error shown -> silent data loss
 applicability:
   requires: [browser]   # must submit an action + inspect the DOM; N/A without --browser
 probe:

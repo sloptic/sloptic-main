@@ -5,11 +5,48 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class Applicability(BaseModel):
     requires: list[str] = Field(default_factory=list)
+
+
+class Escalator(BaseModel):
+    """One rung of a probe's evidence ladder (SCORING_V2_SPEC.md): if `evidence` (a ctx.evidence flag the
+    predicate sets when it OBSERVES that impact) is truthy, the penalty may lift to `point`, clamped to the
+    Severity range. Rungs never sum: the resolver takes the single highest matched rung."""
+    evidence: str            # the ctx.evidence key that must be truthy to reach this rung
+    point: int               # penalty if this is the highest matched rung
+    vrt_variant: str = ""    # provenance: the VRT variant / CVSS change that justifies this rung
+
+
+class Severity(BaseModel):
+    """Authority-anchored penalty (SCORING_V2_SPEC.md). The RANGE is set by named authorities (CVSS x
+    Bugcrowd VRT); the POINT is set by the probe's own evidence. `default` (= range low, abstention) charges
+    the floor; each matched `escalators` rung lifts toward the high end. When a Probe carries this, the
+    resolver in pipeline._run_probe computes the penalty from it instead of the nominal `penalty:` int."""
+    cvss: str = ""                    # canonical CVSS vector, or "n/a" for a non-scorable chore
+    cvss_score: float | None = None
+    vrt: str = ""                     # Bugcrowd VRT baseline, e.g. "P1" or "P4->P1"
+    iso_25010: str = ""               # QA/perf: the ISO/IEC 25010:2023 quality characteristic (reliability / ...)
+    nielsen: str = ""                 # QA/perf: Nielsen usability-severity band 0-4 (frequency x impact x persistence)
+    range: tuple[int, int]            # [lo, hi] penalty bounds, as fractions of the 100 anchor
+    default: int                      # penalty with no escalating evidence (should equal range low)
+    tier: str = ""                    # "chore-floor" marks a Tier-4 diligence floor
+    escalators: list[Escalator] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _range_consistent(self):
+        lo, hi = self.range
+        if lo > hi:
+            raise ValueError(f"severity range low>high: {self.range}")
+        if not lo <= self.default <= hi:
+            raise ValueError(f"severity default {self.default} outside range {self.range}")
+        for e in self.escalators:
+            if not lo <= e.point <= hi:
+                raise ValueError(f"escalator '{e.evidence}' point {e.point} outside range {self.range}")
+        return self
 
 
 class Probe(BaseModel):
@@ -19,12 +56,24 @@ class Probe(BaseModel):
     variant_group_id: str | None = None  # probes sharing one fire once (same logical flaw)
     pool: str = "public"  # public | hidden
     evidence_model: str = "provable"  # provable | oracle (detection hint only)
-    penalty: int  # slop added when the probe fires; deduction-only, so always positive
+    penalty: int = 0  # nominal fallback. A probe with a severity block has this SYNCED to severity.default at
+                      # load (load_catalog), so it never drifts; a migrated probe need not set it at all.
+    # What genuinely counts as a TRUE POSITIVE + the confounders to rule out (a FP is a fire that FAILS this).
+    # Recorded so an audit measures fires against a STATED def, not memory/vibes; doc-only, never affects scoring.
+    # Especially load-bearing for confounder-prone probes (timing/load/cold-start/presence-vs-use), where the
+    # defect and its mimic look identical; binary injection probes barely need it.
+    tp_definition: str = ""
     applicability: Applicability = Field(default_factory=Applicability)
     # Either {"predicate": name} for oracle probes, or {"method", "target"} for declarative ones.
     probe: dict[str, Any] = Field(default_factory=dict)
     # Declarative conditions; ALL must match for slop. Each is a matcher name or {name: arg}.
     slop_if: list[Any] = Field(default_factory=list)
+    # v2 authority-anchored penalty (range + evidence ladder; SCORING_V2_SPEC.md). When set, _run_probe
+    # resolves the penalty from it and `penalty` above is only the nominal fallback. None -> legacy behavior.
+    severity: Severity | None = None
+    # DRY alternative: reference a shared class block by name (catalog/_severity_classes.yaml); load_catalog
+    # resolves it INTO `severity`. Set at most one of severity / severity_ref (the loader enforces this).
+    severity_ref: str | None = None
 
 
 @dataclass
@@ -73,6 +122,7 @@ class Profile:
     backend_tables: list[str] = field(default_factory=list)  # managed-backend (Supabase/Firestore) collections the
     #     app's OWN runtime traffic read — OBSERVED, so a minified or dynamically-built table name that never
     #     appears as a bundle string literal is still testable by the RLS probes. Never guessed.
+    render_state: str | None = None  # canvas-shell host (Streamlit) render outcome: rendered|error|stuck; None otherwise
 
     @property
     def form_endpoints(self) -> list[str]:  # back-compat for predicates that target form actions
@@ -99,6 +149,7 @@ def profile_to_dict(profile: Profile) -> dict:
         "endpoints": [asdict(e) for e in profile.endpoints],
         "host_tiers": dict(profile.host_tiers),   # off-score telemetry, frozen with the surface so a cached re-grade reports the same backend map
         "backend_tables": list(profile.backend_tables),
+        "render_state": profile.render_state,
     }
 
 
@@ -113,7 +164,8 @@ def profile_from_dict(d: dict) -> Profile:
                    routes=list(d.get("routes") or []), forms=forms,
                    capabilities=dict(d.get("capabilities") or {}), endpoints=endpoints,
                    host_tiers=dict(d.get("host_tiers") or {}),
-                   backend_tables=list(d.get("backend_tables") or []))
+                   backend_tables=list(d.get("backend_tables") or []),
+                   render_state=d.get("render_state"))
 
 
 @dataclass
@@ -139,7 +191,26 @@ class Report:
     surface: dict = field(default_factory=dict)            # what discovery SAW (discovery.surface_metrics)
     coverage: dict = field(default_factory=dict)           # how much of the battery APPLIED (coverage_metrics)
     platform: dict = field(default_factory=dict)           # OFF-SCORE: host platform + AI builder (platform_id)
+    bot_challenge: bool = False                            # target served a WAF/challenge/sleep page at some point
+    challenge_stage: str = ""                              # "entry" (challenge from the first fetch -> ungradeable, excluded)
+    #                                                        vs "late" (all probes ran, THEN the origin challenged -> the
+    #                                                        grade completed and is VALID -> kept). "" = no challenge.
+    challenge_onset: str = ""                              # probe whose traffic first tripped a WAF status (diagnose the trigger)
+    request_counts: dict = field(default_factory=dict)     # {probe_id: request count} — which probes send abnormally many
+    blocked_probes: list = field(default_factory=list)     # probes that DID NOT run because a challenge tripped mid-grade
+    #                                                        (a THIRD state distinct from clean/n-a: not tested, not absent-
+    #                                                        surface). A multi-pass grade re-runs these; whatever stays here
+    #                                                        after passes exhaust is honestly UNTESTED -> never a false clean.
+    incomplete_axes: list = field(default_factory=list)    # bundles with >=1 blocked probe -> that axis is PARTIAL, must not
+    #                                                        rank as clean (e.g. "security: partial — N severe edge-blocked")
     trace: list = field(default_factory=list)              # --trace only: every request each probe sent (net.start_trace)
+    session_replay: dict | None = None                     # the replayable session (Cookie/Bearer/apikey) the grade
+    #                                                        ESTABLISHED, so a subset RETRY can --header it and SKIP the
+    #                                                        26-nav browser register walk (which re-hammers the app and
+    #                                                        re-trips its per-app WAF block). None = no session captured.
+    session_established: object = None                     # True = session captured; False = registration was ATTEMPTED
+    #                                                        and FAILED (no self-serve signup / SSO / captcha) -> a retry
+    #                                                        must NOT re-walk a doomed signup; None = never attempted.
 
     @property
     def by_id(self) -> dict[str, str]:

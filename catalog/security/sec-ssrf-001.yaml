@@ -4,6 +4,7 @@ category: ssrf
 pool: public
 evidence_model: provable
 penalty: 35   # server-side request forgery -> internal network access / cloud-metadata theft
+severity: {cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N", cvss_score: 7.5, vrt: "P2", range: [40, 91], default: 40, escalators: [{evidence: internal_reached, point: 70, vrt_variant: "server made the forged request (SSRF confirmed)"}, {evidence: sensitive_fields, point: 91, vrt_variant: "reached cloud metadata / internal secrets"}]}   # fires on a confirmed server-side request -> 70
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:

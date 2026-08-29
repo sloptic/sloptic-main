@@ -7,10 +7,20 @@ penalty: 12   # a control wired to nothing is low-severity but every-user (the A
               # advertises an action it doesn't deliver. Priced BELOW a broken link (24) — dead controls
               # span a wide severity range (a dead primary CTA vs a decorative toggle) and we can't tell
               # which; ONE finding regardless of count (the evidence carries the labels).
+severity: {iso_25010: "functional-suitability", nielsen: "2->3", range: [30, 50], default: 30, escalators: [{evidence: primary_cta, point: 50, vrt_variant: "a dead PRIMARY CTA (submit/save/buy/checkout) blocks the core workflow"}]}
 applicability:
   requires: [browser]   # must render + click to observe effect; N/A without --browser
 probe:
   predicate: dead_controls_present
   target: /              # the entry page's controls — where the primary actions live
   max_controls: 10       # bound the clicks (safety + wall-clock); reveal-safe controls only (_NO_CLICK denylist)
-  threshold: 0           # any inert control fires
+  threshold: 0           # any inert control fires -- a SINGLE dead control is REAL (a dead Login button is the
+                         # AI-shell tell). v18 live-audit: ~95% precise; the audit's "require >=2" was WRONG --
+                         # it would suppress 28+ genuinely-dead CTAs (Login/Try now/GO PRO/...). The one FP class,
+                         # download-link anchors, is closed in the observer's download channel (browser.py), not
+                         # by raising this threshold.
+tp_definition: |
+  TP: a control that presents an action does NOTHING when activated -- the UI lies about what it can do.
+  NOT (confounders/FP): the control DOES act via a channel the probe cannot observe -- canvas/WebGL draw,
+  input.value= form-fill, new-tab/popup, clipboard, an already-active re-click, or an effect completing after
+  the observation window. Probe-blind != dead.

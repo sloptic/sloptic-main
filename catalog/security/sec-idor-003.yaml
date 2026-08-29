@@ -9,3 +9,4 @@ applicability:
   requires: [has_auth_entrypoint]
 probe:
   predicate: idor_user_record
+severity_ref: access-control   # shared block in catalog/_severity_classes.yaml (idor_user_record sets cross_user_read + sensitive_fields)

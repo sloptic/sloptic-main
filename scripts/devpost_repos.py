@@ -14,10 +14,12 @@ Two modes, toggled by flag:
 Repos go to stdout (one per line — pipeable); progress goes to stderr. `--json` emits
 {hackathon, project, repo} records instead.
 
-How it works (verified 2026): Devpost's hackathons API (`/api/hackathons`) is open JSON. The GLOBAL
-software gallery is AWS-WAF-blocked, but each hackathon's OWN submissions pages
-(`<slug>.devpost.com/submissions/search?page=N`) are plain server-rendered HTML with no WAF — so this
-needs only httpx + a browser UA (no key, no Playwright). A project's real repo lives in the page's
+How it works (verified 2026): Devpost's hackathons API (`/api/hackathons`) is open JSON. Each hackathon's
+OWN submissions pages (`<slug>.devpost.com/submissions/search?page=N`) are server-rendered HTML fetchable
+with httpx + a browser UA (no key, no Playwright). They ARE fronted by an AWS WAF that rate-limits per
+client under load, so `_get` retries with backoff and `page_projects` warns loudly on a persistent 403
+(distinct from an empty gallery) instead of silently reading a block as 'no projects'. A short UA string
+(bare `Mozilla/5.0`) is 403'd; the full Chrome UA below passes. A project's real repo lives in the page's
 `app-links` block (embedded vendor scripts like newrelic sit outside it, so they're excluded).
 """
 import argparse
@@ -105,11 +107,42 @@ class IngestCache:
             append_jsonl(self.path, {"k": key, "v": val})
 
 
-def _get(client, url, **kw):
-    try:
-        return client.get(url, headers={"User-Agent": UA}, timeout=25, **kw)
-    except httpx.HTTPError:
-        return None
+# Devpost's AWS-WAF answers a rate-limited client several ways, NONE of them an empty gallery: 403/429/503,
+# and -- observed on the Dell under fan-out load -- a 202 or 405 CAPTCHA/Challenge with a 0-byte body. A real
+# gallery is always 200 + ~140KB, so every one of these on this endpoint is a block to retry, never "no page".
+_BLOCK_STATUS = frozenset({202, 403, 405, 429, 503})
+_DEBUG = bool(os.environ.get("DEVPOST_DEBUG"))   # DEVPOST_DEBUG=1 -> page_projects logs status/size/item-count
+
+
+def _get(client, url, tries=5, **kw):
+    """GET with retry + backoff on a transient WAF block (202 / 403 / 405 / 429 / 503) OR a transport error.
+    Devpost fronts its submissions subdomains with an AWS WAF that rate-limits per client under load, a burst
+    of slugs/pages can start challenging mid-run (a 0-byte 202/405 CAPTCHA, a 403/429/503, or a dropped
+    connection). Returns the response (even a FINAL block, so the caller can tell a WAF challenge from a 404 /
+    empty gallery and warn instead of silently reading it as 'no projects'), or None if it never got one."""
+    delay = 1.5
+    r = None
+    for i in range(tries):
+        try:
+            r = client.get(url, headers={"User-Agent": UA}, timeout=25, **kw)
+        except httpx.HTTPError as e:                    # RST / SSL / timeout: the WAF drops connections too
+            if _DEBUG:
+                sys.stderr.write(f"  [debug] _get TRANSPORT-ERROR {type(e).__name__}: {e} "
+                                 f"(try {i + 1}/{tries})  url={url}\n")
+            r = None
+            if i < tries - 1:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            return None
+        if r.status_code not in _BLOCK_STATUS:
+            return r
+        if _DEBUG:
+            sys.stderr.write(f"  [debug] _get block HTTP {r.status_code} (try {i + 1}/{tries})  url={url}\n")
+        if i < tries - 1:
+            time.sleep(delay)
+            delay *= 2                # backoff 1.5s, 3s, 6s, 12s: rides out a transient rate window
+    return r                          # still blocked after retries -> hand the 403 back so the caller warns
 
 
 def hackathon_slugs(client, query, count, completed):
@@ -148,14 +181,31 @@ def page_projects(client, slug, page, cache=None):
     if cache is not None and cache.has(ck):
         return [tuple(x) for x in cache.get(ck)]        # JSON stored each (url, winner) pair as a list
     r = _get(client, _SUBS.format(slug=slug, page=page))
-    if not r or r.status_code != 200:
-        return []                                       # transient/unreachable -> do NOT cache
+    if r is None:
+        if _DEBUG:
+            sys.stderr.write(f"  [debug] {slug} p{page}: _get returned None (transport error) -> [] uncached\n")
+        return []                                       # transport error -> transient, retry next run (uncached)
+    if r.status_code in _BLOCK_STATUS:                  # AWS-WAF block AFTER retries -> NOT an empty gallery
+        sys.stderr.write(f"  ⚠ {slug} page {page}: Devpost WAF-blocked ({r.status_code}) after retries — this "
+                         f"client is being rate-limited, NOT an empty gallery. Yields 0 here; fetch from a "
+                         f"less-loaded client, slow down (raise the politeness delay), or wait for the window.\n")
+        return []                                       # uncached (retries next run), but the user now KNOWS why
+    if r.status_code != 200:
+        if _DEBUG:
+            sys.stderr.write(f"  [debug] {slug} p{page}: HTTP {r.status_code} (not 200, not in block set) "
+                             f"{len(r.text)}B -> [] uncached  <-- silent non-200 (WAF CAPTCHA is often 202/405?)\n")
+        return []                                       # genuine 404 / other -> no such gallery page
     out, seen = [], set()
     for block in _GALLERY_SPLIT.split(r.text)[1:]:
         m = _PROJ.search(block)
         if m and m.group(0) not in seen:
             seen.add(m.group(0))
             out.append((m.group(0), bool(re.search(r"\bwinner\b", block, re.I))))
+    if _DEBUG:                                          # DEVPOST_DEBUG=1: what did the REAL fetch actually return?
+        items = len(_GALLERY_SPLIT.split(r.text)) - 1
+        sys.stderr.write(f"  [debug] {slug} p{page}: HTTP {r.status_code} {len(r.text)}B "
+                         f"gallery-items={items} parsed={len(out)}"
+                         f"{'  <-- 200 but 0 items (interstitial?)' if items == 0 else ''}\n")
     if cache is not None:
         cache.put(ck, out)                              # a genuine 200 (even empty = gallery end) is cacheable
     return out

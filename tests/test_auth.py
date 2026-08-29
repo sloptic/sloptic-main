@@ -139,6 +139,33 @@ def test_find_json_login_accepts_a_real_auth_failure():
     assert path is not None and r.status_code == 401
 
 
+def test_find_json_login_rejects_a_2xx_that_accepts_wrong_creds():
+    # usaii /api/sessions returned 201 {"sessionId":...} for WRONG creds -- it ACCEPTED them, so it is not a
+    # login REJECTION to rate-limit (that's a different bug). A 2xx must not be read as a login surface here.
+    c = httpx.Client(base_url="http://t", transport=httpx.MockTransport(
+        lambda req: httpx.Response(201, json={"sessionId": "abc"})))
+    assert find_json_login(c) == (None, None, None)
+
+
+def test_find_json_login_rejects_a_generic_server_error_page():
+    # geoiq /users/login served a bare nginx "400 Bad Request" (text/html): the SERVER rejecting the request
+    # shape, not the APP rejecting credentials. Not a login surface -> no phantom rate-limit finding.
+    c = httpx.Client(base_url="http://t", transport=httpx.MockTransport(
+        lambda req: httpx.Response(400, headers={"content-type": "text/html"},
+                                   text="<html><head><title>400 Bad Request</title></head><body>"
+                                        "<center><h1>400 Bad Request</h1></center></body></html>")))
+    assert find_json_login(c) == (None, None, None)
+
+
+def test_find_json_login_accepts_an_html_credential_rejection():
+    # a real login CAN reject wrong creds in HTML with a credential phrase -> still a login surface
+    c = httpx.Client(base_url="http://t", transport=httpx.MockTransport(
+        lambda req: httpx.Response(401, headers={"content-type": "text/html"},
+                                   text="<html><body>Invalid email or password</body></html>")))
+    path, _creds, r = find_json_login(c)
+    assert path is not None and r.status_code == 401
+
+
 # --- a GUESSED login path must be anchored under the APP, never the origin -----------------------
 # A sub-path deployment must not inherit a NEIGHBOUR's login when we invent the path rather than read it off
 # the page. This is a real correctness fix. It is NOT, however, what clears the GapBench control false

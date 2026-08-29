@@ -4,6 +4,7 @@ category: mixed-content
 pool: public
 evidence_model: provable
 penalty: 20   # https page loads http:// subresources -> MITM can tamper; active mixed content is blocked
+severity: {cvss: "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:L/A:N", cvss_score: 4.2, vrt: "P5", range: [10, 10], default: 10}   # REPRICED 20->10 (P5)
 applicability:
   requires: [at_least_one_http_endpoint_exists]   # further self-gated to https pages by the predicate
 probe:

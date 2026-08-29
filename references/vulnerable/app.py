@@ -91,9 +91,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path == "/":
             return self._send(200, HOME)
         if self.path == "/config.js":  # leaks a (fake, non-placeholder) AWS key in client JS — classic slop;
-            # also ships a jQuery with a known XSS CVE (sec-deps-001 supply-chain) via its license banner
+            # ships a jQuery with a known XSS CVE (sec-deps-001) via its license banner, AND points its API at
+            # localhost + an unset build-time env var (qa-deploy-001: backend dead for every real visitor)
             return self._send(200, '/*! jQuery v1.12.4 | (c) jQuery Foundation | jquery.org/license */\n'
-                                    'const AWS_KEY = "AKIAZ3PK7NBQWXYZ1234";\n', "application/javascript")
+                                    'const AWS_KEY = "AKIAZ3PK7NBQWXYZ1234";\n'
+                                    'const API_BASE = "http://localhost:8000/api";\n'
+                                    'const CDN_URL = "https://undefined/assets";\n', "application/javascript")
         if self.path == "/.env":  # secrets file served at the webroot — deployment slop
             return self._send(
                 200, "DATABASE_URL=postgres://app:hunter2@db/app\nDJANGO_SECRET_KEY=insecure-dev-key\n",
@@ -183,8 +186,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path == "/register":
             length = int(self.headers.get("Content-Length", "0"))
             form = urllib.parse.parse_qs(self.rfile.read(length).decode())
-            user = form.get("username", ["anon"])[0] or "anon"
+            user = form.get("username", [""])[0]
+            if not user:
+                return self._send(400, "username required")  # the field IS required -> an empty body is rejected
             _SESSIONS[user] = user  # vulnerable: session token == username (guessable)
+            # ...but the declared type=email is NEVER validated: an invalid email is accepted (client-only
+            # validation) -> qa-input-001 fires. Rejecting the empty body is what makes it an INPUT-DEPENDENT
+            # enforcement gap, not the shell/auth-guard pattern the probe now (correctly) suppresses.
             return self._send(200, "account created", cookie="session=" + user)
         if self.path == "/notes":  # create a note owned by the current session's user
             length = int(self.headers.get("Content-Length", "0"))

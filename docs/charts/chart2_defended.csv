@@ -1,0 +1,4 @@
+metric,median_slop,n_graded
+worst_case_potential,866,1528
+actual,49,1528
+defended_pct,94.3,1528

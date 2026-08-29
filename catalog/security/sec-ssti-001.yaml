@@ -4,6 +4,7 @@ category: template-injection
 pool: public
 evidence_model: provable
 penalty: 40   # server-side template injection -> code execution (RCE), top-tier severity
+severity_ref: code-injection
 applicability:
   requires: [any_endpoint_accepts_text_input]
 probe:

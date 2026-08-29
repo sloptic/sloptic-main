@@ -81,7 +81,30 @@ def _password_form(forms: list[Form]) -> Form | None:
     return next((f for f in pw if any(h in f.action.lower() for h in _REGISTER_HINTS)), pw[0])
 
 
-def _fill(form: Form, username: str, password: str) -> dict[str, str]:
+_MAGIC_LINK_HINTS = ("login", "signin", "sign-in", "sign_in", "log-in", "auth", "magic", "otp",
+                     "passwordless", "session", "email-link", "email_link")
+
+
+def _email_only_form(forms: list[Form]) -> Form | None:
+    """A PASSWORDLESS (magic-link / email-OTP) auth form: an email field, NO password field, and an auth-hinted
+    action -- the app emails a login link instead of taking a password. Distinct from _password_form (which
+    skips it for want of a password) and from a newsletter/contact form (excluded by the auth-hint requirement,
+    so we never POST an email to a subscribe box). Prefers an explicitly magic/OTP-hinted action."""
+    _NOT_AUTH = ("subscribe", "newsletter", "contact", "waitlist", "notify", "feedback")
+    cands = [
+        f for f in forms
+        if any(("email" in n.lower() or "mail" in n.lower()) for n in f.fields)
+        and not any("pass" in n.lower() or "pwd" in n.lower() for n in f.fields)
+        and any(h in f.action.lower() for h in _MAGIC_LINK_HINTS)
+        and not any(h in f.action.lower() for h in _NOT_AUTH)   # a subscribe/contact box that happens to carry "auth"
+    ]
+    if not cands:
+        return None
+    strong = ("magic", "otp", "passwordless", "email-link", "email_link")
+    return next((f for f in cands if any(h in f.action.lower() for h in strong)), cands[0])
+
+
+def _fill(form: Form, username: str, password: str, email: str | None = None) -> dict[str, str]:
     data = {}
     for name in form.fields:
         low = name.lower()
@@ -90,7 +113,7 @@ def _fill(form: Form, username: str, password: str) -> dict[str, str]:
         if "pass" in low or "pwd" in low or "retype" in low or "repeat" in low:
             data[name] = password
         elif "email" in low or "mail" in low:
-            data[name] = username + "@example.com"
+            data[name] = email or (username + "@example.com")   # email-verification probes inject a real address we own
         else:
             data[name] = username
     return data
@@ -276,13 +299,19 @@ def _login_forms_at(base_url: str, client: httpx.Client) -> list:
 
 
 def register_account(base_url: str, profile: Profile, suffix: str = "", browser_register=None,
-                     headers=None) -> Account | None:
+                     headers=None, email_verify=None) -> Account | None:
     """Create a fresh account (self-as-oracle) for the authed-surface probes. httpx registration first (HTML
     form POST, else JSON-API); if that establishes NO session — the SPA case, where the form's action is a
     placeholder and the real registration is a JS fetch — and a `browser_register` callback is supplied, drive
     the BROWSER to register (its own JS makes the real request) and use the session cookie/token it establishes.
-    Returns None when nothing establishes a session (email-verify / CAPTCHA / SSO / third-party auth) -> caller
-    reads N/A. If the caller supplied a session via --header (Option B), that is used directly (single identity)."""
+    Returns None when nothing establishes a session (CAPTCHA / SSO / third-party auth) -> caller reads N/A. If
+    the caller supplied a session via --header (Option B), that is used directly (single identity).
+
+    `email_verify`, when supplied (built by ctx.register from the configured email receiver), is the EMAIL-GATED
+    lane: given the session-less httpx account, complete the emailed verification and return a fresh
+    session-carrying Account, or None. It runs BEFORE the browser launch — completing a real email confirmation
+    is cheaper than a browser register and yields the identity the app actually intends, so the authed-surface
+    probes see the logged-in surface (the reason the receiver exists)."""
     LAST_BROWSER_DIAG.clear()
     if _provided_session(headers):
         return _account_from_headers(base_url, headers)
@@ -299,6 +328,15 @@ def register_account(base_url: str, profile: Profile, suffix: str = "", browser_
     if _has_session(acct):
         _carry_secure_cookies_over_http(base_url, acct.client)
         return acct
+    # EMAIL-VERIFICATION lane, before the (expensive) browser launch. The callback owns the receiver + the
+    # shared, memoized flow and its own email-gated gate; it returns a session-carrying Account only when the
+    # signup was email-gated AND completing the verification logged us in (else None -> fall through).
+    if email_verify is not None:
+        verified = email_verify(acct)
+        if verified is not None:
+            if acct is not None and verified is not acct:
+                acct.client.close()
+            return verified
     # Two remaining lanes, and their ORDER costs a finding either way round.
     #
     # BROWSER first when a callback is available: it registers the way the app's own JS does, so it observes the
@@ -331,20 +369,22 @@ def register_account(base_url: str, profile: Profile, suffix: str = "", browser_
     return acct
 
 
-def _register_httpx(base_url: str, profile: Profile, suffix: str = "") -> Account | None:
+def _register_httpx(base_url: str, profile: Profile, suffix: str = "", email: str | None = None) -> Account | None:
     """Register via the discovered HTML form (POST its action) or a JSON API. Returns None on a transport error;
-    an Account even when no session cookie came back (the caller checks _has_session; the probes then read N/A)."""
+    an Account even when no session cookie came back (the caller checks _has_session; the probes then read N/A).
+    `email`, when set, fills the email field(s) instead of a dummy @example.com -- the email-verification probes
+    register with a real address they control so the confirmation mail is actually receivable."""
     form = _password_form(profile.forms)
     if form is None:
         # no HTML form -> JSON-API registration + login, preferring endpoints named in the spec
-        return _register_json(base_url, suffix, profile)
+        return _register_json(base_url, suffix, profile, email)
     # per-call random username: a real app with a unique-username constraint rejects a FIXED name on
     # re-grade (run 2+), silently nulling the authed session and flipping the auth probes to clean.
     # The score depends on the cookie's flags, not the username value, so this stays deterministic.
     username = "hl_" + secrets.token_hex(5) + suffix
     password = "Hl-Probe-Passw0rd!"
     client = httpx.Client(base_url=base_url, timeout=15.0, follow_redirects=True)
-    data = _fill(form, username, password)
+    data = _fill(form, username, password, email)
     try:
         # GET the form's page first: sets the CSRF cookie and lets us read the token out of the HTML,
         # so a CSRF-protected registration (Gitea, Django, Rails, ...) is accepted instead of rejected.
@@ -392,6 +432,13 @@ def _bearer_token(resp: httpx.Response) -> str | None:
     return None
 
 
+# a CREDENTIAL-rejection phrase (for an HTML login answer), deliberately NOT matching a generic server-error
+# page like nginx "400 Bad Request" / "403 Forbidden" -- those are the request/server saying no, not the app
+# rejecting credentials (geoiq /users/login served a bare nginx 400 and read as a login surface).
+_AUTH_REJECT_PHRASE = re.compile(r"invalid|incorrect|unauthor|wrong\s+(?:password|credential|email|user)|"
+                                 r"\bcredential|login\s+failed|authentication\s+failed", re.I)
+
+
 def find_json_login(client: httpx.Client, root: str = ""):
     """Probe common JSON login endpoints with a wrong-creds body; return (path, creds, response) for
     the first that behaves like a REAL login, else (None, None, None). Lets the rate-limit probe reach
@@ -431,9 +478,23 @@ def find_json_login(client: httpx.Client, root: str = ""):
         if r.status_code in (404, 405, 501):
             continue
         ct = r.headers.get("content-type", "").lower()
-        # a genuine login rejects wrong creds (400/401/403/422) or answers in JSON; a static SPA returns
-        # 200 text/html (its shell) for everything — that's not a login surface, so keep looking.
-        if r.status_code in (400, 401, 403, 422) or "json" in ct:
+        body = ""
+        try:
+            body = r.text[:5000]
+        except Exception:
+            pass
+        rejects = bool(_AUTH_REJECT_PHRASE.search(body))
+        # A login SURFACE is one that REJECTS wrong creds. Three shapes are NOT that, each a v18 json-login FP:
+        #   - a 2xx SUCCESS body (usaii /api/sessions -> 201 {"sessionId":...}): it ACCEPTED the garbage creds,
+        #     so it is not a rejection to rate-limit. A 2xx qualifies ONLY if the body itself says it rejected
+        #     them (some real logins answer 200 + {"error":"invalid credentials"}).
+        #   - a redirect (3xx): a platform auth handoff, not the app rejecting creds.
+        #   - a bare server-error page (nginx "400 Bad Request" text/html): the SERVER rejected the request
+        #     shape, not the APP rejecting credentials (geoiq /users/login).
+        if r.status_code in (400, 401, 403, 422):
+            if "json" in ct or rejects:
+                return path, creds, r
+        elif 200 <= r.status_code < 300 and rejects:
             return path, creds, r
     return None, None, None
 
@@ -486,12 +547,82 @@ def _auth_shaped(r: httpx.Response) -> bool:
     return "json" in ct or bool(r.headers.get_list("set-cookie")) or _bearer_token(r) is not None
 
 
-def _register_json(base_url: str, suffix: str, profile=None) -> Account | None:
+_FORGOT_HINTS = ("forgot", "reset", "recover", "password-reset", "password_reset", "lost-password",
+                 "lost_password", "recovery")
+
+
+def _forgot_form(forms: list[Form]) -> Form | None:
+    """A FORGOT-PASSWORD form: an email field, NO password field (you request a reset link, you don't set a
+    password here), and a forgot/reset/recover-hinted action. Email-only + the reset hint keeps it distinct from
+    the login form and from a magic-link form (_email_only_form's auth hints don't include forgot/reset)."""
+    cands = [
+        f for f in forms
+        if any(("email" in n.lower() or "mail" in n.lower()) for n in f.fields)
+        and not any("pass" in n.lower() or "pwd" in n.lower() for n in f.fields)
+        and any(h in f.action.lower() for h in _FORGOT_HINTS)
+    ]
+    return cands[0] if cands else None
+
+
+def _trigger_reset_httpx(client: httpx.Client, base_url: str, form: Form, email: str) -> bool:
+    """POST a forgot-password form with OUR controlled address so the app mails us a reset link. Returns True when
+    the request was submitted (2xx/3xx), False on a transport error or a 4xx/5xx that means the request did not
+    take. CSRF-handled like _register_httpx. NEVER call this with anything but an address we own."""
+    data = {}
+    for name in form.fields:
+        low = name.lower()
+        data[name] = email if ("email" in low or "mail" in low) else "hl_reset"
+    try:
+        try:
+            token = _csrf_token(client.get(form.action).text)
+            if token:
+                for name in form.fields:
+                    if is_csrf_field(name):
+                        data[name] = token
+        except (httpx.HTTPError, httpx.InvalidURL):
+            pass
+        resp = client.request("POST", form.action, data=data)
+    except (httpx.HTTPError, httpx.InvalidURL):
+        return False
+    return resp.status_code < 400
+
+
+def _register_passwordless(base_url: str, profile: Profile, suffix: str = "",
+                           email: str | None = None) -> Account | None:
+    """MAGIC-LINK lane (server-rendered): POST a passwordless email-only auth form with OUR controlled address
+    so the app emails a login link. Returns an Account whose register_response the email-verification flow reads
+    (announces_pending_email -> email-gated) and whose client the existing httpx follow reuses to CLICK the
+    emailed link (_follow_verification auto-logs us in). None when there's no email-only auth form -> the caller
+    falls through to the other lanes. No password: the whole point of the lane."""
+    form = _email_only_form(profile.forms)
+    if form is None:
+        return None
+    username = "hl_" + secrets.token_hex(5) + suffix
+    client = httpx.Client(base_url=base_url, timeout=15.0, follow_redirects=True)
+    data = _fill(form, username, "", email)   # fills the email field with our address; no password field to set
+    try:
+        try:
+            token = _csrf_token(client.get(form.action).text)
+            if token:
+                for name in form.fields:
+                    if is_csrf_field(name):
+                        data[name] = token
+        except (httpx.HTTPError, httpx.InvalidURL):
+            pass
+        resp = client.request("POST", form.action, data=data)
+    except (httpx.HTTPError, httpx.InvalidURL):
+        client.close()
+        return None
+    return Account(username=username, password="", client=client, register_response=resp)
+
+
+def _register_json(base_url: str, suffix: str, profile=None, email: str | None = None) -> Account | None:
     """Self-register via a JSON API (no HTML form): try register endpoints (spec-named first), then
-    log in for an authed session — a bearer token (default Authorization header) or a session cookie."""
+    log in for an authed session — a bearer token (default Authorization header) or a session cookie.
+    `email`, when set, overrides the dummy address (email-verification probes register a real one they own)."""
     username = "hl_" + secrets.token_hex(5) + suffix
     password = "Hl-Probe-Passw0rd!"
-    email = username + "@example.com"
+    email = email or (username + "@example.com")
     # order: named in a spec -> inferred from an observed auth namespace -> the generic conventions
     register_paths = list(dict.fromkeys(_spec_auth_paths(profile, _REGISTER_KW)
                                         + _sibling_auth_paths(profile, _REGISTER_KW)
@@ -598,12 +729,26 @@ _PROVIDER_SESSION = ("auth0",)
 # JS-readable (judging it would report a false hygiene failure), a refresh token is not the access session,
 # and an email/verification token is not a login. Exclusions win over hints.
 _NOT_SESSION = ("csrf", "xsrf", "antiforgery", "anti-forgery", "authenticity", "verification", "verify",
-                "refresh")
+                "refresh", "code-verifier", "code_verifier", "clerk_db_jwt", "taboola")
 # `authenticity` was missing and is a pre-existing FP vector this file's own precision test caught: Rails names
 # its CSRF token `authenticity_token`, which contains "token" and so matched as a session. is_csrf_field already
 # listed it for FORM fields (_CSRF_FIELD_HINTS) while the COOKIE check did not — the two lists had drifted. A
 # CSRF cookie is deliberately JS-readable, so judging one reports a false "missing HttpOnly" on an app doing
 # nothing wrong, which is precisely what these exclusions exist to prevent.
+#
+# The last four were the ENTIRE sec-session-001 fire set on the v18 corpus (23/23 findings, a 100%-FP probe),
+# all client-readable-BY-DESIGN vendor cookies namespaced into the auth family but NOT the app's session:
+#   `code-verifier`  Supabase/PKCE `sb-<ref>-auth-token-code-verifier` — the pre-login OAuth nonce (9 apps).
+#                    The real session is a JWT in localStorage, which sec-session-005 already judges. The SDK
+#                    MUST read the verifier from JS to complete the code exchange, so HttpOnly is impossible.
+#   `clerk_db_jwt`   Clerk's dev-instance handshake cookie `__clerk_db_jwt[_suffix]` (13 apps). Clerk's real
+#                    session is `__session` (HttpOnly, and still judged); the db-jwt is JS-read by the FAPI
+#                    client by design. Matched here only via the "jwt" hint.
+#   `taboola`        `taboola_session_id`, a third-party ad-network tracker (1 app) — session-NAMED but not an
+#                    app login at all. Matched via the "session" hint.
+# The verifier/db-jwt were selected because `session_cookie()` prefers a token-shaped value and their opaque
+# base64url bodies pass `_token_shaped`, so nothing downstream rescued the pick. Same bar as every other entry
+# here: added only after being VERIFIED on live findings, never speculatively.
 
 
 def _is_session_cookie(name: str) -> bool:

@@ -1,0 +1,15 @@
+id: perf-font-001
+bundle: performance
+category: font-loading
+pool: public
+evidence_model: oracle
+penalty: 6   # PROVISIONAL (re-priced on v19). Blocking font-display (FOIT). Lighthouse font-display-insight
+             # excludes next/font local() fallbacks + handles encoded display=swap (our probe got both wrong).
+applicability:
+  requires: [lighthouse]
+probe:
+  predicate: lighthouse_audit
+  report_only: true   # OFF-SCORE: fires as a per-metric diagnostic finding at 0 penalty;
+                      # the perf axis is scored once on the overall headline (perf-lighthouse-001).
+  audit: font-display-insight
+  mode: score

@@ -116,11 +116,11 @@ def test_a_curve_is_provisional_until_declared_final_and_says_so():
 
 def test_slop_potential_reconstructs_via_the_real_damping_and_never_undercuts_the_score():
     idx = _catalog_index()
-    # two applicable probes in DIFFERENT categories (headers-002 pen 8, ratelimit-001 pen 15); only one fired.
-    # worst case = both fire = 8 + 15 = 23, damped identically to the real score (no cross-category decay).
+    # two applicable probes in DIFFERENT categories (headers-002 pen 8, ratelimit-001 pen 30 post-v2-reprice);
+    # only one fired. worst case = both fire = 8 + 30 = 38, damped identically (no cross-category decay).
     rec = {"slop_score": 8, "coverage": {"applied": ["sec-headers-002", "sec-ratelimit-001"]},
            "findings": [{"probe_id": "sec-headers-002", "category": "security-headers"}]}
-    assert _slop_potential(rec, idx) == 23
+    assert _slop_potential(rec, idx) == 38
     assert _slop_potential(rec, idx) >= rec["slop_score"]        # the invariant: worst case never below actual
     # a native field emitted at grade time wins over reconstruction
     assert _slop_potential({"slop_potential": 42, "coverage": {"applied": []}}, idx) == 42
@@ -128,12 +128,18 @@ def test_slop_potential_reconstructs_via_the_real_damping_and_never_undercuts_th
 
 def test_rank_key_puts_clean_before_catastrophe_and_rewards_defended_surface():
     same = 50
-    clean_hi = _key(same, False, 300, 5)      # defended a big worst case
-    clean_lo = _key(same, False, 200, 5)      # defended a smaller one
-    catastro = _key(same, True, 300, 5)       # same score, but a catastrophe fired
+    # maxpen held equal (30) so the slop_potential comparison is what decides in this trio
+    clean_hi = _key(same, False, 30, 300, 5)  # defended a big worst case
+    clean_lo = _key(same, False, 30, 200, 5)  # defended a smaller one
+    catastro = _key(same, True, 30, 300, 5)   # same score, but a catastrophe fired
     assert clean_hi < clean_lo                # more defended potential ranks better at equal slop
     assert clean_hi < catastro and clean_lo < catastro   # any clean tie beats a catastrophe tie
-    assert _key(49, True, 0, 0) < _key(50, False, 999, 99)   # slop still dominates every tiebreak
+    assert _key(49, True, 90, 0, 0) < _key(50, False, 0, 999, 99)   # slop still dominates every tiebreak
+    # weakest-link: at equal slop + catastrophe, a SMALLER worst finding ranks earlier, and it outranks a
+    # bigger defended potential (max_penalty sits ABOVE slop_potential in the chain)
+    small_worst = _key(same, False, 30, 200, 5)   # worst finding 30, defended less
+    big_worst = _key(same, False, 70, 999, 9)     # worst finding 70, defended MORE
+    assert small_worst < big_worst
 
 
 def test_build_stores_the_distribution_and_ranks_exactly_off_it():

@@ -134,4 +134,4 @@ def test_catalog_wires_sec_upload_002_to_a_registered_predicate():
     probe = next((p for p in cat if p.id == "sec-upload-002"), None)
     assert probe is not None, "sec-upload-002 missing from the catalog"
     assert probe.probe.get("predicate") in PREDICATES, "sec-upload-002 predicate not registered in PREDICATES"
-    assert probe.penalty == 35
+    assert probe.penalty == 40   # nominal synced to the xss severity default (reflected floor; was a flat 35)

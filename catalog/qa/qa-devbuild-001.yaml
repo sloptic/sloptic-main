@@ -13,6 +13,7 @@ penalty: 15   # frequency(rare in a CDN-deployed corpus, EXPECTED where the play
 # means discovered API endpoints, and a dev-server SPA has none, so a real Vite dev server graded clean while
 # the predicate itself returned True when called directly. The unit tests passed and the direct call passed;
 # only an end-to-end grade against a live dev server exposed it.
+severity: {iso_25010: "functional-suitability", nielsen: "2", range: [28, 28], default: 28}   # dev build in prod: wrong artifact
 probe:
   predicate: development_build_served
   target: /   # routed through _home_path -> the discovered landing page, so a sub-path deployment is graded

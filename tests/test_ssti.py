@@ -39,6 +39,10 @@ class _App(http.server.BaseHTTPRequestHandler):
         name = parse_qs(u.query).get("name", [""])[0]
         if u.path == "/tmpl":                      # input rendered THROUGH the template engine -> SSTI
             self._send("<h1>Hello %s</h1>" % _render(name))
+        elif u.path == "/jinja":                   # ONLY the Jinja2 gadget (contains `cycler`) executes here,
+            salt = re.search(r"hlssti[0-9a-f]+", name)   # so the engine must be identified specifically as jinja2
+            hit = salt and "cycler" in name
+            self._send("<h1>%s</h1>" % (hashlib.sha256(salt.group(0).encode()).hexdigest() if hit else name))
         elif u.path == "/safe":                    # input echoed as data, never evaluated
             self._send("<h1>Hello %s</h1>" % name)
         elif u.path == "/ai":                      # an LLM endpoint: echoes and even FABRICATES a plausible
@@ -67,7 +71,16 @@ def _ctx(url, path):
 
 def test_ssti_fires_when_gadget_is_executed(app):
     # /tmpl runs the hash gadget and returns the salt's real digest -> injectable
-    assert ssti_injectable(_ctx(app, "/tmpl"), _Probe()) is True
+    ctx = _ctx(app, "/tmpl")
+    assert ssti_injectable(ctx, _Probe()) is True
+    assert ctx.evidence.get("engine")             # the winning gadget names the engine that executed it
+
+
+def test_ssti_identifies_the_engine(app):
+    # /jinja executes ONLY the Jinja2 gadget -> the recorded engine fingerprint must be jinja2 specifically
+    ctx = _ctx(app, "/jinja")
+    assert ssti_injectable(ctx, _Probe()) is True
+    assert ctx.evidence.get("engine") == "jinja2"
 
 
 def test_ssti_clean_on_reflection_only(app):

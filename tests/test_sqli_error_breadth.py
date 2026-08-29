@@ -55,6 +55,58 @@ def _handler(bare_quote_errors: bool):
     return H
 
 
+def _reflector_handler():
+    """Emits a DB-error-shaped sentence for ANY non-baseline value (the benign `1` returns rows). The error
+    tracks 'unusual input', not the QUOTE specifically -- an LLM / echoed error-template confound -- so a bare
+    literal with no SQL syntax errors identically. The paired canary in _tech_error is what catches this."""
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            u = urlparse(self.path)
+            if u.path != "/api/users":
+                self.send_response(404); self.end_headers(); self.wfile.write(b"no"); return
+            v = parse_qs(u.query).get("username", [""])[0]
+            body = _ROWS if v == "1" else json.dumps({"error": 'syntax error at or near "%s"' % v}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+    return H
+
+
+def _flaky_handler():
+    """Deterministic endpoint returns rows for the benign value, but errors on the bare quote ONLY the FIRST
+    time and returns rows thereafter -- a flaky upstream / an LLM in the path. The detect send matches; the
+    determinism-gate resend does not reproduce -> suppressed. (Only the exact `'` flakes, so TRUE/FALSE stay
+    stable and the boolean technique cannot fire either.)"""
+    state = {"q": 0}
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            u = urlparse(self.path)
+            if u.path != "/api/users":
+                self.send_response(404); self.end_headers(); self.wfile.write(b"no"); return
+            v = parse_qs(u.query).get("username", [""])[0]
+            errors = False
+            if v == "'":
+                state["q"] += 1
+                errors = state["q"] == 1   # errors once, then clean -> the match will not reproduce
+            body = (json.dumps({"error": "unterminated string at character 35"}).encode()
+                    if errors else _ROWS)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+    return H
+
+
 class _Probe:
     probe = {"max_attempts": 80, "time_delay": 1}
 
@@ -80,6 +132,22 @@ def vulnerable():
 @pytest.fixture
 def clean():
     srv = _serve(False)
+    yield "http://127.0.0.1:%d" % srv.server_address[1]
+    srv.shutdown()
+
+
+@pytest.fixture
+def reflector():
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _reflector_handler())
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield "http://127.0.0.1:%d" % srv.server_address[1]
+    srv.shutdown()
+
+
+@pytest.fixture
+def flaky():
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _flaky_handler())
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
     yield "http://127.0.0.1:%d" % srv.server_address[1]
     srv.shutdown()
 
@@ -110,6 +178,21 @@ def test_the_repro_names_the_payload_that_ACTUALLY_matched(vulnerable):
 def test_an_endpoint_that_errors_on_neither_payload_stays_clean(clean):
     """Precision guard: trying more payloads must not manufacture a finding on a parameterized endpoint."""
     ctx = _Ctx(clean, _profile(clean))
+    assert api_sqli(ctx, _Probe()) is False
+
+
+def test_reflected_sql_error_is_suppressed_by_the_paired_canary(reflector):
+    """v2.0 foundation #2: the endpoint emits a DB-error sentence for a bare non-SQL literal too, so the error
+    is not CAUSED by the quote. Without the canary, `1'` alone fires error-based; the canary confirms a
+    syntax-free literal errors identically and suppresses the non-causal match."""
+    ctx = _Ctx(reflector, _profile(reflector))
+    assert api_sqli(ctx, _Probe()) is False
+
+
+def test_nondeterministic_sql_error_is_suppressed_by_the_determinism_gate(flaky):
+    """v2.0 foundation #1: the quote errors on the detect send but not on the identical resend (flaky upstream /
+    an LLM in the path), so the match does not reproduce and must be treated as can't-assess, not a fire."""
+    ctx = _Ctx(flaky, _profile(flaky))
     assert api_sqli(ctx, _Probe()) is False
 
 

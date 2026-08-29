@@ -5,6 +5,7 @@ variant_group_id: sqli-auth-bypass
 pool: public
 evidence_model: oracle
 penalty: 40
+severity_ref: sql-injection
 applicability:
   requires: [any_endpoint_accepts_text_input]
 probe:

@@ -5,11 +5,13 @@ surface), and not_applicable on the minimal app where the surface is absent. Thi
 exercises both aggregation dampers end-to-end: a SQLi variant group (fires once) and a
 crash-resistance category (diminishing returns).
 """
+import fcntl
 import pathlib
 
 from sloptic.catalog import load_catalog
 from sloptic.deploy import SubprocessDeployer
-from sloptic.pipeline import run
+from sloptic.pipeline import run, _needs_lighthouse
+from sloptic.schema import Applicability, Probe
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 CATALOG = ROOT / "catalog"
@@ -24,27 +26,35 @@ ALL_PROBES = [
     "sec-split-001",  # HTTP response splitting (CRLF into a reflected header)
     "sec-dos-001",  # decompression-bomb: decompresses gzip request bodies with no size cap
     "sec-headers-001", "sec-headers-002", "sec-headers-004", "sec-headers-005", "sec-headers-006",  # header depth (003=HSTS https-only); 006=X-Powered-By
-    "qa-errhyg-001", "perf-ttfb-001",
+    "qa-errhyg-001",
     "sec-debug-001",  # framework debug mode on in prod (Werkzeug debugger page at /crash)
     "sec-exposure-001", "sec-exposure-002", "sec-exposure-003", "sec-exposure-004",  # .env + .git + .aws/credentials
     "sec-idor-001",  # horizontal IDOR (self-as-oracle, two accounts)
     "qa-crash-010",  # crash-resistance: malformed input (values / JSON / decode-crashing path) -> 5xx
     "qa-input-001",  # declared-constraint: /register accepts type=email="hlnotanemail" (client-only validation)
     "qa-race-001",  # race condition: concurrent creates collide on the same id
-    "perf-load-001",  # load resilience: 5xx under a concurrent burst
-    "perf-compress-001",  # no gzip on a sizeable text response
-    "perf-cache-001",  # static asset served with no cache validators -> refetched every load
+    "perf-load-001",  # load resilience: 5xx under a concurrent burst (the one perf probe NOT Lighthouse-backed)
     "qa-http-001",  # soft-404: a nonexistent static asset returns 2xx instead of 404
     "qa-a11y-002",  # static WCAG hard-fails: missing lang / alt / label / title / contrast floor
     "qa-links-001",  # broken navigation: an internal <a href> lands on a 4xx dead end
     "qa-seo-001",  # missing best-practice meta (viewport / description)
     "qa-http-002",  # HTTP conformance: an HTML response with no declared charset
+    "qa-deploy-001",  # v2.0 Family 1: /config.js ships API_BASE=http://localhost + CDN=https://undefined -> backend dead in prod
 ]
+# qa-deploy-002 (redirect loop) is NOT here: like other probes that don't fire on the simple ref, the vuln ref
+# has no looping route, so it grades clean (asserted below) and is wedge-locked in test_redirect_loop.py.
 SURFACE_PROBES = ["sec-sqli-001", "sec-sqli-002", "sec-sqli-003", "sec-xss-001"]
 
 
+def _catalog():
+    # perf is Lighthouse now; the pipeline integration tests exclude the lighthouse_audit probes (a real
+    # Lighthouse run per test is slow + environment-variable, and that path is covered by test_lighthouse_audit
+    # + a live validation). perf-load-001 (the hand-rolled burst-stress probe) is not lighthouse-backed -> stays.
+    return [p for p in load_catalog(CATALOG) if p.probe.get("predicate") != "lighthouse_audit"]
+
+
 def _run(app: str):
-    return run(SubprocessDeployer(str(REFS / app / "app.py")), load_catalog(CATALOG))
+    return run(SubprocessDeployer(str(REFS / app / "app.py")), _catalog())
 
 
 def test_vulnerable_app_accrues_slop():
@@ -90,14 +100,11 @@ def test_vulnerable_app_accrues_slop():
     assert o["sec-domxss-001"] == "not_applicable"
     # qa-race-001 (self-as-oracle): N concurrent creates collide on one id -> non-atomic allocation:
     assert o["qa-race-001"] == "slop_detected"
-    # perf-load-001: /report 5xx's under a concurrent burst (unsynchronized shared state):
+    # perf-load-001: /report 5xx's under a concurrent burst (unsynchronized shared state). The one perf probe
+    # NOT Lighthouse-backed -> still tested here; the Lighthouse-backed perf probes are covered separately.
     assert o["perf-load-001"] == "slop_detected"
-    # perf-compress-001: the homepage HTML is served uncompressed (no Content-Encoding):
-    assert o["perf-compress-001"] == "slop_detected"
     # qa-crash-010: malformed input (nasty field values / JSON / decode-crashing path) -> unhandled 5xx:
     assert o["qa-crash-010"] == "slop_detected"
-    # perf-cache-001: /config.js (a static asset) ships no Cache-Control / ETag -> refetched every load:
-    assert o["perf-cache-001"] == "slop_detected"
     # qa-http-001: a nonexistent /<rand>.js falls through to a 200 index shell (soft-404), not a 404:
     assert o["qa-http-001"] == "slop_detected"
     # qa-a11y-002 (no browser): <html> has no lang, inputs are placeholder-only (no accessible name),
@@ -105,6 +112,13 @@ def test_vulnerable_app_accrues_slop():
     assert o["qa-a11y-002"] == "slop_detected"
     # qa-links-001: the homepage's <a href="/login"> dead-ends on a 404 (login is POST-only) -> broken nav:
     assert o["qa-links-001"] == "slop_detected"
+    # qa-deploy-002: none of the vuln ref's linked routes redirect-loop (they 404/500/200, not endlessly) -> clean
+    assert o["qa-deploy-002"] == "clean"
+    # qa-deploy-003 (oauth localhost): the vuln ref has no OAuth flow -> N/A; sec-tls-001 (no-TLS): the ref is
+    # served on loopback (http://127.0.0.1), a local host that is http by nature -> N/A (not a public cleartext origin)
+    assert o["qa-deploy-003"] == "not_applicable"
+    assert o["sec-tls-001"] == "not_applicable"
+    assert o["sec-sri-001"] == "not_applicable"   # the vuln ref loads only same-origin/inline scripts -> nothing to guard
     # sec-mixed-001 is https-gated: over the plain-http reference there's nothing to be "mixed" -> N/A
     # (fire/clean is CI-locked against a self-signed HTTPS server in test_mixed_content):
     assert o["sec-mixed-001"] == "not_applicable"
@@ -112,15 +126,10 @@ def test_vulnerable_app_accrues_slop():
     assert o["qa-seo-001"] == "slop_detected"
     # qa-http-002: the vulnerable app serves text/html with no charset -> browser must guess encoding:
     assert o["qa-http-002"] == "slop_detected"
-    # evidence rides on outcomes (clean ones too): the load-time probe records the measured number, and
-    # api_sqli records the techniques it tried even when the app is clean -> for the display layer.
-    ltime = next(x for x in report.outcomes if x.probe_id == "perf-loadtime-001")
-    assert "load_time_s" in ltime.evidence and ltime.evidence["ceiling_s"] == 5.0
+    # evidence rides on outcomes (clean ones too): api_sqli records the techniques it tried even when the app
+    # is clean -> for the display layer.
     sqli = next(x for x in report.outcomes if x.probe_id == "sec-sqli-004")
     assert set(sqli.evidence.get("techniques_tried", [])) == {"error", "boolean"}  # scored; time=advisory, union=cut
-    # perf-cwv-001 (FCP) / perf-cwv-002 (full Core Web Vitals) are browser-only -> N/A here; browser run in test_browser:
-    assert o["perf-cwv-001"] == "not_applicable"
-    assert o["perf-cwv-002"] == "not_applicable"
     # qa-console-001 / qa-a11y-001 are browser-only too -> N/A here (fired in test_browser):
     assert o["qa-console-001"] == "not_applicable"
     assert o["qa-a11y-001"] == "not_applicable"
@@ -140,21 +149,17 @@ def test_vulnerable_app_accrues_slop():
     assert o["sec-split-001"] == "slop_detected"
     # sec-dos-001: /ingest decompresses a gzip request body with no size cap -> zip-bomb exhaustible:
     assert o["sec-dos-001"] == "slop_detected"
-    # Total decomposes by axis (the subtotals sum to slop_score). Penalties are risk-priced
-    # (frequency x severity, see the catalog): security holds its catastrophic per-instance ceiling (40),
-    # while qa/perf are priced up for their every-user frequency. On this deliberately security-riddled
-    # reference, security still dominates; a realistic janky app (references/qa-janky) leans qa/perf.
-    assert report.axis_slop == {"security": 429, "qa": 152, "performance": 68}
-    assert report.slop_score == 649   # qa 167->152 and total 664->649: the a11y tier re-pricing
-                                      # (30/18/10/4 -> 20/12/7/3, see _A11Y_TIER). This reference renders
-                                      # critical 1 + serious 2, priced 47 -> 32, and that -15 is the WHOLE
-                                      # delta — security 429 and performance 68 are unmoved, which is the
-                                      # check that the re-pricing stayed inside its own category.
-                                      # Earlier moves, kept for the trail: security 435->429 because
-                                      # sec-session-003 (Secure) is https-gated -> N/A over http (mirrors
-                                      # HSTS). qa 183->167:
-                                      # crash re-price (qa-crash-010 32->16) — a 500-not-400 on malformed input
-                                      # is ungraceful error handling (a QA-hygiene tier), not a server crash
+    # Total decomposes by axis (the subtotals sum to slop_score). Security is now AUTHORITY-ANCHORED (v2:
+    # a CVSS x Bugcrowd-VRT range placed by observed evidence, see catalog/_severity_classes.yaml + docs/
+    # SCORING_V2_SPEC.md): a confirmed SQLi is 90, a served .env / .aws / a live server-secret / a Werkzeug
+    # RCE debugger is 90-98, an IDOR that read a record is 55, missing headers stay a 2-8 chore floor.
+    assert report.axis_slop == {"security": 930.7, "qa": 240.3, "performance": 60.0}   # 1-decimal float scoring;
+    #     so performance is just perf-load-001 (28 -> 60: it 5xx'd under load -> the observed_5xx escalator).
+    #     All three axes are v2 authority-anchored now: security CVSS x Bugcrowd-VRT, qa ISO-25010 x Nielsen
+    #     (crash 16->55, race 30->50, input 16->30, links 12->25), perf-load on its reliability band.
+    assert report.slop_score == 1231.0   # ... -> 1227.7 (1-decimal float) -> 1231.5 (broken-links fraction:
+                                       # 1-of-5 dead nav = 28.8) -> 1231.0 (a11y sum 1-decimal: a11y-002 = 31.5). missing-CSP
+                                       # 8->24 and HttpOnly-missing 15->28 become OPERATIVE). Per-probe <= 100 anchor.
     assert sum(report.axis_slop.values()) == report.slop_score
 
 
@@ -191,14 +196,17 @@ def test_minimal_app_resolves_surface_probes_na():
     assert o["sec-csrf-001"] == "not_applicable"
     assert o["sec-ratelimit-001"] == "not_applicable"  # no password form -> no login to brute-force
     assert o["sec-cors-001"] == "clean"  # applies (any endpoint) but minimal doesn't reflect Origin
-    assert o["perf-compress-001"] == "clean"  # tiny homepage -> too small to need compression
     assert o["qa-crash-010"] == "clean"       # robust: malformed input -> graceful 4xx / 404
-    assert o["perf-cache-001"] == "not_applicable"  # homepage references no static asset to cache
     assert o["qa-http-001"] == "clean"        # correct: a missing asset 404s (universally testable)
     assert o["qa-a11y-002"] == "clean"        # accessible HTML: lang + title set, no img/unlabeled control
     assert o["qa-links-001"] == "not_applicable"  # no <a href> links on the homepage -> nothing to follow
     assert o["qa-seo-001"] == "clean"         # minimal sets viewport + description meta
     assert o["qa-http-002"] == "clean"        # minimal serves text/html; charset=utf-8
+    assert o["qa-deploy-001"] == "clean"      # its bundle references no localhost/private-IP/undefined backend
+    assert o["qa-deploy-002"] == "clean"      # its homepage resolves and links no route that redirect-loops
+    assert o["qa-deploy-003"] == "not_applicable"   # no OAuth flow to inspect
+    assert o["sec-tls-001"] == "not_applicable"     # served on loopback (local host) -> not a public http origin
+    assert o["sec-sri-001"] == "not_applicable"     # no cross-origin subresource to guard
     assert o["sec-redirect-001"] == "clean"   # no redirect endpoint reflects an external host
     assert o["sec-hosthdr-001"] == "clean"    # no endpoint reflects the Host header
     assert o["sec-split-001"] == "not_applicable"  # no form/param surface to inject CRLF into
@@ -211,8 +219,6 @@ def test_minimal_app_resolves_surface_probes_na():
     assert o["sec-idor-001"] == "not_applicable"      # same gate
     assert o["sec-domxss-001"] == "not_applicable"    # browser-gated
     assert o["qa-race-001"] == "not_applicable"       # no password form -> can't self-register
-    assert o["perf-cwv-001"] == "not_applicable"      # browser-gated
-    assert o["perf-cwv-002"] == "not_applicable"      # browser-gated
     assert o["qa-console-001"] == "not_applicable"    # browser-gated
     assert o["qa-a11y-001"] == "not_applicable"       # browser-gated
     assert o["qa-deadctrl-001"] == "not_applicable"   # browser-gated
@@ -223,10 +229,10 @@ def test_cached_profile_freezes_surface_and_reproduces_score(monkeypatch):
     # build 1b (per-commit surface cache): the FIRST grade mints + hands back the discovered surface; a
     # re-grade REUSES it verbatim, skipping the crawl entirely, and reproduces the EXACT score. The
     # deployment's port differs between runs, so this also exercises the base_url re-bind (paths are relative).
-    catalog = load_catalog(CATALOG)
+    catalog = _catalog()   # exclude Lighthouse perf -> fast + deterministic (no metric variance in this repro test)
     minted = []
     r1 = run(SubprocessDeployer(str(REFS / "vulnerable" / "app.py")), catalog, on_profile=minted.append)
-    assert len(minted) == 1 and r1.slop_score == 649          # cache MISS -> discovered once + handed back
+    assert len(minted) == 1 and r1.slop_score == 1231.0          # cache MISS -> discovered once + handed back
 
     import sloptic.pipeline as pipeline_mod            # PROVE the crawl is skipped on a cache HIT:
     monkeypatch.setattr(pipeline_mod, "discover",             # discover() must never be called with a cached profile
@@ -234,7 +240,7 @@ def test_cached_profile_freezes_surface_and_reproduces_score(monkeypatch):
     seen = []
     r2 = run(SubprocessDeployer(str(REFS / "vulnerable" / "app.py")), catalog,
              cached_profile=minted[0], on_profile=seen.append)
-    assert r2.slop_score == 649 and seen == []                # HIT -> same score, no re-crawl, no re-mint
+    assert r2.slop_score == 1231.0 and seen == []                # HIT -> same score, no re-crawl, no re-mint
     assert r2.axis_slop == r1.axis_slop                       # identical per-axis decomposition too
 
 
@@ -258,6 +264,51 @@ def test_progress_callback_fires_per_probe():
     assert starts == n and dones == n  # one start + one done per probe, none skipped
 
 
+def test_lighthouse_lock_noops_without_env_and_serializes_with(tmp_path, monkeypatch):
+    # the cross-process semaphore around the Lighthouse trace: no env var -> a plain no-op (serial runs pay
+    # nothing); env set -> grab a slot flock for the trace's duration, released after so it's re-acquirable.
+    from sloptic.pipeline import _lighthouse_lock
+    monkeypatch.delenv("SLOPTIC_LIGHTHOUSE_LOCK", raising=False)
+    with _lighthouse_lock():                        # unset -> no-op, must not raise or block
+        pass
+    lock = tmp_path / "lh.lock"
+    monkeypatch.setenv("SLOPTIC_LIGHTHOUSE_LOCK", str(lock))
+    monkeypatch.delenv("SLOPTIC_LIGHTHOUSE_SLOTS", raising=False)   # default 1 -> strict mutex
+    with _lighthouse_lock():                         # acquires the single lane (slot 0)
+        assert (tmp_path / "lh.lock.0").exists()
+    with _lighthouse_lock():                         # released above -> re-acquirable in-process (no deadlock)
+        pass
+
+
+def test_lighthouse_lock_counting_semaphore_allows_N_concurrent(tmp_path, monkeypatch):
+    # SLOPTIC_LIGHTHOUSE_SLOTS=2 -> two traces may run at once. Hold slot 0 externally; the CM must fall
+    # through to slot 1 rather than block (proving it's a counting semaphore, not a plain mutex).
+    from sloptic.pipeline import _lighthouse_lock
+    lock = tmp_path / "lh.lock"
+    monkeypatch.setenv("SLOPTIC_LIGHTHOUSE_LOCK", str(lock))
+    monkeypatch.setenv("SLOPTIC_LIGHTHOUSE_SLOTS", "2")
+    other = open(f"{lock}.0", "w")
+    fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)   # occupy lane 0
+    try:
+        with _lighthouse_lock():                        # must acquire lane 1, not deadlock
+            assert (tmp_path / "lh.lock.1").exists()
+    finally:
+        fcntl.flock(other, fcntl.LOCK_UN)
+        other.close()
+
+
+def test_needs_lighthouse_keys_on_the_declared_capability_not_the_predicate_name():
+    # the Lighthouse-run gate must trigger for the SCORING probe (predicate lighthouse_perf_score), not only
+    # the report_only lighthouse_audit diagnostics -- else a --probe perf-lighthouse-001 subset, or dropping
+    # the diagnostics, would silently take the whole perf axis dark.
+    def probe(pred, requires):
+        return Probe(id="t", bundle="performance", category="overall", penalty=1,
+                     probe={"predicate": pred}, applicability=Applicability(requires=requires))
+    assert _needs_lighthouse([probe("lighthouse_perf_score", ["lighthouse"])])   # the scoring probe ALONE
+    assert _needs_lighthouse([probe("lighthouse_audit", ["lighthouse"])])        # a report_only diagnostic
+    assert not _needs_lighthouse([probe("broken_links", [])])                    # no lighthouse-dependent probe
+
+
 def test_a_predicate_can_override_its_penalty_absolutely(monkeypatch):
     # a11y computes a per-rule severity SUM that can EXCEED the nominal ceiling (barriers stack); the
     # predicate sets evidence["penalty_override"] and the framework uses it as the absolute fire penalty,
@@ -269,10 +320,12 @@ def test_a_predicate_can_override_its_penalty_absolutely(monkeypatch):
     prof = Profile(base_url="http://x")
     client = httpx.Client(base_url="http://x")
 
-    def run_one(override):
+    def run_one(override, report_only=False):
         def pred(ctx, probe):
             if override is not None:
                 ctx.evidence["penalty_override"] = override
+            if report_only:
+                ctx.evidence["report_only"] = True
             return True
         monkeypatch.setitem(PREDICATES, "_hl_override_test", pred)
         p = Probe(id="t", bundle="qa", category="c", penalty=26, probe={"predicate": "_hl_override_test"})
@@ -282,7 +335,36 @@ def test_a_predicate_can_override_its_penalty_absolutely(monkeypatch):
         assert run_one(None) == 26            # no override -> the nominal catalog penalty
         assert run_one(18) == 18              # below nominal -> down (a lone serious barrier)
         assert run_one(48) == 48              # ABOVE nominal -> up (barriers sum past the ceiling — the point)
-        assert run_one(0) == 1                # bounded to >= 1
+        assert run_one(0) == 1                # a normal fire is bounded to >= 1 (a fire is never free)
+        assert run_one(0, report_only=True) == 0   # ...UNLESS report_only: an OFF-SCORE diagnostic fire is 0
         assert run_one(9999) == _PENALTY_CAP  # runaway-guarded
+    finally:
+        client.close()
+
+
+def test_register_reuses_a_seeded_crawl_session_instead_of_registering_again(monkeypatch):
+    """UNIFICATION: when the authenticated crawl already established a session (seeded into
+    ctx._email_cache['account_session']), ctx.register('') REUSES it -- no second registration. The IDOR
+    identities ('_a'/'_b') still register fresh (distinct users)."""
+    import httpx
+    from sloptic.pipeline import _Ctx
+    from sloptic import auth
+    from sloptic.schema import Profile
+    prof = Profile(base_url="http://x")
+    client = httpx.Client(base_url="http://x")
+    calls = []
+    monkeypatch.setattr(auth, "register_account",
+                        lambda *a, **k: (calls.append(k.get("suffix")), "FRESH")[1])
+    try:
+        ctx = _Ctx("http://x", client, prof, None)
+        ctx._email_cache["account_session"] = {
+            "headers": {"Cookie": "sid=seeded"}, "username": "u", "password": "p",
+            "response": auth._synthesize_response("http://x", []), "storage_exposed": False}
+        acct = ctx.register("")                      # primary identity -> reuse the seed, do NOT re-register
+        assert acct != "FRESH" and acct.username == "u"
+        assert "sid=seeded" in acct.client.headers.get("Cookie", "")
+        assert calls == []                           # register_account was never called for ""
+        assert ctx.register("_a") == "FRESH"         # IDOR identity bypasses the seed -> fresh registration
+        assert "_a" in calls
     finally:
         client.close()

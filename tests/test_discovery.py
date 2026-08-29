@@ -668,7 +668,7 @@ def test_merge_perceived_rejects_third_party_and_fieldless_forms():
     assert prof.forms == []
 
 
-def _stub_render(base_url, paths, headers=None, net_sink=None, script_sink=None):
+def _stub_render(base_url, paths, headers=None, net_sink=None, script_sink=None, **kwargs):
     return {p: "<html><body><h1>App</h1><button>Sign in</button></body></html>" for p in paths}
 
 

@@ -5,6 +5,7 @@ pool: public
 evidence_model: provable
 penalty: 12   # missing viewport/description hits ALL acquisition (very high frequency) but is
               # growth-not-function -> survivable, so priced in the qa mid-band.
+severity: {iso_25010: "n/a-discoverability", nielsen: "1", range: [10, 10], default: 10}   # OUTLIER: SEO is not an ISO-25010 characteristic; corpus-only
 applicability:
   requires: [at_least_one_http_endpoint_exists]
 probe:
