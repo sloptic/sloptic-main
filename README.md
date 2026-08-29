@@ -61,9 +61,15 @@ The catalog is **100+ probes** across three axes:
 |------|----------|
 | **security** | managed backend exposure (Supabase or Firebase RLS), exposed `.env` / `.git` / secrets in the bundle, missing rate limiting, header, CORS, and redirect defenses, and the injection classes (SQLi, XSS, SSTI, path traversal, SSRF) |
 | **qa** | accessibility (axe-core, tiered by severity), controls that do nothing, crashes on malformed input, broken links, soft 404s, a dev build shipped to production, content type honesty |
-| **performance** | Core Web Vitals (throttled, best of N), page weight, request count, response time |
+| **performance** | Lighthouse, run locally at a pinned version: the overall performance score and the Core Web Vitals it reports (LCP, CLS, TBT, load time), throttled and scored as the median of three runs |
 
 Each axis reports its own damped subtotal, and the three sum exactly to the slop score.
+
+Performance is the one axis Sloptic does not measure with probes of its own. It defers to Lighthouse,
+run locally at a pinned version, because a hand written timing probe cannot match years of calibration
+and its false positives would poison a score meant to be trusted. The heavier Lighthouse audits, page
+weight, request count, and DOM size, are read from the same run and reported off the score as
+diagnostics.
 
 ## The score, and comparing across apps
 
@@ -90,10 +96,13 @@ unauthenticated, observable surface well. It does not claim to exercise deep aut
 ## Install
 
 ```sh
-pip install sloptic                # core (grades everything reachable over HTTP)
-pip install "sloptic[browser]"     # + Playwright, for the accessibility, CWV, and DOM XSS probes
-playwright install chromium        # only needed with [browser]
+pip install sloptic                # core: everything reachable over HTTP
+pip install "sloptic[browser]"     # + Playwright, for accessibility, DOM XSS, and SPA rendering
+playwright install chromium        # the browser binary, once
 ```
+
+The performance axis runs Lighthouse locally at a pinned version through `npx`, so grading
+performance also needs Node installed.
 
 ## Usage
 
