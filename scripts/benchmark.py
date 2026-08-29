@@ -115,13 +115,14 @@ def _pcts(values: list) -> dict:
 
 # ---- ranking signals beyond the raw score -------------------------------------------------------------------
 # Two apps at the same slop are not equal. The comparator, best -> worst: slop asc, catastrophe asc (a clean
-# composition beats one carrying an absolute-gate class at the same score), slop_potential desc (defended more
+# composition beats one carrying an absolute-gate class at the same score), max_penalty asc (a smaller worst
+# finding beats the same slop spread over moderate ones), slop_potential desc (defended more
 # worst-case damage), categories-applied desc (exercised a broader surface). slop_potential is the score an app
 # WOULD carry if every applicable probe fired, reconstructed from coverage.applied through the SAME aggregation
 # the real score uses, so the dampers (a variant group fires once; per-category diminishing returns) apply
 # identically and slop_potential >= slop_score by construction. A record may also carry a native `slop_potential`
 # emitted at grade time; that wins over reconstruction.
-_COMPARATOR = ("slop_asc", "catastrophe_asc", "slop_potential_desc", "categories_desc")
+_COMPARATOR = ("slop_asc", "catastrophe_asc", "max_penalty_asc", "slop_potential_desc", "categories_desc")
 
 
 @lru_cache(maxsize=1)
@@ -161,10 +162,18 @@ def _categories_applied(record: dict) -> int:
     return len((record.get("coverage") or {}).get("ran_kinds") or [])
 
 
-def _key(slop, has_cat, potential, ncats) -> tuple:
-    """The rank key, LOWER is better: slop asc; clean (0) before catastrophe (1); MORE defended potential and
-    MORE categories rank earlier, so both are negated."""
-    return (slop, 1 if has_cat else 0, -potential, -ncats)
+def _max_penalty(record: dict) -> float:
+    """The single worst fired finding's penalty (weakest-link tiebreak): at equal slop, a SMALLER worst finding
+    ranks earlier -- one severe trapdoor (broken deploy, locked-out signup, silent data loss) is worse than the
+    same slop spread over moderate findings. 0 when nothing fired."""
+    return max((f.get("penalty") or 0 for f in record.get("findings") or []), default=0)
+
+
+def _key(slop, has_cat, maxpen, potential, ncats) -> tuple:
+    """The rank key, LOWER is better: slop asc; clean (0) before catastrophe (1); SMALLER worst finding
+    (max_penalty) asc -- weakest-link, one severe trapdoor beats the same slop spread over moderate findings;
+    then MORE defended potential and MORE categories rank earlier, so both are negated."""
+    return (slop, 1 if has_cat else 0, maxpen, -potential, -ncats)
 
 
 def _rank_on_dist(dist: list, key: tuple) -> tuple:
@@ -190,13 +199,13 @@ def build(recs: list, version: str, source: str, status: str = "provisional") ->
     if not rows:
         sys.exit("ERROR: no eligible rows (need deployed + scored + not anchor/subset/dead/DNF)")
     idx = _catalog_index()
-    # the empirical distribution: one [slop, catastrophe(0/1), slop_potential, categories] row per app, no
+    # the empirical distribution: one [slop, catastrophe(0/1), max_penalty, slop_potential, categories] row per app, no
     # identities. This is what makes the overall percentile exact and the tiebreaks possible; the landmark
     # summaries below stay for human reading and the per-axis (spiky, non-granular) ranks. Rows are sorted by
     # the SAME comparator ranking uses (best -> worst), so file order is rank order — slop asc, then clean before
-    # catastrophe, then higher slop_potential, then more categories. (Ranking rescans and does not rely on this
+    # catastrophe, then smaller max_penalty, then higher slop_potential, then more categories. (Ranking rescans and does not rely on this
     # order; the sort is so the file reads the way it ranks.)
-    dist = [[r["slop_score"], 1 if _has_catastrophe(r) else 0,
+    dist = [[r["slop_score"], 1 if _has_catastrophe(r) else 0, _max_penalty(r),
              _slop_potential(r, idx), _categories_applied(r)] for r in rows]
     dist.sort(key=lambda row: _key(*row))
     # status rides ON the curve and into every ranked result. A curve built before the catalog's calibration
@@ -332,7 +341,8 @@ def rank(curve: dict, score, record: dict | None = None) -> dict:
     if dist is not None and record is not None:
         idx = _catalog_index()
         potential, ncats = _slop_potential(record, idx), _categories_applied(record)
-        pct, cleaner_than = _rank_on_dist(dist, _key(int(score), _has_catastrophe(record), potential, ncats))
+        pct, cleaner_than = _rank_on_dist(dist, _key(int(score), _has_catastrophe(record),
+                                                     _max_penalty(record), potential, ncats))
     elif dist is not None:
         pct, cleaner_than = _rank_score_only(dist, score)     # a bare score has no tiebreak keys: slop alone
     else:

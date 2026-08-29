@@ -128,12 +128,18 @@ def test_slop_potential_reconstructs_via_the_real_damping_and_never_undercuts_th
 
 def test_rank_key_puts_clean_before_catastrophe_and_rewards_defended_surface():
     same = 50
-    clean_hi = _key(same, False, 300, 5)      # defended a big worst case
-    clean_lo = _key(same, False, 200, 5)      # defended a smaller one
-    catastro = _key(same, True, 300, 5)       # same score, but a catastrophe fired
+    # maxpen held equal (30) so the slop_potential comparison is what decides in this trio
+    clean_hi = _key(same, False, 30, 300, 5)  # defended a big worst case
+    clean_lo = _key(same, False, 30, 200, 5)  # defended a smaller one
+    catastro = _key(same, True, 30, 300, 5)   # same score, but a catastrophe fired
     assert clean_hi < clean_lo                # more defended potential ranks better at equal slop
     assert clean_hi < catastro and clean_lo < catastro   # any clean tie beats a catastrophe tie
-    assert _key(49, True, 0, 0) < _key(50, False, 999, 99)   # slop still dominates every tiebreak
+    assert _key(49, True, 90, 0, 0) < _key(50, False, 0, 999, 99)   # slop still dominates every tiebreak
+    # weakest-link: at equal slop + catastrophe, a SMALLER worst finding ranks earlier, and it outranks a
+    # bigger defended potential (max_penalty sits ABOVE slop_potential in the chain)
+    small_worst = _key(same, False, 30, 200, 5)   # worst finding 30, defended less
+    big_worst = _key(same, False, 70, 999, 9)     # worst finding 70, defended MORE
+    assert small_worst < big_worst
 
 
 def test_build_stores_the_distribution_and_ranks_exactly_off_it():
