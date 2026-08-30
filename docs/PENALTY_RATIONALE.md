@@ -70,7 +70,7 @@ Every security class below names its CVSS 3.1 vector score and its Bugcrowd VRT 
 | Anonymous whole database read | `backend-001`, `exposure-008` | 7.5 to 9 | P1 | 70 to 98, default 70 | PII fields 80, bulk records 90, anon write 98 |
 | XML external entity | `xxe-001` | 7.5 | P1 | 70 to 91, default 70 | reached internal host 82, read a system file 91 |
 
-These map to OWASP A05 Injection (the four execution classes), A01 Broken Access Control (auth bypass, anonymous read), and A02 Cryptographic and secret failures. The injection and upload probes fire only on a proven execution oracle, a salt hash the engine must return or a webshell that must run, so they never trip on the basic variant the VRT would rate a P4 or P5, which is why their floor is terminal rather than low.
+These map to the OWASP Top 10 2025: A05 Injection (the four execution classes), A01 Broken Access Control (auth bypass, anonymous read), and A04 Cryptographic Failures (disclosed secrets and served credentials). The injection and upload probes fire only on a proven execution oracle, a salt hash the engine must return or a webshell that must run, so they never trip on the basic variant the VRT would rate a P4 or P5, which is why their floor is terminal rather than low.
 
 ### High, evidence critical
 
@@ -101,7 +101,7 @@ The XSS probes confirm by executing in a real browser, so execution is the fire 
 
 ## 5. The security header floor, and why it is cheap
 
-Security headers are real hygiene, but each one is a single config change and none of them bites on its own, so the VRT rates the class P5 and the penalties stay low on purpose.
+Security headers are real hygiene, but each one is a single config change and none of them bites on its own, so the VRT rates the class P5. They sit under OWASP A02 Security Misconfiguration, the second most common risk in the 2025 list yet a purchasable one, and the penalties stay low on purpose.
 
 | header | probe | penalty |
 |---|---|---:|
@@ -127,7 +127,7 @@ Quality and performance failures are not vulnerabilities, so CVSS does not descr
 | Dead control | `deadctrl-001` | functional suitability | 30, primary CTA 50 |
 | Broken deep link | `deeplink-001` | functional suitability | 15 |
 | Dead back button | `backnav-001` | functional suitability | 12 |
-| Accessibility barrier | `a11y-001/002` | operability | per rule sum, below |
+| Accessibility barrier | `a11y-001/002` | usability (accessibility) | per rule sum, below |
 
 Data integrity leads, because a save that silently loses or corrupts the user's data breaks the one promise the app made. A crash returns a 5xx where a graceful 4xx belonged, which the RFC treats as a server fault, so it is priced above the every user interface defects but below data loss.
 
@@ -137,13 +137,13 @@ The signup and recovery flows use their own evidence ladders, since a broken acc
 
 ## 7. Performance is Lighthouse, priced by the shortfall
 
-The performance axis defers to a pinned local Lighthouse rather than any hand written timing probe, because a hand rolled metric cannot match Lighthouse's calibration and its false positives would poison a score meant to be trusted. The penalty is the distance below Lighthouse's own green line:
+The performance axis defers to a pinned local Lighthouse, and it does so because the first version did not. Sloptic's early performance probes were hand written, and their false positive rates ran off the roof, since timing a page from the outside and inferring a verdict is the kind of judgment a lone tool gets wrong in a hundred ways. Rather than reinvent a wheel that Google has spent years calibrating and battle testing, Sloptic borrows the Lighthouse score outright. The penalty is the distance below Lighthouse's own green line:
 
 ```
 penalty = round(max(0, 0.90 - lighthouse_score) × 100 × scale)
 ```
 
-An app at or above the 0.90 green cutoff earns a clean zero. An app at 0.84 loses 6, one at 0.25 loses 65. Lighthouse does the scoring off its own weighted metrics, and Sloptic charges only the shortfall below good, measured as the median of three runs so a single noisy load does not swing the grade. The structural cap at 90 keeps the worst possible slow app just below a full compromise.
+An app at or above the 0.90 green cutoff earns a clean zero, and that cutoff is deliberate. 90 is Lighthouse's own definition of good, the 8th percentile control point in its scoring, so the grade stops there on purpose. There is no slop above the good line, and chasing a perfect 100 is not the bar. An app at 0.84 loses 6, one at 0.25 loses 65. Lighthouse does the scoring off its own weighted metrics, and Sloptic charges only the shortfall below good, measured as the median of three runs so a single noisy load does not swing the grade. The structural cap at 90 keeps the worst possible slow app just below a full compromise.
 
 ## 8. The one CVE shaped probe: deps-001
 
@@ -158,3 +158,18 @@ This is enforced, not promised. A continuous integration gate requires every sec
 ## 10. Reading one number
 
 Put it together on a real finding. A probe reports 90 on an app. The 90 says the finding is 90% of a total catastrophe. Tracing it back: the class is anonymous data exposure, pinned to CVSS 7.5 and VRT P1, with a range of 70 to 98 and a floor of 70. The probe did not stop at the floor, because it set `bulk_read`, having read many records from a world open database, which lifts the rung to 90. Had those records also carried a password column it would have set `sensitive_fields` too, and had the database also accepted an anonymous write it would have set `write_confirmed` and reached 98. Every step of that is either an authority or an observation. None of it is an opinion, which is the entire point.
+
+
+## Sources
+
+Every authority named above, so the numbers can be checked against the original.
+
+- CVSS 3.1, the base severity scale: [first.org/cvss](https://www.first.org/cvss/)
+- Bugcrowd Vulnerability Rating Taxonomy, the P1 to P5 baseline: [github.com/bugcrowd/vulnerability-rating-taxonomy](https://github.com/bugcrowd/vulnerability-rating-taxonomy)
+- OWASP Top 10 2025, the coverage and category map: [owasp.org/Top10](https://owasp.org/Top10/)
+- CWE, the weakness catalog: [cwe.mitre.org](https://cwe.mitre.org/), including [CWE-319 cleartext transmission](https://cwe.mitre.org/data/definitions/319.html), [CWE-770 resource allocation without limits](https://cwe.mitre.org/data/definitions/770.html), [CWE-799 interaction frequency](https://cwe.mitre.org/data/definitions/799.html), and [CWE-943 data query logic](https://cwe.mitre.org/data/definitions/943.html)
+- ISO/IEC 25010, the software quality characteristics: [iso25000.com](https://iso25000.com/index.php/en/iso-25000-standards/iso-25010)
+- Nielsen severity ratings, the 0 to 4 usability scale: [nngroup.com](https://www.nngroup.com/articles/how-to-rate-the-severity-of-usability-problems/)
+- Lighthouse performance scoring, the green line and the metric weights: [developer.chrome.com](https://developer.chrome.com/docs/lighthouse/performance/performance-scoring)
+- axe-core, the accessibility rule engine, against WCAG 2 A and AA: [github.com/dequelabs/axe-core](https://github.com/dequelabs/axe-core), [w3.org/TR/WCAG21](https://www.w3.org/TR/WCAG21/)
+- EPSS and CISA KEV, exploitation likelihood for `deps-001`: [first.org/epss](https://www.first.org/epss/), [cisa.gov/known-exploited-vulnerabilities-catalog](https://www.cisa.gov/known-exploited-vulnerabilities-catalog)
