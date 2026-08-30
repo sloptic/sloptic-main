@@ -68,15 +68,25 @@ def mode() -> str:
     return os.environ.get("SLOPTIC_EGRESS", "on").strip().lower()
 
 
+_NAT64 = ipaddress.ip_network("64:ff9b::/96")   # RFC 6052 well-known NAT64 prefix (embeds a v4 in the low 32 bits)
+_V4COMPAT = ipaddress.ip_network("::/96")        # deprecated IPv4-compatible IPv6 (also embeds a v4)
+
+
 def check_ip(ip: str, *, allow_loopback: bool = False) -> bool:
     """True only for a PUBLIC unicast address. IPv4-mapped IPv6 is normalized first, so
-    ``::ffff:10.0.0.1`` cannot slip past as a v6 literal."""
+    ``::ffff:10.0.0.1``, ``64:ff9b::10.0.0.1`` (NAT64), and ``::10.0.0.1`` cannot slip past as v6 literals."""
     try:
         addr = ipaddress.ip_address(ip)
     except ValueError:
         return False
-    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
-        addr = addr.ipv4_mapped
+    if isinstance(addr, ipaddress.IPv6Address):
+        # Unwrap any IPv6 form that embeds an IPv4 and judge THAT, so a private v4 cannot ride in as a
+        # v6 literal: v4-mapped (::ffff:x), NAT64 (64:ff9b::x), and deprecated v4-compatible (::x). A
+        # PUBLIC embedded v4 still passes, so grading over a DNS64 network keeps working.
+        if addr.ipv4_mapped is not None:
+            addr = addr.ipv4_mapped
+        elif addr in _NAT64 or (addr in _V4COMPAT and not addr.is_unspecified and not addr.is_loopback):
+            addr = ipaddress.IPv4Address(int(addr) & 0xFFFFFFFF)
     if allow_loopback and addr.is_loopback:
         return True
     return not (

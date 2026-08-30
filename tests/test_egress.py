@@ -56,6 +56,7 @@ def fake_dns(monkeypatch):
     "0.0.0.0", "224.0.0.1", "240.0.0.1",                 # this-net / multicast / reserved
     "::1", "fe80::1", "fc00::1",                          # v6 loopback / link-local / ULA
     "::ffff:10.0.0.1",                                    # v4-mapped v6 must normalize, not pass
+    "64:ff9b::a00:1", "::a00:1",                          # NAT64 + deprecated v4-compat embedding 10.0.0.1
 ])
 def test_check_ip_refuses_everything_internal(strict, bad):
     assert not egress.check_ip(bad)
