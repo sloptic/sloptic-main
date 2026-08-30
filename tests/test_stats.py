@@ -188,10 +188,12 @@ def test_auth_surface_empty_on_a_pre_field_corpus():
 
 def test_severity_tier_buckets_by_penalty_at_the_boundaries():
     # [6] FINDING SEVERITY derives tiers from the risk-priced penalty (no severity field in the record).
-    assert _severity_tier(40) == "critical" and _severity_tier(30) == "critical"
-    assert _severity_tier(29) == "serious" and _severity_tier(16) == "serious"
-    assert _severity_tier(15) == "moderate" and _severity_tier(8) == "moderate"
-    assert _severity_tier(7) == "minor" and _severity_tier(1) == "minor"
+    # Five 10-wide bands, critical at 40+ (the reworked framing: an app's WORST finding >= 40 is "acute").
+    assert _severity_tier(40) == "critical" and _severity_tier(90) == "critical"
+    assert _severity_tier(39) == "severe" and _severity_tier(31) == "severe"
+    assert _severity_tier(30) == "serious" and _severity_tier(21) == "serious"
+    assert _severity_tier(20) == "moderate" and _severity_tier(11) == "moderate"
+    assert _severity_tier(10) == "minor" and _severity_tier(1) == "minor"
 
 
 def test_diff_report_json_movers_and_fire_deltas(capsys):
