@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -443,7 +444,11 @@ def _grade(args, source, catalog, render, auth_headers, progress, phase=None):
     # browser render; off when a --header session is already supplied (that is used directly).
     browser_register = browser.register_in_browser if (args.browser_auth and args.browser) else None
     auth_crawl = bool(args.browser_auth and args.browser and not auth_headers)
-    # Trusted reference app: subprocess, no Docker.
+    # Trusted reference app: subprocess, no Docker. Local lanes (subprocess + Docker submission)
+    # target loopback health gates, so they run the egress guard in LOCAL mode: loopback allowed,
+    # everything non-public still refused (see sloptic/egress.py). A --target URL is a remote origin
+    # and keeps the default strict mode; the web worker never sets this.
+    os.environ.setdefault("SLOPTIC_EGRESS", "local")
     if args.app:
         return run(SubprocessDeployer(args.app), catalog, render=render, headers=auth_headers,
                    on_progress=progress, on_phase=phase, source_dir=args.source, email_receiver=email_receiver,
