@@ -151,7 +151,7 @@ A vulnerable client dependency is the single case where the finding actually is 
 
 ## 9. Pinned, calibrated, and the gate that keeps it honest
 
-Every number carries one of two provenances. A **pinned** value comes straight from an authority: a CVSS canonical vector, a VRT baseline, an OWASP factor, a CWE. A **calibrated** value is a point proposed inside a pinned range and confirmed against a corpus re-grade. Range bounds are almost all pinned; the rung points inside them are calibrated. The document never hides which is which, and neither does the catalog.
+Every number carries one of two provenances. A **pinned** value comes straight from an authority: a CVSS canonical vector, a VRT baseline, an OWASP factor, a CWE. A **calibrated** value is a point proposed inside a pinned range and confirmed against a corpus regrade. Range bounds are almost all pinned; the rung points inside them are calibrated. The document never hides which is which, and neither does the catalog.
 
 This is enforced, not promised. A continuous integration gate requires every security probe to carry a severity block with a real CVSS vector and a VRT rating, or to declare itself a chore floor. Every escalator point must fall inside its range, and the default must equal the floor unless a comment justifies otherwise. A naked `penalty: 40` with no authority behind it fails the build and cannot merge. That gate is the difference between frequency times severity as a slogan and frequency times severity as a rule.
 
