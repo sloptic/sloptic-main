@@ -16,7 +16,7 @@ import textwrap
 from collections import defaultdict
 from dataclasses import asdict
 
-from . import browser, runcache, safety
+from . import browser, egress, runcache, safety
 from .aggregate import CATEGORY_DECAY
 from .catalog import ProbeSelectionError, default_catalog_dir, load_catalog, select_probes
 from .deploy import DockerDeployer, RemoteDeployer, SubprocessDeployer
@@ -294,6 +294,7 @@ def _make_phase(args):
 # ---- entry point ----------------------------------------------------------------------------
 
 def main() -> None:
+    egress.install()   # opt-in resolver egress guard for the whole CLI process
     ap = argparse.ArgumentParser(
         prog="sloptic",
         description="Deploy/target an app, probe it over HTTP, and report a slop score (lower is better).",

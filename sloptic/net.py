@@ -242,12 +242,3 @@ def is_bot_challenge(resp) -> bool:
     except (httpx.HTTPError, ValueError, UnicodeError):
         return False
     return any(m in body for m in _CHALLENGE_MARKERS)
-
-
-# Egress sandbox, installed as soon as the grader's shared net layer loads (every entrypoint imports
-# it: cli, pipeline, probes, discovery, and the web worker). See sloptic/egress.py for what it covers;
-# the short version is that ALL outbound resolution in-process, httpx and raw sockets alike, redirect
-# hops included, passes one guard that refuses non-public destinations.
-from . import egress as _egress
-
-_egress.install()
