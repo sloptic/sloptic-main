@@ -444,10 +444,12 @@ def _grade(args, source, catalog, render, auth_headers, progress, phase=None):
     # browser render; off when a --header session is already supplied (that is used directly).
     browser_register = browser.register_in_browser if (args.browser_auth and args.browser) else None
     auth_crawl = bool(args.browser_auth and args.browser and not auth_headers)
-    # Trusted reference app: subprocess, no Docker. Local lanes (subprocess + Docker submission)
-    # target loopback health gates, so they run the egress guard in LOCAL mode: loopback allowed,
-    # everything non-public still refused (see sloptic/egress.py). A --target URL is a remote origin
-    # and keeps the default strict mode; the web worker never sets this.
+    # Egress guard mode for the WHOLE CLI (this runs before the lane branch, deliberately): the CLI is
+    # a trusted local tool, and all three of its lanes legitimately touch loopback -- subprocess and
+    # Docker deployers health-gate on 127.0.0.1, and `--target http://localhost:3000` is how you
+    # dogfood a local app. LOCAL mode allows loopback and still refuses every other non-public
+    # destination (see sloptic/egress.py). It is a setdefault, so an explicit SLOPTIC_EGRESS wins.
+    # The web worker, which takes URLs from strangers, never sets this and so runs strict.
     os.environ.setdefault("SLOPTIC_EGRESS", "local")
     if args.app:
         return run(SubprocessDeployer(args.app), catalog, render=render, headers=auth_headers,
