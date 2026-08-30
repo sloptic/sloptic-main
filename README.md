@@ -102,7 +102,10 @@ playwright install chromium        # the browser binary, once
 ```
 
 The performance axis runs Lighthouse locally at a pinned version through `npx`, so grading
-performance also needs Node installed.
+performance also needs Node installed. Lighthouse drives Chrome over a loopback DevTools port, so if
+you run the grader behind a firewall, leave loopback reachable for its user. A blocked loopback does
+not error: the whole performance axis silently reads N/A while the rest of the grade looks clean, and
+the only trace is `na_reason: requires unmet: lighthouse` on the twelve perf probes.
 
 ## Usage
 
