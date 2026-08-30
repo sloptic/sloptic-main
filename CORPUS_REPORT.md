@@ -10,12 +10,12 @@
 
 We pointed one black box grader at every submission we could find from 80 hackathons and asked one question. From the outside, what does AI era failure actually look like?
 
-- Slop is overwhelmingly **chronic, not acute**. On 1,625 live apps, the failure is the missing floor (no security headers, slow heavy pages, broken accessibility, a button that does nothing), not exploitable holes. Only **2.9%** carry an exploitable finding, and essentially none an injection or remote code execution class.
-- **But the corpus is not benign.** A quarter of apps, **26%**, carry an **acute** finding (priced 40 or more), and a clear majority, **59%**, carry at least one **significant** finding (21 or more), a problem past the cosmetic floor. 85% of the acute tier is functional, a crash, a dead deploy, an unusably slow page, not an exploit. These apps are broken far more often than they are hackable.
+- Slop is overwhelmingly **chronic**. On 1,625 live apps the failure is the missing floor: no security headers, slow heavy pages, broken accessibility, a button that does nothing. Exploitable holes stay rare, only **2.9%** of apps carry one, and essentially none an injection or remote code execution class.
+- **But the corpus is not benign.** A quarter of apps, **26%**, carry an **acute** finding (priced 40 or more), and a clear majority, **59%**, carry at least one **significant** finding (21 or more), a problem past the cosmetic floor. 85% of the acute tier is functional: a crash, a dead deploy, an unusably slow page. These apps break far more often than they get hacked.
 - The acute danger that remains **moved into the managed backend, and this run finally reached it.** The single largest exploitable class is a world readable or writable Supabase or Firebase backend, **18 apps**, several of them serving plaintext passwords or bulk emails to any anonymous visitor.
 - **The AI builder story flipped.** A year ago Lovable's slop premium was entirely performance. Here it is no longer statistically significant on the score, and what stands out instead is that AI built apps leak their managed backend at **13%** (11 of 82), more than ten times the population rate.
 - **Winners are not cleaner.** The apps the judges picked carry **12% more** median slop than the ones they passed over, so human judged merit does not predict whether the thing holds up.
-- **The dangerous surface is thin because it is unreachable, not because it is safe.** Only **14%** of apps have a drivable signup we can get behind, only **18%** run an own backend we could inject, and a Vercel bot challenge blocked the deep security tail on **404** apps. The low acute number is a floor.
+- **The dangerous surface is thin because it sits out of reach.** Only **14%** of apps have a drivable signup we can get behind, only **18%** run an own backend we could inject, and a Vercel bot challenge blocked the deep security tail on **404** apps. A low acute number measures reachability and leaves the code's safety unproven.
 - The median app realizes about **2.3%** of the slop it could carry if every applicable probe fired. Per app, slop is the exception. It is the diffuse universal floor, spread across the whole population, that adds up.
 
 ---
@@ -117,7 +117,7 @@ The median app's worst finding is a **27**, which sits in the significant band, 
 | performance | 206 | 42% |
 | security | 76 | 15% |
 
-85% of the acute tier is quality and performance, not security. A catastrophically slow page (Lighthouse red) and a crash on malformed input dominate it, then a deploy that will not stay up and a backend left open to anyone, with real breaches a thin 15%. Only **59 apps (3.6%)** carry a security critical at all, and **47 (2.9%)** an exploitable one.
+Quality and performance make up 85% of the acute tier. A catastrophically slow page (Lighthouse red) and a crash on malformed input dominate it, then a deploy that will not stay up and a backend left open to anyone, with real breaches the thin 15% that remains. Only **59 apps (3.6%)** carry a security critical at all, and **47 (2.9%)** an exploitable one.
 
 So the corpus reads at three levels.
 
@@ -125,9 +125,9 @@ So the corpus reads at three levels.
 - **Significant, 59%.** At least one finding past the cosmetic floor: a dead control, a broken link, a missing rate limit, a page slow enough to notice.
 - **The floor, everyone.** Missing headers, middling accessibility, orange performance. No app escapes it.
 
-The part that should sting is how little of the significant band has any excuse. A dead control, a broken link, a crash on bad input, a missing label, a backend left open, each is a couple of prompts to repair or delete for a team that had a day or more and an AI writing the code. They do not ship because they are hard, they ship because the demo never exercises them, it clicks the three buttons that work, not the dead fourth, and never sends the input that 500s the API. Performance is no exception, whatever the team meant to build. A page that takes five to ten seconds has already lost the user, who does not care how many features are loading, so optimizing it is the job, not a stylistic call. It can cost more than two prompts, but harder to fix is not the same as allowed to ship. A finding at 21 or more is not bad luck anywhere in this band, it is the part of the app nobody went back to, which is the exact part a durability grader exists to see.
+The part that should sting is how little of the significant band has any excuse. A dead control, a broken link, a crash on bad input, a missing label, a backend left open, each is a couple of prompts to repair or delete for a team that had a day or more and an AI writing the code. They do not ship because they are hard, they ship because the demo never exercises them, it clicks the three buttons that work and never the dead fourth, and never sends the input that 500s the API. Performance is no exception, whatever the team meant to build. A page that takes five to ten seconds has already lost the user, who does not care how many features are loading, so optimizing it is simply the job. It can cost more than two prompts, and harder to fix still has to ship fixed. A finding at 21 or more, anywhere in this band, is the part of the app nobody went back to, which is the exact part a durability grader exists to see.
 
-## 6.1 Within security, chronic not acute
+## 6.1 Within security, the chronic floor
 
 Within the security axis alone, splitting every finding into **acute**, exploitable right now, and **chronic**, a missing mitigation, the population is lopsided.
 
@@ -140,15 +140,15 @@ Within the security axis alone, splitting every finding into **acute**, exploita
 | access control or data exposure | 0.4% | a protected resource reachable with no credentials |
 | chronic hygiene, representative | 67 to 98% | headers, performance, accessibility |
 
-About **3%** of apps are exploitable, essentially none through an injection hole, while **67 to 98%** are missing basic hygiene. The functionality is mostly there, and the boring nonfunctional floor is pervasively absent. That is the empirical signature of AI era slop from the outside, chronic rot rather than a field of smoking guns.
+About **3%** of apps are exploitable, essentially none through an injection hole, while **67 to 98%** are missing basic hygiene. The functionality is mostly there, and the boring nonfunctional floor is pervasively absent. That is the empirical signature of AI era slop from the outside, chronic rot across the board with few smoking guns.
 
 The small acute slice, though, changed shape in a way we did not expect. A year ago the largest acute class was a served secret file, and we described the exploitable danger as hidden behind authentication where a black box grader could not reach it. This run reaches part of it. The **largest acute class is now managed backend exposure**, a Supabase or Firebase backend left open to an anonymous client because row level security was never switched on. And we do not guess at these. The probe confirms each one by reading a real row or completing a real anonymous insert. One Firestore `users` collection handed back documents carrying a `password` field. A Supabase `profiles` table leaked `email` and `phone`. A `candidates` table accepted an anonymous insert. The acute danger did not vanish and it did not stay fully hidden. Part of it walked into plain sight, in a database that ships open by default, in front of a probe that knows to ask.
 
 ## 7. Why the dangerous surface is so thin
 
-The acute rate is low because the danger is mostly **unreachable from the street**, not because these apps are safe.
+The acute rate is low because the danger sits mostly **out of reach from the street**. Reachability holds the number down, and whether the code is safe is a separate question the grade cannot settle from outside.
 
-**First, most apps have no backend to attack.** Of the 1,106 apps whose runtime traffic we could classify, the tiers overlap (one app talks to several at once), so these are memberships, not slices of a pie.
+**First, most apps have no backend to attack.** Of the 1,106 apps whose runtime traffic we could classify, the tiers overlap (one app talks to several at once), so read these as overlapping memberships, where one app can sit in several rows.
 
 | host tier | apps carrying it (of 1,106) | reachable from the street? |
 |---|---:|---|
@@ -178,7 +178,7 @@ Together those three say something other than "these apps are secure." The moder
 
 ## 8. The AI builder question
 
-The whole AI slop thesis rests on one testable claim, whether AI built apps are sloppier than hand deployed ones. Because the grader fingerprints the builder from served markup (Lovable ships `cdn.gpteng.co`, Bolt its own signature), we can check.
+The whole AI slop worry rests on one testable claim, whether AI built apps are sloppier than hand deployed ones. Because the grader fingerprints the builder from served markup (Lovable ships `cdn.gpteng.co`, Bolt its own signature), we can check.
 
 | group | n | median slop | security (mean) | quality (mean) | performance (mean) |
 |---|---:|---:|---:|---:|---:|
@@ -188,7 +188,7 @@ The whole AI slop thesis rests on one testable claim, whether AI built apps are 
 
 First, **the Lovable performance premium is gone from the score.** In the prior corpus Lovable ran a median of 72 against 49, an all performance gap at p = 1.1e-5. Here it is 52.6 against 49.7, and a one sided Mann-Whitney test lands at **p = 0.056**, just outside significance. Hand built apps got a little sloppier too, mostly on the newly continuous performance axis, and the gap closed.
 
-Second, **where AI built apps stand out now is security, not performance.** Lovable's security mean rose above hand built, Bolt's is far above, and the mechanism is concrete. **Managed backend exposure fires on 11 of the 82 Lovable and Bolt apps, 13%**, against roughly 1% across the population. The AI builder habit of wiring a Supabase or Firebase backend and shipping without configuring its access rules is the dominant AI builder risk now, and the new probe is what made it visible. The story moved from heavy bundles to open databases.
+Second, **AI built apps now stand out on security, where a year ago they stood out on performance.** Lovable's security mean rose above hand built, Bolt's is far above, and the mechanism is concrete. **Managed backend exposure fires on 11 of the 82 Lovable and Bolt apps, 13%**, against roughly 1% across the population. The AI builder habit of wiring a Supabase or Firebase backend and shipping without configuring its access rules is the dominant AI builder risk now, and the new probe is what made it visible. The story moved from heavy bundles to open databases.
 
 ## 9. Do the winners hold up?
 
@@ -205,7 +205,7 @@ The winners are not cleaner. They ship a **12% higher** median slop and perform 
 
 Slop varies more than threefold across events. The sloppiest hackathons (median slop, at least ten graded apps) are hack-brown-2026 at 105.8, ellehacks-2026 at 79.6, and hackeurope at 67.5; the cleanest are oregonhacks at 28.3, wildhacks-2026 at 30.2, and la-hacks-2025 at 33.7. Prestige does not track cleanliness, the flagship events sit in the middle of the pack.
 
-By hosting stack the pattern is sharper, and it makes the report's recurring point for us. Streamlit apps are the cleanest of any platform, a median slop of **0**, and not because they are well built, since a Streamlit app is a frontend with almost no attackable surface, so there is nothing to find. Vercel and GitHub Pages sit low too (medians around 45), both frontend heavy. Render, Firebase, and Lovable sit at the sloppy end (medians of 58 to 67), because that is where a real backend and a real feature set live, which is more surface to get wrong. A low score can mean a clean app or a thin one, which is exactly why the coverage report ships with every grade.
+By hosting stack the pattern is sharper, and it makes the report's recurring point for us. Streamlit apps are the cleanest of any platform, a median slop of **0**, and the reason is thinness, since a Streamlit app is a frontend with almost no attackable surface, so there is nothing to find. Vercel and GitHub Pages sit low too (medians around 45), both frontend heavy. Render, Firebase, and Lovable sit at the sloppy end (medians of 58 to 67), because that is where a real backend and a real feature set live, which is more surface to get wrong. A low score can mean a clean app or a thin one, which is exactly why the coverage report ships with every grade.
 
 ## 10. Under the hood of the two heavy axes
 
@@ -234,7 +234,7 @@ Four times out of five, an accessibility finding is text you cannot read against
 
 The server is not the problem. Layout is not the problem. The problem is the shipped bundle, a median page weighing **4.0 MB** (one weighs 124 MB), some shipping over 2,000 requests, a handful locking the main thread for minutes. TTFB and CLS the platform and the framework hand you for free. LCP, TBT, and page weight are the parts the builder controls, and they are the parts that are heavy. Performance slop is a bundle discipline problem wearing an infrastructure costume.
 
-And the axes are not independent of each other. Across the corpus a lower overall score goes with a better Lighthouse score (Spearman rho of -0.57), so the app that skips the security floor tends to skip the performance one too. Slop is a habit, not a one off, and the teams that hardened one thing tended to harden the rest.
+And the axes move together. Across the corpus a lower overall score goes with a better Lighthouse score (Spearman rho of -0.57), so the app that skips the security floor tends to skip the performance one too. Slop is a habit that runs across the axes, and the teams that hardened one thing tended to harden the rest.
 
 ## 11. What never fired, and the reach frontier
 
@@ -242,33 +242,33 @@ A grader is as interesting for what it cannot say as for what it can. Four probe
 
 ## 12. A few apps that broke the mold
 
-The anomaly list is where the fuzzer bugs and the truly broken apps hide, so we always read it by hand. Exactly one app scored a clean `0` (a thin landing page with no real surface, not a perfect app, so the 0% clean floor essentially holds). At the other end, the worst 40 apps are a catalog of the acute tail, `theoceanguard.tech` at 239 (a leaked backend plus a crash plus broken accessibility), a run of Lovable and Bolt apps carrying backend exposure at 98, and a cluster of apps failing `availability` at 85 (a page that would not stay up under load). The tail is not random. It is the same few severe classes, stacked.
+The anomaly list is where the fuzzer bugs and the truly broken apps hide, so we always read it by hand. Exactly one app scored a clean `0` (a thin landing page with no real surface, so its clean 0 marks thinness and the 0% clean floor essentially holds). At the other end, the worst 40 apps are a catalog of the acute tail, `theoceanguard.tech` at 239 (a leaked backend plus a crash plus broken accessibility), a run of Lovable and Bolt apps carrying backend exposure at 98, and a cluster of apps failing `availability` at 85 (a page that would not stay up under load). The tail is orderly, the same few severe classes stacked.
 
 ## 13. Is the ruler trustworthy?
 
 We put the ruler through four honesty checks, because a comparable number is worthless if it drifts or lies.
 
-The first check is stability, and the score is deterministic by construction. No model sits in the number, since the perception LLM only proposes targets and a deterministic probe alone decides every fire, at temperature 0 with a cached plan. The two seasoned engines are pinned (axe-core 4.10.2, Lighthouse 13.4.1, the latter a median of three runs to tame its timing swing), repeat runs of the prior engine correlated at 0.97 or higher with no drift, and 2.0 adds probes, not nondeterminism.
+The first check is stability, and the score is deterministic by construction. No model sits in the number, since the perception LLM only proposes targets and a deterministic probe alone decides every fire, at temperature 0 with a cached plan. The two seasoned engines are pinned (axe-core 4.10.2, Lighthouse 13.4.1, the latter a median of three runs to tame its timing swing), repeat runs of the prior engine correlated at 0.97 or higher with no drift, and 2.0 adds probes while keeping that determinism.
 
 Coverage is the second check, and the average app ran **53 of the 102 probes**, a median of 57% of the battery. That bound ships with every grade, so a score reads as "tested on most of what applied," not "clean."
 
-Parity, the third check, produced a refusal, and a useful one. We asked the tool for a cross stack false negative comparison, contrasting SPA against server rendered apps, and it refused correctly, because every app in this corpus arrived as a bare URL with no source, so it is a single stack with nothing to contrast, and the lens says "cannot assess" rather than inventing a clean bill. A tool that tells you when it cannot measure something is worth more than one that always answers.
+Parity, the third check, produced a refusal, and a useful one. We asked the tool for a cross stack false negative comparison, contrasting SPA against server rendered apps, and it refused correctly, because every app in this corpus arrived as a bare URL with no source, so it is a single stack with nothing to contrast, and the lens says "cannot assess" instead of inventing a clean bill. A tool that tells you when it cannot measure something is worth more than one that always answers.
 
-Precision is the fourth check. The automated audit recognizes a fixed list of false positive classes and is blunt that it is not a true precision number. Of the 14,561 scored fires, **zero of the known false positive classes survived**, but only 40 are positively vouched and **62% carry no precision rule at all**, dominated by the deterministic presence checks (a header is absent, a control is dead) where false positive risk is structurally low. Eleven fires are flagged as real findings on the wrong owner's page (a rate limit or a bundle secret on a shared catch all host), which dissolve when a team submits its own URL. We also audited the fired findings by hand, and the backend exposure driver is clean, **18 of 18** confirmed by a real read or write, with the residual a handful of scope errors at the margin (one middleware bypass check firing on a Cloudflare path). None of it touches the high volume penalty mass or the acute findings. The audit cannot tell "no rule needed" from "no rule written," and we can, so we report the unaudited mass as unaudited rather than claim a precision we have not measured.
+Precision is the fourth check. The automated audit recognizes a fixed list of false positive classes and is blunt that it is not a true precision number. Of the 14,561 scored fires, **zero of the known false positive classes survived**, but only 40 are positively vouched and **62% carry no precision rule at all**, dominated by the deterministic presence checks (a header is absent, a control is dead) where false positive risk is structurally low. Eleven fires are flagged as real findings on the wrong owner's page (a rate limit or a bundle secret on a shared catch all host), which dissolve when a team submits its own URL. We also audited the fired findings by hand, and the backend exposure driver is clean, **18 of 18** confirmed by a real read or write, with the residual a handful of scope errors at the margin (one middleware bypass check firing on a Cloudflare path). None of it touches the high volume penalty mass or the acute findings. The audit cannot tell "no rule needed" from "no rule written," and we can, so we report the unaudited mass as unaudited instead of claiming a precision we have not measured.
 
 ## 14. What it all means
 
-The median app's **worst case slop**, the score it would carry if every applicable probe fired, is around **1,954**, while its actual median score is **50**, so it realizes about **2.3%** of its potential failure surface. It defends nearly everything it exposes, and fails on the diffuse hygiene it never thought about. That gap is the whole thesis in one number.
+The median app's **worst case slop**, the score it would carry if every applicable probe fired, is around **1,954**, while its actual median score is **50**, so it realizes about **2.3%** of its potential failure surface. It defends nearly everything it exposes, and fails on the diffuse hygiene it never thought about. That gap is the whole finding in one number.
 
-So the story of this corpus is not "AI writes insecure code that gets exploited." From the outside it is "AI writes **functional** code that ships without the boring universal floor," no headers, heavy bundles, unreadable text, a dead button, sometimes a localhost backend still pointing at the developer's laptop. The acute danger is real but rare, and the slice that remains has partly surfaced in the managed backend, where the danger now lives in a configuration toggle. The apps did not get more dangerous. The danger moved somewhere a grader can, for once, walk right up to it.
+So the story of this corpus, from the outside, is "AI writes **functional** code that ships without the boring universal floor," no headers, heavy bundles, unreadable text, a dead button, sometimes a localhost backend still pointing at the developer's laptop. The popular version, "AI writes insecure code that gets exploited," is the rarer case here. The acute danger is real but rare, and the slice that remains has partly surfaced in the managed backend, where the danger now lives in a configuration toggle. The apps stayed about as dangerous as before, and what changed is that the danger moved somewhere a grader can, for once, walk right up to it.
 
-## 15. Limitations, stated not hidden
+## 15. Limitations, stated openly
 
 - **Unauthenticated surface only.** A defect behind a login we cannot establish is undercounted. The acute rate is a floor, and Section 7 shows how large a floor.
-- **The injection surface is dark, and that is reach, not absence.** Two thirds static frontends behind a WAF is not a place injection can land, so a zero fire rate there proves nothing about the code.
-- **Recall is not audited, and precision is vouched, not blanket.** This provisional release guarantees stability and precision on the classes with explicit rules or a confirmed read or write. Everything else is unaudited, not endorsed.
-- **Independent of intent.** Sloptic grades the universal floor, not whether a feature is good. Originality and product quality are out of scope by design.
-- **Population, not universe.** These are young, small, frontend heavy hackathon apps. Do not read the distribution as production software.
+- **The injection surface is dark, and that is a matter of reach.** Two thirds static frontends behind a WAF give injection nowhere to land, so a zero fire rate there proves nothing about the code.
+- **Recall is unaudited, and precision is vouched only where a rule exists.** This provisional release guarantees stability and precision on the classes with explicit rules or a confirmed read or write. Everything else is unaudited and carries no endorsement.
+- **Independent of intent.** Sloptic grades the universal floor and leaves the worth of a feature alone. Originality and product quality are out of scope by design.
+- **One population.** These are young, small, frontend heavy hackathon apps, so do not read the distribution as production software.
 
 ## 16. Reproduce
 

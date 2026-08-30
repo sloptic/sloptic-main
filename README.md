@@ -20,7 +20,7 @@ galleries fill with submissions that look finished but were never hardened. Stud
 code bear out the worry, finding a vulnerability in roughly half of it. Yet when we graded 1,600+
 real submissions ourselves, the failure was rarely a dramatic exploit. Far more often it was the
 boring, pervasive floor left undone, no security headers, no rate limiting, broken accessibility, a
-dev build in production. App slop, it turns out, is chronic rather than acute. The full study, with the exact
+dev build in production. App slop, it turns out, is chronic, a missing floor far more often than a smoking gun. The full study, with the exact
 figures and the per axis breakdowns, is in [CORPUS_REPORT.md](CORPUS_REPORT.md).
 
 Hence the name.
@@ -44,7 +44,7 @@ human judge cannot hold a hundred stacks in their head. Sloptic grades them all 
 each one on a single curve.
 
 Sloptic grades the observable consequences of slop, the failures that are wrong no matter what
-the app is for, not the code that produced them.
+the app is for, and it leaves aside the code that produced them.
 
 ## What it grades
 
@@ -82,8 +82,8 @@ diagnostics.
 - **Damped, so one root cause counts once.** A probe's detection variants collapse to a single
   finding, and repeated instances of the same category across many endpoints have diminishing
   marginal penalty. Ten endpoints missing a header are not ten findings.
-- **Comparable.** A frozen reference distribution turns a raw score into a percentile, not just "42
-  slop" but "cleaner than 70 percent of the population." That comparison is what makes ranking
+- **Comparable.** A frozen reference distribution turns a raw score into a percentile, so "42
+  slop" reads as "cleaner than 70 percent of the population." That comparison is what makes ranking
   possible, and it is what separates Sloptic from a scanner.
 
 ## Coverage honesty
@@ -91,7 +91,7 @@ diagnostics.
 A low score means something only if you know what was tested. Every grade ships with a coverage
 report (probes applicable, probes that ran, surface observed) so a `0` that means "clean" is
 distinguishable from a `0` that means "we could not reach the surface." Sloptic grades the
-unauthenticated, observable surface well. It does not claim to exercise deep authenticated behavior, or behavior that depends on intent, and it says so rather than implying comprehensiveness.
+unauthenticated, observable surface well. It does not claim to exercise deep authenticated behavior, or behavior that depends on intent, and it says so instead of implying comprehensiveness.
 
 ## Install
 
@@ -160,13 +160,13 @@ Two instruments check correctness, because each answers a different question.
    ground truth tells you the detector works.
 
 From a source checkout, `uv sync` then `uv run pytest -q` runs the full calibration suite against the
-bundled reference apps (`references/`, not shipped in the pip package).
+bundled reference apps (the `references/` directory, absent from the pip package).
 
 ## Scope, honestly
 
 Sloptic is for grading deployed web apps at scale, hackathon submissions, CI gates, and your own
 projects. It is strongest on the unauthenticated observable surface and on SPAs rendered on the client with
-backends on the same origin. It is weaker where a defect hides behind authentication it cannot establish from the outside, or where judging the finding needs product intent. Those limits are reported, not hidden.
+backends on the same origin. It is weaker where a defect hides behind authentication it cannot establish from the outside, or where judging the finding needs product intent. Those limits are reported openly.
 
 ## License
 
