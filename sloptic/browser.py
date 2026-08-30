@@ -465,8 +465,6 @@ def await_streamlit(page, budget_s: float = 60.0) -> str:
     return "stuck"
 
 
-
-
 def render_routes(base_url: str, paths, headers=None, timeout: float = 12.0,
                   total_timeout: float = 60.0, interact: bool = True,
                   interact_routes: int = 6, net_sink: list | None = None,
@@ -1818,8 +1816,6 @@ def inert_controls(url: str, headers=None, timeout: float = 12.0, max_controls: 
         return None
 
 
-
-
 # Accessibility is graded with axe-core (Deque), the gold-standard WCAG engine, injected into the render.
 # axe splits results into `violations` (algorithmically DETERMINABLE — a rule definitively failed) and
 # `incomplete` (needs a human to decide). We take `violations` only, filtered to the WCAG 2 A/AA
@@ -2088,28 +2084,6 @@ _METRICS_JS = """(() => {
     window.__hlm.lcp_loading = (el && el.getAttribute && (el.getAttribute('loading') || '').toLowerCase()) || '';
   });
 })()"""
-
-
-
-
-# Core Web Vitals — LCP (largest content paint), CLS (layout shift), total blocking time (main-thread
-# jank) — measured by a PerformanceObserver injected BEFORE load, over N renders throttled to a mid-tier
-# device (4x CPU + Slow-4G, Lighthouse's lab profile), so a bad number means bad on a REAL device, not
-# flattered by a fast sandbox. The predicate scores off the player-favorable edge (best-of-N), so
-# measurement variance can only ever help a player -- the app must be poor even on its best run to fire.
-_VITALS_JS = """(() => {
-  window.__hlv = {lcp: 0, cls: 0, tbt: 0};
-  const obs = (t, cb) => { try { new PerformanceObserver(cb).observe({type: t, buffered: true}); } catch (e) {} };
-  obs('largest-contentful-paint', l => { const es = l.getEntries(); if (es.length) window.__hlv.lcp = es[es.length - 1].startTime; });
-  obs('layout-shift', l => { for (const e of l.getEntries()) if (!e.hadRecentInput) window.__hlv.cls += e.value; });
-  obs('longtask', l => { for (const e of l.getEntries()) if (e.duration > 50) window.__hlv.tbt += (e.duration - 50); });
-})()"""
-
-# Lighthouse's standard mobile lab throttle -> the published CWV device profile (distinct from perf.py's
-# transfer profile, which grades server-side load time). ~Slow 4G: 150ms RTT, 1.6Mbps down, 750Kbps up.
-_CWV_THROTTLE = {"offline": False, "latency": 150, "downloadThroughput": 200_000, "uploadThroughput": 93_750}
-
-
 
 
 @_browser_guarded
