@@ -20,7 +20,7 @@ try:
 except ImportError:   # non-POSIX (Windows) -> the cross-process Lighthouse lock degrades to a no-op
     fcntl = None
 
-from . import auth, lighthouse, platform_id, safety, secretscan
+from . import auth, egress, lighthouse, platform_id, safety, secretscan
 from .aggregate import compute_axis_slop, compute_slop_score, coverage_metrics
 from .deploy import Deployer
 from .discovery import discover, surface_metrics
@@ -439,6 +439,7 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
     flags a LONG, otherwise-silent phase a watched grade should see even when not verbose (chiefly the ~2-3min
     Lighthouse trace). Formatting + verbosity are the caller's; best-effort — a callback error never touches the
     grade."""
+    egress.install()   # resolver egress guard is opt-in now; every grade (CLI or worker) enters through run()
     def _phase(name, label, important=False):
         if on_phase:
             try:

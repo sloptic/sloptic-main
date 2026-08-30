@@ -15,6 +15,8 @@ import time
 
 import httpx
 
+from .net import make_client
+
 
 class DeployHandle:
     def __init__(self, base_url: str):
@@ -254,9 +256,14 @@ class RemoteDeployer(Deployer):
                 # "/": a target with a path (e.g. .../portal.php, pointing at a specific vuln page) would
                 # become ".../portal.php/", which on some apps (bWAPP) triggers a relative-redirect loop
                 # -> TooManyRedirects -> a false "did not respond".
-                if httpx.get(self.base_url, timeout=_LIVENESS_READ_TIMEOUT, follow_redirects=True,
-                             verify=False).status_code < 500:   # target may present a self-signed cert
-                    return DeployHandle(self.base_url)  # a non-5xx response means it is up
+                # make_client, not a raw httpx.get: the liveness fetch is the FIRST request a target
+                # (and its WAF) ever sees from us, so it must present the real-Chrome UA + h2 like every
+                # other grader request, and it inherits the resolver-level egress guard via net.py.
+                # EgressRefused subclasses gaierror -> httpx.ConnectError -> caught below, so a target
+                # that resolves non-public reads as "did not respond" instead of being dialed.
+                with make_client("", timeout=_LIVENESS_READ_TIMEOUT, follow_redirects=True) as c:
+                    if c.get(self.base_url).status_code < 500:   # non-5xx means up; verify=False is make_client's default (self-signed targets)
+                        return DeployHandle(self.base_url)
             except httpx.HTTPError:
                 pass
             time.sleep(0.3)

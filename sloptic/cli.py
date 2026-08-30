@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -15,7 +16,7 @@ import textwrap
 from collections import defaultdict
 from dataclasses import asdict
 
-from . import browser, runcache, safety
+from . import browser, egress, runcache, safety
 from .aggregate import CATEGORY_DECAY
 from .catalog import ProbeSelectionError, default_catalog_dir, load_catalog, select_probes
 from .deploy import DockerDeployer, RemoteDeployer, SubprocessDeployer
@@ -293,6 +294,7 @@ def _make_phase(args):
 # ---- entry point ----------------------------------------------------------------------------
 
 def main() -> None:
+    egress.install()   # opt-in resolver egress guard for the whole CLI process
     ap = argparse.ArgumentParser(
         prog="sloptic",
         description="Deploy/target an app, probe it over HTTP, and report a slop score (lower is better).",
@@ -443,7 +445,13 @@ def _grade(args, source, catalog, render, auth_headers, progress, phase=None):
     # browser render; off when a --header session is already supplied (that is used directly).
     browser_register = browser.register_in_browser if (args.browser_auth and args.browser) else None
     auth_crawl = bool(args.browser_auth and args.browser and not auth_headers)
-    # Trusted reference app: subprocess, no Docker.
+    # Egress guard mode for the WHOLE CLI (this runs before the lane branch, deliberately): the CLI is
+    # a trusted local tool, and all three of its lanes legitimately touch loopback -- subprocess and
+    # Docker deployers health-gate on 127.0.0.1, and `--target http://localhost:3000` is how you
+    # dogfood a local app. LOCAL mode allows loopback and still refuses every other non-public
+    # destination (see sloptic/egress.py). It is a setdefault, so an explicit SLOPTIC_EGRESS wins.
+    # The web worker, which takes URLs from strangers, never sets this and so runs strict.
+    os.environ.setdefault("SLOPTIC_EGRESS", "local")
     if args.app:
         return run(SubprocessDeployer(args.app), catalog, render=render, headers=auth_headers,
                    on_progress=progress, on_phase=phase, source_dir=args.source, email_receiver=email_receiver,

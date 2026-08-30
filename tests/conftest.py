@@ -18,3 +18,14 @@ def _no_real_lighthouse(monkeypatch):
         raise lh.PSIError("run_local disabled in the test suite (see tests/conftest.py)")
 
     monkeypatch.setattr(lh, "run_local", _disabled)
+
+
+@pytest.fixture(autouse=True)
+def _egress_local_lane(monkeypatch):
+    """The suite grades reference apps on loopback, so the resolver-level egress guard
+    (sloptic/egress.py, installed explicitly by each entrypoint and here) runs in LOCAL mode here: loopback
+    allowed, every other non-public destination still refused. tests/test_egress.py pins the mode
+    per test, overriding this."""
+    monkeypatch.setenv("SLOPTIC_EGRESS", "local")
+    from sloptic import egress
+    egress.install()

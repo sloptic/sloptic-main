@@ -22,6 +22,8 @@ import threading
 import time
 import urllib.parse
 
+from . import egress
+
 # An <img onerror> payload executes when inserted into the DOM (unlike a bare <script>), so it fires
 # for both reflected-that-executes and DOM-sink XSS. The marker is read back from window.
 _XSS_PAYLOAD = "<img src=x onerror=\"window.__hl_domxss='hl-domxss-9a2b'\">"
@@ -131,14 +133,89 @@ def _browser_guarded(fn):
     return _wrap
 
 
+# EGRESS SANDBOX, browser tier (see sloptic/egress.py). Chromium is a SEPARATE PROCESS with its own
+# network stack and its own resolver, so the resolver guard that covers every httpx call does nothing
+# for it: a page that loads clean from a public host can still name `<script src="http://10.0.0.1/">`
+# and the browser will fetch it. This filter runs every request the browser initiates (document,
+# script, xhr, image, websocket) through the same address predicate before it is allowed out.
+#
+# TWO HONEST LIMITS, both closed by the OS tier rather than papered over here:
+#   1. We decide, then Chromium resolves independently, so a TTL-0 rebinding host has a narrow
+#      window this filter cannot close.
+#   2. It covers the Playwright browser ONLY. The performance axis is outsourced to Lighthouse,
+#      which sloptic/lighthouse.py shells out via `npx` -- its own Chrome, its own process, never
+#      touched by this route handler.
+# In both cases the nftables deny is the control that actually holds, which is why the sandbox is
+# layered rather than a single check.
+#
+# Scope is deliberately NOT enforced on subresources (see egress.host_allowed): a normal page loads
+# fonts and scripts cross-origin, and aborting those would change every measurement.
+def _install_egress_filter(target) -> None:
+    """Route every request `target` (a Page or BrowserContext) makes through the egress predicate."""
+    if egress.mode() == "off":
+        return
+
+    def _guard(route):
+        try:
+            parts = urllib.parse.urlparse(route.request.url)
+            host = parts.hostname
+            if host is None:      # data:, blob:, about:blank -- no destination to check
+                route.continue_()
+                return
+            port = parts.port or (443 if parts.scheme == "https" else 80)
+            if egress.host_allowed(host, port):
+                route.continue_()
+            else:
+                route.abort("blockedbyclient")
+        except Exception:
+            # Never let the filter itself break a lane: a page that navigates away mid-decision
+            # invalidates the route, and continue_() on a dead route raises.
+            with contextlib.suppress(Exception):
+                route.continue_()
+
+    with contextlib.suppress(Exception):
+        target.route("**/*", _guard)
+
+
 def _launch(p):
     global _LAST_LAUNCH_ERROR
     for kwargs in _LAUNCH_ORDER:
         try:
-            return p.chromium.launch(headless=True, **kwargs)
+            return _EgressGuardedBrowser(p.chromium.launch(headless=True, **kwargs))
         except Exception as e:     # try the next channel; keep the last failure so the preflight can report WHY
             _LAST_LAUNCH_ERROR = f"{type(e).__name__}: {str(e).splitlines()[0][:200]}"
     return None
+
+
+class _EgressGuardedBrowser:
+    """A Playwright Browser that installs the egress route filter on everything it creates.
+
+    Wrapping the browser (rather than editing the ~15 `new_page()` / `new_context()` call sites) is
+    the same reasoning as the resolver guard: one chokepoint that a new lane cannot forget to use.
+    Everything else delegates to the real Browser untouched."""
+
+    def __init__(self, browser):
+        self._browser = browser
+
+    def __getattr__(self, name):
+        return getattr(self._browser, name)
+
+    def __enter__(self):          # dunders bypass __getattr__, so proxy them explicitly
+        self._browser.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        return self._browser.__exit__(*exc)
+
+    def new_page(self, **kwargs):
+        page = self._browser.new_page(**kwargs)
+        _install_egress_filter(page)
+        return page
+
+    def new_context(self, **kwargs):
+        ctx = self._browser.new_context(**kwargs)
+        _install_egress_filter(ctx)
+        return ctx
 
 
 def browser_preflight() -> tuple[bool, str]:
@@ -386,8 +463,6 @@ def await_streamlit(page, budget_s: float = 60.0) -> str:
             pass
         page.wait_for_timeout(1500)
     return "stuck"
-
-
 
 
 def render_routes(base_url: str, paths, headers=None, timeout: float = 12.0,
@@ -1741,8 +1816,6 @@ def inert_controls(url: str, headers=None, timeout: float = 12.0, max_controls: 
         return None
 
 
-
-
 # Accessibility is graded with axe-core (Deque), the gold-standard WCAG engine, injected into the render.
 # axe splits results into `violations` (algorithmically DETERMINABLE — a rule definitively failed) and
 # `incomplete` (needs a human to decide). We take `violations` only, filtered to the WCAG 2 A/AA
@@ -2011,28 +2084,6 @@ _METRICS_JS = """(() => {
     window.__hlm.lcp_loading = (el && el.getAttribute && (el.getAttribute('loading') || '').toLowerCase()) || '';
   });
 })()"""
-
-
-
-
-# Core Web Vitals — LCP (largest content paint), CLS (layout shift), total blocking time (main-thread
-# jank) — measured by a PerformanceObserver injected BEFORE load, over N renders throttled to a mid-tier
-# device (4x CPU + Slow-4G, Lighthouse's lab profile), so a bad number means bad on a REAL device, not
-# flattered by a fast sandbox. The predicate scores off the player-favorable edge (best-of-N), so
-# measurement variance can only ever help a player -- the app must be poor even on its best run to fire.
-_VITALS_JS = """(() => {
-  window.__hlv = {lcp: 0, cls: 0, tbt: 0};
-  const obs = (t, cb) => { try { new PerformanceObserver(cb).observe({type: t, buffered: true}); } catch (e) {} };
-  obs('largest-contentful-paint', l => { const es = l.getEntries(); if (es.length) window.__hlv.lcp = es[es.length - 1].startTime; });
-  obs('layout-shift', l => { for (const e of l.getEntries()) if (!e.hadRecentInput) window.__hlv.cls += e.value; });
-  obs('longtask', l => { for (const e of l.getEntries()) if (e.duration > 50) window.__hlv.tbt += (e.duration - 50); });
-})()"""
-
-# Lighthouse's standard mobile lab throttle -> the published CWV device profile (distinct from perf.py's
-# transfer profile, which grades server-side load time). ~Slow 4G: 150ms RTT, 1.6Mbps down, 750Kbps up.
-_CWV_THROTTLE = {"offline": False, "latency": 150, "downloadThroughput": 200_000, "uploadThroughput": 93_750}
-
-
 
 
 @_browser_guarded

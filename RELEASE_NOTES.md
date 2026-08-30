@@ -1,4 +1,4 @@
-# Sloptic v2.0.0
+# Sloptic v2.1.0
 
 Sloptic grades any deployed web app, whatever its stack or purpose, and returns one
 **slop score** you can compare across apps (lower is better, `0` means nothing found),
@@ -9,7 +9,24 @@ was built with.
 Versions 1.1 and 1.2 kept the 2026.1 curve, so grades stayed comparable and the changes were
 precision and diagnostics. Version 2.0 is different: it is a **new ruler**. New probe families and
 continuous scoring changed what the number measures, and the reference curve moved to **2026.3**, so
-a 2.0 score does not compare to a 1.x one. A 2.0 percentile is quoted against 2026.3.
+a 2.0 score does not compare to a 1.x one. A 2.0 percentile is quoted against 2026.3. Version 2.1 keeps that 2026.3 ruler, so a 2.1 grade compares directly to a 2.0 one, and it adds the egress sandbox the hosted service needs to accept public URL submissions safely.
+
+## What's new in 2.1.0
+
+- **An egress sandbox, so the hosted service can take public URLs.** Grading a URL a stranger submitted
+  means fetching a destination you did not choose, which without a guard can walk a fetch toward
+  loopback, a private network, or the cloud metadata endpoint and turn the grader into an SSRF relay.
+  2.1 adds one resolver level chokepoint, a guard on `socket.getaddrinfo` that refuses any host
+  resolving to a non-public address, covering every httpx client, raw socket, and redirect hop at once,
+  plus a browser tier filter that aborts a private subresource in the Chromium lane. It validates every
+  resolved address all or nothing and hands that same address back to the dialer, so the address checked
+  is the address connected and there is no DNS rebinding window. Modes are set by `SLOPTIC_EGRESS` (`on`
+  strict by default, `local` to allow loopback for the reference app lane, `off` to bypass), and
+  `origin_scope()` pins a public grade to one origin so a redirect off site fails closed.
+- **The guard is opt in.** It installs from the grade entrypoints, `pipeline.run()` and the CLI, so
+  importing the package for a probe or a utility leaves the standard library untouched.
+- **No curve movement.** For public targets the scores are byte identical, so 2.1 stays on curve 2026.3
+  and nothing in the distribution moves.
 
 ## What's new in 2.0.0
 
