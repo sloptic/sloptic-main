@@ -169,3 +169,69 @@ def test_guard_does_not_recurse_into_itself(strict, fake_dns):
     table, _ = fake_dns
     table["ok.test"] = [_ai(GOOD)]
     assert socket.getaddrinfo("ok.test", 443)
+
+
+# ---------------------------------------------------------------- browser tier: attack (d)
+
+def test_host_allowed_ignores_origin_scope(strict, fake_dns):
+    """Subresources must NOT inherit the grade's origin scope: a normal page loads fonts and scripts
+    cross-origin, and enforcing scope there would abort half the web and move every measurement."""
+    table, _ = fake_dns
+    table["cdn.test"] = [_ai(GOOD2)]
+    with egress.origin_scope("https://target.test"):
+        assert egress.host_allowed("cdn.test", 443)          # allowed: public, though off-origin
+        assert not egress.host_allowed("10.0.0.9", 80)       # still refused: private
+
+
+def test_host_allowed_permits_unresolvable(strict):
+    """Nothing to protect against, and Chromium's own connect will fail naturally."""
+    assert egress.host_allowed("no-such-host.invalid", 80)
+
+
+def test_browser_filter_aborts_a_private_subresource(monkeypatch):
+    """End to end, in a real Chromium: a page served from loopback names an image on the LAN. The
+    route filter must abort that request while the page itself still loads."""
+    monkeypatch.setenv("SLOPTIC_EGRESS", "local")   # loopback page allowed; 10.0.0.1 still refused
+    import http.server
+    import threading
+
+    from sloptic import browser
+
+    html = b"<html><body><p id=ok>loaded</p><img src='http://10.0.0.1/x.png'></body></html>"
+
+    class _H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(html)))
+            self.end_headers()
+            self.wfile.write(html)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    port = srv.server_address[1]
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        pytest.skip("playwright not installed")
+
+    failed: list[str] = []
+    try:
+        with sync_playwright() as pw:
+            b = browser._launch(pw)
+            if b is None:
+                pytest.skip("no chromium available")
+            page = b.new_page()
+            page.on("requestfailed", lambda r: failed.append(r.url))
+            page.goto(f"http://127.0.0.1:{port}/", wait_until="load")
+            page.wait_for_timeout(600)
+            assert page.text_content("#ok") == "loaded"      # the page itself still renders
+            b.close()
+    finally:
+        srv.shutdown()
+
+    assert any("10.0.0.1" in u for u in failed), f"private subresource was not aborted: {failed}"

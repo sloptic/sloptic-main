@@ -149,3 +149,48 @@ def install() -> None:
             return
         socket.getaddrinfo = _guarded_getaddrinfo
         _installed = True
+
+
+# ---------------------------------------------------------------- browser lane
+
+_host_cache: dict[tuple, bool] = {}
+_HOST_CACHE_CAP = 2048
+
+
+def host_allowed(host: str, port: int = 443) -> bool:
+    """True if EVERY address `host` resolves to is public (or loopback in local mode).
+
+    For the browser route filter, which asks once per subresource. Two deliberate differences from
+    the resolver guard:
+
+      * ORIGIN SCOPE IS NOT APPLIED. A scoped grade pins the GRADER's own fetches to one origin, but
+        a normal page legitimately loads fonts, scripts and images cross-origin; enforcing scope on
+        subresources would abort half the web and change every measurement. The browser filter is an
+        IP-reachability control only.
+      * It never raises. A host that does not resolve returns True: there is nothing to protect
+        against, and Chromium's own connect will fail naturally, which is the behavior the lane
+        already handles.
+
+    Cached per (host, port, mode) since a page pulls many subresources from few hosts.
+    """
+    key = (host, port, mode())
+    cached = _host_cache.get(key)
+    if cached is not None:
+        return cached
+
+    m = key[2]
+    if m == "off":
+        return True
+    tok = _in_guard.set(True)     # resolve through the REAL resolver: no recursion, no scope
+    try:
+        infos = _real_getaddrinfo(host, port)
+    except socket.gaierror:
+        return True               # unresolvable, not cached: DNS may just be flaky right now
+    finally:
+        _in_guard.reset(tok)
+
+    ok = all(check_ip(i[4][0], allow_loopback=(m == "local")) for i in infos)
+    if len(_host_cache) >= _HOST_CACHE_CAP:
+        _host_cache.clear()
+    _host_cache[key] = ok
+    return ok
