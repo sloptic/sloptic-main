@@ -59,10 +59,10 @@ _AUTHED_PROBES = frozenset({
 
 
 def _severity_tier(penalty):
-    """A finding's severity tier, derived from its risk priced penalty (no explicit severity field in the record):
-    critical >= 30, serious 16..29, moderate 8..15, minor 1..7."""
-    return ("critical" if penalty >= 30 else "serious" if penalty >= 16
-            else "moderate" if penalty >= 8 else "minor")
+    """A finding's severity tier, derived from its risk priced penalty (no explicit severity field in the record).
+    Clean 10 wide bands so they read plainly: minor 1..10, moderate 11..20, serious 21..30, severe 31..40, critical 40+."""
+    return ("critical" if penalty >= 40 else "severe" if penalty > 30
+            else "serious" if penalty > 20 else "moderate" if penalty > 10 else "minor")
 
 
 def load(path):
@@ -255,7 +255,7 @@ def audit_category(recs, query):
     if d:
         print(f"  slop per affected app:  mean {d['avg']}  median {d['median']}  stdev {d['stdev']}  "
               f"(min {d['min']}  max {d['max']}, over the {d['n']} apps with a finding here)")
-    print(f"  severity:  critical {sev['critical']}  serious {sev['serious']}  "
+    print(f"  severity:  critical {sev['critical']}  severe {sev['severe']}  serious {sev['serious']}  "
           f"moderate {sev['moderate']}  minor {sev['minor']}")
     try:
         pcat = {p.id: p for p in load_catalog(str(_ROOT / "catalog"))}
@@ -1519,7 +1519,7 @@ def main():
                                                      if _scored(f) and _severity_tier(f["penalty"]) == t),
                                      "apps": len({r["repo"] for r in graded for f in r.get("findings", [])
                                                   if _scored(f) and _severity_tier(f["penalty"]) == t})}
-                                 for t in ("critical", "serious", "moderate", "minor")},
+                                 for t in ("critical", "severe", "serious", "moderate", "minor")},
             "category_concentration": {k: round(v, 1) for k, v in sorted(cat_total.items(), key=lambda x: -x[1])},
             "probe_fire_frequency": {pid: n for pid, n in freq},
             "email_verification": email_break,
@@ -1728,8 +1728,8 @@ def main():
                 sev_per_app[t][r["repo"]] += 1
     if sev_findings:
         sec("FINDING SEVERITY  (scored findings by risk priced penalty tier; apps = # with >=1 at that tier)")
-        for tier in ("critical", "serious", "moderate", "minor"):
-            pen = ">=30" if tier == "critical" else "16-29" if tier == "serious" else "8-15" if tier == "moderate" else "1-7"
+        for tier in ("critical", "severe", "serious", "moderate", "minor"):
+            pen = "40+" if tier == "critical" else "31-40" if tier == "severe" else "21-30" if tier == "serious" else "11-20" if tier == "moderate" else "1-10"
             line = (f"    {tier:9} (pen {pen:>5})   {sev_findings.get(tier, 0):>4} findings   "
                     f"across {len(sev_apps.get(tier, set())):>3} apps")
             counts = list(sev_per_app[tier].values())   # per-app count of that tier, among apps that have one
@@ -1742,7 +1742,7 @@ def main():
         # mean count, with its variance. This is the UNCONDITIONAL expectation, what a random graded app carries,
         # distinct from the per app line above, which conditions on apps that already have >=1 at the tier.
         print(f"    expected per app  (all {len(graded)} graded, zeros counted; E = sum_k k*Pr(k)):")
-        for tier in ("critical", "serious", "moderate", "minor"):
+        for tier in ("critical", "severe", "serious", "moderate", "minor"):
             xs = [sev_per_app[tier].get(r["repo"], 0) for r in graded]
             var = statistics.pvariance(xs) if len(xs) > 1 else 0.0
             print(f"      {tier:9} E={statistics.mean(xs):.2f}  var={var:.2f}  sd={var ** 0.5:.2f}")
