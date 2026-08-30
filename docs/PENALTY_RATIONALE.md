@@ -2,7 +2,7 @@
 
 ### How Sloptic prices a finding, and the authority behind each number
 
-Sloptic's score is a sum of penalties, one per finding, and the whole grade is only as trustworthy as those numbers. So none of them is hand placed. Every penalty derives from a named authority, and the exact point inside its range is set by what the probe actually observed, not by taste. This document is the ledger: what each number is, where it came from, and why it sits where it does.
+Sloptic's score is a sum of penalties, one per finding, and the whole grade is only as trustworthy as those numbers. So none of them is hand placed. Every penalty derives from a named authority, and the exact point inside its range is set by what the probe actually observed, and taste never enters. This document is the ledger: what each number is, where it came from, and why it sits where it does.
 
 The short version is one sentence. Security penalties come from CVSS magnitude reconciled with the Bugcrowd Vulnerability Rating Taxonomy, quality and performance penalties come from ISO/IEC 25010 crossed with Nielsen severity, and in both cases the probe charges the floor of its class unless it proves worse impact, at which point evidence lifts the number toward the ceiling.
 
@@ -14,7 +14,7 @@ Every penalty is a percentage of a single total catastrophe.
 
 - The anchor is **100**, a CVSS 10.0 event scaled by ten: an unauthenticated remote code execution with full confidentiality, integrity, and availability loss and a scope change. Nothing a single probe can find exceeds it.
 - So `penalty = severity × 10`. A finding priced at 40 is 40% of a catastrophe, a missing referrer policy at 2 is 2% of one.
-- The **ceiling is per probe, not per app**. The aggregate stays unbounded and deductions only, so an app carrying three catastrophes loses roughly 250 after damping. The reverted 0 to 100 total score did not come back.
+- The **ceiling applies per probe**. The aggregate stays unbounded and deductions only, so an app carrying three catastrophes loses roughly 250 after damping. The reverted 0 to 100 total score did not come back.
 - Performance caps structurally at **90**, because a fully slow app is close to a catastrophe for the user but is not a compromise. Slowness ranks just under owned, which is correct.
 
 ## 2. Which authority sets which number
@@ -33,7 +33,7 @@ Only the severity layer sets the number this document is about. Coverage decides
 
 ## 3. Default low, evidence lifts
 
-Each security class carries a **range**, its CVSS band reconciled with its VRT band, and a **default** equal to the floor of that range. The probe abstains to the floor and charges more only when it observes worse impact. It sets evidence flags as it runs, and a resolver picks the highest matching rung, clamped to the range. When CVSS and VRT disagree, the range widens rather than forcing a manual call. The rule is the same everywhere: charge the floor, let proof lift it.
+Each security class carries a **range**, its CVSS band reconciled with its VRT band, and a **default** equal to the floor of that range. The probe abstains to the floor and charges more only when it observes worse impact. It sets evidence flags as it runs, and a resolver picks the highest matching rung, clamped to the range. When CVSS and VRT disagree, the range widens instead of forcing a manual call. The rule is the same everywhere: charge the floor, let proof lift it.
 
 These are the flags a probe can set, each tied to a concrete observation.
 
@@ -43,19 +43,19 @@ These are the flags a probe can set, each tied to a concrete observation.
 | `cross_user_read` | read another user's record |
 | `cross_user_write` | changed another user's record |
 | `sensitive_fields` | the exposed data held PII, secrets, or tokens |
-| `bulk_read` | many records were reachable, not one |
-| `data_extracted` | an injection returned real database rows, not just an oracle |
+| `bulk_read` | many records were reachable at once |
+| `data_extracted` | an injection returned real database rows, beyond a mere oracle |
 | `write_confirmed` | an injection or mutation changed server state |
 | `execution_confirmed` | the payload actually executed |
 | `internal_reached` | a forged request reached an internal or metadata host |
 | `validated_live` | a discovered secret authenticated against its provider |
 | `high_privilege` | the secret or access was admin, service role, or private key tier |
 
-A probe that fires but proves nothing beyond presence earns the default. That is deliberate: unproven impact is not charged at the high end. It is also what makes the score fair across apps rather than across classes. An access control failure that read a whole table is priced at 85, one that read a single row at 55, and the difference is the evidence, not the label.
+A probe that fires but proves nothing beyond presence earns the default. That is deliberate: unproven impact stays at the floor. It is also what makes the score fair across apps instead of across classes. An access control failure that read a whole table is priced at 85, one that read a single row at 55, and the gap between them is set by what each probe proved.
 
 ## 4. The security ladder, class by class
 
-Every security class below names its CVSS 3.1 vector score and its Bugcrowd VRT baseline. Range bounds are pinned from those authorities; the rung points inside a range are calibrated against the corpus. Where a class is not in the VRT, it is anchored on CVSS alone and held conservative, which is marked.
+Every security class below names its CVSS 3.1 vector score and its Bugcrowd VRT baseline. Range bounds are pinned from those authorities; the rung points inside a range are calibrated against the corpus. Where a class falls outside the VRT, it is anchored on CVSS alone and held conservative, which is marked.
 
 ### Terminal classes (VRT P1, CVSS 9 to 9.8)
 
@@ -70,7 +70,7 @@ Every security class below names its CVSS 3.1 vector score and its Bugcrowd VRT 
 | Anonymous whole database read | `backend-001`, `exposure-008` | 7.5 to 9 | P1 | 70 to 98, default 70 | PII fields 80, bulk records 90, anon write 98 |
 | XML external entity | `xxe-001` | 7.5 | P1 | 70 to 91, default 70 | reached internal host 82, read a system file 91 |
 
-These map to the OWASP Top 10 2025: A05 Injection (the four execution classes), A01 Broken Access Control (auth bypass, anonymous read), and A04 Cryptographic Failures (disclosed secrets and served credentials). The injection and upload probes fire only on a proven execution oracle, a salt hash the engine must return or a webshell that must run, so they never trip on the basic variant the VRT would rate a P4 or P5, which is why their floor is terminal rather than low.
+These map to the OWASP Top 10 2025: A05 Injection (the four execution classes), A01 Broken Access Control (auth bypass, anonymous read), and A04 Cryptographic Failures (disclosed secrets and served credentials). The injection and upload probes fire only on a proven execution oracle, a salt hash the engine must return or a webshell that must run, so they never trip on the basic variant the VRT would rate a P4 or P5, which is why their floor sits at terminal instead of low.
 
 ### High, evidence critical
 
@@ -153,7 +153,7 @@ A vulnerable client dependency is the single case where the finding actually is 
 
 Every number carries one of two provenances. A **pinned** value comes straight from an authority: a CVSS canonical vector, a VRT baseline, an OWASP factor, a CWE. A **calibrated** value is a point proposed inside a pinned range and confirmed against a corpus regrade. Range bounds are almost all pinned; the rung points inside them are calibrated. The document never hides which is which, and neither does the catalog.
 
-This is enforced, not promised. A continuous integration gate requires every security probe to carry a severity block with a real CVSS vector and a VRT rating, or to declare itself a chore floor. Every escalator point must fall inside its range, and the default must equal the floor unless a comment justifies otherwise. A naked `penalty: 40` with no authority behind it fails the build and cannot merge. That gate is the difference between frequency times severity as a slogan and frequency times severity as a rule.
+This is enforced. A continuous integration gate requires every security probe to carry a severity block with a real CVSS vector and a VRT rating, or to declare itself a chore floor. Every escalator point must fall inside its range, and the default must equal the floor unless a comment justifies otherwise. A naked `penalty: 40` with no authority behind it fails the build and cannot merge. That gate is the difference between frequency times severity as a slogan and frequency times severity as a rule.
 
 ## 10. Reading one number
 
