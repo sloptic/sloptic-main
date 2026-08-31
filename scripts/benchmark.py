@@ -383,7 +383,7 @@ def rank(curve: dict, score, record: dict | None = None) -> dict:
     if dist is not None and record is not None:
         idx = _catalog_index()
         potential, ncats = _slop_potential(record, idx), _categories_applied(record)
-        pct, cleaner_than = _rank_on_dist(dist, _key(int(score), _has_catastrophe(record),
+        pct, cleaner_than = _rank_on_dist(dist, _key(score, _has_catastrophe(record),
                                                      _max_penalty(record), potential, ncats))
     elif dist is not None:
         pct, cleaner_than = _rank_score_only(dist, score)     # a bare score has no tiebreak keys: slop alone
@@ -397,7 +397,7 @@ def rank(curve: dict, score, record: dict | None = None) -> dict:
     if record:
         if potential is not None:
             out["slop_potential"] = potential
-            out["defended"] = max(potential - int(score), 0)  # worst-case damage held off, the tiebreak signal
+            out["defended"] = round(max(potential - score, 0))  # worst-case damage held off, the tiebreak signal
             out["categories_applied"] = ncats
         applicable = _axis_applicable(record)
         for axis, part in curve["axes"].items():

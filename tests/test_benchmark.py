@@ -206,3 +206,12 @@ def test_rank_refuses_a_cross_mode_placement():
     full = build([_graded(102, s) for s in (10, 20, 30)], "2026.3", "t")
     full.pop("probe_set")                          # a legacy untagged curve is treated as full
     assert rank(full, 20, _graded(102, 20))["percentile"] is not None
+
+
+def test_rank_uses_the_exact_fractional_score_not_its_integer_floor():
+    # build() stores raw fractional slop; rank() must query the same, or a 21.6 app keyed as 21 jumps
+    # ahead of everyone scoring 21.0 to 21.9. Here the 21.4 app is cleaner, the rest worse.
+    curve = build([_graded(102, s) for s in (21.4, 21.8, 22.3, 30.0)], "2026.3", "t")
+    res = rank(curve, 21.6, _graded(102, 21.6))
+    assert res["percentile"] == 25          # exactly one of four (21.4) is cleaner
+    assert res["cleaner_than_pct"] == 75     # the int(21.6)=21 bug would read 0 / 100
