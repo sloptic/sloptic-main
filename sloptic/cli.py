@@ -13,7 +13,7 @@ import pathlib
 import subprocess
 import sys
 import textwrap
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import asdict
 
 from . import browser, egress, runcache, safety
@@ -89,6 +89,28 @@ def _axis_line(report) -> str:
     return "    " + " · ".join(parts) if parts else ""
 
 
+def _fully_na_axes(report):
+    """Axes whose probes ALL read n/a: a whole battery that silently did not run. Lighthouse unreachable,
+    for one, takes the entire performance axis, and axis_slop OMITS a clean axis rather than zeroing it, so
+    a clean axis and a never-ran axis look identical without this. Returns [(axis, n_na, reason)]."""
+    c = report.coverage or {}
+    ran, na = Counter(), Counter()
+    for v in (c.get("by_kind") or {}).values():
+        b = v.get("bundle")
+        if b:
+            ran[b] += v.get("ran", 0)
+            na[b] += v.get("na", 0)
+    prefix = {"security": "sec-", "qa": "qa-", "performance": "perf-"}
+    out = []
+    for axis in ("security", "qa", "performance"):
+        if ran[axis] == 0 and na[axis] > 0:      # had probes, none ran -> a silently deleted axis
+            reasons = Counter(r for pid, r in (c.get("na_reasons_by_probe") or {}).items()
+                              if pid.startswith(prefix[axis]))
+            top = reasons.most_common(1)
+            out.append((axis, na[axis], top[0][0] if top else "unknown"))
+    return out
+
+
 def _summary_text(report, source: str) -> str:
     outs = report.outcomes
     slop = [o for o in outs if o.outcome == "slop_detected"]
@@ -112,6 +134,10 @@ def _summary_text(report, source: str) -> str:
     cov = _coverage_text(report)
     if cov:
         lines += ["", cov]
+    for axis, n_na, reason in _fully_na_axes(report):
+        lines += ["",
+                  f"  ⚠ {axis} did not run: all {n_na} probes n/a ({reason}).",
+                  f"    a missing axis is omitted, not zeroed, so this is NOT a clean {axis}."]
     lines += [
         "",
         f"  {len(slop)} slop · {clean} clean · {na} n/a        ({len(outs)} checks incl. fan-out)",
