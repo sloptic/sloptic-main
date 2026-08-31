@@ -14,8 +14,9 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
+import pytest  # noqa: E402
 from benchmark import (  # noqa: E402
-    _axis_applicable, _band, _catalog_index, _key, _percentile_of, _slop_potential, build, rank)
+    _axis_applicable, _band, _catalog_index, _key, _percentile_of, _probe_set, _slop_potential, build, rank)
 
 
 def _app(slop, security=0, qa=0, perf=0, applied=None, findings=None, **kw):
@@ -171,3 +172,37 @@ def test_a_served_secret_file_gates_but_a_source_map_does_not():
     assert rank(curve, 12, env)["absolute_gates"] == ["exposure"]
     assert rank(curve, 12, git)["absolute_gates"] == ["exposure"]
     assert "absolute_gates" not in rank(curve, 12, smap)     # same category, not exploitable, not a gate
+
+
+def _graded(total, slop):
+    """A minimally eligible record carrying a battery size, for the passive/full split."""
+    return {"deployed": True, "slop_score": slop, "functional": True,
+            "coverage": {"probes_total": total, "applied": ["sec-headers-001"], "ran_kinds": ["headers"]},
+            "findings": [], "axis_slop": {"security": slop}}
+
+
+def test_probe_set_reads_the_battery_size():
+    assert _probe_set(_graded(102, 10), 44) == "full"
+    assert _probe_set(_graded(44, 10), 44) == "passive"
+    assert _probe_set({"probe_filter": True, "coverage": {"probes_total": 44}}, 44) == "subset"
+    assert _probe_set({"slop_score": 5}, 44) == "full"     # no coverage -> legacy full
+
+
+def test_build_keeps_the_two_batteries_apart():
+    recs = [_graded(102, s) for s in (10, 20, 30)] + [_graded(44, s) for s in (5, 8, 12)]
+    full = build(recs, "2026.3", "t", probe_set="full")
+    passive = build(recs, "passive-2026.1", "t", probe_set="passive")
+    assert full["probe_set"] == "full" and full["n"] == 3
+    assert passive["probe_set"] == "passive" and passive["n"] == 3
+    assert [row[0] for row in full["dist"]] == [10, 20, 30]     # only the full rows
+    assert [row[0] for row in passive["dist"]] == [5, 8, 12]    # only the passive rows
+
+
+def test_rank_refuses_a_cross_mode_placement():
+    passive = build([_graded(44, s) for s in (5, 8, 12)], "passive-2026.1", "t", probe_set="passive")
+    with pytest.raises(ValueError):
+        rank(passive, 20, _graded(102, 20))       # a full grade may not rank on the passive curve
+    assert rank(passive, 8, _graded(44, 8))["percentile"] is not None    # a passive grade may
+    full = build([_graded(102, s) for s in (10, 20, 30)], "2026.3", "t")
+    full.pop("probe_set")                          # a legacy untagged curve is treated as full
+    assert rank(full, 20, _graded(102, 20))["percentile"] is not None

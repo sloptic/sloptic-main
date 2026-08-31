@@ -49,6 +49,7 @@ sys.path.insert(0, str(_HERE.parent))     # repo root on path, so the lazy `impo
 from sloptic.eligibility import (is_shell_only, is_ungradeable_challenge,  # noqa: E402  (needs the path insert above)
                                  is_wrong_owner, wrong_owner_reason)
 _DEFAULT_CURVE = _HERE.parent / "validation" / "benchmark-curve.json"
+_PASSIVE_CURVE = _HERE.parent / "validation" / "benchmark-curve-passive.json"
 _AXES = ("security", "qa", "performance")
 _PREFIX = {"sec-": "security", "qa-": "qa", "perf-": "performance"}
 _LANDMARKS = (10, 25, 50, 75, 90, 95, 99)
@@ -77,6 +78,42 @@ def _axis_of(probe_id: str) -> str | None:
         if probe_id.startswith(pre):
             return axis
     return None
+
+
+def _passive_full_counts() -> tuple:
+    """(n_passive, n_full) from the live catalog: the battery sizes that tell a passive grade from a full
+    one. Falls back to the shipped 2.1 sizes if the catalog cannot load."""
+    try:
+        from sloptic import safety
+        from sloptic.catalog import default_catalog_dir, load_catalog
+        cat = load_catalog(str(default_catalog_dir()))
+        return len(safety.passive_catalog(cat)), len(cat)
+    except Exception:
+        return 44, 102
+
+
+def _probe_set(record: dict, n_passive: int) -> str:
+    """Which battery produced this grade: 'passive', 'full', or 'subset'. A passive-only run's
+    coverage.probes_total is the passive battery (<= n_passive); a full run is the whole catalog; an
+    arbitrary --probe run carries probe_filter and belongs to neither curve. This is the guiding-principle
+    'never mix measurements' turned into a check."""
+    if record.get("probe_filter"):
+        return "subset"
+    total = (record.get("coverage") or {}).get("probes_total")
+    if total is None:
+        return "full"                        # legacy record with no coverage: treat as full
+    return "passive" if total <= n_passive else "full"
+
+
+def _guard_mode(record: dict, curve: dict) -> None:
+    """Refuse to rank a grade against a curve built from a different battery."""
+    want = curve.get("probe_set", "full")    # an untagged (older) curve is the full curve
+    got = _probe_set(record, _passive_full_counts()[0])
+    if got != want:
+        raise ValueError(
+            f"mode mismatch: this is a '{got}' grade but {curve.get('version')} is the '{want}' curve. "
+            f"A passive grade ranks only on the passive curve and a full grade only on the full curve, "
+            f"because they measure different probe batteries.")
 
 
 def _eligible(r: dict) -> bool:
@@ -194,10 +231,13 @@ def _rank_score_only(dist: list, score) -> tuple:
     return round(100 * better / n), round(100 * worse / n)
 
 
-def build(recs: list, version: str, source: str, status: str = "provisional") -> dict:
-    rows = [r for r in recs if _eligible(r)]
+def build(recs: list, version: str, source: str, status: str = "provisional",
+          probe_set: str = "full") -> dict:
+    n_passive = _passive_full_counts()[0]
+    rows = [r for r in recs if _eligible(r) and _probe_set(r, n_passive) == probe_set]
     if not rows:
-        sys.exit("ERROR: no eligible rows (need deployed + scored + not anchor/subset/dead/DNF)")
+        sys.exit(f"ERROR: no eligible '{probe_set}' rows (need deployed + scored, from the {probe_set} "
+                 f"battery, not anchor/subset/dead/DNF). A passive curve needs a --passive-only corpus run.")
     idx = _catalog_index()
     # the empirical distribution: one [slop, catastrophe(0/1), max_penalty, slop_potential, categories] row per app, no
     # identities. This is what makes the overall percentile exact and the tiebreaks possible; the landmark
@@ -211,7 +251,7 @@ def build(recs: list, version: str, source: str, status: str = "provisional") ->
     # status rides ON the curve and into every ranked result. A curve built before the catalog's calibration
     # settles will be regraded, and a percentile quoted from it must say so: a provisional number presented as
     # final is the failure mode a versioned reference exists to prevent.
-    curve = {"version": version, "source": source, "status": status,
+    curve = {"version": version, "source": source, "status": status, "probe_set": probe_set,
              "population": "live hackathon web apps", "n": len(rows), "comparator": list(_COMPARATOR),
              "overall": _pcts([r["slop_score"] for r in rows]), "axes": {}, "dist": dist}
     for axis in _AXES:
@@ -337,6 +377,8 @@ def rank(curve: dict, score, record: dict | None = None) -> dict:
     """Place one app on the frozen curve. Lower slop is better, so a LOW percentile is good: pct is the share
     of the reference population this app is cleaner than... inverted at the end for readability."""
     dist = curve.get("dist")
+    if record is not None:
+        _guard_mode(record, curve)
     potential = ncats = None
     if dist is not None and record is not None:
         idx = _catalog_index()
@@ -426,7 +468,12 @@ def main() -> None:
     b = sub.add_parser("build", help="freeze a reference curve from a corpus run")
     b.add_argument("results")
     b.add_argument("--version", required=True, help="curve version, e.g. 2026.1 (a badge must cite one)")
-    b.add_argument("--out", default=str(_DEFAULT_CURVE))
+    b.add_argument("--out", default=None,
+                   help="curve path (default: the full curve, or the passive curve under --passive)")
+    b.add_argument("--passive", action="store_true",
+                   help="build the PASSIVE-FLOOR curve from a --passive-only corpus run (the 44-probe "
+                        "battery the anonymous web tier uses); writes benchmark-curve-passive.json and tags "
+                        "it probe_set=passive so a full grade can never rank against it")
     b.add_argument("--status", default="provisional", choices=("provisional", "final"),
                    help="provisional (default) until the catalog's calibration settles and the corpus is "
                         "regraded; it is stamped on the curve and shown with every rank")
@@ -440,10 +487,12 @@ def main() -> None:
 
     if args.cmd == "build":
         recs = [json.loads(l) for l in pathlib.Path(args.results).read_text().splitlines() if l.strip()]
-        curve = build(recs, args.version, pathlib.Path(args.results).name, args.status)
-        pathlib.Path(args.out).write_text(json.dumps(curve, indent=2) + "\n")
+        probe_set = "passive" if args.passive else "full"
+        out = args.out or (str(_PASSIVE_CURVE) if args.passive else str(_DEFAULT_CURVE))
+        curve = build(recs, args.version, pathlib.Path(args.results).name, args.status, probe_set=probe_set)
+        pathlib.Path(out).write_text(json.dumps(curve, indent=2) + "\n")
         o = curve["overall"]
-        print(f"\n  froze {args.out}  ({curve['version']}, {curve['status']}, "
+        print(f"\n  froze {out}  ({curve['version']} {curve['probe_set']}, {curve['status']}, "
               f"n={o['n']} from {curve['source']})")
         print(f"  overall  p10 {o['p10']}  p25 {o['p25']}  median {o['p50']}  p75 {o['p75']}  "
               f"p90 {o['p90']}  p99 {o['p99']}  max {o['max']}")
@@ -466,7 +515,10 @@ def main() -> None:
     score = args.score if args.score is not None else record and record["slop_score"]
     if score is None:
         sys.exit("ERROR: give a score, or --results with --app")
-    res = rank(curve, score, record)
+    try:
+        res = rank(curve, score, record)
+    except ValueError as e:
+        sys.exit(f"ERROR: {e}")
     if args.json:
         json.dump(res, sys.stdout, indent=2)
         print()
