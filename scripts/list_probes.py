@@ -137,13 +137,14 @@ def main() -> None:
         return
     if args.verbose:   # human: a report-card block per probe instead of the table
         for r in data:
-            print(f"\n{r['id']}  [{r['bundle']}/{r['category']}]  penalty {r['penalty_display']}"
+            print(f"\n{r['id']}  [{r['bundle']}/{r['category']}]  {r['lane']}  penalty {r['penalty_display']}"
                   + (f"  ({r['penalty_note']})" if r["penalty_note"] else "")
                   + (f"  ·  {r['variant_group']}" if r["variant_group"] else ""))
             print(f"  EXPECTED:    {r['card_expected']}")
             print(f"  INDICATES:   {r['card_indicates']}")
             print(f"  REMEDIATION: {r['card_remediation']}")
-        print(f"\n{len(catalog)} probes.")
+        n_pass = sum(1 for p in catalog if safety.is_passive(p.id))
+        print(f"\n{len(catalog)} probes · {n_pass} passive · {len(catalog) - n_pass} active.")
         return
 
     header = "  ".join(h.ljust(w) for _, h, w in _COLS)
