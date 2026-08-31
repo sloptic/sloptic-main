@@ -876,7 +876,7 @@ def _grade_phase_line(name, label, important):
 def _grade_worker(url, use_browser, features, q, cached_profile=None, cache_key=None, repo_url=None,
                   proactive=False, model=DEFAULT_MODEL, browser_auth=False, session_headers=None,
                   llm_reasoning=False, recon=False, controlled_deploy=False, trace=False, login_creds=None,
-                  probe_filter=None, email_cfg=None):
+                  probe_filter=None, email_cfg=None, passive_only=False):
     os.setsid()   # own process group so the parent can SIGKILL this child AND its headless chrome together
     try:
         render = browser.render_routes if use_browser else None
@@ -903,8 +903,11 @@ def _grade_worker(url, use_browser, features, q, cached_profile=None, cache_key=
         if cached_profile is None:   # a cache HIT reuses the frozen surface -> no discovery, no delay to explain
             _kinds = "crawl" + (" + browser-render" if use_browser else "") + (" + LLM perception" if proactive else "")
             print(f"  discovering surface ({_kinds}) — this runs before the first probe ...", flush=True)
-        report = run(RemoteDeployer(url, health_timeout=20),
-                     select_probes(load_catalog(str(_ROOT / "catalog")), probe_filter),
+        catalog = select_probes(load_catalog(str(_ROOT / "catalog")), probe_filter)
+        if passive_only:                       # anonymous web-tier battery: drop every active probe before the run
+            from sloptic import safety
+            catalog = safety.passive_catalog(catalog)
+        report = run(RemoteDeployer(url, health_timeout=20), catalog,
                      render=render, on_progress=_grade_heartbeat, on_phase=_grade_phase_line,
                      seed_features=features, headers=session_headers,
                      cached_profile=cached_profile, on_profile=on_profile, perceive=perceive,
@@ -937,7 +940,7 @@ def _hard_kill_group(p) -> None:
 def grade(url: str, use_browser: bool, timeout=None, features=None,
           cached_profile=None, cache_key=None, repo_url=None, proactive=False, model=DEFAULT_MODEL,
           browser_auth=False, session_headers=None, llm_reasoning=False, recon=False, controlled_deploy=False,
-          trace=False, login_creds=None, probe_filter=None, email_cfg=None):
+          trace=False, login_creds=None, probe_filter=None, email_cfg=None, passive_only=False):
     """Grade the running app in a CHILD PROCESS. A subprocess (not an in-process SIGALRM) because a signal
     can't interrupt a Playwright CPU-spin (the browser probes), but an EXTERNAL SIGKILL of the child + its
     chrome always works. `timeout` is the grading phase's OWN wall-clock budget (independent of deploy time,
@@ -949,7 +952,7 @@ def grade(url: str, use_browser: bool, timeout=None, features=None,
     p = ctx.Process(target=_grade_worker,
                     args=(url, use_browser, features, q, cached_profile, cache_key, repo_url, proactive, model,
                           browser_auth, session_headers, llm_reasoning, recon, controlled_deploy, trace,
-                          login_creds, probe_filter, email_cfg))
+                          login_creds, probe_filter, email_cfg, passive_only))
     p.start()
     try:
         result = q.get(timeout=timeout)              # timeout=None (direct run) blocks until the child reports
@@ -1305,6 +1308,8 @@ def main():
     ap.add_argument("--build-timeout", type=int, default=480, dest="build_timeout",
                     help="kill a docker build after N seconds (default 480). Lower = better batch "
                          "throughput but risks false-killing a genuinely heavy build; 300 is aggressive")
+    ap.add_argument("--passive-only", action="store_true", dest="passive_only",
+                    help="run ONLY passive probes (the anonymous web-tier battery); no active testing")
     ap.add_argument("--grade-timeout", type=int, default=600, dest="grade_timeout",
                     help="wall-clock cap (seconds) on the grading phase, externally enforced by killing the "
                          "grade subprocess + its process group (even a Playwright CPU-spin OR a wedged Lighthouse "
@@ -1509,7 +1514,8 @@ def main():
                            session_headers=_parse_headers(args.headers), llm_reasoning=args.llm_reasoning,
                            recon=args.recon, controlled_deploy=args.controlled_deploy, trace=args.trace,
                            login_creds=_parse_login(args.login), probe_filter=args.probe,
-                           email_cfg=(args.email_domain, args.email_endpoint, args.email_token))
+                           email_cfg=(args.email_domain, args.email_endpoint, args.email_token),
+                           passive_only=args.passive_only)
         except GradeTimeout as e:
             timings["grade_s"] = round(time.monotonic() - _t, 1)
             result["grade_timeout"] = True         # deployed but ungradeable in budget (broken/pathological

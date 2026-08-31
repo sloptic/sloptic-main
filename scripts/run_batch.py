@@ -301,6 +301,8 @@ def _build_cmd(j, args, ckpt):
         cmd += ["--login", args.login]
     for pat in (getattr(args, "probe", None) or ()):   # subset the catalog per target (recall runs)
         cmd += ["--probe", pat]
+    if getattr(args, "passive_only", False):            # passive-floor corpus: the anonymous web-tier battery
+        cmd += ["--passive-only"]
     if args.llm_reasoning:
         cmd += ["--llm-reasoning"]
     for h in (args.headers or []):
@@ -445,6 +447,8 @@ def main():
                          "scraped hackathon does ~zero network (default: $HL_CACHE_DIR/devpost-ingest.jsonl).")
     ap.add_argument("--no-ingest-cache", action="store_true", dest="no_ingest_cache",
                     help="forward to devpost_repos: disable the ingest cache (fetch every page/project fresh).")
+    ap.add_argument("--passive-only", action="store_true", dest="passive_only",
+                    help="grade every target with ONLY the passive battery (for the passive-floor corpus)")
     ap.add_argument("--results", required=True, metavar="FILE", help="JSONL to append results to")
     ap.add_argument("--no-browser", dest="browser", action="store_false",
                     help="skip the browser-rendered surface (faster; default is browser ON for grading — "
