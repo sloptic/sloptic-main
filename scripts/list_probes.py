@@ -19,6 +19,7 @@ sys.path.insert(0, str(_ROOT))   # so `sloptic` imports when run as scripts/list
 
 from sloptic.aggregate import compute_slop_score  # noqa: E402
 from sloptic.catalog import load_catalog  # noqa: E402
+from sloptic import safety  # noqa: E402
 from sloptic.probes import describe  # noqa: E402
 from sloptic.reportcard import card_copy  # noqa: E402
 from sloptic.schema import Outcome  # noqa: E402
@@ -76,6 +77,7 @@ def _rows(catalog):
         yield {
             "id": p.id,
             "bundle": p.bundle,
+            "lane": "passive" if safety.is_passive(p.id) else "active",
             "category": p.category,
             "penalty": 0 if report_only else p.penalty,   # nominal/default (numeric, back-compat)
             "penalty_min": pmin,
@@ -105,6 +107,7 @@ def _worst_case(probes) -> int:
 # (dict key, column header, width) for the human table
 _COLS = [("id", "ID", 18), ("bundle", "BUNDLE", 11), ("category", "CATEGORY", 18),
          ("penalty", "PEN", 7), ("pool", "POOL", 6), ("evidence_model", "MODEL", 8),
+         ("lane", "LANE", 8),
          ("check", "CHECK", 24), ("why", "WHY", 58)]
 
 
@@ -167,12 +170,16 @@ def main() -> None:
     worst = _worst_case(catalog)
     print(f"  {len(catalog)} probes · raw sum(max) {raw} · WORST-CASE {worst}  "
           f"(every probe fires at its top escalator; variant-group + category dampers applied)")
-    print(f"  {'BUNDLE':<12} {'PROBES':>6} {'RAWMAX':>6} {'WORST-CASE':>11}")
+    print(f"  {'BUNDLE':<12} {'PROBES':>6} {'PASSIVE':>7} {'RAWMAX':>6} {'WORST-CASE':>11}")
     by_id = {r["id"]: r for r in rows}
     for b in sorted({p.bundle for p in catalog}):
         bp = [p for p in catalog if p.bundle == b]
         rawmax = sum(by_id[p.id]["penalty_max"] for p in bp)
-        print(f"  {b:<12} {len(bp):>6} {rawmax:>6} {_worst_case(bp):>11}")
+        npass = sum(1 for p in bp if safety.is_passive(p.id))
+        print(f"  {b:<12} {len(bp):>6} {npass:>7} {rawmax:>6} {_worst_case(bp):>11}")
+    n_pass = sum(1 for p in catalog if safety.is_passive(p.id))
+    print(f"  passive (the anonymous web-tier battery, --passive-only): {n_pass} of {len(catalog)} · "
+          f"active: {len(catalog) - n_pass}")
 
 
 if __name__ == "__main__":
