@@ -97,3 +97,57 @@ def test_the_grade_script_stamps_verdicts_on_the_row():
     """Guards silent removal, mirroring the contract_version guard: the assembly site must reference _verdicts."""
     src = (pathlib.Path(__file__).resolve().parent.parent / "scripts" / "deploy_and_grade.py").read_text()
     assert "verdicts=_verdicts(report.outcomes)" in src
+
+
+# ── the emitted record's findings have to add up to its own score ───────────────────────────────────────
+def _fired(pid, category, penalty, bundle="security", group=None):
+    return Outcome(probe_id=pid, bundle=bundle, category=category, outcome="slop_detected",
+                   penalty=penalty, variant_group_id=group)
+
+
+def _report(outcomes):
+    from sloptic.aggregate import compute_axis_slop, compute_slop_score
+    from sloptic.schema import Report
+    return Report(slop_score=compute_slop_score(outcomes), outcomes=outcomes,
+                  axis_slop=compute_axis_slop(outcomes))
+
+
+def test_the_records_contribution_column_sums_to_its_slop_score():
+    """The reason the field exists. A report listing penalties lists prices, and prices do not add to the
+    score, which reads as a bug to anyone who tries the arithmetic."""
+    from sloptic.cli import _grade_record
+    outs = [_fired("sec-headers-001", "headers", 41), _fired("sec-headers-002", "headers", 12),
+            _fired("sec-headers-003", "headers", 8), _fired("sqli-1", "sql-injection", 40, group="g"),
+            _fired("sqli-2", "sql-injection", 40, group="g"),
+            _fired("qa-a11y-001", "accessibility", 15, bundle="qa"),
+            Outcome(probe_id="clean-1", bundle="qa", category="c", outcome="clean", penalty=0)]
+    rec = _grade_record(_report(outs), "https://example.test")
+    assert round(sum(f["contribution"] for f in rec["findings"]), 10) == rec["slop_score"]
+
+
+def test_every_fired_outcome_is_emitted_so_nothing_is_scored_off_the_list():
+    """The other way the column could come up short: an outcome the score counted but the record never
+    listed. The scored set and the emitted set are the same predicate over the same list, and this says so."""
+    from sloptic.cli import _grade_record
+    outs = [_fired("a", "crash", 10), _fired("b", "crash", 10),
+            Outcome(probe_id="na-1", bundle="qa", category="c", outcome="not_applicable", penalty=0)]
+    rec = _grade_record(_report(outs), "x")
+    assert len(rec["findings"]) == 2
+    assert [f["probe_id"] for f in rec["findings"]] == ["a", "b"]
+
+
+def test_penalty_survives_untouched_next_to_the_contribution():
+    """Both numbers are wanted: penalty is what the fault is worth alone, contribution is what it added."""
+    from sloptic.cli import _grade_record
+    outs = [_fired("a", "crash", 30), _fired("b", "crash", 30)]
+    rec = _grade_record(_report(outs), "x")
+    assert [f["penalty"] for f in rec["findings"]] == [30, 30]
+    assert [f["contribution"] for f in rec["findings"]] == [30.0, 18.0]
+
+
+def test_a_group_member_the_score_dropped_is_listed_at_zero():
+    """A fault the reader can see, priced at nothing, and the record says which one and why it is free."""
+    from sloptic.cli import _grade_record
+    outs = [_fired("sqli-1", "sql-injection", 40, group="g"), _fired("sqli-2", "sql-injection", 40, group="g")]
+    rec = _grade_record(_report(outs), "x")
+    assert [f["contribution"] for f in rec["findings"]] == [40.0, 0.0]

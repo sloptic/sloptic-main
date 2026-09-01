@@ -14,6 +14,7 @@ double-count.
 """
 from __future__ import annotations
 
+import math
 from collections import defaultdict
 from dataclasses import replace
 
@@ -76,6 +77,67 @@ def _damped_total(counted: list[Outcome], decay: float) -> float:
         for i, penalty in enumerate(sorted(penalties, reverse=True)):
             total += penalty * (decay ** i)
     return total
+
+
+def contributions(outcomes: list[Outcome], decay: float = CATEGORY_DECAY,
+                  ndigits: int | None = 1) -> list[float]:
+    """What each fired outcome actually ADDED to the slop score, aligned one to one with
+    `[o for o in outcomes if o.outcome == "slop_detected"]`, in that order.
+
+    A finding's `penalty` is what the fault is worth on its own. Its contribution is what survived the
+    dampers, and the two differ a lot: a variant group's losing members contribute 0, the second finding in
+    a category contributes `penalty * decay`, and a corroborated defense-in-depth finding contributes on its
+    ESCALATED penalty rather than the one stored on the outcome. A report that lists penalties is listing
+    prices, not addends, which is why a list of them does not sum to the score.
+
+    **The invariant: `sum(contributions(outcomes))` is `compute_slop_score(outcomes)`.** With the default
+    `ndigits=1` the returned values are rounded by largest remainder, so they sum to the score EXACTLY as
+    emitted, at the same precision the score itself carries. Pass `ndigits=None` for the raw values, which
+    sum to the score only after rounding. Rounding each value independently would break the invariant, which
+    is the whole failure this function exists to prevent.
+    """
+    fired = _escalate_corroborated([o for o in outcomes if o.outcome == "slop_detected"])
+    if not fired:
+        return []
+    # Mirror _damped_total exactly, but carry indices instead of penalties, so each surviving outcome can be
+    # handed the term it produced. Same group winner (first one wins a tie), same feed order, same tie order
+    # under a stable sort, so the terms are the same terms and in the same sequence.
+    winner: dict[str, int] = {}
+    singles: list[int] = []
+    for i, o in enumerate(fired):
+        if o.variant_group_id:
+            cur = winner.get(o.variant_group_id)
+            if cur is None or o.penalty > fired[cur].penalty:
+                winner[o.variant_group_id] = i
+        else:
+            singles.append(i)
+    by_category: dict[str, list[int]] = defaultdict(list)
+    for i in (*singles, *winner.values()):
+        by_category[fired[i].category].append(i)
+
+    raw = [0.0] * len(fired)                          # a variant group's losers keep 0.0, which is the truth
+    for idxs in by_category.values():
+        for rank, i in enumerate(sorted(idxs, key=lambda j: -fired[j].penalty)):
+            raw[i] = fired[i].penalty * (decay ** rank)
+    if ndigits is None:
+        return raw
+    return _largest_remainder(raw, round(_damped_total(fired, decay), ndigits), ndigits)
+
+
+def _largest_remainder(values: list[float], total: float, ndigits: int) -> list[float]:
+    """Round `values` to `ndigits` so they sum to `total` exactly, giving each leftover unit to the value
+    holding the largest discarded fraction. Zeros stay zero: they are excluded from the distribution, so a
+    damped-away finding never picks up a phantom tenth, and nothing is ever pushed below zero."""
+    scale = 10 ** ndigits
+    units = [int(math.floor(v * scale + 1e-9)) for v in values]
+    leftover = int(round(total * scale)) - sum(units)
+    if leftover:
+        up = leftover > 0
+        eligible = [i for i in range(len(values)) if values[i] > 0 and (up or units[i] > 0)]
+        eligible.sort(key=lambda i: (values[i] * scale - units[i], values[i]), reverse=up)
+        for i in eligible[:abs(leftover)]:
+            units[i] += 1 if up else -1
+    return [u / scale for u in units]
 
 
 def compute_slop_score(outcomes: list[Outcome], decay: float = CATEGORY_DECAY) -> float:

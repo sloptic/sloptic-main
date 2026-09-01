@@ -45,7 +45,7 @@ sys.path.insert(0, str(_ROOT))
 from sloptic import browser  # noqa: E402
 from sloptic.jsonl import append_jsonl  # noqa: E402
 from sloptic.scope import off_target  # noqa: E402
-from sloptic.aggregate import CATEGORY_DECAY, _damped_total  # noqa: E402
+from sloptic.aggregate import CATEGORY_DECAY, _damped_total, contributions  # noqa: E402
 from sloptic.catalog import load_catalog, select_probes  # noqa: E402
 from sloptic import provenance  # noqa: E402
 from sloptic.deploy import RemoteDeployer  # noqa: E402
@@ -1543,18 +1543,21 @@ def main():
         # 61 identical x-content-type-options rows). The score damper already handles the penalty; the
         # findings list shouldn't carry 60 duplicates. Keep `count` + up to 5 sample targets. stats.py
         # expands by `count` when it rebuilds the damped subtotals, so the score math is unaffected.
+        # `contribution` is what the row actually ADDED to the score after the dampers, summed over the
+        # rows it collapses, so the column sums to slop_score across the whole (collapsed) list.
         findings, _seen = [], {}
-        for o in slop:
+        for o, share in zip(slop, contributions(report.outcomes)):
             key = (o.probe_id, o.reason)
             f = _seen.get(key)
             if f is not None:
                 f["count"] += 1
+                f["contribution"] = round(f["contribution"] + share, 6)
                 if o.target and o.target not in f["targets"] and len(f["targets"]) < 5:
                     f["targets"].append(o.target)
                 continue
             f = {"probe_id": o.probe_id, "bundle": o.bundle, "category": o.category, "penalty": o.penalty,
                  "group": o.variant_group_id, "reason": o.reason, "target": o.target, "count": 1,
-                 "targets": [o.target] if o.target else [], "evidence": o.evidence}
+                 "contribution": share, "targets": [o.target] if o.target else [], "evidence": o.evidence}
             _seen[key] = f
             findings.append(f)
         result.update(slop_score=report.slop_score, axis_slop=report.axis_slop,

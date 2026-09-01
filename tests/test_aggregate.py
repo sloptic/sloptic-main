@@ -1,5 +1,5 @@
 """Aggregation dampers: a variant group fires once at its max, and repeated instances within a category decay."""
-from sloptic.aggregate import compute_axis_slop, compute_slop_score, coverage_metrics
+from sloptic.aggregate import compute_axis_slop, compute_slop_score, contributions, coverage_metrics
 from sloptic.schema import Outcome
 
 
@@ -134,3 +134,86 @@ def test_escalation_reflected_in_axis_decomposition_and_still_sums():
     axis = compute_axis_slop(outs)
     assert axis["security"] == 35 + 24 and axis["performance"] == 20
     assert sum(axis.values()) == compute_slop_score(outs)   # decomposition still sums to the total
+
+
+# ── per-finding contributions: the report's list has to add up to the score ─────────────────────────────
+def _sum(cs):
+    return round(sum(cs), 10)
+
+
+def test_contributions_sum_to_the_score_and_align_with_the_fired_list():
+    outs = [_o("a", "crash", 10), _o("b", "crash", 10), _o("c", "crash", 10),
+            _o("d", "headers", 8, bundle="qa"), _o("clean", "crash", 40, outcome="clean")]
+    cs = contributions(outs)
+    assert len(cs) == 4                                    # one per FIRED outcome, in order, clean excluded
+    assert cs == [10.0, 6.0, 3.6, 8.0]                     # 10 + 10*0.6 + 10*0.36, then a category of its own
+    assert _sum(cs) == compute_slop_score(outs) == 27.6
+
+
+def test_a_variant_group_loser_contributes_exactly_zero():
+    # the informative part: the reader sees the fault AND sees that it was not priced twice
+    outs = [_o("sqli-1", "sql-injection", 40, group="g1"), _o("sqli-2", "sql-injection", 40, group="g1")]
+    cs = contributions(outs)
+    assert cs == [40.0, 0.0]
+    assert _sum(cs) == compute_slop_score(outs) == 40
+
+
+def test_the_group_member_that_wins_is_the_one_the_score_used():
+    # the max member carries the whole group; a lower-priced sibling is the one that zeroes out
+    outs = [_o("sec-backend-003", "backend-exposure", 12, group="g"),
+            _o("sec-backend-001", "backend-exposure", 40, group="g")]
+    assert contributions(outs) == [0.0, 40.0]
+
+
+def test_contributions_price_the_escalated_penalty_not_the_stored_one():
+    # a missing CSP is re-priced up when an XSS it would have contained fires, and the score uses the
+    # escalated number, so the contribution has to as well or the column stops summing
+    outs = [_o("sec-headers-002", "headers", 12), _o("x", "xss", 40)]
+    cs = contributions(outs)
+    assert cs[0] == 24.0                                   # 12 stored, 24 as scored
+    assert _sum(cs) == compute_slop_score(outs)
+
+
+def test_rounding_is_largest_remainder_so_the_parts_re_add_to_the_whole():
+    # seven fires in one category. Rounding each contribution on its own gives 79.3 against a score of
+    # 79.4, which is the same bug as listing raw penalties, just with smaller numbers. The row holding the
+    # largest discarded fraction absorbs the remainder instead, so the column lands on the score.
+    outs = [_o(f"p{i}", "crash", p) for i, p in enumerate([38, 37, 4, 3, 19, 10, 37])]
+    score = compute_slop_score(outs)
+    assert score == 79.4
+    raw = contributions(outs, ndigits=None)
+    assert round(sum(round(v, 1) for v in raw), 1) == 79.3          # what independent rounding would ship
+    assert contributions(outs) == [38.0, 22.2, 0.3, 0.2, 4.1, 1.3, 13.3]
+    assert _sum(contributions(outs)) == score
+
+
+def test_full_precision_is_available_and_sums_to_the_unrounded_total():
+    outs = [_o("a", "crash", 41), _o("b", "crash", 41), _o("c", "crash", 41)]
+    raw = contributions(outs, ndigits=None)
+    assert raw[1] == 41 * 0.6 and raw[2] == 41 * 0.6 ** 2
+    assert round(sum(raw), 1) == compute_slop_score(outs)
+
+
+def test_grouping_rows_for_display_keeps_the_total_exact():
+    # the site collapses repeats of one fault into a single row; summing their contributions must still
+    # land on the score, whatever the grouping
+    outs = [_o("h", "headers", 8, bundle="qa") for _ in range(12)] + [_o("k", "crash", 30)]
+    cs = contributions(outs)
+    collapsed = {}
+    for o, c in zip([o for o in outs if o.outcome == "slop_detected"], cs):
+        collapsed[o.probe_id] = collapsed.get(o.probe_id, 0) + c
+    assert round(sum(collapsed.values()), 10) == compute_slop_score(outs)
+
+
+def test_contributions_hold_for_a_passive_only_battery():
+    # the passive lane is a probe filter over the same aggregation, so nothing special happens here, but
+    # the hosted tier grades on it and the invariant is the reason to check rather than assume
+    outs = [_o("sec-headers-001", "headers", 8), _o("sec-headers-002", "headers", 12),
+            _o("qa-a11y-001", "accessibility", 15, bundle="qa"),
+            _o("perf-lighthouse-001", "performance", 22, bundle="performance")]
+    assert _sum(contributions(outs)) == compute_slop_score(outs)
+
+
+def test_no_findings_no_contributions():
+    assert contributions([]) == []
+    assert contributions([_o("a", "crash", 10, outcome="clean")]) == []

@@ -242,3 +242,27 @@ def test_throttle_spaces_job_starts_and_zero_disables():
         rb._throttle(d)
     elapsed = time.monotonic() - t0
     assert 2 * d - 0.05 <= elapsed <= 2 * d + 0.20
+
+
+def test_a_merge_that_recomputes_the_score_also_recomputes_the_contributions():
+    """Each finding's contribution was damped against its OWN record's fired set. Concatenating two records
+    puts every one of them in a different neighbourhood, so a merge that recomputes the score without
+    recomputing the column ships a list that no longer adds up to it."""
+    main = _scored([_f("sec-headers-001", "security-headers", 41)], ["sec-cmdi-001"], ["security"])
+    main["findings"][0]["contribution"] = 41.0                  # true while it was the only header finding
+    retry = _retry([], [_f("sec-headers-002", "security-headers", 24)])
+    retry["findings"][0]["contribution"] = 24.0
+    m = merge(main, retry, BUNDLE)
+    assert round(sum(f["contribution"] for f in m["findings"]), 10) == m["slop_score"]
+    assert [f["contribution"] for f in m["findings"]] == [41.0, 14.4]   # the second one decays now
+
+
+def test_a_clean_recovery_leaves_the_stored_contributions_alone():
+    """No new findings means the stored score stands, so the stored column must stand with it."""
+    main = _scored([_f("sec-headers-001", "security-headers", 41), _f("sec-headers-002", "security-headers", 24)],
+                   ["sec-cmdi-001"], ["security"])
+    for f, c in zip(main["findings"], (41.0, 14.4)):
+        f["contribution"] = c
+    m = merge(main, _retry([], []), BUNDLE)
+    assert m["slop_score"] == main["slop_score"]
+    assert round(sum(f["contribution"] for f in m["findings"]), 10) == m["slop_score"]

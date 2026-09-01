@@ -17,7 +17,7 @@ from collections import Counter, defaultdict
 from dataclasses import asdict
 
 from . import browser, egress, runcache, safety
-from .aggregate import CATEGORY_DECAY
+from .aggregate import CATEGORY_DECAY, contributions
 from .catalog import ProbeSelectionError, default_catalog_dir, load_catalog, select_probes
 from .deploy import DockerDeployer, RemoteDeployer, SubprocessDeployer
 from .ingest import SubmissionError, extract_submission
@@ -46,7 +46,10 @@ def _grade_record(report, source: str) -> dict:
     outcomes — the ranker reads their category for the absolute gate and their probe_id for coverage; the rest
     (axis_slop, coverage.applied/ran_kinds, observed_surface) drive the per-axis rank, slop_potential and the
     completeness bundle."""
-    findings = [asdict(o) for o in report.outcomes if o.outcome == "slop_detected"]
+    # `penalty` is what the fault is worth alone; `contribution` is what it actually added after the
+    # dampers, so a report can list both and have the column sum to slop_score. See aggregate.contributions.
+    fired = [o for o in report.outcomes if o.outcome == "slop_detected"]
+    findings = [{**asdict(o), "contribution": c} for o, c in zip(fired, contributions(report.outcomes))]
     rec = {"repo": source, "deployed": True, "slop_score": report.slop_score,
            "axis_slop": report.axis_slop, "coverage": report.coverage, "observed_surface": report.surface,
            "platform": report.platform, "bot_challenge": report.bot_challenge,
