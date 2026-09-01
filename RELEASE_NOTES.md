@@ -38,6 +38,12 @@ a 2.0 score does not compare to a 1.x one. A 2.0 percentile is quoted against 20
   absence. The event host is pinned as exactly `<slug>.devpost.com` and rechecked after redirects, and link
   extraction returns hrefs rather than answering "does this page contain X", so a token quoted in a
   discussion thread can never pass for one the organizer published.
+- **Every finding carries the contribution it made.** A report listing findings with their penalty lists
+  prices, and prices do not add up to the score, because the dampers sit between the two: on the corpus the
+  raw penalties sum to a median 1.9 times the score. Each entry of `findings` now also carries
+  `contribution`, what that finding actually added after a variant group collapsed and its category decayed,
+  rounded by largest remainder so the column sums to `slop_score` exactly as emitted. `penalty` is unchanged
+  next to it, since what a fault is worth alone is a separate fact from what it added here.
 - **`rank()` no longer truncates the score it is ranking.** It cast a fractional slop score to an integer
   before searching the distribution, which put an app in the wrong place against a curve that has been
   continuous since 2.0.
