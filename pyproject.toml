@@ -1,6 +1,6 @@
 [project]
 name = "sloptic"
-version = "2.1.0"
+version = "2.2.0"
 description = "Sloptic grades any deployed web app, whatever its stack or purpose, and gives it one slop score you can compare across apps (lower is better, 0 means nothing found)."
 readme = "README.md"
 license = "Apache-2.0"

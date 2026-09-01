@@ -1,4 +1,4 @@
-# Sloptic v2.1.0
+# Sloptic v2.2.0
 
 Sloptic grades any deployed web app, whatever its stack or purpose, and returns one
 **slop score** you can compare across apps (lower is better, `0` means nothing found),
@@ -9,7 +9,40 @@ was built with.
 Versions 1.1 and 1.2 kept the 2026.1 curve, so grades stayed comparable and the changes were
 precision and diagnostics. Version 2.0 is different: it is a **new ruler**. New probe families and
 continuous scoring changed what the number measures, and the reference curve moved to **2026.3**, so
-a 2.0 score does not compare to a 1.x one. A 2.0 percentile is quoted against 2026.3. Version 2.1 keeps that 2026.3 ruler, so a 2.1 grade compares directly to a 2.0 one, and it adds the egress sandbox the hosted service needs to accept public URL submissions safely.
+a 2.0 score does not compare to a 1.x one. A 2.0 percentile is quoted against 2026.3. Version 2.1 keeps that 2026.3 ruler, so a 2.1 grade compares directly to a 2.0 one, and it adds the egress sandbox the hosted service needs to accept public URL submissions safely. Version 2.2 keeps it as well, and spends its changes on the crawl, on a second frozen curve for the passive battery, and on the client the hosted service needs to verify an event.
+
+## What's new in 2.2.0
+
+- **A rendering deadline the interpreter cannot ignore.** A crawl that pinned the GIL sailed straight past
+  its own watchdog, because a `threading.Timer` cannot fire while the main thread holds the lock, and the
+  grade stayed wedged until the batch runner killed the whole app at 900 seconds. The full corpus run lost
+  114 apps that way. Route rendering now runs in a forked child that streams each route back the instant it
+  finishes, and the parent holds a 150 second budget it enforces with an OS signal the child has no way to
+  swallow. A wedged crawl now grades what the crawler already found. On the app that surfaced this, a 900
+  second DNF became an 87.5 second grade.
+- **A second frozen curve, for the passive battery.** `passive-2026.1` is frozen from the 44 probe passive
+  subset alone, the slice a visitor's browser sees with no active testing, over its own 1,750 app run. The
+  hosted tier that grades a stranger's URL runs that battery, so it now has a ruler built from the same
+  battery instead of borrowing percentiles from the full one. The two never mix: a percentile always cites
+  the curve it was measured against, and `benchmark.py` refuses a record whose battery does not match the
+  curve it is asked to rank on.
+- **The corpus figures as data.** `scripts/stats.py --corpus-json` writes the whole aggregate picture of a
+  corpus run to one committed, versioned JSON, `validation/corpus-figures-active.json` and
+  `-passive.json`, so a site or a report reads figures instead of transcribing them. Aggregate only by
+  construction: no app names, no URLs, no row that identifies one team.
+- **A Devpost client in the package.** `sloptic.devpost` promotes the scraper's Devpost logic out of
+  `scripts/` and into the package, so event verification consumes it rather than reimplementing it. Every
+  fetch is tri-state, `ok` / `not_found` / `blocked`, because Devpost's WAF answers a rate limited client
+  with 202, 403, 405, 429 or 503 and sometimes an empty body, and a client that folds those into the same
+  value a 404 returns will eventually read a block as proof that something is absent. Only 404 and 410 mean
+  absence. The event host is pinned as exactly `<slug>.devpost.com` and rechecked after redirects, and link
+  extraction returns hrefs rather than answering "does this page contain X", so a token quoted in a
+  discussion thread can never pass for one the organizer published.
+- **`rank()` no longer truncates the score it is ranking.** It cast a fractional slop score to an integer
+  before searching the distribution, which put an app in the wrong place against a curve that has been
+  continuous since 2.0.
+- **No curve movement.** The full ruler is still 2026.3, so a 2.2 grade compares directly to a 2.0 or 2.1
+  one.
 
 ## What's new in 2.1.0
 
