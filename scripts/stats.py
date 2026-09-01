@@ -1233,12 +1233,17 @@ def corpus_json(recs: list) -> dict:
     (_severity_tier, lighthouse_scores, auth_surface, cat_subtotals, _dnf_reason, _dist) and the catastrophe
     gate for the exploitable rate, so every number matches the report by construction. See --corpus-json."""
     import datetime, hashlib
-    from benchmark import _has_catastrophe
+    from benchmark import _has_catastrophe, _probe_set, _passive_full_counts
     graded = [r for r in recs if _is_graded(r)]
     if not graded:
         sys.exit("corpus-json: no graded records")
     n = len(graded)
     scores = sorted(r["slop_score"] for r in graded)
+    # which battery produced this corpus (full 102 or passive 44), so version + curve self-label correctly
+    _np = _passive_full_counts()[0]   # load the catalog ONCE, not per record
+    probe_set = Counter(_probe_set(r, _np) for r in graded).most_common(1)[0][0]
+    curve = "passive-2026.1" if probe_set == "passive" else "2026.3"
+    version = "corpus-" + curve
 
     def pctl(p):   # curve-consistent percentile (matches benchmark._pcts + the frozen 2026.3 curve)
         i = min(n - 1, max(0, round((p / 100) * (n - 1))))
@@ -1456,10 +1461,11 @@ def corpus_json(recs: list) -> dict:
                     "platforms are in by_stack_excluded, not here.",
         "reach": "attempted is every submission with a gradeable URL; graded is those that returned a score."}
     return {
-        "version": "corpus-2026.3",
+        "version": version,
+        "probe_set": probe_set,
         "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
         "provenance": {"corpus_id": "multihacksv23", "run_date": run_date, "n_apps": n, "n_events": len(ev),
-                       "n_probes": n_probes, "catalog_fingerprint": cat_fp, "curve_version": "2026.3",
+                       "n_probes": n_probes, "catalog_fingerprint": cat_fp, "curve_version": curve, "probe_set": probe_set,
                        "attempted": attempted},
         "reach": {"attempted": attempted, "graded": n},
         "attrition": attrition,
@@ -1490,9 +1496,10 @@ def main():
                     help="aggregate one category across the corpus (e.g. exposure, accessibility), grouped by "
                          "category instead of by probe, then exit")
     ap.add_argument("--json", action="store_true", help="emit a machine readable summary instead of the report")
-    ap.add_argument("--corpus-json", nargs="?", const="validation/corpus-figures.json", dest="corpus_json",
+    ap.add_argument("--corpus-json", nargs="?", const="__AUTO__", dest="corpus_json",
                     metavar="OUT", help="emit the aggregate CORPUS_REPORT figures as ONE versioned JSON "
-                         "(for sloptic.org /findings); writes to OUT (default validation/corpus-figures.json)")
+                         "(for sloptic.org /findings); writes to OUT (default validation/corpus-figures-{active,passive}.json "
+                         "by detected battery)")
     ap.add_argument("--sigma", type=float, default=2.0, help="high outlier threshold in stdevs (default 2)")
     ap.add_argument("--charts", action="store_true",
                     help="render the corpus writeup PNG charts (+ sibling CSVs) to docs/charts/, then exit "
@@ -1523,8 +1530,11 @@ def main():
         sys.exit("no records")
     if args.corpus_json:
         cj = corpus_json(recs)
-        open(args.corpus_json, "w").write(json.dumps(cj, indent=2) + "\n")
-        print(f"wrote {args.corpus_json}  (version {cj['version']}, n={cj['provenance']['n_apps']}, "
+        out = args.corpus_json
+        if out == "__AUTO__":   # default: name by the detected battery (active = full, passive = 44-probe floor)
+            out = "validation/corpus-figures-%s.json" % ("passive" if cj["probe_set"] == "passive" else "active")
+        open(out, "w").write(json.dumps(cj, indent=2) + "\n")
+        print(f"wrote {out}  (version {cj['version']}, n={cj['provenance']['n_apps']}, "
               f"generated {cj['generated_at']})")
         return
     if args.diff:

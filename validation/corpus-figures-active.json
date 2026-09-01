@@ -1,6 +1,7 @@
 {
   "version": "corpus-2026.3",
-  "generated_at": "2026-09-01T12:21:48+00:00",
+  "probe_set": "full",
+  "generated_at": "2026-09-01T12:38:09+00:00",
   "provenance": {
     "corpus_id": "multihacksv23",
     "run_date": "2026-08-27",
@@ -9,6 +10,7 @@
     "n_probes": 102,
     "catalog_fingerprint": "bfc247b720a6",
     "curve_version": "2026.3",
+    "probe_set": "full",
     "attempted": 2685
   },
   "reach": {
