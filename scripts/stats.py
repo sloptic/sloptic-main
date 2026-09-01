@@ -60,8 +60,8 @@ _AUTHED_PROBES = frozenset({
 
 def _severity_tier(penalty):
     """A finding's severity tier, derived from its risk priced penalty (no explicit severity field in the record).
-    Clean 10 wide bands so they read plainly: minor 1..10, moderate 11..20, serious 21..30, severe 31..39, critical 40+."""
-    return ("critical" if penalty >= 40 else "severe" if penalty > 30
+    Clean 10 wide bands so they read plainly: minor 1..10, moderate 11..20, serious 21..30, severe 31..40, critical 41+ (each band's top value is the lower tier, so 40 is severe)."""
+    return ("critical" if penalty > 40 else "severe" if penalty > 30
             else "serious" if penalty > 20 else "moderate" if penalty > 10 else "minor")
 
 
@@ -1292,21 +1292,21 @@ def corpus_json(recs: list) -> dict:
     tiers = {t: tierstat(v) for t, v in per.items()}
     worst = [max([float(f["penalty"]) for f in r.get("findings", []) if _scored(f)] or [0]) for r in graded]
     ws = sorted(worst)
-    acute = sum(1 for w in worst if w >= 40)
+    acute = sum(1 for w in worst if w > 40)
     signif = sum(1 for w in worst if w >= 21)
     floor_apps = sum(1 for w in worst if w > 0)   # apps with ANY finding -> "virtually every app", NOT a hardcoded 100%
     exploit = sum(1 for r in graded if _has_catastrophe(r))
     comp = Counter()
     for r in graded:
         for f in r.get("findings", []):
-            if _scored(f) and float(f["penalty"]) >= 40:
+            if _scored(f) and float(f["penalty"]) > 40:
                 pid = f.get("probe_id") or f.get("id") or ""
                 comp["security" if pid.startswith("sec-") else "performance" if pid.startswith("perf-") else "quality"] += 1
     ctot = sum(comp.values()) or 1
     severity = {
         "note": "Levels are cumulative by each app's single worst finding.",
         "levels": [
-            {"key": "acute", "label": "Acute", "threshold": "worst finding priced 40 or more", "apps": acute,
+            {"key": "acute", "label": "Acute", "threshold": "worst finding priced above 40", "apps": acute,
              "pct": round(100 * acute / n, 1),
              "definition": "Severe issues that noticeably degrade the user experience or allow attacker "
                            "access, such as crashes, unusable pages, or exposed backends."},
@@ -1320,7 +1320,7 @@ def corpus_json(recs: list) -> dict:
                            "people often skip."}],
         "exploitable_apps": exploit, "exploitable_pct": round(100 * exploit / n, 1),
         "exploitable_definition": "Catastrophic vulnerabilities that an attacker can exploit today.",
-        "tier_bands": {"critical": "40+", "severe": "31-39", "serious": "21-30", "moderate": "11-20",
+        "tier_bands": {"critical": "41+", "severe": "31-40", "serious": "21-30", "moderate": "11-20",
                        "minor": "1-10"},
         "tiers": tiers,
         "acute_axis_composition": {k: {"findings": comp[k], "pct": round(100 * comp[k] / ctot, 1)}
@@ -1334,6 +1334,23 @@ def corpus_json(recs: list) -> dict:
     lighthouse = {"overall": lighthouse_scores(graded)["performance"],
                   "winners": lighthouse_scores([r for r in graded if r.get("winner") is True])["performance"],
                   "non_winners": lighthouse_scores([r for r in graded if r.get("winner") is False])["performance"]}
+
+    # perf independence: Lighthouse vs the slop OUTSIDE performance (correlating against total slop is
+    # tautological, Lighthouse is the perf axis). Near 0 = perf quality does not predict the rest of the slop.
+    ap_pairs = []
+    for r in graded:
+        _lh = (r.get("observed_surface") or {}).get("lighthouse")
+        if isinstance(_lh, dict) and _lh.get("performance") is not None:
+            ap_pairs.append((_lh["performance"], r["slop_score"] - ((r.get("axis_slop") or {}).get("performance", 0) or 0)))
+    try:
+        _rho = round(statistics.correlation([a for a, _ in ap_pairs], [b for _, b in ap_pairs], method="ranked"), 3) if len(ap_pairs) >= 10 else None
+    except (statistics.StatisticsError, ValueError):
+        _rho = None
+    axis_independence = {"perf_vs_nonperf_slop_rho": _rho, "n": len(ap_pairs),
+                         "note": "Spearman rho of Lighthouse performance against slop with the performance "
+                                 "axis removed. Near 0 means performance quality does not predict the rest of "
+                                 "the slop, so the axes are close to independent. Correlating against total "
+                                 "slop would be tautological, since Lighthouse is essentially the perf axis."}
 
     # 9  winners vs non winners (median, graded only)
     win = [r["slop_score"] for r in graded if r.get("winner") is True]
@@ -1473,6 +1490,7 @@ def corpus_json(recs: list) -> dict:
         "axis_split": axis_split,
         "severity": severity,
         "lighthouse": lighthouse,
+        "axis_independence": axis_independence,
         "winners": winners,
         "by_event": by_event,
         "by_stack": by_stack,

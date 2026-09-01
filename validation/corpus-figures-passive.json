@@ -1,7 +1,7 @@
 {
   "version": "corpus-passive-2026.1",
   "probe_set": "passive",
-  "generated_at": "2026-09-01T18:16:11+00:00",
+  "generated_at": "2026-09-01T18:23:44+00:00",
   "provenance": {
     "corpus_id": "multihacksv23",
     "run_date": "2026-08-31",
@@ -225,9 +225,9 @@
       {
         "key": "acute",
         "label": "Acute",
-        "threshold": "worst finding priced 40 or more",
-        "apps": 285,
-        "pct": 16.3,
+        "threshold": "worst finding priced above 40",
+        "apps": 283,
+        "pct": 16.2,
         "definition": "Severe issues that noticeably degrade the user experience or allow attacker access, such as crashes, unusable pages, or exposed backends."
       },
       {
@@ -251,17 +251,17 @@
     "exploitable_pct": 0.8,
     "exploitable_definition": "Catastrophic vulnerabilities that an attacker can exploit today.",
     "tier_bands": {
-      "critical": "40+",
-      "severe": "31-39",
+      "critical": "41+",
+      "severe": "31-40",
       "serious": "21-30",
       "moderate": "11-20",
       "minor": "1-10"
     },
     "tiers": {
       "critical": {
-        "findings": 306,
-        "apps": 285,
-        "pct_apps": 16.3,
+        "findings": 303,
+        "apps": 283,
+        "pct_apps": 16.2,
         "per_app": {
           "mean": 1.1,
           "median": 1,
@@ -276,12 +276,12 @@
         }
       },
       "severe": {
-        "findings": 245,
-        "apps": 230,
-        "pct_apps": 13.1,
+        "findings": 248,
+        "apps": 233,
+        "pct_apps": 13.3,
         "per_app": {
           "mean": 1.1,
-          "median": 1.0,
+          "median": 1,
           "sd": 0.2,
           "min": 1,
           "max": 2
@@ -346,16 +346,16 @@
     },
     "acute_axis_composition": {
       "quality": {
-        "findings": 50,
-        "pct": 16.3
+        "findings": 48,
+        "pct": 15.8
       },
       "performance": {
-        "findings": 227,
-        "pct": 74.2
+        "findings": 226,
+        "pct": 74.6
       },
       "security": {
         "findings": 29,
-        "pct": 9.5
+        "pct": 9.6
       }
     },
     "worst_finding": {
@@ -405,6 +405,11 @@
       "green_n": 465,
       "pct_green": 32.6
     }
+  },
+  "axis_independence": {
+    "perf_vs_nonperf_slop_rho": -0.122,
+    "n": 1690,
+    "note": "Spearman rho of Lighthouse performance against slop with the performance axis removed. Near 0 means performance quality does not predict the rest of the slop, so the axes are close to independent. Correlating against total slop would be tautological, since Lighthouse is essentially the perf axis."
   },
   "winners": {
     "winner": {

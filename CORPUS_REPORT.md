@@ -13,7 +13,7 @@
 We pointed one black box grader at every submission we could find from 80 hackathons and asked one question. From the outside, what does AI era failure actually look like?
 
 - Slop is overwhelmingly **chronic**. On 1,625 live apps the failure is the missing floor: no security headers, slow heavy pages, broken accessibility, a button that does nothing. Exploitable holes stay rare, only **2.9%** of apps carry one, and essentially none an injection or remote code execution class.
-- **But the corpus is not benign.** A quarter of apps, **26%**, carry an **acute** finding (priced 40 or more), and a clear majority, **59%**, carry at least one **significant** finding (21 or more), a problem past the cosmetic floor. 85% of the acute tier is functional: a crash, a dead deploy, an unusably slow page. These apps break far more often than they get hacked.
+- **But the corpus is not benign.** A quarter of apps, **26%**, carry an **acute** finding (priced above 40), and a clear majority, **59%**, carry at least one **significant** finding (21 or more), a problem past the cosmetic floor. 86% of the acute tier is functional: a crash, a dead deploy, an unusably slow page. These apps break far more often than they get hacked.
 - The acute danger that remains **moved into the managed backend, and this run finally reached it.** The single largest exploitable class is a world readable or writable Supabase or Firebase backend, **18 apps**, several of them serving plaintext passwords or bulk emails to any anonymous visitor.
 - **The AI builder signal is a leaking backend.** AI built apps leak their managed backend at **13%** (11 of 82), more than ten times the population rate, and it is the dominant risk in that cohort. A backend probe added this cycle is what made the exposure visible.
 - **Winners are not cleaner.** The apps the judges picked carry **12% more** median slop than the ones they passed over, so human judged merit does not predict whether the thing holds up.
@@ -97,8 +97,8 @@ We priced every finding into a severity tier, each band ten points wide, and cou
 
 | tier (priced penalty) | findings | apps with at least one | expected per app |
 |---|---:|---:|---:|
-| **critical (40+)** | 495 | **426 (26%)** | 0.30 |
-| severe (31 to 39) | 257 | 239 (15%) | 0.16 |
+| **critical (41+)** | 485 | **420 (26%)** | 0.30 |
+| severe (31 to 40) | 267 | 248 (15%) | 0.16 |
 | serious (21 to 30) | 660 | 563 (35%) | 0.41 |
 | moderate (11 to 20) | 893 | 757 (47%) | 0.55 |
 | minor (1 to 10) | 7,076 | 1,618 (100%) | 4.35 |
@@ -107,19 +107,19 @@ Apps land in several tiers at once, so the cleaner read is each app's single wor
 
 | an app's worst finding | apps | reading |
 |---|---:|---|
-| 40 or more, acute | 426 (26%) | it crashes, leaks, or is unusable |
+| above 40, acute | 420 (26%) | it crashes, leaks, or is unusable |
 | 21 or more, significant | 957 (59%) | at least one problem past cosmetic |
 | 11 or more | 1,279 (79%) | above the pure hygiene floor |
 
 The median app's worst finding is a **27**, which sits in the significant band, so the typical app's single biggest problem is already more than cosmetic. Splitting the acute tier by axis shows what "acute" is made of.
 
-| critical (40+) findings | count | share |
+| critical (41+) findings | count | share |
 |---|---:|---:|
-| quality | 213 | 43% |
-| performance | 206 | 42% |
-| security | 76 | 15% |
+| quality | 211 | 44% |
+| performance | 205 | 42% |
+| security | 69 | 14% |
 
-Quality and performance make up 85% of the acute tier. A catastrophically slow page (Lighthouse red) and a crash on malformed input dominate it, then a deploy that will not stay up and a backend left open to anyone, with real breaches the thin 15% that remains. Only **59 apps (3.6%)** carry a security critical at all, and **47 (2.9%)** an exploitable one.
+Quality and performance make up 86% of the acute tier. A catastrophically slow page (Lighthouse red) and a crash on malformed input dominate it, then a deploy that will not stay up and a backend left open to anyone, with real breaches the thin 14% that remains. Only **52 apps (3.2%)** carry a security critical at all, and **47 (2.9%)** an exploitable one.
 
 So the corpus reads at three levels.
 
