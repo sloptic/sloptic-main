@@ -1,0 +1,707 @@
+{
+  "version": "corpus-2026.3",
+  "generated_at": "2026-09-01T03:18:56+00:00",
+  "provenance": {
+    "corpus_id": "multihacksv23",
+    "run_date": "2026-08-27",
+    "n_apps": 1625,
+    "n_events": 80,
+    "catalog_fingerprint": "bfc247b720a6",
+    "curve_version": "2026.3",
+    "attempted": 2685
+  },
+  "reach": {
+    "attempted": 2685,
+    "graded": 1625
+  },
+  "distribution": {
+    "n": 1625,
+    "median": 50.0,
+    "p75": 77.4,
+    "p90": 108.2,
+    "p99": 179.9,
+    "max": 239.1,
+    "bin_width": 10,
+    "bins": [
+      [
+        0,
+        10,
+        4
+      ],
+      [
+        10,
+        20,
+        199
+      ],
+      [
+        20,
+        30,
+        210
+      ],
+      [
+        30,
+        40,
+        197
+      ],
+      [
+        40,
+        50,
+        201
+      ],
+      [
+        50,
+        60,
+        169
+      ],
+      [
+        60,
+        70,
+        139
+      ],
+      [
+        70,
+        80,
+        128
+      ],
+      [
+        80,
+        90,
+        78
+      ],
+      [
+        90,
+        100,
+        74
+      ],
+      [
+        100,
+        110,
+        71
+      ],
+      [
+        110,
+        120,
+        31
+      ],
+      [
+        120,
+        130,
+        42
+      ],
+      [
+        130,
+        140,
+        18
+      ],
+      [
+        140,
+        150,
+        16
+      ],
+      [
+        150,
+        160,
+        12
+      ],
+      [
+        160,
+        170,
+        9
+      ],
+      [
+        170,
+        180,
+        11
+      ],
+      [
+        180,
+        190,
+        3
+      ],
+      [
+        190,
+        200,
+        4
+      ],
+      [
+        200,
+        210,
+        3
+      ],
+      [
+        210,
+        220,
+        3
+      ],
+      [
+        220,
+        230,
+        2
+      ],
+      [
+        230,
+        240,
+        1
+      ]
+    ]
+  },
+  "axis_split": {
+    "security": {
+      "share_pct": 31.5,
+      "median": 13.7
+    },
+    "qa": {
+      "share_pct": 40.6,
+      "median": 14.5
+    },
+    "performance": {
+      "share_pct": 27.9,
+      "median": 10.6
+    }
+  },
+  "severity": {
+    "note": "Levels are cumulative by each app's single worst finding: acute is a subset of significant, which is a subset of the floor (every app).",
+    "levels": [
+      {
+        "key": "acute",
+        "label": "Acute",
+        "threshold": "worst finding priced 40 or more",
+        "apps": 426,
+        "pct": 26.2,
+        "definition": "Broken enough to fail a real user or leak to a real attacker: a crash, a dead deploy, an unusable page, an open backend."
+      },
+      {
+        "key": "significant",
+        "label": "Significant",
+        "threshold": "worst finding priced 21 or more",
+        "apps": 957,
+        "pct": 58.9,
+        "definition": "At least one finding past the cosmetic floor: a dead control, a broken link, a missing rate limit, a page slow enough to notice."
+      },
+      {
+        "key": "floor",
+        "label": "Hygiene floor",
+        "threshold": "every graded app",
+        "apps": 1625,
+        "pct": 100.0,
+        "definition": "The universal hygiene floor: missing headers, middling accessibility, orange performance. No app escapes it."
+      }
+    ],
+    "exploitable_apps": 47,
+    "exploitable_pct": 2.9,
+    "exploitable_definition": "Carries a catastrophe-gate finding, an exploit an attacker could use now: a leaked backend, a served secret, a confirmed injection."
+  },
+  "winners": {
+    "winner": {
+      "n": 253,
+      "median": 54.9
+    },
+    "non_winner": {
+      "n": 1372,
+      "median": 49.1
+    },
+    "delta_pct": 11.8
+  },
+  "by_event": [
+    {
+      "event": "hack-brown-2026",
+      "n": 13,
+      "median": 105.8
+    },
+    {
+      "event": "civic-hacks",
+      "n": 5,
+      "median": 83.0
+    },
+    {
+      "event": "ellehacks-2026",
+      "n": 14,
+      "median": 79.6
+    },
+    {
+      "event": "ds-x",
+      "n": 3,
+      "median": 71.8
+    },
+    {
+      "event": "luddyhacks",
+      "n": 4,
+      "median": 70.4
+    },
+    {
+      "event": "kenthackit",
+      "n": 1,
+      "median": 69.5
+    },
+    {
+      "event": "hacklahoma-2026",
+      "n": 8,
+      "median": 68.6
+    },
+    {
+      "event": "civic-hacks-2026",
+      "n": 5,
+      "median": 68.4
+    },
+    {
+      "event": "hackeurope",
+      "n": 37,
+      "median": 67.5
+    },
+    {
+      "event": "stem-connect-fall2025",
+      "n": 4,
+      "median": 67.3
+    },
+    {
+      "event": "devfest-2026",
+      "n": 8,
+      "median": 65.3
+    },
+    {
+      "event": "byte-hacks",
+      "n": 2,
+      "median": 64.8
+    },
+    {
+      "event": "hackrpi-2025",
+      "n": 12,
+      "median": 63.4
+    },
+    {
+      "event": "hacknyu-2025",
+      "n": 8,
+      "median": 63.2
+    },
+    {
+      "event": "diamondhacks-2026",
+      "n": 27,
+      "median": 62.7
+    },
+    {
+      "event": "uwb-hacks-the-future",
+      "n": 17,
+      "median": 62.7
+    },
+    {
+      "event": "hack-mit-2023",
+      "n": 13,
+      "median": 62.6
+    },
+    {
+      "event": "hackprinceton-fall-2025",
+      "n": 33,
+      "median": 62.5
+    },
+    {
+      "event": "deltahacks-12",
+      "n": 21,
+      "median": 62.1
+    },
+    {
+      "event": "nwhacks-2026",
+      "n": 29,
+      "median": 60.9
+    },
+    {
+      "event": "hackgt-12",
+      "n": 26,
+      "median": 60.7
+    },
+    {
+      "event": "imaginehack2026",
+      "n": 7,
+      "median": 59.7
+    },
+    {
+      "event": "uncommon-hacks-2026",
+      "n": 1,
+      "median": 58.9
+    },
+    {
+      "event": "bigred-hacks-2025",
+      "n": 9,
+      "median": 58.5
+    },
+    {
+      "event": "devleague-2026",
+      "n": 14,
+      "median": 58.5
+    },
+    {
+      "event": "hack-for-humanity-26",
+      "n": 21,
+      "median": 57.2
+    },
+    {
+      "event": "mhacks-2025",
+      "n": 16,
+      "median": 57.0
+    },
+    {
+      "event": "hackharvard-2025",
+      "n": 38,
+      "median": 56.5
+    },
+    {
+      "event": "treehacks-2026",
+      "n": 105,
+      "median": 56.4
+    },
+    {
+      "event": "hacklondon-2026",
+      "n": 10,
+      "median": 56.2
+    },
+    {
+      "event": "boilermake-xii",
+      "n": 9,
+      "median": 56.1
+    },
+    {
+      "event": "hackku26",
+      "n": 14,
+      "median": 55.8
+    },
+    {
+      "event": "hackillinois-2026",
+      "n": 48,
+      "median": 54.8
+    },
+    {
+      "event": "vibe-coder-hackathon",
+      "n": 21,
+      "median": 54.4
+    },
+    {
+      "event": "henhacks-2026",
+      "n": 19,
+      "median": 54.2
+    },
+    {
+      "event": "hackrice-15",
+      "n": 20,
+      "median": 53.8
+    },
+    {
+      "event": "terrahacks-2025",
+      "n": 12,
+      "median": 53.5
+    },
+    {
+      "event": "swamphacks-xi",
+      "n": 18,
+      "median": 53.2
+    },
+    {
+      "event": "codecrunch-305hackathon-fall25",
+      "n": 2,
+      "median": 52.8
+    },
+    {
+      "event": "ai-hackathon-2026",
+      "n": 60,
+      "median": 52.6
+    },
+    {
+      "event": "hackduke-code-for-good-2026",
+      "n": 8,
+      "median": 52.2
+    },
+    {
+      "event": "usaii-global-ai-hackathon-2026",
+      "n": 248,
+      "median": 52.0
+    },
+    {
+      "event": "hack4her-mty",
+      "n": 8,
+      "median": 51.3
+    },
+    {
+      "event": "hackmty2025",
+      "n": 22,
+      "median": 51.2
+    },
+    {
+      "event": "hack-western-12",
+      "n": 14,
+      "median": 51.1
+    },
+    {
+      "event": "nus-fintech-summit-2026",
+      "n": 9,
+      "median": 49.6
+    },
+    {
+      "event": "hacktech-by-caltech-2026",
+      "n": 18,
+      "median": 48.7
+    },
+    {
+      "event": "innovation-hacks-2",
+      "n": 33,
+      "median": 48.7
+    },
+    {
+      "event": "emory-hacks-2025-fall",
+      "n": 4,
+      "median": 47.9
+    },
+    {
+      "event": "hackbeanpot2025",
+      "n": 4,
+      "median": 46.6
+    },
+    {
+      "event": "hackpsu-spring-2026",
+      "n": 17,
+      "median": 46.4
+    },
+    {
+      "event": "vthacks-13",
+      "n": 14,
+      "median": 46.2
+    },
+    {
+      "event": "hack-arizona-2026",
+      "n": 10,
+      "median": 46.1
+    },
+    {
+      "event": "hackupc-2026",
+      "n": 15,
+      "median": 45.7
+    },
+    {
+      "event": "hacktx2025",
+      "n": 22,
+      "median": 45.0
+    },
+    {
+      "event": "hackcwru-012025",
+      "n": 5,
+      "median": 44.6
+    },
+    {
+      "event": "steminate-hacks-2026",
+      "n": 25,
+      "median": 43.3
+    },
+    {
+      "event": "interhackbcn",
+      "n": 9,
+      "median": 43.0
+    },
+    {
+      "event": "hacknc-2025",
+      "n": 22,
+      "median": 42.0
+    },
+    {
+      "event": "hack-brooklyn-2026",
+      "n": 8,
+      "median": 41.8
+    },
+    {
+      "event": "newhacks-2025",
+      "n": 9,
+      "median": 41.7
+    },
+    {
+      "event": "hackumass-xiii",
+      "n": 20,
+      "median": 41.0
+    },
+    {
+      "event": "unihack2026",
+      "n": 57,
+      "median": 40.6
+    },
+    {
+      "event": "sb-hacks-xii",
+      "n": 17,
+      "median": 40.3
+    },
+    {
+      "event": "hacknroll2026",
+      "n": 41,
+      "median": 40.0
+    },
+    {
+      "event": "la-hacks-2026",
+      "n": 43,
+      "median": 39.9
+    },
+    {
+      "event": "vibehack-london-2026",
+      "n": 23,
+      "median": 39.4
+    },
+    {
+      "event": "uofthacks-13",
+      "n": 21,
+      "median": 37.9
+    },
+    {
+      "event": "cs-girlies-wellness-hackathon",
+      "n": 37,
+      "median": 37.9
+    },
+    {
+      "event": "beaverhacks",
+      "n": 10,
+      "median": 37.1
+    },
+    {
+      "event": "jumbohack-2026",
+      "n": 7,
+      "median": 35.8
+    },
+    {
+      "event": "bostonhacks-2025",
+      "n": 12,
+      "median": 34.8
+    },
+    {
+      "event": "la-hacks-2025",
+      "n": 10,
+      "median": 33.7
+    },
+    {
+      "event": "wildhacks-2026",
+      "n": 23,
+      "median": 30.2
+    },
+    {
+      "event": "hack-for-humanity-2026",
+      "n": 5,
+      "median": 29.3
+    },
+    {
+      "event": "jumbohack-2025",
+      "n": 5,
+      "median": 28.7
+    },
+    {
+      "event": "oregonhacks",
+      "n": 31,
+      "median": 28.3
+    },
+    {
+      "event": "biggest-little-hackathon-2026",
+      "n": 1,
+      "median": 26.7
+    },
+    {
+      "event": "hackdartmouth-xi",
+      "n": 3,
+      "median": 21.2
+    },
+    {
+      "event": "hack-ireland-2025",
+      "n": 1,
+      "median": 19.5
+    }
+  ],
+  "by_stack": [
+    {
+      "stack": "cloudflare-pages",
+      "n": 15,
+      "median": 45.1,
+      "probes_applied_median": 47
+    },
+    {
+      "stack": "github-pages",
+      "n": 96,
+      "median": 45.2,
+      "probes_applied_median": 55.5
+    },
+    {
+      "stack": "vercel",
+      "n": 1058,
+      "median": 45.6,
+      "probes_applied_median": 51.0
+    },
+    {
+      "stack": "cloudflare-workers",
+      "n": 13,
+      "median": 54.3,
+      "probes_applied_median": 59
+    },
+    {
+      "stack": "netlify",
+      "n": 115,
+      "median": 54.8,
+      "probes_applied_median": 55
+    },
+    {
+      "stack": "lovable",
+      "n": 69,
+      "median": 55.3,
+      "probes_applied_median": 53
+    },
+    {
+      "stack": "render",
+      "n": 57,
+      "median": 59.8,
+      "probes_applied_median": 60
+    },
+    {
+      "stack": "railway",
+      "n": 12,
+      "median": 64.0,
+      "probes_applied_median": 60.5
+    },
+    {
+      "stack": "firebase",
+      "n": 29,
+      "median": 66.7,
+      "probes_applied_median": 49
+    },
+    {
+      "stack": "base44",
+      "n": 13,
+      "median": 68.8,
+      "probes_applied_median": 65
+    },
+    {
+      "stack": "google-cloud-run",
+      "n": 19,
+      "median": 68.8,
+      "probes_applied_median": 50
+    },
+    {
+      "stack": "unknown",
+      "n": 126,
+      "median": 69.8,
+      "probes_applied_median": 53.0
+    }
+  ],
+  "by_stack_excluded": [
+    {
+      "stack": "streamlit",
+      "apps": 82,
+      "reason": "canvas-shell host: the grade measures the framework, not the app"
+    }
+  ],
+  "star_finding": {
+    "key": "managed_backend_exposure",
+    "apps": 18,
+    "pct": 1.1,
+    "breakdown": {
+      "supabase": 14,
+      "firebase": 0,
+      "bulk_records": 7,
+      "with_pii_columns": 3,
+      "with_password_column": 0,
+      "with_email_column": 2
+    }
+  },
+  "notes": {
+    "severity": "Levels are cumulative by each app's single worst finding (acute is a subset of significant, which is every app).",
+    "by_event": "Includes small events; n is the graded-app count per event, so filter by n before comparing medians (single-app events are not representative).",
+    "by_stack": "Rows are the graded, ranked population; probes_applied_median contextualizes a low median (a thin stack applies few probes). Canvas-shell platforms are in by_stack_excluded, not here, because they were graded as the framework, not the app.",
+    "reach": "attempted is every submission with a gradeable URL; graded is those that returned a score (the rest were dead, timed out, bot-challenged, or not a web app)."
+  }
+}

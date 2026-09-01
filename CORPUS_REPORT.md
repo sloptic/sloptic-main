@@ -2,8 +2,10 @@
 
 ### A black box quality audit of 1,625 live hackathon web apps
 
-**Reference release:** `2026.3` (provisional) · **Instrument:** Sloptic, a deductions only black box grader · **Population:** live hackathon submissions · **Run:** 2,685 apps attempted, 1,625 graded, 38 hours of wall clock
+**Reference release:** `2026.3` (final) · **Instrument:** Sloptic, a deductions only black box grader · **Population:** live hackathon submissions · **Run:** 2,685 apps attempted, 1,625 graded, 38 hours of wall clock
 
+
+> **Figures as data:** every number in this report is emitted, aggregate only, to `validation/corpus-figures.json` by `scripts/stats.py --corpus-json`. That file is the single source this prose and the sloptic.org findings page both quote, so they cannot drift.
 ---
 
 ## TL;DR

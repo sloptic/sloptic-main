@@ -1224,6 +1224,163 @@ def diff_report(cur, prev, args):
     print(f"\n    → per probe / per app detail: --json, or --audit <probe id> on either run\n")
 
 
+def corpus_json(recs: list) -> dict:
+    """The CORPUS_REPORT figures as ONE aggregate JSON, so the report prose and the sloptic.org /findings
+    page quote a single source and can never drift. AGGREGATE ONLY: no app names, URLs, hosts, keys, tables,
+    or per-app rows -- event slugs and platform names are group keys, not team identifiers. Reuses the same
+    helpers the report sections come from (_is_graded, _severity_tier via worst-finding, _has_catastrophe for
+    the exploitable/gate rate, by_hackathon). See --corpus-json."""
+    import datetime, hashlib
+    graded = [r for r in recs if _is_graded(r)]
+    if not graded:
+        sys.exit("corpus-json: no graded records")
+    n = len(graded)
+    scores = sorted(r["slop_score"] for r in graded)
+
+    def pct(p):   # curve-consistent percentile (matches benchmark._pcts + the frozen 2026.3 curve)
+        i = min(len(scores) - 1, max(0, round((p / 100) * (len(scores) - 1))))
+        return round(scores[i], 1)
+
+    # 4  distribution: 10-wide histogram + the landmarks the headline chart needs
+    W = 10
+    top = int(max(scores) // W + 1) * W
+    bins = [[lo, lo + W, sum(1 for x in scores if lo <= x < lo + W)] for lo in range(0, top, W)]
+    if bins:                                   # fold the exact max into the last bin (half-open would drop it)
+        bins[-1][2] = sum(1 for x in scores if bins[-1][0] <= x <= max(scores))
+    distribution = {"n": n, "median": pct(50), "p75": pct(75), "p90": pct(90), "p99": pct(99),
+                    "max": round(max(scores), 1), "bin_width": W, "bins": bins}
+
+    # 5  axis split: each axis's share of total slop + its median (subtotals sum to the score)
+    axes = ("security", "qa", "performance")
+    tot = {a: 0.0 for a in axes}
+    vals = {a: [] for a in axes}
+    for r in graded:
+        for a in axes:
+            v = (r.get("axis_slop") or {}).get(a, 0) or 0
+            tot[a] += v
+            vals[a].append(v)
+    grand = sum(tot.values()) or 1
+    axis_split = {a: {"share_pct": round(100 * tot[a] / grand, 1),
+                      "median": round(statistics.median(vals[a]), 1)} for a in axes}
+
+    # 6  three-level severity by each app's WORST finding (cumulative), + the exploitable (gate) rate
+    worst = [max([float(f["penalty"]) for f in r.get("findings", []) if _scored(f)] or [0]) for r in graded]
+    acute = sum(1 for w in worst if w >= 40)
+    signif = sum(1 for w in worst if w >= 21)
+    from benchmark import _has_catastrophe   # exploitable == the catastrophe gate (matches the report's 2.9%)
+    exploit = sum(1 for r in graded if _has_catastrophe(r))
+    severity = {
+        "note": "Levels are cumulative by each app's single worst finding: acute is a subset of significant, "
+                "which is a subset of the floor (every app).",
+        "levels": [
+            {"key": "acute", "label": "Acute", "threshold": "worst finding priced 40 or more", "apps": acute,
+             "pct": round(100 * acute / n, 1),
+             "definition": "Broken enough to fail a real user or leak to a real attacker: a crash, a dead "
+                           "deploy, an unusable page, an open backend."},
+            {"key": "significant", "label": "Significant", "threshold": "worst finding priced 21 or more",
+             "apps": signif, "pct": round(100 * signif / n, 1),
+             "definition": "At least one finding past the cosmetic floor: a dead control, a broken link, a "
+                           "missing rate limit, a page slow enough to notice."},
+            {"key": "floor", "label": "Hygiene floor", "threshold": "every graded app", "apps": n, "pct": 100.0,
+             "definition": "The universal hygiene floor: missing headers, middling accessibility, orange "
+                           "performance. No app escapes it."}],
+        "exploitable_apps": exploit, "exploitable_pct": round(100 * exploit / n, 1),
+        "exploitable_definition": "Carries a catastrophe-gate finding, an exploit an attacker could use now: "
+                                  "a leaked backend, a served secret, a confirmed injection."}
+
+    # 9  winners vs non winners (graded only; a DNF winner has no score)
+    win = [r["slop_score"] for r in graded if r.get("winner") is True]
+    non = [r["slop_score"] for r in graded if r.get("winner") is False]
+    wm, nm = statistics.median(win), statistics.median(non)
+    winners = {"winner": {"n": len(win), "median": round(wm, 1)},
+               "non_winner": {"n": len(non), "median": round(nm, 1)},
+               "delta_pct": round(100 * (wm - nm) / nm, 1) if nm else None}
+
+    # 9.1  by event (slug = a group of teams, not a team) and by stack (platform, with the coverage caveat)
+    ev = defaultdict(list)
+    for r in graded:
+        ev[r.get("hackathon") or "(unlabeled)"].append(r["slop_score"])
+    by_event = sorted(({"event": k, "n": len(v), "median": round(statistics.median(v), 1)}
+                       for k, v in ev.items()), key=lambda x: -x["median"])
+    st = defaultdict(lambda: {"slop": [], "applied": []})
+    for r in graded:
+        plat = (r.get("platform") or {}).get("host_platform") or "other"
+        st[plat]["slop"].append(r["slop_score"])
+        a = (r.get("coverage") or {}).get("probes_applicable")
+        if a is not None:
+            st[plat]["applied"].append(a)
+    by_stack = sorted(({"stack": k, "n": len(v["slop"]), "median": round(statistics.median(v["slop"]), 1),
+                        "probes_applied_median": round(statistics.median(v["applied"]), 1) if v["applied"] else None}
+                       for k, v in st.items() if len(v["slop"]) >= 5), key=lambda x: x["median"])
+
+    # 7 / 6.1  the star finding: managed backend exposure, AGGREGATE COUNTS ONLY (no hosts/keys/tables)
+    def _be_findings(r):
+        return [f for f in r.get("findings", []) if (f.get("probe_id") or f.get("id")) == "sec-backend-001"]
+    be = [r for r in graded if _be_findings(r)]
+    def _cols(r):
+        c = []
+        for f in _be_findings(r):
+            e = f.get("evidence") or {}
+            c += (e.get("columns") or []) + (e.get("sensitive_columns") or [])
+        return " ".join(c).lower()
+    def _flag(r, key):
+        return any((f.get("evidence") or {}).get(key) for f in _be_findings(r))
+    def _backend(r):
+        for f in _be_findings(r):
+            b = (f.get("evidence") or {}).get("backend")
+            if b:
+                return b
+        return "other"
+    import re as _re
+    star = {"key": "managed_backend_exposure", "apps": len(be), "pct": round(100 * len(be) / n, 1),
+            "breakdown": {
+                "supabase": sum(1 for r in be if _backend(r) == "supabase"),
+                "firebase": sum(1 for r in be if _backend(r) == "firebase"),
+                "bulk_records": sum(1 for r in be if _flag(r, "bulk_read")),
+                "with_pii_columns": sum(1 for r in be if _flag(r, "sensitive_columns") or (r and (r.get("findings") and any((f.get("evidence") or {}).get("sensitive_columns") for f in _be_findings(r))))),
+                "with_password_column": sum(1 for r in be if _re.search(r"pass|pwd", _cols(r))),
+                "with_email_column": sum(1 for r in be if _re.search(r"email|e_mail", _cols(r)))}}
+
+    # provenance + reach
+    attempted = len(recs)
+    tss = [r.get("ts") for r in graded if isinstance(r.get("ts"), (int, float))]
+    run_date = datetime.datetime.fromtimestamp(max(tss), datetime.timezone.utc).date().isoformat() if tss else None
+    try:
+        cat = load_catalog(str(_ROOT / "catalog"))
+        cat_ver = hashlib.sha256("|".join(f"{p.id}:{p.penalty}" for p in sorted(cat, key=lambda x: x.id)).encode()).hexdigest()[:12]
+    except Exception:
+        cat_ver = None
+    # canvas-shell platforms (Streamlit) are excluded from the ranked population because the grade would
+    # measure the framework shell, not the app. Surfaced so the page can say so instead of charting a
+    # misleading "median 0", which is exactly the thinness artifact to avoid.
+    shell = defaultdict(int)
+    for r in recs:
+        if is_shell_only(r):
+            shell[(r.get("platform") or {}).get("host_platform") or "other"] += 1
+    by_stack_excluded = sorted(({"stack": k, "apps": v,
+                                 "reason": "canvas-shell host: the grade measures the framework, not the app"}
+                                for k, v in shell.items()), key=lambda x: -x["apps"])
+    notes = {
+        "severity": "Levels are cumulative by each app's single worst finding (acute is a subset of "
+                    "significant, which is every app).",
+        "by_event": "Includes small events; n is the graded-app count per event, so filter by n before "
+                    "comparing medians (single-app events are not representative).",
+        "by_stack": "Rows are the graded, ranked population; probes_applied_median contextualizes a low "
+                    "median (a thin stack applies few probes). Canvas-shell platforms are in "
+                    "by_stack_excluded, not here, because they were graded as the framework, not the app.",
+        "reach": "attempted is every submission with a gradeable URL; graded is those that returned a score "
+                 "(the rest were dead, timed out, bot-challenged, or not a web app)."}
+    return {
+        "version": "corpus-2026.3",
+        "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "provenance": {"corpus_id": "multihacksv23", "run_date": run_date, "n_apps": n, "n_events": len(ev),
+                       "catalog_fingerprint": cat_ver, "curve_version": "2026.3", "attempted": attempted},
+        "reach": {"attempted": attempted, "graded": n},
+        "distribution": distribution, "axis_split": axis_split, "severity": severity, "winners": winners,
+        "by_event": by_event, "by_stack": by_stack, "by_stack_excluded": by_stack_excluded,
+        "star_finding": star, "notes": notes}
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Analyze deploy_and_grade results: the default RECALL report, plus --parity (cross stack "
@@ -1234,6 +1391,9 @@ def main():
                     help="aggregate one category across the corpus (e.g. exposure, accessibility), grouped by "
                          "category instead of by probe, then exit")
     ap.add_argument("--json", action="store_true", help="emit a machine readable summary instead of the report")
+    ap.add_argument("--corpus-json", nargs="?", const="validation/corpus-figures.json", dest="corpus_json",
+                    metavar="OUT", help="emit the aggregate CORPUS_REPORT figures as ONE versioned JSON "
+                         "(for sloptic.org /findings); writes to OUT (default validation/corpus-figures.json)")
     ap.add_argument("--sigma", type=float, default=2.0, help="high outlier threshold in stdevs (default 2)")
     ap.add_argument("--charts", action="store_true",
                     help="render the corpus writeup PNG charts (+ sibling CSVs) to docs/charts/, then exit "
@@ -1262,6 +1422,12 @@ def main():
     recs = load(args.results)
     if not recs:
         sys.exit("no records")
+    if args.corpus_json:
+        cj = corpus_json(recs)
+        open(args.corpus_json, "w").write(json.dumps(cj, indent=2) + "\n")
+        print(f"wrote {args.corpus_json}  (version {cj['version']}, n={cj['provenance']['n_apps']}, "
+              f"generated {cj['generated_at']})")
+        return
     if args.diff:
         diff_report(recs, load(args.diff), args)
         return
