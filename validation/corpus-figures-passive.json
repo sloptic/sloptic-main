@@ -1,7 +1,7 @@
 {
   "version": "corpus-passive-2026.1",
   "probe_set": "passive",
-  "generated_at": "2026-09-01T14:14:15+00:00",
+  "generated_at": "2026-09-01T18:16:11+00:00",
   "provenance": {
     "corpus_id": "multihacksv23",
     "run_date": "2026-08-31",
@@ -252,7 +252,7 @@
     "exploitable_definition": "Catastrophic vulnerabilities that an attacker can exploit today.",
     "tier_bands": {
       "critical": "40+",
-      "severe": "31-40",
+      "severe": "31-39",
       "serious": "21-30",
       "moderate": "11-20",
       "minor": "1-10"

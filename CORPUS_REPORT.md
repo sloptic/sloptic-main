@@ -98,7 +98,7 @@ We priced every finding into a severity tier, each band ten points wide, and cou
 | tier (priced penalty) | findings | apps with at least one | expected per app |
 |---|---:|---:|---:|
 | **critical (40+)** | 495 | **426 (26%)** | 0.30 |
-| severe (31 to 40) | 257 | 239 (15%) | 0.16 |
+| severe (31 to 39) | 257 | 239 (15%) | 0.16 |
 | serious (21 to 30) | 660 | 563 (35%) | 0.41 |
 | moderate (11 to 20) | 893 | 757 (47%) | 0.55 |
 | minor (1 to 10) | 7,076 | 1,618 (100%) | 4.35 |
@@ -236,7 +236,7 @@ Four times out of five, an accessibility finding is text you cannot read against
 
 The server is not the problem. Layout is not the problem. The problem is the shipped bundle, a median page weighing **4.0 MB** (one weighs 124 MB), some shipping over 2,000 requests, a handful locking the main thread for minutes. TTFB and CLS the platform and the framework hand you for free. LCP, TBT, and page weight are the parts the builder controls, and they are the parts that are heavy. Performance slop is a bundle discipline problem wearing an infrastructure costume.
 
-And the axes move together. Across the corpus a lower overall score goes with a better Lighthouse score (Spearman rho of -0.57), so the app that skips the security floor tends to skip the performance one too. Slop is a habit that runs across the axes, and the teams that hardened one thing tended to harden the rest.
+And the axes are close to independent. An app's Lighthouse performance does not predict the slop it carries outside performance: the Spearman correlation between the two is -0.07. A correlation against total slop reads far stronger at -0.57, but that is mostly an artifact, since the performance axis is a large share of total slop and Lighthouse is essentially that axis, so it measures performance against itself. Corrected for that, the signal is flat. Performance quality tells you almost nothing about whether an app is otherwise broken or insecure, so an app can be fast and leaky, or slow and clean.
 
 ## 11. What never fired, and the reach frontier
 

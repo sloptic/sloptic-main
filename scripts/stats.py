@@ -60,7 +60,7 @@ _AUTHED_PROBES = frozenset({
 
 def _severity_tier(penalty):
     """A finding's severity tier, derived from its risk priced penalty (no explicit severity field in the record).
-    Clean 10 wide bands so they read plainly: minor 1..10, moderate 11..20, serious 21..30, severe 31..40, critical 40+."""
+    Clean 10 wide bands so they read plainly: minor 1..10, moderate 11..20, serious 21..30, severe 31..39, critical 40+."""
     return ("critical" if penalty >= 40 else "severe" if penalty > 30
             else "serious" if penalty > 20 else "moderate" if penalty > 10 else "minor")
 
@@ -1320,7 +1320,7 @@ def corpus_json(recs: list) -> dict:
                            "people often skip."}],
         "exploitable_apps": exploit, "exploitable_pct": round(100 * exploit / n, 1),
         "exploitable_definition": "Catastrophic vulnerabilities that an attacker can exploit today.",
-        "tier_bands": {"critical": "40+", "severe": "31-40", "serious": "21-30", "moderate": "11-20",
+        "tier_bands": {"critical": "40+", "severe": "31-39", "serious": "21-30", "moderate": "11-20",
                        "minor": "1-10"},
         "tiers": tiers,
         "acute_axis_composition": {k: {"findings": comp[k], "pct": round(100 * comp[k] / ctot, 1)}
@@ -2042,16 +2042,20 @@ def main():
         for r in graded:
             lh = (r.get("observed_surface") or {}).get("lighthouse")
             if isinstance(lh, dict) and lh.get("performance") is not None and isinstance(r.get("slop_score"), (int, float)):
-                pairs.append((lh["performance"], r["slop_score"]))
+                # NON-perf slop (total minus the perf axis). Correlating perf against TOTAL slop is tautological:
+                # Lighthouse IS the perf axis (rho ~-0.99 against it) and perf is a big share of the total, so
+                # that only measures perf vs itself. The real question is whether perf predicts the REST.
+                nonperf = r["slop_score"] - ((r.get("axis_slop") or {}).get("performance", 0) or 0)
+                pairs.append((lh["performance"], nonperf))
         if len(pairs) >= 10:
             try:
                 rho = statistics.correlation([p for p, _ in pairs], [s for _, s in pairs], method="ranked")
             except (statistics.StatisticsError, ValueError):
                 rho = None
             if rho is not None:
-                rel = ("independent, the axes measure different things" if abs(rho) < 0.2 else
+                rel = ("independent: perf quality does not predict the rest of the slop" if abs(rho) < 0.2 else
                        "cleaner apps also perf better" if rho < 0 else "cleaner apps perf worse")
-                print(f"     slop vs perf (Spearman, n {len(pairs)}): rho {rho:+.2f}   ({rel})")
+                print(f"     perf vs NON-perf slop (Spearman, n {len(pairs)}): rho {rho:+.2f}   ({rel})")
 
     # (c)
     sec(f"PER PROBE FIRE FREQUENCY  (# of the {len(graded)} graded apps each probe fired on)")
