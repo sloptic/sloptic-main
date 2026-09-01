@@ -41,7 +41,7 @@ That is the purpose it was built for, objective quality grading of hackathon sub
 began as the resilience grader for the HackLet League and is now its own project, for that league and
 for any hackathon organizer who wants an objective, consistent quality measure across every entry. A
 human judge cannot hold a hundred stacks in their head. Sloptic grades them all the same way and places
-each one on a single curve.
+each one on one shared curve.
 
 Sloptic grades the observable consequences of slop, the failures that are wrong no matter what
 the app is for, and it leaves aside the code that produced them.
@@ -84,7 +84,7 @@ diagnostics.
   marginal penalty. Ten endpoints missing a header are not ten findings.
 - **Comparable.** A frozen reference distribution turns a raw score into a percentile, so "42
   slop" reads as "cleaner than 70 percent of the population." That comparison is what makes ranking
-  possible, and it is what separates Sloptic from a scanner.
+  possible, and it is what separates Sloptic from a scanner. There are two frozen curves, the full ruler and a passive floor for the observation only subset, and a percentile always cites the matching one.
 
 ## Coverage honesty
 
