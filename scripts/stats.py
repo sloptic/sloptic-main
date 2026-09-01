@@ -1225,53 +1225,81 @@ def diff_report(cur, prev, args):
 
 
 def corpus_json(recs: list) -> dict:
-    """The CORPUS_REPORT figures as ONE aggregate JSON, so the report prose and the sloptic.org /findings
-    page quote a single source and can never drift. AGGREGATE ONLY: no app names, URLs, hosts, keys, tables,
-    or per-app rows -- event slugs and platform names are group keys, not team identifiers. Reuses the same
-    helpers the report sections come from (_is_graded, _severity_tier via worst-finding, _has_catastrophe for
-    the exploitable/gate rate, by_hackathon). See --corpus-json."""
+    """The full CORPUS_REPORT picture as ONE aggregate JSON, so the report prose and the sloptic.org
+    /findings page quote a single source and cannot drift. Renders what the default report prints, but
+    AGGREGATE ONLY: no app names, URLs, hosts, keys, or per-app rows (event slugs, platform, builder,
+    category and probe ids are group keys, not team identifiers), so the anomaly list and any host list are
+    deliberately absent. version + generated_at detect a stale vendored copy. Reuses the report's own helpers
+    (_severity_tier, lighthouse_scores, auth_surface, cat_subtotals, _dnf_reason, _dist) and the catastrophe
+    gate for the exploitable rate, so every number matches the report by construction. See --corpus-json."""
     import datetime, hashlib
+    from benchmark import _has_catastrophe
     graded = [r for r in recs if _is_graded(r)]
     if not graded:
         sys.exit("corpus-json: no graded records")
     n = len(graded)
     scores = sorted(r["slop_score"] for r in graded)
 
-    def pct(p):   # curve-consistent percentile (matches benchmark._pcts + the frozen 2026.3 curve)
-        i = min(len(scores) - 1, max(0, round((p / 100) * (len(scores) - 1))))
+    def pctl(p):   # curve-consistent percentile (matches benchmark._pcts + the frozen 2026.3 curve)
+        i = min(n - 1, max(0, round((p / 100) * (n - 1))))
         return round(scores[i], 1)
 
-    # 4  distribution: 10-wide histogram + the landmarks the headline chart needs
+    def _stats(xs):   # _dist, but the mean is named "mean" (not "avg") as the page expects
+        d = _dist(xs) or {}
+        if "avg" in d:
+            d["mean"] = d.pop("avg")
+        return d
+
+    # 4  distribution: full stats + landmarks + 10-wide histogram + modalities
     W = 10
     top = int(max(scores) // W + 1) * W
     bins = [[lo, lo + W, sum(1 for x in scores if lo <= x < lo + W)] for lo in range(0, top, W)]
-    if bins:                                   # fold the exact max into the last bin (half-open would drop it)
+    if bins:
         bins[-1][2] = sum(1 for x in scores if bins[-1][0] <= x <= max(scores))
-    distribution = {"n": n, "median": pct(50), "p75": pct(75), "p90": pct(90), "p99": pct(99),
-                    "max": round(max(scores), 1), "bin_width": W, "bins": bins}
+    modes = Counter(round(x, 1) for x in scores)
+    distribution = {**_stats(scores), "p90": pctl(90), "p99": pctl(99), "bin_width": W, "bins": bins,
+                    "distinct": len(modes), "pct_unique": round(100 * len(modes) / n, 1),
+                    "top_modes": [[float(v), k] for v, k in modes.most_common(8)]}
 
-    # 5  axis split: each axis's share of total slop + its median (subtotals sum to the score)
+    # 5  axis split: each axis's share of total slop + its full spread
     axes = ("security", "qa", "performance")
-    tot = {a: 0.0 for a in axes}
-    vals = {a: [] for a in axes}
-    for r in graded:
-        for a in axes:
-            v = (r.get("axis_slop") or {}).get(a, 0) or 0
-            tot[a] += v
-            vals[a].append(v)
-    grand = sum(tot.values()) or 1
-    axis_split = {a: {"share_pct": round(100 * tot[a] / grand, 1),
-                      "median": round(statistics.median(vals[a]), 1)} for a in axes}
+    axv = {a: [(r.get("axis_slop") or {}).get(a, 0) or 0 for r in graded] for a in axes}
+    grand = sum(sum(v) for v in axv.values()) or 1
+    axis_split = {a: {"share_pct": round(100 * sum(axv[a]) / grand, 1), **_stats(axv[a])} for a in axes}
 
-    # 6  three-level severity by each app's WORST finding (cumulative), + the exploitable (gate) rate
+    # 6  severity: the five 10-wide tiers (findings/apps/per-app/expected), the three cumulative levels with
+    #    verbatim definitions, the acute-tier axis composition, the worst-finding summary, and the gate rate
+    per = {t: [] for t in ("critical", "severe", "serious", "moderate", "minor")}
+    for r in graded:
+        cnt = Counter(_severity_tier(f["penalty"]) for f in r.get("findings", []) if _scored(f))
+        for t in per:
+            per[t].append(cnt.get(t, 0))
+
+    def tierstat(vals):
+        nz = [v for v in vals if v > 0]
+        var = statistics.pvariance(vals) if len(vals) > 1 else 0.0
+        return {"findings": sum(vals), "apps": len(nz), "pct_apps": round(100 * len(nz) / n, 1),
+                "per_app": ({"mean": round(statistics.mean(nz), 1), "median": round(statistics.median(nz), 1),
+                             "sd": round(statistics.pstdev(nz), 1) if len(nz) > 1 else 0.0,
+                             "min": min(nz), "max": max(nz)} if nz else None),
+                "expected_per_app": {"E": round(statistics.mean(vals), 2), "var": round(var, 2),
+                                     "sd": round(var ** 0.5, 2)}}
+    tiers = {t: tierstat(v) for t, v in per.items()}
     worst = [max([float(f["penalty"]) for f in r.get("findings", []) if _scored(f)] or [0]) for r in graded]
+    ws = sorted(worst)
     acute = sum(1 for w in worst if w >= 40)
     signif = sum(1 for w in worst if w >= 21)
-    from benchmark import _has_catastrophe   # exploitable == the catastrophe gate (matches the report's 2.9%)
     exploit = sum(1 for r in graded if _has_catastrophe(r))
+    comp = Counter()
+    for r in graded:
+        for f in r.get("findings", []):
+            if _scored(f) and float(f["penalty"]) >= 40:
+                pid = f.get("probe_id") or f.get("id") or ""
+                comp["security" if pid.startswith("sec-") else "performance" if pid.startswith("perf-") else "quality"] += 1
+    ctot = sum(comp.values()) or 1
     severity = {
         "note": "Levels are cumulative by each app's single worst finding: acute is a subset of significant, "
-                "which is a subset of the floor (every app).",
+                "which is every app. tiers are the disjoint 10-wide penalty bands.",
         "levels": [
             {"key": "acute", "label": "Acute", "threshold": "worst finding priced 40 or more", "apps": acute,
              "pct": round(100 * acute / n, 1),
@@ -1285,18 +1313,32 @@ def corpus_json(recs: list) -> dict:
              "definition": "The universal hygiene floor: missing headers, middling accessibility, orange "
                            "performance. No app escapes it."}],
         "exploitable_apps": exploit, "exploitable_pct": round(100 * exploit / n, 1),
-        "exploitable_definition": "Carries a catastrophe-gate finding, an exploit an attacker could use now: "
-                                  "a leaked backend, a served secret, a confirmed injection."}
+        "exploitable_definition": "Carries a catastrophe-gate finding, an exploit usable now: a leaked "
+                                  "backend, a served secret, a confirmed injection.",
+        "tier_bands": {"critical": "40+", "severe": "31-40", "serious": "21-30", "moderate": "11-20",
+                       "minor": "1-10"},
+        "tiers": tiers,
+        "acute_axis_composition": {k: {"findings": comp[k], "pct": round(100 * comp[k] / ctot, 1)}
+                                   for k in ("quality", "performance", "security")},
+        "worst_finding": {"n": n, "min": round(ws[0], 1), "median": round(statistics.median(ws), 1),
+                          "q1": round(ws[max(0, round(0.25 * (n - 1)))], 1),
+                          "q3": round(ws[min(n - 1, round(0.75 * (n - 1)))], 1),
+                          "max": round(ws[-1], 1), "mean": round(statistics.mean(ws), 1)}}
 
-    # 9  winners vs non winners (graded only; a DNF winner has no score)
+    # 7  lighthouse performance (the perf axis grades on this), + the winner split
+    lighthouse = {"overall": lighthouse_scores(graded)["performance"],
+                  "winners": lighthouse_scores([r for r in graded if r.get("winner") is True])["performance"],
+                  "non_winners": lighthouse_scores([r for r in graded if r.get("winner") is False])["performance"]}
+
+    # 9  winners vs non winners (median, graded only)
     win = [r["slop_score"] for r in graded if r.get("winner") is True]
     non = [r["slop_score"] for r in graded if r.get("winner") is False]
     wm, nm = statistics.median(win), statistics.median(non)
-    winners = {"winner": {"n": len(win), "median": round(wm, 1)},
-               "non_winner": {"n": len(non), "median": round(nm, 1)},
+    winners = {"winner": {"n": len(win), "median": round(wm, 1), "mean": round(statistics.mean(win), 1)},
+               "non_winner": {"n": len(non), "median": round(nm, 1), "mean": round(statistics.mean(non), 1)},
                "delta_pct": round(100 * (wm - nm) / nm, 1) if nm else None}
 
-    # 9.1  by event (slug = a group of teams, not a team) and by stack (platform, with the coverage caveat)
+    # 9.1  by event, by stack (platform, with coverage), by builder (AI vs hand)
     ev = defaultdict(list)
     for r in graded:
         ev[r.get("hackathon") or "(unlabeled)"].append(r["slop_score"])
@@ -1312,47 +1354,83 @@ def corpus_json(recs: list) -> dict:
     by_stack = sorted(({"stack": k, "n": len(v["slop"]), "median": round(statistics.median(v["slop"]), 1),
                         "probes_applied_median": round(statistics.median(v["applied"]), 1) if v["applied"] else None}
                        for k, v in st.items() if len(v["slop"]) >= 5), key=lambda x: x["median"])
+    bl = defaultdict(list)
+    for r in graded:
+        p = r.get("platform")
+        if isinstance(p, dict):
+            bl[p.get("builder") or "hand built"].append(r["slop_score"])
+    by_builder = sorted(({"builder": k, "n": len(v), "median": round(statistics.median(v), 1)}
+                         for k, v in bl.items() if len(v) >= 5), key=lambda x: -x["n"])
 
-    # 7 / 6.1  the star finding: managed backend exposure, AGGREGATE COUNTS ONLY (no hosts/keys/tables)
-    def _be_findings(r):
+    # 7 / 6.1  star finding: managed backend exposure, AGGREGATE COUNTS ONLY (no hosts/keys/tables)
+    def _bef(r):
         return [f for f in r.get("findings", []) if (f.get("probe_id") or f.get("id")) == "sec-backend-001"]
-    be = [r for r in graded if _be_findings(r)]
+    be = [r for r in graded if _bef(r)]
+
+    def _flag(r, k):
+        return any((f.get("evidence") or {}).get(k) for f in _bef(r))
+
     def _cols(r):
-        c = []
-        for f in _be_findings(r):
+        out = []
+        for f in _bef(r):
             e = f.get("evidence") or {}
-            c += (e.get("columns") or []) + (e.get("sensitive_columns") or [])
-        return " ".join(c).lower()
-    def _flag(r, key):
-        return any((f.get("evidence") or {}).get(key) for f in _be_findings(r))
+            out += (e.get("columns") or []) + (e.get("sensitive_columns") or [])
+        return " ".join(out).lower()
+
     def _backend(r):
-        for f in _be_findings(r):
+        for f in _bef(r):
             b = (f.get("evidence") or {}).get("backend")
             if b:
                 return b
         return "other"
-    import re as _re
     star = {"key": "managed_backend_exposure", "apps": len(be), "pct": round(100 * len(be) / n, 1),
-            "breakdown": {
-                "supabase": sum(1 for r in be if _backend(r) == "supabase"),
-                "firebase": sum(1 for r in be if _backend(r) == "firebase"),
-                "bulk_records": sum(1 for r in be if _flag(r, "bulk_read")),
-                "with_pii_columns": sum(1 for r in be if _flag(r, "sensitive_columns") or (r and (r.get("findings") and any((f.get("evidence") or {}).get("sensitive_columns") for f in _be_findings(r))))),
-                "with_password_column": sum(1 for r in be if _re.search(r"pass|pwd", _cols(r))),
-                "with_email_column": sum(1 for r in be if _re.search(r"email|e_mail", _cols(r)))}}
+            "breakdown": {"supabase": sum(1 for r in be if _backend(r) == "supabase"),
+                          "firebase": sum(1 for r in be if _backend(r) == "firebase"),
+                          "bulk_records": sum(1 for r in be if _flag(r, "bulk_read")),
+                          "with_pii_columns": sum(1 for r in be if _flag(r, "sensitive_columns")),
+                          "with_password_column": sum(1 for r in be if re.search(r"pass|pwd", _cols(r))),
+                          "with_email_column": sum(1 for r in be if re.search(r"email|e_mail", _cols(r)))}}
 
-    # provenance + reach
+    # supporting: fire frequency (aggregate), category concentration, backend tier, auth surface, attrition
+    pa = defaultdict(set)
+    pm = {}
+    for r in graded:
+        for f in r.get("findings", []):
+            if _scored(f):
+                pa[f["probe_id"]].add(r["repo"])            # repos used only to COUNT distinct apps, never emitted
+                pm[f["probe_id"]] = (f["bundle"], f["category"])
+    fire_frequency = [{"probe_id": pid, "bundle": pm[pid][0], "category": pm[pid][1],
+                       "apps": len(a), "pct": round(100 * len(a) / n, 1)}
+                      for pid, a in sorted(pa.items(), key=lambda x: -len(x[1]))]
+    catt = Counter()
+    for r in graded:
+        for (_, cat), v in cat_subtotals(r).items():
+            catt[cat] += v
+    ctot2 = sum(catt.values()) or 1
+    category_concentration = [{"category": k, "slop": round(v, 1), "pct": round(100 * v / ctot2, 1)}
+                              for k, v in sorted(catt.items(), key=lambda x: -x[1])]
+
+    def _tc(r):
+        srf = r.get("observed_surface")
+        t = srf.get("host_tiers") if isinstance(srf, dict) else None
+        return t if isinstance(t, dict) and isinstance(t.get("counts"), dict) else None
+    tiered = [t for r in recs for t in [_tc(r)] if t and sum(t["counts"].values())]
+    backend_tier = {"n": len(tiered),
+                    **{k: sum(1 for t in tiered if t["counts"].get(k))
+                       for k in ("same_origin", "own_backend", "managed_baas", "vendor", "opaque")}}
+    A = auth_surface(graded)
+    auth = {k: (dict(v) if isinstance(v, Counter) else v) for k, v in A.items()}
+
     attempted = len(recs)
-    tss = [r.get("ts") for r in graded if isinstance(r.get("ts"), (int, float))]
-    run_date = datetime.datetime.fromtimestamp(max(tss), datetime.timezone.utc).date().isoformat() if tss else None
-    try:
-        cat = load_catalog(str(_ROOT / "catalog"))
-        cat_ver = hashlib.sha256("|".join(f"{p.id}:{p.penalty}" for p in sorted(cat, key=lambda x: x.id)).encode()).hexdigest()[:12]
-    except Exception:
-        cat_ver = None
-    # canvas-shell platforms (Streamlit) are excluded from the ranked population because the grade would
-    # measure the framework shell, not the app. Surfaced so the page can say so instead of charting a
-    # misleading "median 0", which is exactly the thinness artifact to avoid.
+    dnf = [r for r in recs if not _is_graded(r)]
+    zeros = sum(1 for r in graded if r["slop_score"] == 0)
+    bot = [r for r in recs if r.get("bot_challenge")]
+    attrition = {"attempted": attempted, "graded": n, "graded_pct": round(100 * n / attempted, 1),
+                 "dnf": len(dnf), "dnf_by_reason": dict(Counter(_dnf_reason(r) for r in dnf).most_common()),
+                 "clean_zero": zeros, "clean_pct": round(100 * zeros / n, 1),
+                 "bot_challenged": len(bot), "bot_challenged_pct": round(100 * len(bot) / attempted, 1)}
+
+    # excluded canvas-shell platforms (Streamlit) surfaced so the page says so, not a misleading median 0
     shell = defaultdict(int)
     for r in recs:
         if is_shell_only(r):
@@ -1360,25 +1438,48 @@ def corpus_json(recs: list) -> dict:
     by_stack_excluded = sorted(({"stack": k, "apps": v,
                                  "reason": "canvas-shell host: the grade measures the framework, not the app"}
                                 for k, v in shell.items()), key=lambda x: -x["apps"])
+
+    tss = [r.get("ts") for r in graded if isinstance(r.get("ts"), (int, float))]
+    run_date = datetime.datetime.fromtimestamp(max(tss), datetime.timezone.utc).date().isoformat() if tss else None
+    try:
+        cat = load_catalog(str(_ROOT / "catalog"))
+        cat_fp = hashlib.sha256("|".join(f"{p.id}:{p.penalty}" for p in sorted(cat, key=lambda x: x.id)).encode()).hexdigest()[:12]
+        n_probes = len(cat)
+    except Exception:
+        cat_fp, n_probes = None, None
     notes = {
-        "severity": "Levels are cumulative by each app's single worst finding (acute is a subset of "
-                    "significant, which is every app).",
-        "by_event": "Includes small events; n is the graded-app count per event, so filter by n before "
-                    "comparing medians (single-app events are not representative).",
-        "by_stack": "Rows are the graded, ranked population; probes_applied_median contextualizes a low "
-                    "median (a thin stack applies few probes). Canvas-shell platforms are in "
-                    "by_stack_excluded, not here, because they were graded as the framework, not the app.",
-        "reach": "attempted is every submission with a gradeable URL; graded is those that returned a score "
-                 "(the rest were dead, timed out, bot-challenged, or not a web app)."}
+        "aggregate_only": "No app names, URLs, hosts, keys, or per-app rows. Group keys (event, platform, "
+                          "builder, category, probe id) are not team identifiers. The report's anomaly list "
+                          "and any host list are intentionally omitted.",
+        "severity": "levels are cumulative by each app's worst finding; tiers are the disjoint 10-wide bands.",
+        "by_event": "Includes small events; filter by n before comparing medians (a single-app event is not "
+                    "representative).",
+        "by_stack": "Graded, ranked population; probes_applied_median contextualizes a low median. Canvas-shell "
+                    "platforms are in by_stack_excluded, not here.",
+        "reach": "attempted is every submission with a gradeable URL; graded is those that returned a score."}
     return {
         "version": "corpus-2026.3",
         "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
         "provenance": {"corpus_id": "multihacksv23", "run_date": run_date, "n_apps": n, "n_events": len(ev),
-                       "catalog_fingerprint": cat_ver, "curve_version": "2026.3", "attempted": attempted},
+                       "n_probes": n_probes, "catalog_fingerprint": cat_fp, "curve_version": "2026.3",
+                       "attempted": attempted},
         "reach": {"attempted": attempted, "graded": n},
-        "distribution": distribution, "axis_split": axis_split, "severity": severity, "winners": winners,
-        "by_event": by_event, "by_stack": by_stack, "by_stack_excluded": by_stack_excluded,
-        "star_finding": star, "notes": notes}
+        "attrition": attrition,
+        "distribution": distribution,
+        "axis_split": axis_split,
+        "severity": severity,
+        "lighthouse": lighthouse,
+        "winners": winners,
+        "by_event": by_event,
+        "by_stack": by_stack,
+        "by_stack_excluded": by_stack_excluded,
+        "by_builder": by_builder,
+        "star_finding": star,
+        "fire_frequency": fire_frequency,
+        "category_concentration": category_concentration,
+        "backend_tier": backend_tier,
+        "auth_surface": auth,
+        "notes": notes}
 
 
 def main():
