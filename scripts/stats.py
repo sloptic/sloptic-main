@@ -1294,6 +1294,7 @@ def corpus_json(recs: list) -> dict:
     ws = sorted(worst)
     acute = sum(1 for w in worst if w >= 40)
     signif = sum(1 for w in worst if w >= 21)
+    floor_apps = sum(1 for w in worst if w > 0)   # apps with ANY finding -> "virtually every app", NOT a hardcoded 100%
     exploit = sum(1 for r in graded if _has_catastrophe(r))
     comp = Counter()
     for r in graded:
@@ -1303,23 +1304,22 @@ def corpus_json(recs: list) -> dict:
                 comp["security" if pid.startswith("sec-") else "performance" if pid.startswith("perf-") else "quality"] += 1
     ctot = sum(comp.values()) or 1
     severity = {
-        "note": "Levels are cumulative by each app's single worst finding: acute is a subset of significant, "
-                "which is every app. tiers are the disjoint 10-wide penalty bands.",
+        "note": "Levels are cumulative by each app's single worst finding.",
         "levels": [
             {"key": "acute", "label": "Acute", "threshold": "worst finding priced 40 or more", "apps": acute,
              "pct": round(100 * acute / n, 1),
-             "definition": "Broken enough to fail a real user or leak to a real attacker: a crash, a dead "
-                           "deploy, an unusable page, an open backend."},
+             "definition": "Severe issues that noticeably degrade the user experience or allow attacker "
+                           "access, such as crashes, unusable pages, or exposed backends."},
             {"key": "significant", "label": "Significant", "threshold": "worst finding priced 21 or more",
              "apps": signif, "pct": round(100 * signif / n, 1),
-             "definition": "At least one finding past the cosmetic floor: a dead control, a broken link, a "
-                           "missing rate limit, a page slow enough to notice."},
-            {"key": "floor", "label": "Hygiene floor", "threshold": "every graded app", "apps": n, "pct": 100.0,
-             "definition": "The universal hygiene floor: missing headers, middling accessibility, orange "
-                           "performance. No app escapes it."}],
+             "definition": "Findings that are not just cosmetic, such as dead controls, broken links, "
+                           "missing rate limits, overly slow pages."},
+            {"key": "floor", "label": "Hygiene", "threshold": "virtually every graded app", "apps": floor_apps,
+             "pct": round(100 * floor_apps / n, 1),
+             "definition": "E.g. missing headers, poor accessibility, orange Lighthouse score; the things "
+                           "people often skip."}],
         "exploitable_apps": exploit, "exploitable_pct": round(100 * exploit / n, 1),
-        "exploitable_definition": "Carries a catastrophe-gate finding, an exploit usable now: a leaked "
-                                  "backend, a served secret, a confirmed injection.",
+        "exploitable_definition": "Catastrophic vulnerabilities that an attacker can exploit today.",
         "tier_bands": {"critical": "40+", "severe": "31-40", "serious": "21-30", "moderate": "11-20",
                        "minor": "1-10"},
         "tiers": tiers,

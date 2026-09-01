@@ -1,7 +1,7 @@
 {
   "version": "corpus-passive-2026.1",
   "probe_set": "passive",
-  "generated_at": "2026-09-01T12:38:19+00:00",
+  "generated_at": "2026-09-01T14:14:15+00:00",
   "provenance": {
     "corpus_id": "multihacksv23",
     "run_date": "2026-08-31",
@@ -220,7 +220,7 @@
     }
   },
   "severity": {
-    "note": "Levels are cumulative by each app's single worst finding: acute is a subset of significant, which is every app. tiers are the disjoint 10-wide penalty bands.",
+    "note": "Levels are cumulative by each app's single worst finding.",
     "levels": [
       {
         "key": "acute",
@@ -228,7 +228,7 @@
         "threshold": "worst finding priced 40 or more",
         "apps": 285,
         "pct": 16.3,
-        "definition": "Broken enough to fail a real user or leak to a real attacker: a crash, a dead deploy, an unusable page, an open backend."
+        "definition": "Severe issues that noticeably degrade the user experience or allow attacker access, such as crashes, unusable pages, or exposed backends."
       },
       {
         "key": "significant",
@@ -236,20 +236,20 @@
         "threshold": "worst finding priced 21 or more",
         "apps": 779,
         "pct": 44.5,
-        "definition": "At least one finding past the cosmetic floor: a dead control, a broken link, a missing rate limit, a page slow enough to notice."
+        "definition": "Findings that are not just cosmetic, such as dead controls, broken links, missing rate limits, overly slow pages."
       },
       {
         "key": "floor",
-        "label": "Hygiene floor",
-        "threshold": "every graded app",
-        "apps": 1750,
-        "pct": 100.0,
-        "definition": "The universal hygiene floor: missing headers, middling accessibility, orange performance. No app escapes it."
+        "label": "Hygiene",
+        "threshold": "virtually every graded app",
+        "apps": 1749,
+        "pct": 99.9,
+        "definition": "E.g. missing headers, poor accessibility, orange Lighthouse score; the things people often skip."
       }
     ],
     "exploitable_apps": 14,
     "exploitable_pct": 0.8,
-    "exploitable_definition": "Carries a catastrophe-gate finding, an exploit usable now: a leaked backend, a served secret, a confirmed injection.",
+    "exploitable_definition": "Catastrophic vulnerabilities that an attacker can exploit today.",
     "tier_bands": {
       "critical": "40+",
       "severe": "31-40",
