@@ -1342,8 +1342,7 @@ def corpus_json(recs: list) -> dict:
     ev = defaultdict(list)
     for r in graded:
         ev[r.get("hackathon") or "(unlabeled)"].append(r["slop_score"])
-    by_event = sorted(({"event": k, "n": len(v), "median": round(statistics.median(v), 1)}
-                       for k, v in ev.items()), key=lambda x: -x["median"])
+    by_event = sorted(({"event": k, **_stats(v)} for k, v in ev.items()), key=lambda x: -x["median"])
     st = defaultdict(lambda: {"slop": [], "applied": []})
     for r in graded:
         plat = (r.get("platform") or {}).get("host_platform") or "other"
@@ -1351,7 +1350,7 @@ def corpus_json(recs: list) -> dict:
         a = (r.get("coverage") or {}).get("probes_applicable")
         if a is not None:
             st[plat]["applied"].append(a)
-    by_stack = sorted(({"stack": k, "n": len(v["slop"]), "median": round(statistics.median(v["slop"]), 1),
+    by_stack = sorted(({"stack": k, **_stats(v["slop"]),
                         "probes_applied_median": round(statistics.median(v["applied"]), 1) if v["applied"] else None}
                        for k, v in st.items() if len(v["slop"]) >= 5), key=lambda x: x["median"])
     bl = defaultdict(list)
@@ -1359,8 +1358,7 @@ def corpus_json(recs: list) -> dict:
         p = r.get("platform")
         if isinstance(p, dict):
             bl[p.get("builder") or "hand built"].append(r["slop_score"])
-    by_builder = sorted(({"builder": k, "n": len(v), "median": round(statistics.median(v), 1)}
-                         for k, v in bl.items() if len(v) >= 5), key=lambda x: -x["n"])
+    by_builder = sorted(({"builder": k, **_stats(v)} for k, v in bl.items() if len(v) >= 5), key=lambda x: -x["n"])
 
     # 7 / 6.1  star finding: managed backend exposure, AGGREGATE COUNTS ONLY (no hosts/keys/tables)
     def _bef(r):
