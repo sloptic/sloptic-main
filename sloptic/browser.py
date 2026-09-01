@@ -14,6 +14,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import json
+import multiprocessing
 import os
 import pathlib
 import re
@@ -465,81 +466,150 @@ def await_streamlit(page, budget_s: float = 60.0) -> str:
     return "stuck"
 
 
-def render_routes(base_url: str, paths, headers=None, timeout: float = 12.0,
-                  total_timeout: float = 60.0, interact: bool = True,
-                  interact_routes: int = 6, net_sink: list | None = None,
-                  script_sink: list | None = None, meta_sink: dict | None = None) -> dict[str, str]:
-    """Render each same-origin path in ONE reused browser session and return {path: rendered_DOM}.
-    Paths that fail to load are omitted; {} if no browser is available. A single launch is amortized
-    across all routes — a launch-per-route helper would relaunch (and re-warm) the browser each time.
-    Bounded by total_timeout so a slow-loris route can't stall the whole crawl (like dom_xss_executes).
-    Used by discovery to harvest the client-rendered forms/inputs a SPA paints on routes OTHER than "/"
-    (login, upload, search) — the interactive surface a single "/" render misses. Pass ["/"] for just
-    the entry page.
+_CRAWL_RENDER_BUDGET = 150.0    # hard wall for the whole browser-render phase (discovery shares it across its
+#                                 two render calls). Past it the parent SIGKILLs the render subprocess: an OS
+#                                 kill, immune to a route that pins the Python GIL, which the old thread timer
+#                                 was not (see the 900s DNF spike -- ~112 apps, insightaco-class wedgers).
+_MAX_DOM_BYTES = 4_000_000      # cap the DOM streamed back per route so a giant page can't wedge the PARENT on recv
 
-    interact_routes bounds HOW MANY routes get the (expensive) reveal-click pass: every route is still
-    rendered, but only the first `interact_routes` are interacted with. Reveal-clicking EVERY route on a
-    big SPA is what pushed AfroSecured past the grade budget, and the gated surface (login/upload) lives
-    on the entry + top nav routes anyway — deep routes almost never gate NEW controls."""
-    out: dict[str, str] = {}
+
+def _render_worker(conn, base_url, paths, headers, timeout, total_timeout, interact, interact_routes,
+                   want_net, want_script, want_meta):
+    """Forked child: render each route and STREAM ("route", path, dom) back the instant it completes, so a
+    parent SIGKILL at the deadline keeps every route found before a wedging one. Sinks ride the final
+    ("done", net, script, meta). Returns nothing; everything leaves over `conn`."""
+    net = [] if want_net else None
+    script = [] if want_script else None
+    meta = {} if want_meta else None
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
-        return out
-    hung = {"v": False}   # rebound to the watchdog's flag once we enter the with; stays False if we never do
+        with contextlib.suppress(Exception):
+            conn.send(("done", net, script, meta)); conn.close()
+        return
     try:
-        # WEDGE BACKSTOP: total_timeout is only checked BETWEEN routes, so a single route op that never returns
-        # (a goto on a CPU-spun renderer whose 12s Playwright timeout can't fire, a hanging _drive_actions) escapes
-        # it and burns to the 900s external grade kill (measured: ~8% of a corpus, empty records). The watchdog
-        # kills the browser at total_timeout+grace so the wedged call raises -> we return the partial render and
-        # the grade proceeds to the HTTP probes. meta_sink records the hang.
-        with _kill_browser_on_stall(total_timeout + _RENDER_HANG_GRACE) as hung, sync_playwright() as pw:
+        with sync_playwright() as pw:
             b = _launch(pw)
-            if b is None:
-                return out
-            try:
-                page = b.new_page()
-                _apply_auth(page, base_url, headers)  # cookies/headers persist for the origin across gotos
-                if net_sink is not None or script_sink is not None:  # harvest the app's runtime requests as it renders
-                    _host = urllib.parse.urlparse(base_url).netloc
-                    def _cap(req):
+            if b is not None:
+                try:
+                    page = b.new_page()
+                    _apply_auth(page, base_url, headers)  # cookies/headers persist for the origin across gotos
+                    if net is not None or script is not None:  # harvest the app's runtime requests as it renders
+                        _host = urllib.parse.urlparse(base_url).netloc
+                        def _cap(req):
+                            with contextlib.suppress(Exception):
+                                u = req.url
+                                if net is not None and req.resource_type in ("xhr", "fetch") and len(net) < 150:
+                                    net.append((req.method, u, req.post_data))   # xhr/fetch = the API surface
+                                if script is not None and len(script) < 60:
+                                    pu = urllib.parse.urlparse(u)          # a runtime-loaded same-origin .js (ESM
+                                    if pu.netloc == _host and pu.path.rsplit(".", 1)[-1].lower() == "js":  # import()
+                                        script.append(u)                   # chunk) with no <script src> tag to scan
+                        page.on("request", _cap)
+                    deadline = time.monotonic() + total_timeout
+                    for idx, path in enumerate(paths):
+                        if time.monotonic() > deadline:
+                            break
+                        url = base_url.rstrip("/") + path
+                        dom = None
                         with contextlib.suppress(Exception):
-                            u = req.url
-                            if net_sink is not None and req.resource_type in ("xhr", "fetch") and len(net_sink) < 150:
-                                net_sink.append((req.method, u, req.post_data))   # xhr/fetch = the API surface (all
-                            if script_sink is not None and len(script_sink) < 60:  # origins; discovery classifies)
-                                pu = urllib.parse.urlparse(u)         # a runtime-loaded same-origin .js — a native ESM
-                                if pu.netloc == _host and pu.path.rsplit(".", 1)[-1].lower() == "js":  # import() chunk
-                                    script_sink.append(u)             # / modulepreload leaves NO <script src> tag for
-                    page.on("request", _cap)                          # the DOM scan -> discovery folds it into routes
-                deadline = time.monotonic() + total_timeout
-                for idx, path in enumerate(paths):
-                    if time.monotonic() > deadline:
-                        break
-                    url = base_url.rstrip("/") + path
+                            page.goto(url, timeout=timeout * 1000, wait_until="load")
+                            if idx == 0 and _looks_streamlit(page, url):
+                                st_state = await_streamlit(page, budget_s=max(8.0, min(35.0, deadline - time.monotonic())))
+                                if meta is not None:
+                                    meta["render_state"] = st_state
+                            else:
+                                page.wait_for_timeout(300)  # let client JS paint the route's forms/inputs
+                            dom = page.content()
+                            if interact and idx < interact_routes:  # bound: reveal-clicking every route on a big
+                                dom += _reveal_hidden_controls(page, deadline=deadline)  # SPA is the grade-timeout
+                                if net is not None and idx < _DRIVE_ROUTES:   # then ACT (submit/click) to fire the
+                                    _drive_actions(page, deadline=deadline)   # app's business API calls
+                        if dom is not None:
+                            with contextlib.suppress(Exception):
+                                conn.send(("route", path, dom[:_MAX_DOM_BYTES]))   # cap so the parent recv can't wedge
+                finally:
                     with contextlib.suppress(Exception):
-                        page.goto(url, timeout=timeout * 1000, wait_until="load")
-                        if idx == 0 and _looks_streamlit(page, url):
-                            # websocket-rendered SPA: wake + wait for the real app. Bounded to ~35s (covers a
-                            # cold-start wake; a slower app is marked 'stuck', not waited on) so a mostly-dead
-                            # Streamlit corpus can't burn the run — still within the crawl deadline.
-                            st_state = await_streamlit(page, budget_s=max(8.0, min(35.0, deadline - time.monotonic())))
-                            if meta_sink is not None:      # rendered|error|stuck -> the record's shell_only signal
-                                meta_sink["render_state"] = st_state
-                        else:
-                            page.wait_for_timeout(300)  # let client JS paint the route's forms/inputs
-                        dom = page.content()
-                        if interact and idx < interact_routes:  # bound: reveal-clicking every route on a big
-                            dom += _reveal_hidden_controls(page, deadline=deadline)  # SPA is the grade-timeout
-                            if net_sink is not None and idx < _DRIVE_ROUTES:   # then ACT (submit/click) to fire
-                                _drive_actions(page, deadline=deadline)         # the app's business API calls
-                        out[path] = dom
-            finally:
-                b.close()
+                        b.close()
     except Exception:
-        pass                       # a wedge-kill tears the browser down mid-op; return whatever rendered so far
-    if hung["v"] and meta_sink is not None:
-        meta_sink["render_hang"] = True   # observability: this app wedged the renderer and was force-unblocked
+        pass
+    with contextlib.suppress(Exception):
+        conn.send(("done", net, script, meta)); conn.close()
+
+
+def render_routes(base_url: str, paths, headers=None, timeout: float = 12.0,
+                  total_timeout: float = 60.0, interact: bool = True,
+                  interact_routes: int = 6, net_sink: list | None = None,
+                  script_sink: list | None = None, meta_sink: dict | None = None,
+                  hard_deadline: float | None = None) -> dict[str, str]:
+    """Render each same-origin path in ONE reused browser session and return {path: rendered_DOM}.
+    Paths that fail to load are omitted; {} if no browser is available. Used by discovery to harvest the
+    client-rendered forms/inputs a SPA paints on routes OTHER than "/" (login, upload, search). Pass ["/"]
+    for just the entry page. interact_routes bounds HOW MANY routes get the (expensive) reveal-click pass.
+
+    The render runs in a FORKED subprocess that streams each route's DOM back as it finishes; the parent
+    SIGKILLs it at `hard_deadline` (an absolute time.monotonic deadline; default now + total_timeout). A
+    SIGKILL is delivered by the OS, so a route that pins the Python GIL in a huge deserialize cannot escape
+    it -- the failure mode that burned ~112 apps to the 900s cap -- and the parent keeps every route streamed
+    before the wedge, so the grade proceeds against the partial surface. This is the wedge backstop, reliable
+    where the old in-thread timer was not."""
+    out: dict[str, str] = {}
+    paths = list(paths)
+    if not paths:
+        return out
+    try:
+        from playwright.sync_api import sync_playwright  # noqa: F401  early-skip if no browser at all
+    except ImportError:
+        return out
+    deadline = hard_deadline if hard_deadline is not None else time.monotonic() + total_timeout
+    try:
+        ctx = multiprocessing.get_context("fork")
+        parent_conn, child_conn = ctx.Pipe(duplex=False)
+        proc = ctx.Process(target=_render_worker, args=(
+            child_conn, base_url, paths, headers, timeout, total_timeout, interact, interact_routes,
+            net_sink is not None, script_sink is not None, meta_sink is not None))
+        proc.start()
+        child_conn.close()   # only the child writes; the parent reads
+    except Exception:
+        return out           # fork/mp unavailable -> no render (browser probes read N/A), grade continues
+    hung = False
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                hung = True
+                break
+            if not parent_conn.poll(min(remaining, 1.0)):
+                if not proc.is_alive():
+                    break          # child exited without a 'done' (crash) -> take what streamed
+                continue
+            try:
+                msg = parent_conn.recv()
+            except EOFError:
+                break
+            if msg[0] == "route":
+                out[msg[1]] = msg[2]
+            else:                  # ("done", net, script, meta)
+                _, w_net, w_script, w_meta = msg
+                if net_sink is not None and w_net:
+                    net_sink.extend(w_net)
+                if script_sink is not None and w_script:
+                    script_sink.extend(w_script)
+                if meta_sink is not None and w_meta:
+                    meta_sink.update(w_meta)
+                break
+    finally:
+        with contextlib.suppress(Exception):
+            if proc.is_alive():    # SIGKILL the render worker AND its chromium tree (GIL-immune)
+                for pid in [proc.pid, *_descendant_pids(proc.pid)]:
+                    with contextlib.suppress(OSError):
+                        os.kill(pid, signal.SIGKILL)
+        with contextlib.suppress(Exception):
+            proc.join(timeout=5)
+        with contextlib.suppress(Exception):
+            parent_conn.close()
+    if hung and meta_sink is not None:
+        meta_sink["render_hang"] = True   # observability: this app wedged the renderer and was force-killed
     return out
 
 
