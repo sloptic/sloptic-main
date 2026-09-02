@@ -38,6 +38,12 @@ a 2.0 score does not compare to a 1.x one. A 2.0 percentile is quoted against 20
   absence. The event host is pinned as exactly `<slug>.devpost.com` and rechecked after redirects, and link
   extraction returns hrefs rather than answering "does this page contain X", so a token quoted in a
   discussion thread can never pass for one the organizer published.
+- **Grade timing as data.** `scripts/stats.py --timing-json` writes how long a grade actually takes to
+  `validation/grade-timing.json`, keyed by battery, so a hosted grader quotes an ETA from measured runs
+  rather than guessing. A passive grade runs at a median of 94 seconds against 185 for the full battery,
+  6% of full grades that start hit the 900 second cap against 2% of passive ones, and a dead URL costs two
+  tenths of a second. These are contended wall clock times from a four way parallel corpus run, and the
+  file carries that caveat next to the numbers so they read as an upper bound rather than a promise.
 - **Every finding carries the contribution it made.** A report listing findings with their penalty lists
   prices, and prices do not add up to the score, because the dampers sit between the two: on the corpus the
   raw penalties sum to a median 1.9 times the score. Each entry of `findings` now also carries
