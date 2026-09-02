@@ -1,0 +1,546 @@
+{
+  "version": "grade-timing-1",
+  "batteries": {
+    "full": {
+      "battery": "full",
+      "generated_at": "2026-09-02T20:07:34+00:00",
+      "n_records": 2685,
+      "measurement": {
+        "concurrency": 4,
+        "effective_parallelism": 3.84,
+        "wall_clock_hours": 38.0,
+        "machine_hours": 146.0,
+        "grade_timeout_s": 900,
+        "browser": true,
+        "cores": 4,
+        "cpu": "QEMU Virtual CPU version 2.5+",
+        "lighthouse": "13.4.1",
+        "caveat": "wall clock under contention: the run kept several grades in flight at once on a 4 core box, so a grade running alone is faster than these numbers. Read them as an upper bound, and re-measure on the serving hardware before promising anything."
+      },
+      "seconds": {
+        "n": 1782,
+        "mean": 235.5,
+        "stdev": 156.5,
+        "min": 27.9,
+        "p10": 103.0,
+        "p25": 128.3,
+        "median": 184.6,
+        "p75": 288.2,
+        "p90": 434.6,
+        "p95": 573.4,
+        "p99": 832.4,
+        "max": 934.9
+      },
+      "phases": {
+        "grade_s": {
+          "n": 1782,
+          "mean": 224.0,
+          "stdev": 157.2,
+          "min": 19.7,
+          "p10": 87.8,
+          "p25": 112.7,
+          "median": 177.3,
+          "p75": 279.1,
+          "p90": 421.6,
+          "p95": 558.6,
+          "p99": 816.5,
+          "max": 900.0
+        },
+        "overhead_s": {
+          "n": 1782,
+          "mean": 11.4,
+          "stdev": 15.7,
+          "min": 1.4,
+          "p10": 4.8,
+          "p25": 5.6,
+          "median": 7.0,
+          "p75": 9.3,
+          "p90": 15.0,
+          "p95": 40.5,
+          "p99": 81.3,
+          "max": 84.9
+        }
+      },
+      "reach": {
+        "records": 2685,
+        "attempted": 1894,
+        "graded_pct_of_attempted": 94.1,
+        "timeout_pct_of_attempted": 5.9,
+        "note": "attempted = a grade that ran, so it either scored or hit the timeout. Dead URLs and errors never reached the grader and are excluded here, though outcomes still counts them and prices what they cost."
+      },
+      "outcomes": {
+        "graded": {
+          "n": 1782,
+          "share_pct": 66.4,
+          "seconds": {
+            "n": 1782,
+            "mean": 235.5,
+            "stdev": 156.5,
+            "min": 27.9,
+            "p10": 103.0,
+            "p25": 128.3,
+            "median": 184.6,
+            "p75": 288.2,
+            "p90": 434.6,
+            "p95": 573.4,
+            "p99": 832.4,
+            "max": 934.9
+          }
+        },
+        "dead_url": {
+          "n": 757,
+          "share_pct": 28.2,
+          "seconds": {
+            "n": 757,
+            "mean": 3.2,
+            "stdev": 9.4,
+            "min": 0.0,
+            "p10": 0.0,
+            "p25": 0.1,
+            "median": 0.2,
+            "p75": 0.4,
+            "p90": 10.1,
+            "p95": 10.4,
+            "p99": 45.2,
+            "max": 46.8
+          }
+        },
+        "timeout": {
+          "n": 112,
+          "share_pct": 4.2,
+          "seconds": {
+            "n": 112,
+            "mean": 924.7,
+            "stdev": 22.8,
+            "min": 902.9,
+            "p10": 905.9,
+            "p25": 909.1,
+            "median": 915.5,
+            "p75": 926.3,
+            "p90": 965.1,
+            "p95": 972.2,
+            "p99": 987.7,
+            "max": 995.4
+          }
+        },
+        "error": {
+          "n": 34,
+          "share_pct": 1.3,
+          "seconds": {
+            "n": 34,
+            "mean": 0.5,
+            "stdev": 0.8,
+            "min": 0.1,
+            "p10": 0.2,
+            "p25": 0.2,
+            "median": 0.3,
+            "p75": 0.6,
+            "p90": 0.9,
+            "p95": 1.0,
+            "p99": 4.5,
+            "max": 4.5
+          }
+        }
+      },
+      "by_platform": {
+        "vercel": {
+          "n": 1114,
+          "mean": 225.8,
+          "stdev": 146.2,
+          "min": 32.5,
+          "p10": 103.0,
+          "p25": 125.0,
+          "median": 182.0,
+          "p75": 272.6,
+          "p90": 398.4,
+          "p95": 537.7,
+          "p99": 812.0,
+          "max": 934.9
+        },
+        "unknown": {
+          "n": 140,
+          "mean": 308.0,
+          "stdev": 191.0,
+          "min": 27.9,
+          "p10": 117.1,
+          "p25": 150.8,
+          "median": 264.9,
+          "p75": 406.5,
+          "p90": 582.1,
+          "p95": 676.0,
+          "p99": 883.6,
+          "max": 897.6
+        },
+        "netlify": {
+          "n": 115,
+          "mean": 216.8,
+          "stdev": 132.2,
+          "min": 81.2,
+          "p10": 101.0,
+          "p25": 117.8,
+          "median": 179.5,
+          "p75": 263.0,
+          "p90": 412.2,
+          "p95": 501.1,
+          "p99": 660.2,
+          "max": 667.6
+        },
+        "github-pages": {
+          "n": 96,
+          "mean": 154.4,
+          "stdev": 93.7,
+          "min": 61.3,
+          "p10": 80.4,
+          "p25": 93.6,
+          "median": 117.8,
+          "p75": 191.9,
+          "p90": 242.6,
+          "p95": 317.1,
+          "p99": 387.3,
+          "max": 730.8
+        },
+        "streamlit": {
+          "n": 82,
+          "mean": 129.5,
+          "stdev": 21.4,
+          "min": 32.5,
+          "p10": 132.9,
+          "p25": 133.7,
+          "median": 135.1,
+          "p75": 136.3,
+          "p90": 137.4,
+          "p95": 138.5,
+          "p99": 139.7,
+          "max": 140.6
+        },
+        "lovable": {
+          "n": 73,
+          "mean": 355.4,
+          "stdev": 148.4,
+          "min": 111.4,
+          "p10": 165.0,
+          "p25": 284.8,
+          "median": 341.0,
+          "p75": 408.6,
+          "p90": 499.9,
+          "p95": 664.9,
+          "p99": 733.7,
+          "max": 889.1
+        },
+        "render": {
+          "n": 57,
+          "mean": 298.8,
+          "stdev": 157.4,
+          "min": 92.1,
+          "p10": 149.2,
+          "p25": 195.7,
+          "median": 253.2,
+          "p75": 358.4,
+          "p90": 521.8,
+          "p95": 552.3,
+          "p99": 619.5,
+          "max": 907.4
+        },
+        "firebase": {
+          "n": 29,
+          "mean": 207.6,
+          "stdev": 127.9,
+          "min": 83.7,
+          "p10": 99.4,
+          "p25": 111.9,
+          "median": 192.3,
+          "p75": 245.1,
+          "p90": 295.2,
+          "p95": 417.7,
+          "p99": 721.7,
+          "max": 721.7
+        },
+        "google-cloud-run": {
+          "n": 20,
+          "mean": 366.5,
+          "stdev": 235.2,
+          "min": 124.3,
+          "p10": 161.3,
+          "p25": 209.4,
+          "median": 339.8,
+          "p75": 370.9,
+          "p90": 777.2,
+          "p95": 878.1,
+          "p99": 879.4,
+          "max": 879.4
+        }
+      }
+    },
+    "passive": {
+      "battery": "passive",
+      "generated_at": "2026-09-02T20:07:35+00:00",
+      "n_records": 2685,
+      "measurement": {
+        "concurrency": 4,
+        "effective_parallelism": 3.69,
+        "wall_clock_hours": 19.7,
+        "machine_hours": 72.7,
+        "grade_timeout_s": 900,
+        "browser": true,
+        "cores": 4,
+        "cpu": "QEMU Virtual CPU version 2.5+",
+        "lighthouse": "13.4.1",
+        "caveat": "wall clock under contention: the run kept several grades in flight at once on a 4 core box, so a grade running alone is faster than these numbers. Read them as an upper bound, and re-measure on the serving hardware before promising anything."
+      },
+      "seconds": {
+        "n": 1858,
+        "mean": 121.7,
+        "stdev": 87.8,
+        "min": 15.6,
+        "p10": 56.4,
+        "p25": 68.3,
+        "median": 94.0,
+        "p75": 139.0,
+        "p90": 217.7,
+        "p95": 301.2,
+        "p99": 454.7,
+        "max": 900.6
+      },
+      "phases": {
+        "grade_s": {
+          "n": 1858,
+          "mean": 110.2,
+          "stdev": 85.8,
+          "min": 8.4,
+          "p10": 50.8,
+          "p25": 59.0,
+          "median": 81.7,
+          "p75": 124.5,
+          "p90": 206.4,
+          "p95": 284.3,
+          "p99": 440.6,
+          "max": 886.1
+        },
+        "overhead_s": {
+          "n": 1858,
+          "mean": 11.5,
+          "stdev": 16.1,
+          "min": 1.6,
+          "p10": 4.5,
+          "p25": 5.2,
+          "median": 6.6,
+          "p75": 9.3,
+          "p90": 16.5,
+          "p95": 47.2,
+          "p99": 81.6,
+          "max": 92.0
+        }
+      },
+      "reach": {
+        "records": 2685,
+        "attempted": 1894,
+        "graded_pct_of_attempted": 98.1,
+        "timeout_pct_of_attempted": 1.9,
+        "note": "attempted = a grade that ran, so it either scored or hit the timeout. Dead URLs and errors never reached the grader and are excluded here, though outcomes still counts them and prices what they cost."
+      },
+      "outcomes": {
+        "graded": {
+          "n": 1858,
+          "share_pct": 69.2,
+          "seconds": {
+            "n": 1858,
+            "mean": 121.7,
+            "stdev": 87.8,
+            "min": 15.6,
+            "p10": 56.4,
+            "p25": 68.3,
+            "median": 94.0,
+            "p75": 139.0,
+            "p90": 217.7,
+            "p95": 301.2,
+            "p99": 454.7,
+            "max": 900.6
+          }
+        },
+        "dead_url": {
+          "n": 756,
+          "share_pct": 28.2,
+          "seconds": {
+            "n": 756,
+            "mean": 2.7,
+            "stdev": 8.4,
+            "min": 0.0,
+            "p10": 0.0,
+            "p25": 0.1,
+            "median": 0.2,
+            "p75": 0.4,
+            "p90": 10.1,
+            "p95": 10.2,
+            "p99": 45.2,
+            "max": 45.6
+          }
+        },
+        "timeout": {
+          "n": 36,
+          "share_pct": 1.3,
+          "seconds": {
+            "n": 36,
+            "mean": 932.9,
+            "stdev": 29.5,
+            "min": 904.5,
+            "p10": 907.3,
+            "p25": 913.5,
+            "median": 915.4,
+            "p75": 955.8,
+            "p90": 986.4,
+            "p95": 988.0,
+            "p99": 1002.5,
+            "max": 1002.5
+          }
+        },
+        "error": {
+          "n": 35,
+          "share_pct": 1.3,
+          "seconds": {
+            "n": 35,
+            "mean": 0.5,
+            "stdev": 0.5,
+            "min": 0.1,
+            "p10": 0.2,
+            "p25": 0.2,
+            "median": 0.3,
+            "p75": 0.5,
+            "p90": 0.8,
+            "p95": 0.9,
+            "p99": 2.6,
+            "max": 2.6
+          }
+        }
+      },
+      "by_platform": {
+        "vercel": {
+          "n": 1152,
+          "mean": 113.9,
+          "stdev": 86.2,
+          "min": 34.7,
+          "p10": 56.3,
+          "p25": 66.7,
+          "median": 88.2,
+          "p75": 124.9,
+          "p90": 192.7,
+          "p95": 280.8,
+          "p99": 454.7,
+          "max": 900.6
+        },
+        "unknown": {
+          "n": 156,
+          "mean": 158.4,
+          "stdev": 111.1,
+          "min": 15.6,
+          "p10": 66.0,
+          "p25": 80.4,
+          "median": 114.8,
+          "p75": 202.8,
+          "p90": 325.9,
+          "p95": 380.5,
+          "p99": 479.6,
+          "max": 612.4
+        },
+        "netlify": {
+          "n": 118,
+          "mean": 97.3,
+          "stdev": 51.3,
+          "min": 45.2,
+          "p10": 52.2,
+          "p25": 60.5,
+          "median": 87.5,
+          "p75": 110.1,
+          "p90": 161.7,
+          "p95": 206.9,
+          "p99": 259.0,
+          "max": 332.6
+        },
+        "github-pages": {
+          "n": 96,
+          "mean": 81.8,
+          "stdev": 47.6,
+          "min": 38.3,
+          "p10": 48.6,
+          "p25": 54.7,
+          "median": 65.3,
+          "p75": 86.9,
+          "p90": 144.6,
+          "p95": 182.6,
+          "p99": 217.7,
+          "max": 337.2
+        },
+        "streamlit": {
+          "n": 82,
+          "mean": 132.1,
+          "stdev": 20.6,
+          "min": 46.1,
+          "p10": 133.8,
+          "p25": 135.7,
+          "median": 136.6,
+          "p75": 138.1,
+          "p90": 140.6,
+          "p95": 141.7,
+          "p99": 150.4,
+          "max": 159.8
+        },
+        "lovable": {
+          "n": 74,
+          "mean": 171.5,
+          "stdev": 70.0,
+          "min": 61.9,
+          "p10": 77.6,
+          "p25": 104.1,
+          "median": 182.7,
+          "p75": 220.2,
+          "p90": 264.8,
+          "p95": 278.7,
+          "p99": 328.7,
+          "max": 328.8
+        },
+        "render": {
+          "n": 65,
+          "mean": 136.2,
+          "stdev": 62.0,
+          "min": 39.0,
+          "p10": 76.0,
+          "p25": 95.3,
+          "median": 120.7,
+          "p75": 161.9,
+          "p90": 210.5,
+          "p95": 289.8,
+          "p99": 309.2,
+          "max": 347.0
+        },
+        "firebase": {
+          "n": 30,
+          "mean": 114.6,
+          "stdev": 98.5,
+          "min": 45.2,
+          "p10": 57.8,
+          "p25": 63.3,
+          "median": 85.7,
+          "p75": 124.0,
+          "p90": 177.7,
+          "p95": 269.2,
+          "p99": 559.8,
+          "max": 559.8
+        },
+        "base44": {
+          "n": 23,
+          "mean": 318.1,
+          "stdev": 128.3,
+          "min": 152.3,
+          "p10": 197.2,
+          "p25": 274.0,
+          "median": 310.0,
+          "p75": 335.4,
+          "p90": 396.7,
+          "p95": 401.4,
+          "p99": 829.2,
+          "max": 829.2
+        }
+      }
+    }
+  },
+  "generated_at": "2026-09-02T20:07:35+00:00"
+}

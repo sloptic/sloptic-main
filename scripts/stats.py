@@ -1224,6 +1224,132 @@ def diff_report(cur, prev, args):
     print(f"\n    → per probe / per app detail: --json, or --audit <probe id> on either run\n")
 
 
+def timing_json(recs: list) -> dict:
+    """How long a grade actually TAKES, as one aggregate JSON, so a hosted grader can quote an ETA from
+    measured runs instead of guessing. Separate from the corpus figures on purpose: those describe what the
+    scores look like, this describes what the machine did, and the two go stale for different reasons.
+
+    Covers every record, not just the scored ones, because an ETA has to price the ways a grade ends early:
+    a dead URL costs almost nothing, a pathological target burns the whole timeout. Aggregate only, same
+    rule as the corpus figures: platform is a group key, and no host, URL or app name appears.
+
+    The headline caveat travels inside the file. These are wall clock times from a corpus run with several
+    grades in flight at once, so they are contended, and the effective parallelism measured off the record
+    timestamps is reported next to them. Treat the numbers as an upper bound for one grade running alone.
+    """
+    import datetime
+    from benchmark import _probe_set, _passive_full_counts
+    if not recs:
+        sys.exit("timing-json: no records")
+    scored = [r for r in recs if r.get("slop_score") is not None]
+    _np = _passive_full_counts()[0]
+    battery = (Counter(_probe_set(r, _np) for r in scored).most_common(1)[0][0]
+               if scored else "full")
+    battery = "passive" if battery == "passive" else "full"
+
+    def _t(r, key="total_s"):
+        return (r.get("timings") or {}).get(key)
+
+    def _secs(xs):
+        xs = sorted(x for x in xs if isinstance(x, (int, float)))
+        if not xs:
+            return None
+
+        def p(q):   # nearest rank, so every percentile here is a duration some grade actually took
+            return round(xs[min(len(xs) - 1, max(0, round(q / 100 * (len(xs) - 1))))], 1)
+        return {"n": len(xs), "mean": round(statistics.mean(xs), 1),
+                "stdev": round(statistics.stdev(xs), 1) if len(xs) > 1 else 0.0,
+                "min": round(xs[0], 1), "p10": p(10), "p25": p(25),
+                "median": round(statistics.median(xs), 1),   # the true median, as _dist reports it elsewhere
+                "p75": p(75), "p90": p(90), "p95": p(95), "p99": p(99), "max": round(xs[-1], 1)}
+
+    # how a grade ended, in the order the runner decides it: a timeout and a dead URL both also carry a
+    # deploy_error, so the specific classes have to be read before the generic one
+    def _end(r):
+        if r.get("timeout") or r.get("grade_timeout"):
+            return "timeout"
+        if r.get("dead_url"):
+            return "dead_url"
+        if r.get("slop_score") is not None:
+            return "graded"
+        return "error"
+
+    ends = defaultdict(list)
+    for r in recs:
+        ends[_end(r)].append(r)
+    n = len(recs)
+    outcomes = {k: {"n": len(v), "share_pct": round(100 * len(v) / n, 1),
+                    "seconds": _secs([_t(r) for r in v])}
+                for k, v in sorted(ends.items(), key=lambda kv: -len(kv[1]))}
+
+    graded = ends.get("graded", [])
+    # An ETA applies to a URL that is actually up. A hosted service filters the dead ones with its own
+    # liveness check long before it quotes a wait, so the rate that matters is out of the grades that ran,
+    # not out of every row in the corpus.
+    attempted = len(graded) + len(ends.get("timeout", []))
+    reach = {"records": n, "attempted": attempted,
+             "graded_pct_of_attempted": round(100 * len(graded) / attempted, 1) if attempted else None,
+             "timeout_pct_of_attempted": (round(100 * len(ends.get("timeout", [])) / attempted, 1)
+                                          if attempted else None),
+             "note": "attempted = a grade that ran, so it either scored or hit the timeout. Dead URLs and "
+                     "errors never reached the grader and are excluded here, though outcomes still counts "
+                     "them and prices what they cost."}
+
+    by_platform = defaultdict(list)
+    for r in graded:
+        by_platform[(r.get("platform") or {}).get("host_platform") or "unknown"].append(_t(r))
+    platforms = {k: _secs(v) for k, v in sorted(by_platform.items(), key=lambda kv: -len(kv[1]))
+                 if len(v) >= 20}       # a group too small to be a stable estimate is not worth quoting
+
+    # provenance: what the run actually ran on, read off the records rather than remembered
+    prov = [r.get("provenance") or {} for r in recs]
+    flags = [p.get("flags") or {} for p in prov]
+    hosts = [p.get("host") or {} for p in prov]
+
+    def _one(vals, key, cast=None):
+        """The value the run actually used, keeping its own type: a consumer comparing concurrency to a
+        number should not be handed the string "4"."""
+        c = Counter(str(v.get(key)) for v in vals if v.get(key) is not None)
+        if not c:
+            return None
+        want = c.most_common(1)[0][0]
+        raw = next(v[key] for v in vals if str(v.get(key)) == want)
+        try:
+            return cast(raw) if cast else raw
+        except (TypeError, ValueError):
+            return raw
+
+    stamps = sorted(r["ts"] for r in recs if isinstance(r.get("ts"), (int, float)))
+    span = (stamps[-1] - stamps[0]) if len(stamps) > 1 else 0
+    busy = sum(x for x in (_t(r) for r in recs) if isinstance(x, (int, float)))
+
+    return {
+        "battery": battery,
+        "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "n_records": n,
+        "measurement": {
+            "concurrency": _one(flags, "concurrency", int),
+            "effective_parallelism": round(busy / span, 2) if span else None,
+            "wall_clock_hours": round(span / 3600, 1) if span else None,
+            "machine_hours": round(busy / 3600, 1),
+            "grade_timeout_s": _one(flags, "grade_timeout", int),
+            "browser": _one(flags, "browser", bool),
+            "cores": _one(hosts, "cores", int),
+            "cpu": _one(hosts, "cpu"),
+            "lighthouse": _one([p.get("versions") or {} for p in prov], "lighthouse"),
+            "caveat": ("wall clock under contention: the run kept several grades in flight at once on a "
+                       "4 core box, so a grade running alone is faster than these numbers. Read them as an "
+                       "upper bound, and re-measure on the serving hardware before promising anything."),
+        },
+        "seconds": _secs([_t(r) for r in graded]),            # the headline: a grade that produced a score
+        "phases": {"grade_s": _secs([_t(r, "grade_s") for r in graded]),
+                   "overhead_s": _secs([(_t(r) or 0) - (_t(r, "grade_s") or 0) for r in graded])},
+        "reach": reach,
+        "outcomes": outcomes,
+        "by_platform": platforms,
+    }
+
+
 def corpus_json(recs: list) -> dict:
     """The full CORPUS_REPORT picture as ONE aggregate JSON, so the report prose and the sloptic.org
     /findings page quote a single source and cannot drift. Renders what the default report prints, but
@@ -1518,6 +1644,12 @@ def main():
                     metavar="OUT", help="emit the aggregate CORPUS_REPORT figures as ONE versioned JSON "
                          "(for sloptic.org /findings); writes to OUT (default validation/corpus-figures-{active,passive}.json "
                          "by detected battery)")
+    ap.add_argument("--timing-json", nargs="?", const="__AUTO__", dest="timing_json",
+                    metavar="OUT",
+                    help="emit HOW LONG a grade takes as one aggregate JSON (for a hosted grader's ETA); "
+                         "writes to OUT (default validation/grade-timing.json). Keyed by battery and MERGED "
+                         "into the file, so running it once on the full corpus and once on the passive one "
+                         "leaves both lanes in a single file. Separate from --corpus-json on purpose.")
     ap.add_argument("--sigma", type=float, default=2.0, help="high outlier threshold in stdevs (default 2)")
     ap.add_argument("--charts", action="store_true",
                     help="render the corpus writeup PNG charts (+ sibling CSVs) to docs/charts/, then exit "
@@ -1554,6 +1686,24 @@ def main():
         open(out, "w").write(json.dumps(cj, indent=2) + "\n")
         print(f"wrote {out}  (version {cj['version']}, n={cj['provenance']['n_apps']}, "
               f"generated {cj['generated_at']})")
+        return
+    if args.timing_json:
+        tj = timing_json(recs)
+        out = args.timing_json if args.timing_json != "__AUTO__" else "validation/grade-timing.json"
+        doc = {"version": "grade-timing-1", "batteries": {}}
+        try:                           # merge: keep the OTHER battery's block instead of clobbering it
+            prev = json.loads(open(out).read())
+            if isinstance(prev.get("batteries"), dict):
+                doc["batteries"] = prev["batteries"]
+        except (json.JSONDecodeError, OSError):
+            pass                       # no file yet, or an unreadable one: write a fresh document
+        doc["batteries"][tj["battery"]] = tj
+        doc["generated_at"] = tj["generated_at"]
+        open(out, "w").write(json.dumps(doc, indent=2) + "\n")
+        kept = [b for b in doc["batteries"] if b != tj["battery"]]
+        print(f"wrote {out}  (battery {tj['battery']}, n={tj['n_records']}, "
+              f"median {tj['seconds']['median']}s over {tj['seconds']['n']} graded"
+              + (f"; kept {', '.join(kept)}" if kept else "") + ")")
         return
     if args.diff:
         diff_report(recs, load(args.diff), args)
