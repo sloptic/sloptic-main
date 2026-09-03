@@ -30,6 +30,15 @@ def is_ungradeable_challenge(rec: dict) -> bool:
     return rec.get("challenge_stage") == "entry" or (bool(rec.get("bot_challenge")) and not rec.get("challenge_stage"))
 
 
+def is_limited_battery(rec: dict) -> bool:
+    """A mid-grade challenge tripped BEFORE the keepable fraction of the battery (pipeline._MIN_VALID_FRACTION).
+    The record keeps the pre-onset outcomes -- a real PARTIAL measurement the web presents as a limited grade --
+    but too little of the battery ran to compare against the curve, so it is excluded here alongside entry
+    withholds and refused by benchmark.rank(). The blocked tail is what retry_blocked recovers; a recovery that
+    completes the battery clears the stage."""
+    return rec.get("challenge_stage") == "limited"
+
+
 def is_shell_only(rec: dict) -> bool:
     """True when the grade is a canvas-shell (Streamlit) capture rather than the real app, so it's excluded from
     the reference distribution and never certifiable. CAPTURE-BASED: once the render-await runs it records a

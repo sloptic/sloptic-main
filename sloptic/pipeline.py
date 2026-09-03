@@ -602,15 +602,14 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
         if onset_probe:
             bot_challenge = True
             onset_idx = cat_index.get(onset_probe, total)
-            if onset_idx < _MIN_VALID_FRACTION * total:   # too little clean data -> ungradeable, like an entry challenge
-                bp, ia = _blocked(catalog)                # nothing usable ran -> the whole battery is blocked
-                return Report(slop_score=0, outcomes=[], surface=surface_metrics(profile), platform=plat,
-                              bot_challenge=True, challenge_stage="entry", challenge_onset=onset_probe,
-                              request_counts=req_counts, blocked_probes=bp, incomplete_axes=ia,
-                              trace=trace_sink or [])
             outcomes = [o for o in outcomes if cat_index.get(o.probe_id, total) < onset_idx]
             blocked_probes, incomplete_axes = _blocked(catalog[onset_idx:])   # the tail a challenge cut off
-            stage = "late"
+            # Below the keepable fraction the battery is too partial to rank -- eligibility keeps it off the
+            # curve and benchmark.rank() refuses it -- but the pre-onset outcomes are still real measurements
+            # of the app. The old behaviour WITHHELD them (slop 0, nothing stored), which reported a grade cut
+            # short as if nothing had run and cost a full re-grade to recover. They now stand as a LIMITED
+            # grade: a partial score the web presents as such, with only the tail booked for retry_blocked.
+            stage = "limited" if onset_idx < _MIN_VALID_FRACTION * total else "late"
         elif end_challenged:
             bot_challenge, stage = True, "late"
         surface = surface_metrics(profile)

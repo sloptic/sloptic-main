@@ -46,7 +46,7 @@ from functools import lru_cache
 
 _HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))     # repo root on path, so the lazy `import sloptic` resolves when run as a script
-from sloptic.eligibility import (is_shell_only, is_ungradeable_challenge,  # noqa: E402  (needs the path insert above)
+from sloptic.eligibility import (is_limited_battery, is_shell_only, is_ungradeable_challenge,  # noqa: E402  (needs the path insert above)
                                  is_wrong_owner, wrong_owner_reason)
 _DEFAULT_CURVE = _HERE.parent / "validation" / "benchmark-curve.json"
 _PASSIVE_CURVE = _HERE.parent / "validation" / "benchmark-curve-passive.json"
@@ -125,6 +125,7 @@ def _eligible(r: dict) -> bool:
         and r.get("functional") is not False     # DNF ranks below every working app, not inside the curve
         and not str(r.get("project") or "").startswith("anchor-")
         and not is_ungradeable_challenge(r)      # entry-challenge withhold -> scored 0, nothing was graded
+        and not is_limited_battery(r)            # challenge-cut partial -> a real score over too small a battery
         and not is_shell_only(r)                 # canvas-shell host (Streamlit) -> graded the framework, not the app
         and not is_wrong_owner(r)                # S3 bucket / Jira / no-code site / editor url -> not the team's app
     )
@@ -379,6 +380,11 @@ def rank(curve: dict, score, record: dict | None = None) -> dict:
     dist = curve.get("dist")
     if record is not None:
         _guard_mode(record, curve)
+        if is_ungradeable_challenge(record) or is_limited_battery(record):
+            raise ValueError(
+                "challenge-cut grade: a bot challenge stopped this battery before it was measured in full, so "
+                "its partial score has no placement on the curve. The score stands as a limited measurement; "
+                "the blocked tail is what a retry pass recovers.")
     potential = ncats = None
     if dist is not None and record is not None:
         idx = _catalog_index()
