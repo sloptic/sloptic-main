@@ -502,8 +502,9 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
         # converge here, so this is the one checkpoint.
         if len(profile.routes) > _MAX_SURFACE_ROUTES:
             raise SurfaceTooLarge(
-                f"surface too large: {len(profile.routes)} discovered routes; "
-                f"Sloptic grades hackathon-scale apps")
+                f"surface too large ({len(profile.routes)} discovered routes out of "
+                f"{_MAX_SURFACE_ROUTES} max). Due to capacity constraints we are unable to "
+                f"support apps this large.")
         # bind the client + probes to the ORIGIN (a --target may carry an entry path; discover() crawls
         # from it, but probes construct base_url + "/probe/path" and need the bare origin). profile.base_url
         # is already normalized to the origin by discover().

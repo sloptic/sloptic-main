@@ -26,7 +26,7 @@ def _profile(n_routes: int) -> Profile:
 
 
 def test_gate_refuses_a_blog_archive_sized_surface():
-    with pytest.raises(SurfaceTooLarge, match=r"643 discovered routes"):
+    with pytest.raises(SurfaceTooLarge, match=r"surface too large \(643 discovered routes out of 400 max\)"):
         run(SubprocessDeployer(str(REFS / "vulnerable" / "app.py")), _catalog(),
             cached_profile=_profile(643))
 
