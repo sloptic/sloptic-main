@@ -29,6 +29,18 @@ from .net import challenge_onset, is_bot_challenge, make_client, request_counts,
 # A late-challenge grade is kept only if at least this fraction of the catalog ran BEFORE the WAF tripped (so
 # most outcomes saw the real app). Below it, too much of the grade is contaminated -> withhold like an entry challenge.
 _MIN_VALID_FRACTION = 0.6
+
+# The battery fans probes out PER DISCOVERED ROUTE, so cost scales with surface, not page count. A cap keeps
+# Sloptic on the population it measures: hackathon apps. Across every graded surface (n=76) the median was 25
+# routes, p90 60, max 342 — and one 643-route blog archive kept a single probe running for 4+ minutes and blew
+# three 900s wall clocks. Above the cap the grade is REFUSED (a clean failure naming the reason), never
+# truncated: a half-fanned battery is not a measurement of anything, and a truncated one would rank against
+# whole batteries.
+_MAX_SURFACE_ROUTES = 400
+
+
+class SurfaceTooLarge(RuntimeError):
+    """The discovered surface is beyond the population Sloptic grades; refusal, not a partial grade."""
 from .probes import (MATCHERS, PREDICATES, _email_account, _prime_email, _rebuild_account, _repro_from_resp,
                      describe)
 from .schema import Form, Outcome, Probe, Profile, Report, Severity
@@ -485,6 +497,13 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
             return Report(slop_score=0, outcomes=[], surface=surface_metrics(profile))
         outcomes: list[Outcome] = []
         total = len(catalog)
+        # SURFACE SCALE GATE: refuse targets whose discovered surface is beyond the population Sloptic
+        # measures, BEFORE the battery fans out over it. Both profile paths (fresh crawl / frozen cache)
+        # converge here, so this is the one checkpoint.
+        if len(profile.routes) > _MAX_SURFACE_ROUTES:
+            raise SurfaceTooLarge(
+                f"surface too large: {len(profile.routes)} discovered routes; "
+                f"Sloptic grades hackathon-scale apps")
         # bind the client + probes to the ORIGIN (a --target may carry an entry path; discover() crawls
         # from it, but probes construct base_url + "/probe/path" and need the bare origin). profile.base_url
         # is already normalized to the origin by discover().
