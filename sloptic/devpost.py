@@ -114,6 +114,7 @@ class Link(NamedTuple):
     """One `<a href>` value, and which event page it was found on."""
     href: str
     page: str            # "rules" or "overview"
+    text: str = ""       # the anchor's own display text, for showing the organizer what to look for
 
 
 class Links(NamedTuple):
@@ -130,6 +131,7 @@ class Links(NamedTuple):
     status: Status
     links: list[Link]
     detail: str
+
 
 
 class Meta(NamedTuple):
@@ -265,6 +267,25 @@ def anchor_hrefs(html: str) -> list[str]:
     return list(dict.fromkeys(out))
 
 
+def anchor_pairs(html: str) -> list[tuple[str, str]]:
+    """(href, display text) for every `<a>` in `html`, entity decoded, in document order,
+    deduplicated by href. Same anchors as anchor_hrefs, plus the anchor's own visible words, so a
+    verification slip can show the organizer the link they published. The display text is metadata
+    for display only: the token match stays on the href, exactly where it always was.
+    """
+    pairs: dict[str, str] = {}
+    for m in re.finditer(r"<a\b[^>]*?\bhref\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s\"'>]+))[^>]*>(.*?)</a>",
+                         html or "", re.I | re.S):
+        raw = next((g for g in m.groups()[:3] if g is not None), "")
+        href = _htmllib.unescape(raw).strip()
+        if not href or href in pairs:
+            continue
+        text = re.sub(r"<[^>]+>", " ", m.group(4))
+        text = " ".join(_htmllib.unescape(text).split())
+        pairs[href] = text
+    return list(pairs.items())
+
+
 def event_page(slug: str, page: str = "overview", *, client=None) -> Fetch:
     """Fetch one of an event's own pages, `rules` or `overview`, from the pinned host.
 
@@ -302,7 +323,7 @@ def event_links(slug: str, *, client=None, pages=("rules", "overview")) -> Links
             statuses.append(f.status)
             details.append(f"{page}: {f.detail}")
             if f.status == "ok":
-                found.extend(Link(h, page) for h in anchor_hrefs(f.html))
+                found.extend(Link(h, page, text) for h, text in anchor_pairs(f.html))
         status: Status = ("blocked" if "blocked" in statuses
                           else "not_found" if statuses and all(s == "not_found" for s in statuses)
                           else "ok")

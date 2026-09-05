@@ -161,8 +161,10 @@ def test_event_links_tags_each_href_with_the_page_it_came_from():
         (200, '<a href="https://sloptic.org/v/tok">verify</a>'),
         (200, '<a href="https://example.org/sponsor">sponsor</a>')))
     assert got.status == "ok"
-    assert (("https://sloptic.org/v/tok", "rules") in got.links
-            and ("https://example.org/sponsor", "overview") in got.links)
+    # each link carries its page and, now, the anchor's own display text
+    pairs = [(l.href, l.page, l.text) for l in got.links]
+    assert ("https://sloptic.org/v/tok", "rules", "verify") in pairs
+    assert ("https://example.org/sponsor", "overview", "sponsor") in pairs
 
 
 def test_a_missing_rules_page_still_leaves_the_list_complete():
