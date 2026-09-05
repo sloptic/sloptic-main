@@ -302,6 +302,9 @@ def _band(pct: int) -> str:
 # distribution right, so the cut points have to move with it. RE-DERIVE THESE AFTER EVERY CALIBRATION RUN; they
 # are a property of the corpus and the catalog together, and 90 probes will not be 90 forever.
 _LIMITED_ENGAGEMENT_BELOW = 40
+# The passive battery is a different instrument: 44 checks, so the same corpus-derived FRACTION of
+# the full battery's threshold applies to it. 40 of 102 and 18 of 44 are the same line.
+_LIMITED_ENGAGEMENT_BELOW_PASSIVE = 18
 _SURFACE_NARROW_BELOW, _SURFACE_BROAD_ABOVE = 48, 58
 
 # UNTESTED FAMILIES is OURS, not the spec's, and is kept under its own name for exactly that reason: Limited
@@ -364,10 +367,13 @@ def reporting_bundle(record: dict) -> dict:
     if takes_input and not any(_kind_ran(record, k) for k in _INPUT_KINDS):
         untested.append("input-validation")
         why.append("takes text input but neither input-validation nor xss ran")
-    status = "limited_engagement" if applicable < _LIMITED_ENGAGEMENT_BELOW else "completed"
+    # Mode-aware: a passive grade tops out at 44 applicable probes, so the full battery's floor
+    # would flag almost every passive grade whose app is simply small.
+    mode = record.get("mode") or "full"
+    floor = _LIMITED_ENGAGEMENT_BELOW_PASSIVE if mode == "passive" else _LIMITED_ENGAGEMENT_BELOW
+    status = "limited_engagement" if applicable < floor else "completed"
     if status == "limited_engagement":
-        why.append(f"only {applicable} probes applicable (Limited Engagement below "
-                   f"{_LIMITED_ENGAGEMENT_BELOW})")
+        why.append(f"only {applicable} probes applicable (Limited Engagement below {floor})")
     return {"status": status, "probes_applicable": applicable, "slop_detected": fired,
             "attack_surface_coverage": _surface_coverage(applicable),
             "clean_rate": round(100 * (applicable - fired) / applicable, 1) if applicable else None,
