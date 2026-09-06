@@ -38,6 +38,16 @@ a 2.0 score does not compare to a 1.x one. A 2.0 percentile is quoted against 20
   absence. The event host is pinned as exactly `<slug>.devpost.com` and rechecked after redirects, and link
   extraction returns hrefs rather than answering "does this page contain X", so a token quoted in a
   discussion thread can never pass for one the organizer published.
+- **The origin scope now holds inside the injection fan out.** `origin_scope()` pins a public grade to one
+  origin so a redirect cannot carry authorization somewhere the grant never covered. It is a ContextVar, and
+  a thread the pool starts gets a fresh empty context, so the check silently did not run in the worker
+  threads that send the injection payloads: only the public address predicate was left, and a third party
+  host passes that by definition. A target answering its discovered endpoints with a redirect elsewhere
+  could have SQL injection, command injection and traversal payloads delivered to that third party, turning
+  a grant for one host into a relay. The scope is now bound to the callable on the submitting thread, in
+  both fan out pools, and the regression tests assert from inside a worker, since a main thread test passes
+  either way. Present since 2.1.0, where `origin_scope` shipped. No score moves: the corpus and reference
+  lanes never enter a scope, and an unscoped bind returns the callable itself.
 - **Grade timing as data.** `scripts/stats.py --timing-json` writes how long a grade actually takes to
   `validation/grade-timing.json`, keyed by battery, so a hosted grader quotes an ETA from measured runs
   rather than guessing. A passive grade runs at a median of 94 seconds against 185 for the full battery,
