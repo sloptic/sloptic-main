@@ -24,7 +24,7 @@ from dataclasses import replace
 
 import httpx
 
-from . import auth, baas, browser, depscan, email_verify, lighthouse, oob, secretscan
+from . import auth, baas, browser, depscan, egress, email_verify, lighthouse, oob, secretscan
 from .net import make_client, request_counts
 from .schema import Endpoint
 from .discovery import _CATCHALL_PROBE, _body_sig, _registrable_domain
@@ -1469,6 +1469,10 @@ def _fan_out_first(send, specs, oracle, pool=_INJECT_POOL, cap_check=None):
     each other's measured response time into false positives; those probes keep their sequential path."""
     it = iter(specs)
     hit = None
+    # A pool thread starts with an empty Context, so the egress origin scope does not reach it and an
+    # off-origin redirect would carry payloads to a host the grant never covered. Bind it here, on the
+    # submitting thread, while it is still readable. Unscoped lanes get the callable back untouched.
+    send = egress.scope_bound(send)
     with ThreadPoolExecutor(max_workers=max(1, pool)) as ex:
         pending = set()
 
@@ -5302,6 +5306,7 @@ def idor_horizontal(ctx, probe) -> bool | None:
 def _fanout(work, n: int):
     """Run `work` (a no-arg callable) n times concurrently; return the n results in submit order.
     The shared concurrency primitive for the self-as-oracle race/load probes."""
+    work = egress.scope_bound(work)     # the scope does not cross into a pool thread on its own
     with ThreadPoolExecutor(max_workers=n) as ex:
         return [f.result() for f in [ex.submit(work) for _ in range(n)]]
 

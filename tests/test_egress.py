@@ -236,3 +236,106 @@ def test_browser_filter_aborts_a_private_subresource(monkeypatch):
         srv.shutdown()
 
     assert any("10.0.0.1" in u for u in failed), f"private subresource was not aborted: {failed}"
+
+
+# ------------------------------------------- origin scoping across a thread boundary: attack (e)
+# A ContextVar does not cross into a thread the pool starts, so every one of these asserts from INSIDE
+# a worker. The same assertions made on the main thread pass with or without the fix, which is exactly
+# how the gap survived: the scope check was never running where the injection payloads are sent.
+
+def _resolve_in_pool(host, port=443, workers=2, bind=True):
+    """Resolve `host` from inside a pool thread, the way an injection probe's fan out does."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _go():
+        try:
+            socket.getaddrinfo(host, port)
+            return "allowed"
+        except egress.EgressRefused:
+            return "refused"
+
+    fn = egress.scope_bound(_go) if bind else _go
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        return ex.submit(fn).result()
+
+
+def test_scope_reaches_a_worker_thread(strict, fake_dns):
+    """The regression. A grant for one origin must not become a relay: a pool thread issuing the
+    redirected hop has to refuse the third party just as the main thread does."""
+    table, _ = fake_dns
+    table["victim.example"] = [_ai(GOOD2)]
+    with egress.origin_scope("https://target.test"):
+        assert _resolve_in_pool("victim.example") == "refused"
+
+
+def test_the_scoped_origin_itself_still_resolves_from_a_worker(strict, fake_dns):
+    """Scoping a worker must not break the work: on-origin hops are the ones a probe actually needs."""
+    table, _ = fake_dns
+    table["target.test"] = [_ai(GOOD)]
+    with egress.origin_scope("https://target.test"):
+        assert _resolve_in_pool("target.test") == "allowed"
+
+
+def test_an_unbound_worker_is_the_gap_this_closes(strict, fake_dns):
+    """Pins the reason the wrapper exists. Python hands a new thread a fresh, empty Context, so an
+    unwrapped worker reads no scope and only the public address predicate is left, which a third party
+    passes by definition. If this ever starts refusing, context propagation changed under us."""
+    table, _ = fake_dns
+    table["victim.example"] = [_ai(GOOD2)]
+    with egress.origin_scope("https://target.test"):
+        assert _resolve_in_pool("victim.example", bind=False) == "allowed"
+
+
+def test_the_injection_fan_out_carries_the_scope(strict, fake_dns):
+    """The reported path: sqli, command injection, ssti and traversal all send through _fan_out_first."""
+    from sloptic import probes
+    table, _ = fake_dns
+    table["victim.example"] = [_ai(GOOD2)]
+
+    def _send(spec):
+        try:
+            socket.getaddrinfo(spec, 443)
+            return spec, "delivered"
+        except egress.EgressRefused:
+            return spec, None
+
+    with egress.origin_scope("https://target.test"):
+        hit = probes._fan_out_first(_send, ["victim.example"] * 4, lambda s, r: r is not None)
+    assert hit is None                      # nothing was delivered off origin
+
+
+def test_the_race_fan_out_carries_the_scope(strict, fake_dns):
+    """The second pool, used by the self-as-oracle race and load probes."""
+    from sloptic import probes
+    table, _ = fake_dns
+    table["victim.example"] = [_ai(GOOD2)]
+
+    def _work():
+        try:
+            socket.getaddrinfo("victim.example", 443)
+            return "delivered"
+        except egress.EgressRefused:
+            return "refused"
+
+    with egress.origin_scope("https://target.test"):
+        assert probes._fanout(_work, 3) == ["refused"] * 3
+
+
+def test_a_worker_is_not_left_scoped_for_whatever_runs_next(strict, fake_dns):
+    """Pool threads are reused. A wrapper that set the scope without restoring it would pin an
+    unrelated later task to a stale origin, which fails closed but fails wrongly."""
+    from concurrent.futures import ThreadPoolExecutor
+    table, _ = fake_dns
+    table["elsewhere.test"] = [_ai(GOOD2)]
+    with ThreadPoolExecutor(max_workers=1) as ex:      # one worker, so the second task reuses the thread
+        with egress.origin_scope("https://target.test"):
+            ex.submit(egress.scope_bound(lambda: None)).result()
+        assert ex.submit(lambda: socket.getaddrinfo("elsewhere.test", 443)).result()
+
+
+def test_binding_an_unscoped_callable_hands_back_the_same_object(strict):
+    """The corpus and reference lanes never enter a scope, so they must get the callable itself, not a
+    wrapper: identity here is the argument that this fix cannot move a score."""
+    def f():
+        return 1
+    assert egress.scope_bound(f) is f

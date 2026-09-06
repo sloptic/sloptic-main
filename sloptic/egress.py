@@ -41,6 +41,7 @@ corpus lane runs unscoped so its behavior stays identical to the curve it measur
 """
 import contextlib
 import contextvars
+import functools
 import ipaddress
 import os
 import socket
@@ -118,6 +119,33 @@ def origin_scope(origin: str):
         yield
     finally:
         _origin_scope.reset(tok)
+
+
+def scope_bound(fn):
+    """Bind `fn` to the CALLER's origin scope so it stays scoped when a worker thread runs it.
+
+    A ContextVar does not cross a thread boundary. A thread started by ThreadPoolExecutor begins with a
+    fresh, empty Context, so `_origin_scope.get()` there returns its default of None and the scope check in
+    `_guarded_getaddrinfo` silently does not run, leaving only the public address predicate, which a
+    third-party victim passes by definition. Any callable handed to a pool has to be wrapped in this, or a
+    grant for one origin becomes a relay to any public host the target redirects at.
+
+    Capture happens on the SUBMITTING thread, where the scope is live, and re-entry happens inside the
+    worker. When there is no scope (every corpus and reference lane, which never enters one) this returns
+    the callable itself, so those paths are byte for byte what they were.
+    """
+    scope = _origin_scope.get()
+    if scope is None:
+        return fn
+
+    @functools.wraps(fn)
+    def scoped(*args, **kwargs):
+        tok = _origin_scope.set(scope)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _origin_scope.reset(tok)
+    return scoped
 
 
 def _guarded_getaddrinfo(host, port, *args, **kwargs):
