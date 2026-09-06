@@ -1548,8 +1548,25 @@ def surface_metrics(profile: Profile) -> dict:
     return {
         "routes": len(app_routes),
         "routes_all": len(profile.routes),           # incl. vendor assets, for reference
-        "routes_list": app_routes[:12],              # the actual APP route PATHS (vendor-stripped, capped) —
+        "routes_list": app_routes[:40],              # the actual APP route PATHS (vendor-stripped, capped) —
                                                      # lets the coverage auditor render sub-routes, not just "/"
+                                                     # ORDER IS UNCHANGED. scripts/deploy_and_grade reads this to
+                                                     # pick sub-routes to interact with and takes the first four,
+                                                     # so raising the cap appends and cannot alter what it probes.
+        # WHAT was found, beside how many. Purely additive: `forms` and `endpoints` above keep their
+        # counts, nothing here feeds surface_size, applicability or ranking, and no existing consumer
+        # reads these keys. A report can say which forms and endpoints a grade actually saw instead of
+        # a bare number the reader cannot check.
+        "forms_list": [
+            f"{(f.method or 'get').upper()} {f.action or '(same page)'}"
+            + (f" ({', '.join(f.fields[:6])})" if f.fields else "")
+            for f in forms
+        ][:40],
+        "endpoints_list": [
+            f"{(e.method or 'get').upper()} {e.raw_path or e.path}"
+            + (f" [{e.baseline_status}]" if e.baseline_status else "")
+            for e in eps
+        ][:40],
         # WHICH PAGE THE HOMEPAGE PROBES ACTUALLY GRADED. Every `target: /` probe — a11y, seo, headers, perf,
         # dev-build — routes through _home_path, which resolves to THIS, not to the origin root. On a sub-path
         # deployment they grade /Project rather than the host's not-found shell, so a row without it cannot say
