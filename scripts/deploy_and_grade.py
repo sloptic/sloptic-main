@@ -820,7 +820,17 @@ def execute(plan: dict, repo: pathlib.Path, verbose: bool = False, build_timeout
 class GradeTimeout(Exception):
     """The grading phase blew its wall-clock budget. A pathological target — e.g. every HTML response
     hangs the socket — makes each fan-out probe pay a full read timeout per route, so grading can grind
-    for tens of minutes. This bounds it so one broken app can't stall a batch."""
+    for tens of minutes. This bounds it so one broken app can't stall a batch.
+
+    Carries WHERE it died. The grade runs in a child that gets SIGKILLed on expiry, so anything the child
+    knew dies with it and a DNF used to say only "900s elapsed". That left the corpus unable to answer the
+    one question that sizes the fix: is the tail discovery hanging, Lighthouse, or a probe fanning out? The
+    child now streams phase and probe markers up the queue it already owns, so the parent knows the last
+    one reached when it pulls the trigger."""
+
+    def __init__(self, msg, phase=None, probe=None, done=None, total=None):
+        super().__init__(msg)
+        self.phase, self.probe, self.done, self.total = phase, probe, done, total
 
 
 def _grade_heartbeat(done, total, probe, outcomes):
@@ -907,8 +917,17 @@ def _grade_worker(url, use_browser, features, q, cached_profile=None, cache_key=
         if passive_only:                       # anonymous web-tier battery: drop every active probe before the run
             from sloptic import safety
             catalog = safety.passive_catalog(catalog)
+        def _phase_sink(name, label, important):
+            q.put(("phase", name))            # the parent's breadcrumb; survives the SIGKILL the child won't
+            _grade_phase_line(name, label, important)
+
+        def _progress_sink(done, total, probe, outcomes):
+            if outcomes is None:              # the pre-run tick: this probe is the one now in flight
+                q.put(("probe", probe.id, done, total))
+            _grade_heartbeat(done, total, probe, outcomes)
+
         report = run(RemoteDeployer(url, health_timeout=20), catalog,
-                     render=render, on_progress=_grade_heartbeat, on_phase=_grade_phase_line,
+                     render=render, on_progress=_progress_sink, on_phase=_phase_sink,
                      seed_features=features, headers=session_headers,
                      cached_profile=cached_profile, on_profile=on_profile, perceive=perceive,
                      browser_register=browser_register, recon=recon,
@@ -954,10 +973,23 @@ def grade(url: str, use_browser: bool, timeout=None, features=None,
                           browser_auth, session_headers, llm_reasoning, recon, controlled_deploy, trace,
                           login_creds, probe_filter, email_cfg, passive_only))
     p.start()
+    phase = probe_id = None
+    done = total = None
+    deadline = None if timeout is None else time.monotonic() + timeout
     try:
-        result = q.get(timeout=timeout)              # timeout=None (direct run) blocks until the child reports
-    except queue.Empty:                              # a SET timeout (batch) elapsed -> None -> hard-kill below
-        result = None
+        while True:                                  # drain breadcrumbs until the RESULT arrives or time runs out
+            try:
+                msg = q.get(timeout=None if deadline is None else max(0.0, deadline - time.monotonic()))
+            except queue.Empty:                      # a SET timeout (batch) elapsed -> hard-kill below
+                result = None
+                break
+            if msg[0] == "phase":
+                phase = msg[1]
+            elif msg[0] == "probe":
+                _, probe_id, done, total = msg
+            else:                                    # ("ok", report) / ("err", text): the grade settled
+                result = msg
+                break
     except KeyboardInterrupt:                         # Ctrl-C on an uncapped run -> take the child + its chrome down
         _hard_kill_group(p)
         raise
@@ -966,7 +998,11 @@ def grade(url: str, use_browser: bool, timeout=None, features=None,
         sys.stderr.flush()
     if result is None:                               # timed out (or the child vanished) -> hard-kill the group
         _hard_kill_group(p)
-        raise GradeTimeout(f"grading exceeded {timeout}s")
+        where = f" in phase {phase}" if phase else ""
+        if probe_id:
+            where += f" at probe {probe_id}" + (f" ({done}/{total})" if total else "")
+        raise GradeTimeout(f"grading exceeded {timeout}s{where}", phase=phase, probe=probe_id,
+                           done=done, total=total)
     p.join(5)
     kind, payload = result
     if kind == "err":
@@ -1520,6 +1556,12 @@ def main():
             timings["grade_s"] = round(time.monotonic() - _t, 1)
             result["grade_timeout"] = True         # deployed but ungradeable in budget (broken/pathological
             result["timeout"] = "grade"            # target); the 'took forever' signal + shows in stats
+            # WHERE it died, so the corpus can attribute its DNF tail instead of guessing. `discover` without
+            # a following `discovered` is a discovery hang; `probes` names the probe that was in flight.
+            result["timeout_phase"] = e.phase
+            if e.probe:
+                result["timeout_probe"] = e.probe
+                result["timeout_progress"] = [e.done, e.total]
             result["deploy_error"] = f"GRADE TIMEOUT (>{args.grade_timeout}s)"
             print(f"\n  GRADE TIMEOUT — {e}. Target too pathological to grade in budget; "
                   f"recorded, moving on.")
