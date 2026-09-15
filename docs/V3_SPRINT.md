@@ -81,15 +81,19 @@ New detection. Each is deterministic, so no model enters the grader.
 | 1 | Provider key in the client bundle (Groq/xAI/HF/Replicate + Anthropic split) plus live Gemini validation for `AIza` | no app intends to ship a credential that bills its owner | S | **DONE** `sec-secrets-003` |
 | 2 | Supabase Storage bucket listing open to anonymous | storage policies are separate from table RLS, so not redundant with `sec-backend-001`; zero coverage today | S | **DONE** `sec-backend-004` |
 | 3 | System prompt in the client bundle | structural detection (a provider SDK call with a literal `role: "system"`), never semantic | S | todo |
-| 4 | Scaffold text on a LINKED route | string match only; the moment it asks "is this page finished" it judges intent and fails the wedge | S | todo |
-| 5 | Session token in a URL query string | confirmed uncovered; leaks via referrer, history and logs, and no spec makes it correct | S | todo |
-| 6 | CVE-2025-29927 Next.js middleware auth bypass (`x-middleware-subrequest`) | a route auth-gated to anon becomes reachable with an internal header; no app intends that | M | todo |
+| 4 | Scaffold text on a LINKED route | string match only; the moment it asks "is this page finished" it judges intent and fails the wedge | S | **DONE** `qa-scaffold-001` |
+| 5 | Session token in a URL query string | confirmed uncovered; leaks via referrer, history and logs, and no spec makes it correct | S | **DONE** `sec-session-006` |
+| 6 | CVE-2025-29927 Next.js middleware auth bypass (`x-middleware-subrequest`) | a route auth-gated to anon becomes reachable with an internal header; no app intends that | M | **ALREADY BUILT** `sec-authbypass-001` (predicate `middleware_auth_bypass`, repriced to 90) — the roadmap note calling it dark described intent, not the code |
 
 **CVE-2025-48757 (Supabase anon-RLS) DROPPED as redundant** (2026-09-15, verified against the disclosure).
 It is "missing RLS lets anon or any authed user read protected rows", which is exactly what `sec-backend-001`
 (anon read) and `sec-backend-002` (authed read) already do, and they prove it by reading a real row rather
 than matching a version. A separate signature probe would only duplicate the finding. So "two CVE probes" is
 one, and the storage listing (item 2) is the genuinely uncovered BaaS surface.
+
+**System prompt in the bundle (item 3) DROPPED** (2026-09-15, Ian agreed). It is a marker for things now detected directly: a direct client-to-provider call ships the KEY too (caught at 70-92 by `sec-secrets-003` and the provider patterns), and the only additive slice, a backend that honors a client-supplied system prompt, needs an ACTIVE inference request to prove and belongs with the unmetered-inference stretch item, not a cheap string match.
+
+**So the discovery-run new-detection set is fully landed: two built this sprint (`sec-secrets-003`, `sec-backend-004`), two more built this sprint (`qa-scaffold-001`, `sec-session-006`), one already in the tree (`sec-authbypass-001`), two dropped as redundant or weak (CVE-2025-48757, system-prompt).**
 
 ### Committed: must be in the final run
 

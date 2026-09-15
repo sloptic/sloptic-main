@@ -1,0 +1,19 @@
+id: qa-scaffold-001
+bundle: qa
+category: scaffold-content
+pool: public
+evidence_model: provable
+penalty: 12   # a page the app LINKS to whose visible text is unreplaced generator filler -> shipped
+              # unfinished. PROVISIONAL, re-priced on the discovery run.
+# ISO/IEC 25010 functional suitability -> functional completeness: a declared, linked page that was never
+# implemented. Nielsen severity 2 (minor usability problem): the user reaches a dead-end filler page, an
+# embarrassment that erodes trust but does not block a task, so it sits with the mobile-usability tier (12).
+severity: {iso_25010: "functional-completeness", nielsen: "2", range: [12, 12], default: 12}
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  predicate: scaffold_content_on_route
+  # Fetch each linked route, extract visible text (script/style dropped, tags stripped), and match a strict
+  # deny-list of generator artifacts: lorem ipsum, an LLM's own meta-text, bracket placeholders, and template
+  # defaults (Feature One + Feature Two must co-occur). Never a completeness judgment. N/A when no linked HTML
+  # page was reachable to read.
