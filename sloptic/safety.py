@@ -43,6 +43,10 @@ PASSIVE_PROBES = frozenset({
 
 # Sends a payload / mutates / induces a fault / hammers / needs accounts / pulls exposed data.
 ACTIVE_PROBES = frozenset({
+    # security -- asks a PROVIDER, not the target: one free models.list call confirms whether an AIza key
+    # found in the bundle actually reaches Gemini. Spends a request against the app owner's own credential,
+    # so it belongs only where ownership was attested.
+    "sec-secrets-003",
     # performance
     "perf-load-001",                                                            # concurrent burst (mini-DoS)
     # qa -- fault induction, state mutation, hammering, clicking (may submit)

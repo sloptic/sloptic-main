@@ -83,6 +83,13 @@ _CONTENT: dict[str, tuple[str, str, str]] = {
     "sec-secrets-002": ("No hardcoded server secret (Stripe `sk_`, OpenAI, AWS secret, GitHub PAT, private key) ships in the bundle.",
                         "A server-side secret is embedded in client code — anyone viewing source has full use of it.",
                         "Never put server secrets in the client; call the third party from your backend. Rotate the leaked key now."),
+    "sec-secrets-003": ("No Google API key in the bundle can reach the Gemini API.",
+                        "A key in your client code is a live Gemini credential, confirmed against Google. Anyone "
+                        "who views source can spend your inference budget and read files you uploaded to it. A "
+                        "Firebase or Maps key becomes one automatically once the Generative Language API is "
+                        "enabled on the same project, with no warning and no change to your code.",
+                        "Rotate the key, then restrict it: application (referrer) restrictions do NOT block "
+                        "Gemini, only API restrictions do. Call Gemini from your backend and keep the key there."),
     "sec-hosthdr-001": ("The `Host` / `X-Forwarded-Host` header is not reflected into URLs or redirects.",
                         "Host-header injection — attacker-controlled hosts poison generated links (password-reset hijack, cache poisoning).",
                         "Validate `Host` against an allow-list of known domains; build absolute URLs from config, not the request header."),

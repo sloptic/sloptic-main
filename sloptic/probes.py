@@ -24,7 +24,7 @@ from dataclasses import replace
 
 import httpx
 
-from . import auth, baas, browser, depscan, egress, email_verify, lighthouse, oob, secretscan
+from . import auth, baas, browser, depscan, egress, email_verify, lighthouse, oob, provider_validate, secretscan
 from .net import make_client, request_counts
 from .schema import Endpoint
 from .discovery import _CATCHALL_PROBE, _body_sig, _registrable_domain
@@ -3246,6 +3246,51 @@ def bundle_leaks_secret(ctx, probe) -> bool | None:
         return True
     ctx.evidence.update(secret_kinds=[], scanned_bytes=len(blob))
     return False
+
+
+# A bundle can carry several AIza keys (Firebase config plus Maps, say). Check a few, not all: each is one
+# request against someone's quota, and the finding is "at least one is live", which the first hit settles.
+_MAX_GOOGLE_KEY_CHECKS = 3
+
+
+def gemini_key_live_in_bundle(ctx, probe) -> bool | None:
+    """A Google `AIza` key in the client bundle that ACTUALLY reaches the Gemini API.
+
+    The one predicate that asks a third party rather than the target, because this format cannot be decided
+    any other way. The same 39 characters serve a Firebase web key (public by design) and a Gemini API key
+    (a billing credential), and an existing Firebase key silently gains Gemini access when that API is
+    enabled on the project, so neither the format nor what the bundle calls can tell them apart. See
+    provider_validate.
+
+    Fires only on a key the provider itself confirms, so the public-by-design case can never be scored. That
+    confirmation IS the `validated_live` rung the disclosed-secret ladder already priced at 92 and that
+    nothing had ever been able to set.
+
+    ACTIVE battery only: it spends a request against the app owner's own credential, so it belongs where
+    ownership was attested. N/A with no bundle, no candidate key, or a check that could not complete.
+    """
+    blob = _client_bundle(ctx)
+    if not blob.strip():
+        return None
+    candidates = secretscan.google_api_keys(blob)
+    if not candidates:
+        ctx.evidence.update(google_key_candidates=0)
+        return None                                  # no AIza key at all: nothing to decide
+    checked = 0
+    for key in candidates[:_MAX_GOOGLE_KEY_CHECKS]:
+        checked += 1
+        live = provider_validate.gemini_key_is_live(key)
+        if live:
+            ctx.evidence.update(google_key_candidates=len(candidates), keys_checked=checked,
+                                validated_live=True, provider="google-gemini",
+                                key=secretscan._mask(key), source="client-bundle")
+            return True
+        if live is None:                             # could not tell -> N/A, never a clean verdict
+            ctx.evidence.update(google_key_candidates=len(candidates), keys_checked=checked,
+                                na_reason="provider unreachable")
+            return None
+    ctx.evidence.update(google_key_candidates=len(candidates), keys_checked=checked, validated_live=False)
+    return False                                     # every candidate refused: public-by-design keys
 
 
 # v2.0 FAMILY 1 -- deploy-time "works on my machine" failure. A dev host / private IP / unset env var stringified
@@ -7384,6 +7429,7 @@ PREDICATES = {
     "backend_schema_disclosed": backend_schema_disclosed,
     "authenticated_backend_readable": authenticated_backend_readable,
     "bundle_leaks_secret": bundle_leaks_secret,
+    "gemini_key_live_in_bundle": gemini_key_live_in_bundle,
     "unreachable_backend_reference": unreachable_backend_reference,
     "internal_address_disclosed": internal_address_disclosed,
     "oauth_redirect_localhost": oauth_redirect_localhost,
@@ -7479,6 +7525,7 @@ _PREDICATE_REASONS = {
     "backend_schema_disclosed": "the managed backend discloses its schema to anyone (table list at the API "
                                "root, or database errors naming columns)",
     "authenticated_backend_readable": "any logged-in user reads every other user's data -> broken authenticated-tier RLS/Rules (the IDOR equivalent on a BaaS app; missing per-user row filtering)",
+    "gemini_key_live_in_bundle": "a Google AIza key in the client bundle REACHES the Gemini API (confirmed against Google, not inferred from its format) -> anyone can spend this project's inference budget and read its uploaded files",
     "bundle_leaks_secret": "a hardcoded SECRET key (Stripe sk_ / OpenAI / AWS secret / GitHub PAT / private key) is shipped in the client JS bundle -> account/DB takeover (public anon/publishable keys are not flagged)",
     "unreachable_backend_reference": "the shipped client bundle calls a backend no visitor can reach (localhost / a private IP / an unset env var) -> the app renders but its data layer is dead in production",
     "internal_address_disclosed": "the client bundle hardcodes an internal-only address (a private/link-local IP or an *.internal/.corp hostname) -> leaks infrastructure topology to any source-viewer (recon); loopback/localhost is not flagged",
