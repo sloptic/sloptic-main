@@ -95,6 +95,20 @@ one, and the storage listing (item 2) is the genuinely uncovered BaaS surface.
 
 **So the discovery-run new-detection set is fully landed: two built this sprint (`sec-secrets-003`, `sec-backend-004`), two more built this sprint (`qa-scaffold-001`, `sec-session-006`), one already in the tree (`sec-authbypass-001`), two dropped as redundant or weak (CVE-2025-48757, system-prompt).**
 
+### Committed: must be in the discovery run (added 2026-09-15, from the sloptic-web report)
+
+- **Redirect settling + http fallback at the deployer** (`_settle_origin`, `_http_variant`). A same-host
+  http->https upgrade is adopted as the graded origin, and an https target whose connection fails outright
+  falls back to http once. This is here rather than with the pure fixes because it is SCORE MOVING for a real
+  slice: ~154 corpus origins are http, only 13 are true http-only (they fire sec-tls-001), so ~a hundred
+  redirect to https and were being UNDER-graded (base_url stuck on http, redirect-averse probes saw 301s).
+  Rebasing grades them at their real https origin, which changes their scores, so it must be in the corpus
+  the curve is frozen from. It also fixes the hosted worker's origin-scope DNF (the port changed 80->443) and
+  records `observed_surface.graded_origin` so a record says which scheme answered. The web session's three
+  asks resolve to this: sec-tls-001 already fires on http (penalty 30, confirmed), and the redirect-DNF they
+  saw was origin-scope specific, not a corpus DNF (the corpus http DNFs are dead ports, a ConnectError, not
+  redirects).
+
 ### Committed: must be in the final run
 
 Fixes. These reclassify or remove rather than fire, so they do not need the discovery run to audit them.

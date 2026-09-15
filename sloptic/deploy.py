@@ -14,13 +14,15 @@ import sys
 import time
 
 import httpx
+from urllib.parse import urlparse
 
 from .net import make_client
 
 
 class DeployHandle:
-    def __init__(self, base_url: str):
-        self.base_url = base_url
+    def __init__(self, base_url: str, submitted_url: str | None = None):
+        self.base_url = base_url                       # the origin actually graded (may be redirect-settled)
+        self.submitted_url = submitted_url or base_url  # what the caller asked for, for the audit trail
 
 
 class Deployer(abc.ABC):
@@ -237,6 +239,35 @@ class DockerDeployer(Deployer):
 # constant can drift back into collision.
 _LIVENESS_READ_TIMEOUT = 10.0
 
+def _http_variant(url: str) -> str | None:
+    """The plain-http form of an https url, else None. Only https targets have an http fallback to try."""
+    return ("http://" + url[len("https://"):]) if url.startswith("https://") else None
+
+
+def _settle_origin(submitted: str, final_url: str) -> str:
+    """The origin to actually grade after following redirects.
+
+    A target that answers on the SAME host but upgrades http -> https is the same app, reached over TLS, so
+    we adopt https and keep the submitted host/port/path. This is the fix for two failures at once: probes
+    that do not follow redirects were seeing 301s and under-grading the app, and the hosted worker's origin
+    scope refused the https hop because the port changed (80 -> 443).
+
+    Only a same-host scheme upgrade is adopted. A redirect to a DIFFERENT host (a link shortener, a parked
+    domain bouncing elsewhere) is left as submitted: adopting it would graduate into grading a different app
+    than the one named, which is never what the caller asked for. A same-scheme canonicalization (www, a
+    trailing slash, / -> /home) is also left as submitted, since redirects are followed at request time and
+    the origin is unchanged.
+    """
+    try:
+        sub, fin = urlparse(submitted), urlparse(final_url)
+    except (ValueError, TypeError):
+        return submitted
+    if (sub.hostname and sub.hostname == fin.hostname
+            and sub.scheme == "http" and fin.scheme == "https"):
+        return "https://" + submitted[len("http://"):]
+    return submitted
+
+
 class RemoteDeployer(Deployer):
     """Targets an already-running HTTP endpoint — dogfooding the league's own site, or any URL you
     own or are authorized to test. 'Deploys' nothing, so it needs no Docker and runs on any box
@@ -250,6 +281,7 @@ class RemoteDeployer(Deployer):
 
     def deploy(self) -> DeployHandle:
         deadline = time.time() + self.health_timeout
+        connect_failed = False
         while time.time() < deadline:
             try:
                 # health-check the target AS GIVEN (httpx defaults a bare origin to "/"). Do NOT append
@@ -262,11 +294,27 @@ class RemoteDeployer(Deployer):
                 # EgressRefused subclasses gaierror -> httpx.ConnectError -> caught below, so a target
                 # that resolves non-public reads as "did not respond" instead of being dialed.
                 with make_client("", timeout=_LIVENESS_READ_TIMEOUT, follow_redirects=True) as c:
-                    if c.get(self.base_url).status_code < 500:   # non-5xx means up; verify=False is make_client's default (self-signed targets)
-                        return DeployHandle(self.base_url)
+                    r = c.get(self.base_url)
+                if r.status_code < 500:   # non-5xx means up; verify=False is make_client's default (self-signed targets)
+                    return DeployHandle(_settle_origin(self.base_url, str(r.url)), submitted_url=self.base_url)
+                connect_failed = False    # a 5xx is an HTTP answer, not a dead port -> no http fallback
+            except httpx.HTTPError:
+                connect_failed = True     # transport-level failure (dead port / refused / EgressRefused)
+            time.sleep(0.3)
+        # The https window is exhausted by CONNECTION failures, not HTTP errors. An app served only over
+        # http (or one a caller defaulted to https because it had nothing to fetch with) looks dead from
+        # here, so try the http variant ONCE as a last resort. Preferred strictly after https, so a
+        # transient https blip recovers on https rather than racing an http answer that would mis-grade a
+        # real https app as cleartext.
+        http_alt = _http_variant(self.base_url)
+        if connect_failed and http_alt:
+            try:
+                with make_client("", timeout=_LIVENESS_READ_TIMEOUT, follow_redirects=True) as c:
+                    r = c.get(http_alt)
+                if r.status_code < 500:
+                    return DeployHandle(_settle_origin(http_alt, str(r.url)), submitted_url=self.base_url)
             except httpx.HTTPError:
                 pass
-            time.sleep(0.3)
         raise RuntimeError(f"target did not respond (or only 5xx): {self.base_url}")
 
     def teardown(self) -> None:

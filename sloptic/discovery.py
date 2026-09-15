@@ -1574,6 +1574,8 @@ def surface_metrics(profile: Profile) -> dict:
         # this codebase; recording the resolved value makes a regression visible in the data instead of only in
         # a re-read of the code.
         "landing_path": profile.landing_path,
+        "graded_origin": profile.base_url,   # the origin ACTUALLY graded after redirect settling
+        #     (a same-host http->https upgrade is adopted), so a record says which scheme answered
         "forms": len(forms),
         "inputs": inputs,
         "endpoints": len(healthy_eps),               # healthy = responds to a baseline without a 5xx
