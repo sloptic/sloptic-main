@@ -61,7 +61,7 @@ ACTIVE_PROBES = frozenset({
     "sec-ssrf-001", "sec-filterinj-001", "sec-hosthdr-001", "sec-split-001", "sec-redirect-001",
     "sec-upload-001", "sec-upload-002", "sec-csrf-001", "sec-dos-001", "sec-ratelimit-001",
     "sec-authbypass-001", "sec-idor-001", "sec-idor-002", "sec-idor-003", "sec-idor-004", "sec-idor-005",
-    "sec-backend-001", "sec-backend-002", "sec-backend-003", "sec-debug-001",
+    "sec-backend-001", "sec-backend-002", "sec-backend-003", "sec-backend-004", "sec-debug-001",
     "sec-session-001", "sec-session-002", "sec-session-003", "sec-session-004", "sec-session-005",
     # exposure FETCHERS: go LOOKING for a sensitive file/data the app does not serve normally (guessed
     # paths, backend queries, bulk pulls). exposure-005/006 + secrets-* are OBSERVED-in-served -> passive.

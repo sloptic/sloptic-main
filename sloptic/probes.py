@@ -4249,6 +4249,110 @@ def _firestore_readable(client, base: str, project: str, api_key: str, collectio
     return None if reached else "unreachable"
 
 
+# ---- sec-backend-004: an anon-listable Supabase Storage bucket -----------------------------------------
+# Storage policies are SEPARATE from table RLS, so this is a distinct exposure from sec-backend-001, not a
+# widening of it: a team can lock every table and still leave the file store open, or the reverse. Listing a
+# bucket needs a SELECT policy on storage.objects granted to anon -- "public bucket" only allows downloading a
+# known URL, never enumerating -- so anon listing is a real misconfiguration, not the intended public-asset
+# feature. But like anon table READ, bare "listing works" is intent-dependent: a public gallery legitimately
+# lists its own assets. So this fires on SENSITIVITY, never on listing alone (the backend-001 principle:
+# object-path sensitivity, never the bucket name), and records the rest for the corpus audit to tune.
+_STORAGE_LIST = "/storage/v1/object/list/"
+_STORAGE_BUCKET_REF = re.compile(r"""/storage/v1/object/(?:public|sign|authenticated)/([A-Za-z0-9][A-Za-z0-9_-]{0,60})/"""
+                                 r"""|\.storage\s*\.from\(\s*["']([A-Za-z0-9][A-Za-z0-9_-]{0,60})["']""")
+_STORAGE_COMMON = ("avatars", "uploads", "files", "documents", "images", "media", "attachments",
+                   "user-uploads", "profile-images", "photos", "public", "assets")
+# A bucket whose NAME denotes per-user or private content (not a public-asset bucket). Weaker signal than the
+# per-user path structure below, used only as a fallback sensitivity reason.
+_PRIVATE_BUCKET = re.compile(r"doc|upload|attach|receipt|invoice|kyc|identity|passport|resume|cv\b|"
+                             r"medical|report|submission|private|user|avatar", re.I)
+_UUID_SEG = re.compile(r"(?:^|/)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:/|$)", re.I)
+_EMAIL_SEG = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+
+def _storage_buckets(blob: str) -> list[str]:
+    """Bucket names the bundle names (public/sign URLs, storage.from('x')), then a common fallback."""
+    mined = []
+    for m in _STORAGE_BUCKET_REF.finditer(blob):
+        mined.append(m.group(1) or m.group(2))
+    mined = list(dict.fromkeys([b for b in mined if b]))
+    return (mined + [b for b in _STORAGE_COMMON if b not in mined])[:16]
+
+
+def _storage_sensitive(bucket: str, names: list[str]):
+    """(reason, sample) if the listing is a sensitive exposure, else None. Two rungs, strongest first: object
+    paths that reveal PER-USER structure (a UUID or an email as a path segment) prove cross-user enumeration,
+    which no app intends; failing that, a bucket whose name denotes private content is a weaker fire."""
+    for n in names:
+        if _UUID_SEG.search(n) or _EMAIL_SEG.search(n):
+            return "per-user paths enumerable by anon (cross-user file access)", n
+    if _PRIVATE_BUCKET.search(bucket):
+        return "a private-content bucket is listable by anon", bucket
+    return None
+
+
+def _storage_listable(client, base: str, keys: list[str], buckets: list[str]):
+    """{bucket, objects, reason, repro} for the first bucket an anon key can list SENSITIVELY, 'unreachable'
+    if the storage host never answered (-> N/A), else None. Lists at most a page; never downloads."""
+    reached = False
+    for key in keys[:3]:
+        hdr = {"apikey": key, "Content-Type": "application/json"}
+        if key.startswith("eyJ"):
+            hdr["Authorization"] = "Bearer " + key
+        for bucket in buckets:
+            try:
+                r = client.post(base + _STORAGE_LIST + bucket,
+                                json={"prefix": "", "limit": 100}, headers=hdr, timeout=6.0)
+            except (httpx.HTTPError, httpx.InvalidURL):
+                continue
+            reached = True
+            if r.status_code != 200:
+                continue                              # 400/401/403/404: no such bucket, or listing refused
+            try:
+                objs = r.json()
+            except ValueError:
+                continue
+            if not isinstance(objs, list) or not objs:
+                continue                              # empty bucket or non-array: nothing enumerated
+            names = [o.get("name", "") for o in objs if isinstance(o, dict)]
+            sens = _storage_sensitive(bucket, names)
+            if sens:
+                return {"bucket": bucket, "objects": len(objs), "reason": sens[0],
+                        "sample": secretscan._mask(sens[1]) if "@" in sens[1] else sens[1],
+                        "repro": _repro("POST", base + _STORAGE_LIST + bucket, status=200,
+                                        matched=sens[0])}
+    return "unreachable" if not reached else None
+
+
+def storage_bucket_listable(ctx, probe) -> bool | None:
+    """A Supabase Storage bucket an anonymous client can LIST, exposing other users' uploaded files.
+
+    Distinct from sec-backend-001 (that reads the DATABASE): storage policies are separate, so this fires
+    where the tables are locked but the file store is not. Gated on sensitivity, never bare listing, because
+    a public-asset gallery legitimately lists itself: fires only when object paths reveal per-user structure
+    (cross-user enumeration) or the bucket denotes private content. N/A with no Supabase config, no bucket
+    that lists, or an unreachable storage host. Read-only: it lists a page and never downloads an object."""
+    blob = _client_bundle(ctx)
+    base = _supabase_base(blob, ctx)
+    if not base:
+        return None                                   # no Supabase gateway in the client -> nothing to test
+    keys = [m.group(0) for m in _JWT.finditer(blob)] + _SUPABASE_PUB.findall(blob)
+    if not keys:
+        return None
+    with httpx.Client(timeout=8.0, follow_redirects=True, verify=False) as ext:
+        hit = _storage_listable(ext, base, keys, _storage_buckets(blob))
+    if isinstance(hit, dict):
+        ctx.evidence.update(backend="supabase-storage", host=base, bucket=hit["bucket"],
+                            objects_listed=hit["objects"], bulk_read=True, reason=hit["reason"],
+                            sample=hit["sample"], repro=hit["repro"])
+        return True
+    if hit == "unreachable":
+        ctx.evidence.update(checked=True, reachable=False)
+        return None                                   # storage host never answered -> egress blocked / N/A
+    ctx.evidence.update(checked=True, reachable=True, listable=False)
+    return False
+
+
 def exposed_backend_readable(ctx, probe) -> bool | None:
     """Managed backend (Supabase/Firebase) shipped without row-level security: mine the client bundle for
     the config + public key, then read the DB with that key. Fire if real rows come back. N/A when no such
@@ -7424,6 +7528,7 @@ PREDICATES = {
     "debug_mode_enabled": debug_mode_enabled,
     "leaks_error_detail": leaks_error_detail,
     "exposed_backend_readable": exposed_backend_readable,
+    "storage_bucket_listable": storage_bucket_listable,
     "anon_bulk_data_exposed": anon_bulk_data_exposed,
     "filter_injection": filter_injection,
     "backend_schema_disclosed": backend_schema_disclosed,
@@ -7519,6 +7624,7 @@ _PREDICATE_REASONS = {
     "debug_mode_enabled": "framework debug mode is on in production (interactive debugger / DEBUG page -> source, settings, env and an RCE console exposed)",
     "leaks_error_detail": "an induced server error leaked a stack trace or a database error to the user (info disclosure + a broken error path)",
     "exposed_backend_readable": "the app's managed backend (Supabase/Firebase) is world-readable with its own public key -> the whole database is exposed (missing row-level security)",
+    "storage_bucket_listable": "a Supabase Storage bucket is listable by an anonymous client, so strangers can enumerate other users' uploaded files (a storage SELECT policy granted to anon; separate from table RLS)",
     "filter_injection": "a query parameter reaches the data store's FILTER expression (PostgREST/NoSQL filter injection: the caller controls what the query matches)",
     "anon_bulk_data_exposed": "an anonymous request returned bulk records carrying personal or financial data "
                               "(no authorization on a data-export route)",

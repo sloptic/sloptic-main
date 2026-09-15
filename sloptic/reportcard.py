@@ -96,6 +96,12 @@ _CONTENT: dict[str, tuple[str, str, str]] = {
     "sec-dos-001": ("Compressed request bodies are size-capped before decompression.",
                     "Zip-bomb DoS — a tiny gzip body inflates to gigabytes and exhausts server memory.",
                     "Cap the decompressed size and set a request-body limit; reject oversized payloads early."),
+    "sec-backend-004": ("No storage bucket can be listed by an anonymous visitor.",
+                        "A stranger can enumerate a storage bucket and see other users' uploaded files. "
+                        "Storage access is controlled separately from your database, so locking your tables "
+                        "did not lock this: it needs its own policy.",
+                        "Remove any anon SELECT policy on storage.objects. A bucket marked public still must "
+                        "not be listable; serve known object URLs instead of granting list access."),
     "sec-backend-001": ("The managed backend (Supabase/Firebase) enforces row-level security.",
                         "The database is world-readable/writable through the public anon key — anyone can read or modify all rows.",
                         "Enable RLS / security rules and scope the anon key; never rely on client-side checks for authorization."),

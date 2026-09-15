@@ -76,15 +76,20 @@ being asked of it. **That is the general rule: instrumentation lands before the 
 
 New detection. Each is deterministic, so no model enters the grader.
 
-| # | item | why it passes the wedge | size |
-|---|---|---|---|
-| 1 | Provider key in the client bundle (`sk-ant-`, `AIza`, `gsk_`, `hf_`, `xai-`) | no app intends to ship a credential that bills its owner | S |
-| 2 | Supabase Storage bucket listing open to anonymous | storage policies are separate from table RLS, so not redundant with `sec-backend-001`; zero coverage today | S |
-| 3 | System prompt in the client bundle | structural detection (a provider SDK call with a literal `role: "system"`), never semantic | S |
-| 4 | Scaffold text on a LINKED route | string match only; the moment it asks "is this page finished" it judges intent and fails the wedge | S |
-| 5 | Session token in a URL query string | confirmed uncovered; leaks via referrer, history and logs, and no spec makes it correct | S |
-| 6 | CVE-2025-29927 Next.js middleware auth bypass | known-CVE probe, still dark | M |
-| 7 | CVE-2025-48757 Supabase anon-RLS | known-CVE probe, still dark | M |
+| # | item | why it passes the wedge | size | status |
+|---|---|---|---|---|
+| 1 | Provider key in the client bundle (Groq/xAI/HF/Replicate + Anthropic split) plus live Gemini validation for `AIza` | no app intends to ship a credential that bills its owner | S | **DONE** `sec-secrets-003` |
+| 2 | Supabase Storage bucket listing open to anonymous | storage policies are separate from table RLS, so not redundant with `sec-backend-001`; zero coverage today | S | **DONE** `sec-backend-004` |
+| 3 | System prompt in the client bundle | structural detection (a provider SDK call with a literal `role: "system"`), never semantic | S | todo |
+| 4 | Scaffold text on a LINKED route | string match only; the moment it asks "is this page finished" it judges intent and fails the wedge | S | todo |
+| 5 | Session token in a URL query string | confirmed uncovered; leaks via referrer, history and logs, and no spec makes it correct | S | todo |
+| 6 | CVE-2025-29927 Next.js middleware auth bypass (`x-middleware-subrequest`) | a route auth-gated to anon becomes reachable with an internal header; no app intends that | M | todo |
+
+**CVE-2025-48757 (Supabase anon-RLS) DROPPED as redundant** (2026-09-15, verified against the disclosure).
+It is "missing RLS lets anon or any authed user read protected rows", which is exactly what `sec-backend-001`
+(anon read) and `sec-backend-002` (authed read) already do, and they prove it by reading a real row rather
+than matching a version. A separate signature probe would only duplicate the finding. So "two CVE probes" is
+one, and the storage listing (item 2) is the genuinely uncovered BaaS surface.
 
 ### Committed: must be in the final run
 
