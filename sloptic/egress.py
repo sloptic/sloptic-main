@@ -56,6 +56,8 @@ _install_lock = threading.Lock()
 _origin_scope: contextvars.ContextVar = contextvars.ContextVar("sloptic_egress_origin", default=None)
 # Reentrancy flag: our own validation resolve must use the real resolver, not recurse into the guard.
 _in_guard: contextvars.ContextVar = contextvars.ContextVar("sloptic_egress_in_guard", default=False)
+# Hosts allowed past the ORIGIN PIN (never past the address predicate). See exempt_host.
+_scope_exempt: contextvars.ContextVar = contextvars.ContextVar("sloptic_egress_exempt", default=frozenset())
 
 
 class EgressRefused(socket.gaierror):
@@ -121,6 +123,28 @@ def origin_scope(origin: str):
         _origin_scope.reset(tok)
 
 
+@contextlib.contextmanager
+def exempt_host(host: str):
+    """Allow ONE fixed host past the origin pin for the duration of the block.
+
+    This is a deliberate hole in `origin_scope`, so the reason it is safe has to be stated rather than
+    assumed. The origin pin exists because a grant for one origin must not become a relay to anywhere else,
+    and what makes a relay dangerous is that the TARGET picks the destination, by redirecting us. This
+    exemption inverts that: the host is a constant WE chose (a provider's own validation endpoint), so the
+    target cannot steer it. Pass a literal. Never pass a host derived from a response, a bundle, or anything
+    else the target controls, or this becomes the relay the pin was written to prevent.
+
+    Nothing else is relaxed. The public-address predicate still runs, so an exempt host that resolves to
+    loopback, a private range or cloud metadata is still refused. Only the origin equality check is skipped,
+    and only for the exact host named here.
+    """
+    tok = _scope_exempt.set(frozenset(_scope_exempt.get()) | {host.lower().rstrip(".")})
+    try:
+        yield
+    finally:
+        _scope_exempt.reset(tok)
+
+
 def scope_bound(fn):
     """Bind `fn` to the CALLER's origin scope so it stays scoped when a worker thread runs it.
 
@@ -160,7 +184,7 @@ def _guarded_getaddrinfo(host, port, *args, **kwargs):
     scope = _origin_scope.get()
     if scope is not None:
         h = host.lower().rstrip(".") if isinstance(host, str) else host
-        if h != scope[0] or (isinstance(port, int) and port != scope[1]):
+        if h not in _scope_exempt.get() and (h != scope[0] or (isinstance(port, int) and port != scope[1])):
             raise EgressRefused(
                 f"egress refused: {host}:{port} leaves the scoped origin {scope[0]}:{scope[1]}")
 

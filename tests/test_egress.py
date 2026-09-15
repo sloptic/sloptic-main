@@ -339,3 +339,43 @@ def test_binding_an_unscoped_callable_hands_back_the_same_object(strict):
     def f():
         return 1
     assert egress.scope_bound(f) is f
+
+
+def test_a_named_host_can_be_exempted_from_the_origin_pin(strict, fake_dns):
+    """The one deliberate hole in the scope, for a provider's own validation endpoint. Safe because the host
+    is a constant WE choose, so a redirecting target cannot steer it, unlike the relay the pin prevents."""
+    table, _ = fake_dns
+    table["generativelanguage.googleapis.com"] = [_ai(GOOD2)]
+    with egress.origin_scope("https://target.test"):
+        with pytest.raises(egress.EgressRefused):
+            socket.getaddrinfo("generativelanguage.googleapis.com", 443)      # refused without it
+        with egress.exempt_host("generativelanguage.googleapis.com"):
+            assert socket.getaddrinfo("generativelanguage.googleapis.com", 443)
+
+
+def test_an_exemption_covers_only_the_named_host(strict, fake_dns):
+    table, _ = fake_dns
+    table["elsewhere.test"] = [_ai(GOOD2)]
+    with egress.origin_scope("https://target.test"), egress.exempt_host("generativelanguage.googleapis.com"):
+        with pytest.raises(egress.EgressRefused, match="leaves the scoped origin"):
+            socket.getaddrinfo("elsewhere.test", 443)
+
+
+def test_an_exemption_is_restored_on_the_way_out(strict, fake_dns):
+    table, _ = fake_dns
+    table["generativelanguage.googleapis.com"] = [_ai(GOOD2)]
+    with egress.origin_scope("https://target.test"):
+        with egress.exempt_host("generativelanguage.googleapis.com"):
+            pass
+        with pytest.raises(egress.EgressRefused):
+            socket.getaddrinfo("generativelanguage.googleapis.com", 443)
+
+
+def test_an_exempt_host_still_faces_the_address_predicate(strict, fake_dns):
+    """Only the ORIGIN pin is relaxed. An exempt host resolving inward is still refused, so the exemption
+    can never become an SSRF path."""
+    table, _ = fake_dns
+    table["sneaky.test"] = [_ai("127.0.0.1")]
+    with egress.origin_scope("https://target.test"), egress.exempt_host("sneaky.test"):
+        with pytest.raises(egress.EgressRefused, match="non-public"):
+            socket.getaddrinfo("sneaky.test", 443)
