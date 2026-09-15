@@ -136,6 +136,22 @@ def audits(psi: dict) -> dict:
     return _lhr(psi).get("audits") or {}
 
 
+def benchmark_index(psi: dict) -> float | None:
+    """Lighthouse's own measure of how fast the HOST was during the run (`environment.benchmarkIndex`), or None.
+
+    Worth recording because nothing in the stack normalizes for it. Under the default `simulate` throttling
+    Lighthouse does NOT throttle the real browser at all (lib/emulation.js `throttle` returns early unless the
+    method is `devtools`), so the trace carries the host's actual speed and load, and Lantern then multiplies
+    the observed CPU work by a FIXED `cpuSlowdownMultiplier` of 4. Lighthouse computes this index and reports
+    it, but never applies it as a correction, so a contended or slower box scores an app worse through no
+    fault of the app. Capturing it per grade gives the corpus a host-speed covariate, which is the only way to
+    tell a real perf regression from a busier grading box after the fact.
+    """
+    env = _lhr(psi).get("environment") or {}
+    bi = env.get("benchmarkIndex")
+    return bi if isinstance(bi, (int, float)) else None
+
+
 def perf_score(psi: dict) -> float | None:
     """The overall performance category score in [0,1] (None if absent). Lighthouse's OWN weighted headline
     (LCP/TBT/CLS/FCP/speed-index blended with its calibrated weights) — the perf axis scores off THIS, inverted
@@ -238,4 +254,12 @@ def measure(url: str, *, runs: int = DEFAULT_RUNS, runner=None, **kw) -> dict:
     lhr = dict(_lhr(reports[0]))
     lhr["audits"] = merged
     lhr["categories"] = {"performance": {"score": statistics.median(cat_scores) if cat_scores else None}}
+    # host speed, medianed like every other metric. The SPREAD across runs is itself a contention signal: a
+    # quiet box repeats its benchmark closely, a loaded one does not.
+    idx = [b for r in reports if (b := benchmark_index(r)) is not None]
+    if idx:
+        env = dict(lhr.get("environment") or {})
+        env["benchmarkIndex"] = round(statistics.median(idx), 1)
+        env["benchmarkIndexSpread"] = round(max(idx) - min(idx), 1)
+        lhr["environment"] = env
     return {"lighthouseResult": lhr, "runs": len(reports), "versions": versions()}

@@ -636,6 +636,16 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
         if ctx.lighthouse:   # capture the Lighthouse performance score (0-100) onto the record -- the perf axis
             perf = lighthouse.perf_score(ctx.lighthouse)   # already grades on it; this surfaces it for the stats.
             surface["lighthouse"] = {"performance": round(perf * 100) if perf is not None else None}
+            # Host speed during the run. Nothing in Lighthouse normalizes for it: under the default `simulate`
+            # throttling the real browser is never CPU throttled, so the trace carries the box's actual load,
+            # and Lantern scales that by a fixed 4x. Without this on the record a perf shift between corpora
+            # cannot be told apart from a busier grading box, and a live single app grade (whole machine)
+            # cannot be compared against a curve built at four grades per box.
+            bi = lighthouse.benchmark_index(ctx.lighthouse)
+            if bi is not None:
+                env = (lighthouse._lhr(ctx.lighthouse).get("environment") or {})
+                surface["lighthouse"]["benchmark_index"] = bi
+                surface["lighthouse"]["benchmark_index_spread"] = env.get("benchmarkIndexSpread")
         sess = _captured_session(ctx)               # the session the grade established -> a retry replays it, no re-walk
         attempted = (ctx.browser_register is not None
                      or (isinstance(ctx._email_cache, dict) and "_authed_headers" in ctx._email_cache))
