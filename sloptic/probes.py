@@ -4707,6 +4707,156 @@ def session_token_in_local_storage(ctx, probe) -> bool | None:
         account.client.close()
 
 
+# ---- sec-session-006: a session/access token carried in a URL query string --------------------------------
+# The session family checks cookie flags (001-003), a weak id (004) and localStorage (005); nothing looks at
+# the URL. A REUSABLE session or access token in a query string leaks three ways with no legitimate form: the
+# Referer header hands it to every third-party resource the page loads, it lands in browser history, and it is
+# written to server and proxy access logs. That is CWE-598, and unlike a missing HttpOnly flag it is an ACTIVE
+# leak of a live credential, not merely weak storage. Scoped to the QUERY string only: a token in the URL
+# FRAGMENT (the OAuth implicit / magic-link shape) is not sent to the server or the referrer, so it is a
+# different, lesser thing and sec-session-005's territory. Single-use email-flow tokens are excluded, because a
+# reset/verify link in a URL is the standard pattern and does not carry a reusable session.
+_SESSION_QP_NAME = re.compile(r"^(?:access[_-]?token|session[_-]?token|session|sessionid|sid|auth[_-]?token|"
+                              r"authtoken|jwt|bearer|id[_-]?token|refresh[_-]?token)$", re.I)
+_JWT_QP_NAME = re.compile(r"^(?:token|auth|t|key|jwt|access[_-]?token)$", re.I)   # generic: only a JWT value fires
+_ONE_TIME_QP = re.compile(r"reset|verif|confirm|invite|magic|recovery|signup|token[_-]?hash|otp|oob|"
+                          r"csrf|xsrf|nonce|state|challenge", re.I)
+_QUERY_PARAM = re.compile(r"[?&](?P<k>[A-Za-z][A-Za-z0-9_-]{0,30})=(?P<v>[A-Za-z0-9._~-]{8,})")
+_JWT_VALUE = re.compile(r"^eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{4,}$")
+
+
+# One-time INBOUND flow paths. A token in a confirm/verify/reset/OAuth-callback URL hits the referrer and
+# the log ONCE, on an email or redirect landing, and is the vendor's link design rather than the app's slop.
+# A session token in an ORDINARY navigation URL rides every request and is the real leak, so the path decides.
+_ONE_TIME_PATH = re.compile(r"confirm|verif|reset|recover|/callback|magic|activate|/oauth", re.I)
+
+
+def _url_session_token(urls):
+    """(param, value, kind, url) for the first NAVIGATION url carrying a session/access token, else None.
+    A clearly session-named param fires on any substantial value; a generic token-ish param fires ONLY on a
+    JWT-shaped value (a one-time reset token, not a JWT, does not). Handshake param names and one-time inbound
+    flow PATHS never fire. Literal values only, so a `?access_token=${var}` template cannot match."""
+    for u in urls:
+        head, sep, tail = u.partition("?")
+        if not sep:
+            continue                                  # no query string (a fragment token is not sent -> skip)
+        query = tail.split("#", 1)[0]
+        if _ONE_TIME_PATH.search(head):
+            continue                                  # inbound email/redirect landing, not a navigation leak
+        for m in _QUERY_PARAM.finditer("?" + query):
+            k, v = m.group("k"), m.group("v")
+            if _ONE_TIME_QP.search(k):
+                continue
+            if _SESSION_QP_NAME.match(k) and len(v) >= 12:
+                return k, v, ("jwt" if _JWT_VALUE.match(v) else "opaque"), u
+            if _JWT_QP_NAME.match(k) and _JWT_VALUE.match(v):
+                return k, v, "jwt", u
+    return None
+
+
+def _candidate_urls(routes, bundle):
+    """URL-ish strings to inspect: the discovered routes, plus anything containing a query string in the
+    served client content (hrefs, string-literal URLs the app builds)."""
+    urls = list(routes)
+    urls += re.findall(r'[^\s"\'<>()]+\?[^\s"\'<>()]+', bundle)
+    return list(dict.fromkeys(urls))[:400]
+
+
+# ---- qa-scaffold-001: unreplaced generator boilerplate on a linked page -----------------------------------
+# AI scaffolders emit pages (About, Pricing, Contact) the team never fills in, so the app links to a route
+# whose visible text is still template filler. This is the same class as a dead control: the app declares a
+# page exists and the page contains nothing the team wrote. Kept a STRICT ARTIFACT MATCH, never a completeness
+# judgment -- the moment it asks "is this page finished" it grades intent, and a design tool showing sample
+# content would false-fire. So it fires only on strings no shipped app deliberately shows a user: classic
+# filler, an LLM's own meta-text leaked into content, or an unfilled bracket placeholder. The multi-token
+# template defaults must CO-OCCUR (a lone "Feature One" heading is not enough) to stay clear of real copy.
+_SCAFFOLD_ARTIFACT = re.compile(
+    r"lorem ipsum dolor|as an ai language model|as a large language model|i cannot fulfill that|"
+    r"i'?m sorry,? but i can'?t|\[your name\]|\[your company\]|\[company name\]|\byour name here\b|"
+    r"your company name here|yourname@example\.com|replace this with your|\blorem ipsum\b", re.I)
+_SCAFFOLD_PAIRS = (
+    (re.compile(r"\bfeature one\b", re.I), re.compile(r"\bfeature two\b", re.I)),
+    (re.compile(r"\bcard title\b", re.I), re.compile(r"\bcard description\b", re.I)),
+    (re.compile(r"\bsection one\b", re.I), re.compile(r"\bsection two\b", re.I)),
+)
+_TAGS = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.I | re.S)
+_ANYTAG = re.compile(r"<[^>]+>")
+
+
+def _visible_text(html: str) -> str:
+    """Rendered-ish text: drop script/style blocks, strip tags, collapse whitespace. Keeps the match on what
+    a user would SEE, so a generator string that survives only inside a JS bundle does not false-fire."""
+    t = _TAGS.sub(" ", html)
+    t = _ANYTAG.sub(" ", t)
+    return re.sub(r"\s+", " ", t)
+
+
+def _scaffold_hit(text: str) -> str | None:
+    m = _SCAFFOLD_ARTIFACT.search(text)
+    if m:
+        return m.group(0).strip().lower()
+    for a, b in _SCAFFOLD_PAIRS:
+        if a.search(text) and b.search(text):
+            return a.pattern.strip("\\b")
+    return None
+
+
+def scaffold_content_on_route(ctx, probe) -> bool | None:
+    """A route the app links to whose visible text is unreplaced generator boilerplate: lorem ipsum, an LLM's
+    own meta-text, an unfilled bracket placeholder, or a template's default Feature One/Two block. Fires on the
+    first such route (one finding). Strict artifact match on visible text, never a completeness judgment. N/A
+    when no linked page was reachable to read."""
+    seen = 0
+    for path in list(dict.fromkeys(getattr(ctx.profile, "routes", None) or ["/"]))[:20]:
+        if path.split("?")[0].endswith((".js", ".mjs", ".css", ".json", ".png", ".jpg", ".svg", ".ico",
+                                        ".map", ".txt", ".woff", ".woff2", ".xml")):
+            continue
+        try:
+            r = ctx.client.get(_at(ctx, path.split("?")[0]))
+        except (httpx.HTTPError, httpx.InvalidURL):
+            continue
+        if r.status_code != 200 or "html" not in r.headers.get("content-type", "").lower():
+            continue
+        seen += 1
+        hit = _scaffold_hit(_visible_text(r.text[:400_000]))
+        if hit:
+            ctx.evidence.update(route=path.split("?")[0], artifact=hit,
+                                reason="a linked page still shows generator boilerplate")
+            return True
+    if seen == 0:
+        ctx.evidence["na_reason"] = "no linked HTML page was reachable to read"
+        return None
+    ctx.evidence.update(pages_scanned=seen, scaffold=False)
+    return False
+
+
+def session_token_in_url(ctx, probe) -> bool | None:
+    """A reusable session or access token in a URL query string (CWE-598): it leaks via Referer to third
+    parties, into browser history, and into server logs. Scans the discovered routes (which carry the query
+    strings the app actually used) and the served client content for a session-named param, or a generic
+    token param holding a JWT. Excludes single-use reset/verify links. N/A when nothing was reachable to scan."""
+    routes = getattr(ctx.profile, "routes", None) or []
+    bundle = ""
+    with contextlib.suppress(Exception):
+        bundle = _client_bundle(ctx)
+    urls = _candidate_urls(routes, bundle)
+    if not urls:
+        return None
+    hit = _url_session_token(urls)
+    if hit:
+        k, v, kind, url = hit
+        ctx.evidence.update(param=k, value=_mask_token(v), value_kind=kind, cwe="CWE-598",
+                            route=url.partition("?")[0],
+                            reason="session/access token in a URL query string (leaks via referrer, history, logs)")
+        return True
+    ctx.evidence.update(checked=True, token_in_url=False)
+    return False
+
+
+def _mask_token(v: str) -> str:
+    return v[:6] + "..." + v[-4:] if len(v) > 12 else v[:3] + "..."
+
+
 # A genuine login backend REJECTS wrong creds with an auth-shaped answer. A client-side-auth SPA (Supabase/
 # Firebase from the browser) or a platform-hosted static page just echoes a 200 shell — or 405/404 — for the
 # POST: there's no server auth of the app's to rate-limit, so a "no rate limiting" finding there is a phantom
@@ -7543,6 +7693,8 @@ PREDICATES = {
     "source_map_exposed": source_map_exposed,
     "session_cookie_missing_flag": session_cookie_missing_flag,
     "session_token_in_local_storage": session_token_in_local_storage,
+    "session_token_in_url": session_token_in_url,
+    "scaffold_content_on_route": scaffold_content_on_route,
     "login_no_rate_limit": login_no_rate_limit,
     "csrf_missing": csrf_missing,
     "idor_horizontal": idor_horizontal,
@@ -7641,6 +7793,8 @@ _PREDICATE_REASONS = {
     "source_map_exposed": "a production JS bundle serves its .map -> the original source is reconstructable (business logic, hidden endpoints, and secrets a minified scan misses)",
     "session_cookie_missing_flag": "session cookie missing the {flag} flag",
     "session_token_in_local_storage": "session token persisted in localStorage (readable by any XSS on the origin — unlike an HttpOnly cookie)",
+    "session_token_in_url": "a reusable session/access token is carried in a URL query string (CWE-598) -> leaks via the Referer header, browser history and server logs",
+    "scaffold_content_on_route": "a page the app links to still shows generator boilerplate (lorem ipsum, an AI model's meta-text, or an unfilled placeholder) -> shipped unfinished",
     "csrf_missing": "state-changing POST accepted cross-site with no token / SameSite",
     "idor_horizontal": "another account's object was readable by id (broken access control)",
     "idor_user_record": "one account's private user record was readable by another account by id (horizontal IDOR / broken object-level auth)",

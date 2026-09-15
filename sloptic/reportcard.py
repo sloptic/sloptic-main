@@ -108,6 +108,12 @@ _CONTENT: dict[str, tuple[str, str, str]] = {
     "sec-session-002": ("The session cookie sets a `SameSite` attribute.",
                         "Without `SameSite` the session cookie rides along on cross-site requests — a CSRF exposure.",
                         "Set `SameSite=Lax` (or Strict) plus `Secure` and `HttpOnly` on the session cookie."),
+    "sec-session-006": ("No session or access token is carried in a URL.",
+                        "A reusable login token sits in a page URL. It leaks to any third-party site the "
+                        "page links to through the referrer, into browser history, and into server logs, so "
+                        "anyone who sees one of those can replay the session.",
+                        "Move the token out of the URL: keep the session in an HttpOnly cookie, or post the "
+                        "token in a request body. Rotate any token already exposed this way."),
     "sec-session-005": ("The session token lives in an `HttpOnly` cookie, not `localStorage`.",
                         "A token in `localStorage` is readable by any XSS on the origin — one injection steals every session.",
                         "Store the session in an `HttpOnly`, `Secure` cookie so page scripts (and injected ones) can't read it."),
@@ -232,6 +238,12 @@ _CONTENT: dict[str, tuple[str, str, str]] = {
     "qa-a11y-002": ("The page passes the baseline accessibility hard-checks (`lang`, alt, form-control names, page title).",
                     "A fundamental accessibility element is missing — the page is unusable for assistive tech.",
                     "Add the missing `lang`/title/label/alt; these are one-line fixes with outsized impact."),
+    "qa-scaffold-001": ("Every linked page shows content you wrote, not generator filler.",
+                        "A page your app links to still shows scaffold text: lorem ipsum, an AI assistant in "
+                        "its own words, or an unfilled placeholder like [Your Name]. Visitors who click "
+                        "through reach a page that was never finished.",
+                        "Fill in or remove the page. If a route was generated speculatively and is not "
+                        "needed, delete it and its nav link rather than shipping a stub."),
     "qa-seo-001": ("Best-practice meta tags are present (at least `viewport` and `description`).",
                    "Missing `viewport` breaks mobile layout; missing `description` hurts discoverability — signs of an unfinished page.",
                    "Add `<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">` and a `<meta name=\"description\">`."),

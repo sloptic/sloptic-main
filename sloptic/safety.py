@@ -27,6 +27,7 @@ PASSIVE_PROBES = frozenset({
     # qa -- render / static-analyse / GET; nothing submitted, created, or malformed
     "qa-a11y-001", "qa-a11y-002", "qa-links-001", "qa-console-001", "qa-ctype-001", "qa-devbuild-001",
     "qa-http-001", "qa-http-002", "qa-seo-001", "qa-backnav-001", "qa-chunk-001", "qa-deeplink-001",
+    "qa-scaffold-001",   # GETs each linked route and reads its visible text (a normal visitor load)
     "perf-minify-001",   # fetches the homepage's same-origin .css/.js and measures minification (plain GETs)
     "qa-deploy-001",   # static-analyses the already-served client bundle for a dev/private backend URL
     "qa-deploy-002",   # follows redirects from the homepage/links like a normal visitor (no mutation/payload)
@@ -63,6 +64,7 @@ ACTIVE_PROBES = frozenset({
     "sec-authbypass-001", "sec-idor-001", "sec-idor-002", "sec-idor-003", "sec-idor-004", "sec-idor-005",
     "sec-backend-001", "sec-backend-002", "sec-backend-003", "sec-backend-004", "sec-debug-001",
     "sec-session-001", "sec-session-002", "sec-session-003", "sec-session-004", "sec-session-005",
+    "sec-session-006",   # the session family is categorically active (test_dangerous_families); it reads served content but stays with its family
     # exposure FETCHERS: go LOOKING for a sensitive file/data the app does not serve normally (guessed
     # paths, backend queries, bulk pulls). exposure-005/006 + secrets-* are OBSERVED-in-served -> passive.
     "sec-exposure-001", "sec-exposure-002", "sec-exposure-003", "sec-exposure-004", "sec-exposure-007",

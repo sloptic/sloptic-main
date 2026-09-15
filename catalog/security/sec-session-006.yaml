@@ -1,0 +1,17 @@
+id: sec-session-006
+bundle: security
+category: session
+pool: public
+evidence_model: provable
+penalty: 28   # nominal; severity resolves it. A reusable session/access token in a URL query string is an
+              # ACTIVE leak of a live credential (CWE-598): it reaches every third-party resource via Referer,
+              # persists in browser history, and is written to server/proxy logs. Worse than a missing cookie
+              # flag (15) because the credential is exfiltrated, not merely under-protected; below full takeover.
+severity: {cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:N/A:N", cvss_score: 6.5, vrt: "P3", range: [24, 32], default: 28}
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  predicate: session_token_in_url
+  # Scan the discovered routes (they carry the query strings the app actually used) and the served client
+  # content for a session-named param, or a generic token param holding a JWT value. Excludes single-use
+  # reset/verify links and URL-fragment tokens (a different, lesser thing). Literal values only.
