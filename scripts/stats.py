@@ -13,6 +13,7 @@ Input is the JSONL that `deploy_and_grade.py --record FILE` appends (one line pe
     uv run python scripts/stats.py results.jsonl                        # the recall report (default)
     uv run python scripts/stats.py results.jsonl --all                  # all three lenses, one run
     uv run python scripts/stats.py results.jsonl --audit sec-sqli-004   # every app + evidence for one probe
+  uv run python scripts/stats.py results.jsonl --app mindmatter       # ONE app: every probe that fired, + clean/n-a/blocked
     uv run python scripts/stats.py results.jsonl --category exposure     # aggregate one category (grouped, not by probe)
     uv run python scripts/stats.py results.jsonl --json                 # machine readable summary
     uv run python scripts/stats.py results.jsonl --parity [--by X] [--csv F]   # cross stack visibility
@@ -271,6 +272,99 @@ def audit_category(recs, query):
         pid, pen = app_worst[repo]
         print(f"      {repo:52} {cs:6.1f}   worst: {pid} pen={pen}")
     print("\n  -> per finding repro: scripts/stats.py <results> --audit <probe id>")
+
+
+def app_audit(recs, query):
+    """The per-APP inverse of --audit: everything ONE app's grade recorded, so a suspicious score is
+    auditable in one place instead of by grepping the JSONL. Matches any record whose url / repo / project /
+    hackathon contains QUERY, case insensitive, so a fragment like 'mindmatter' finds the app. Prints the
+    fired probes (penalty, damped contribution, target, reason, repro/evidence), then the flip side an audit
+    needs just as much: what ran CLEAN, what read N/A and WHY, what a challenge BLOCKED, and the coverage
+    line, so 'low score' is legible as 'clean' vs 'never tested'."""
+    q = query.lower()
+    hits = [r for r in recs if q in (r.get("repo") or "").lower() or q in (r.get("url") or "").lower()
+            or q in (r.get("project") or "").lower() or q in (r.get("hackathon") or "").lower()]
+    print(f"\n=== app: {query} ===  {len(hits)} record(s)")
+    if not hits:
+        have = sorted({(r.get("repo") or "") for r in recs})
+        frag = next((h for h in have if q[:8] and q[:8] in h.lower()), None)
+        hint = f"  closest repo: {frag}" if frag else "  (try a fragment of the url, project or hackathon slug)"
+        print(hint)
+        return
+    for r in hits:
+        _app_audit_one(r)
+
+
+def _app_audit_one(r):
+    """Render one record. Fired findings first (heaviest penalty last so the tail is the headline), then the
+    applied-but-clean probes, the N/A probes with their reasons, and the coverage / challenge context."""
+    import datetime
+    url = r.get("url") or r.get("repo") or "(unknown)"
+    when = datetime.datetime.fromtimestamp(r["ts"], tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M") if r.get("ts") else "?"
+    plat = (r.get("platform") or {}).get("host_platform") or "?"
+    total = (r.get("timings") or {}).get("total_s")
+    print(f"\n--- {url}")
+    print(f"      {when} utc | hackathon={r.get('hackathon') or '?'} | platform={plat} | stack={r.get('stack') or '?'}"
+          + (f" | {total:.0f}s" if isinstance(total, (int, float)) else "")
+          + (f" | graded_origin={(r.get('observed_surface') or {}).get('graded_origin')}" if (r.get('observed_surface') or {}).get('graded_origin') else ""))
+
+    if r.get("slop_score") is None:      # a DNF: the audit question is WHY it died
+        why = r.get("deploy_error") or "no score recorded"
+        print(f"      DNF: {why}")
+        if r.get("timeout_phase"):
+            print(f"      timeout in phase {r['timeout_phase']!r}"
+                  + (f" at probe {r['timeout_probe']} {tuple(r.get('timeout_progress') or ())}" if r.get("timeout_probe") else ""))
+        return
+
+    findings = sorted((f for f in r.get("findings", []) if _scored(f)),
+                      key=lambda f: (f.get("penalty", 0) * f.get("count", 1)))
+    print(f"      SLOP SCORE {r['slop_score']}   axes " + " / ".join(
+        f"{b} {v}" for b, v in sorted((r.get("axis_slop") or {}).items())))
+    if not findings:
+        print("      no scored findings (a 0 = every applied probe came back clean; see coverage below)")
+    for f in findings:
+        n = f.get("count", 1)
+        line = f"      {f['probe_id']:<22} {f.get('category', ''):<22} penalty={f.get('penalty', 0)}"
+        if n > 1:
+            line += f" x{n}"
+        if f.get("contribution") is not None:
+            line += f"  -> contributes {f['contribution']}"
+        print(line)
+        if f.get("targets"):
+            print(f"          targets: {', '.join(t or '-' for t in f['targets'][:5])}")
+        elif f.get("target"):
+            print(f"          target: {f['target']}")
+        print(f"          reason: {(f.get('reason') or '')[:110]}")
+        ev = dict(f.get("evidence") or {})
+        repro = ev.pop("repro", None)
+        if repro:
+            print(f"          $ {_curl(repro)}")
+            resp = [f"{k}={repro[k]}" for k in ("status", "ms") if k in repro]
+            if repro.get("matched"):
+                resp.append(f"matched={repro['matched']!r}")
+            if resp:
+                print(f"            -> {' | '.join(resp)}")
+        if ev:
+            print(f"          evidence={json.dumps(ev)[:360]}")
+
+    verdicts = r.get("verdicts") or []
+    clean = [v["probe_id"] for v in verdicts if v.get("outcome") == "clean"]
+    na = [(v["probe_id"], v.get("na_reason") or "") for v in verdicts if v.get("outcome") == "not_applicable"]
+    if clean:
+        print(f"      clean ({len(clean)}): " + ", ".join(clean))
+    if na:
+        print(f"      n/a ({len(na)}):")
+        for pid, why in na:
+            print(f"          {pid:<22} {why[:95]}")
+    if r.get("blocked_probes"):
+        print(f"      blocked by a challenge ({len(r['blocked_probes'])}): " + ", ".join(r["blocked_probes"][:12])
+              + (" ..." if len(r["blocked_probes"]) > 12 else ""))
+    if r.get("incomplete_axes"):
+        print(f"      incomplete axes (a floor, untested probes could only add): {', '.join(r['incomplete_axes'])}")
+    c = r.get("coverage") or {}
+    if c.get("probes_total"):
+        print(f"      coverage: {c.get('probes_applicable')}/{c.get('probes_total')} applicable "
+              f"({c.get('pct_applicable')}%), {c.get('probes_na')} n/a")
 
 
 def _is_graded(r):
@@ -1638,6 +1732,7 @@ def main():
                     "visibility) and --precision (false positive audit). One tool, three lenses on one file.")
     ap.add_argument("results", help="the JSONL from deploy_and_grade --record (or a filled worksheet, with --tally)")
     ap.add_argument("--audit", metavar="PROBE", help="list every app + evidence where PROBE fired, then exit")
+    ap.add_argument("--app", metavar="URL", help="audit ONE app: every probe that fired (penalty, contribution, target, reason, repro), plus clean / n-a / blocked and coverage, then exit")
     ap.add_argument("--category", metavar="CAT",
                     help="aggregate one category across the corpus (e.g. exposure, accessibility), grouped by "
                          "category instead of by probe, then exit")
@@ -1721,6 +1816,9 @@ def main():
         return
     if args.audit:
         audit(recs, args.audit)
+        return
+    if args.app:
+        app_audit(recs, args.app)
         return
     if args.category:
         audit_category(recs, args.category)
