@@ -5196,7 +5196,16 @@ def csrf_missing(ctx, probe) -> bool | None:
                 # request -> not acceptance (the dominant FP: a cross-site POST to an http:// URL -> 308 https)
                 if _same_resource_redirect(str(resp.url), loc):
                     continue
-                ctx.evidence.update(vulnerable=True, form=form.action, method=method, status=resp.status_code)
+                # a redirect to a DIFFERENT host forwarded the request off the submitted app entirely (a
+                # domain move / gateway bounce) — nothing here processed it, so it is not an acceptance.
+                # governancex's 307 to its own canonical domain fired the v24 corpus at 45 points.
+                dest_host = (urllib.parse.urlsplit(urllib.parse.urljoin(str(resp.url), loc)).netloc
+                             or "").lower().removeprefix("www.")
+                here_host = urllib.parse.urlsplit(str(resp.url)).netloc.lower().removeprefix("www.")
+                if dest_host and dest_host != here_host:
+                    continue
+                ctx.evidence.update(vulnerable=True, form=form.action, method=method, status=resp.status_code,
+                                    redirect_location=loc[:200])   # recorded so a 3xx fire is AUDITABLE
                 return True
             if resp.status_code < 400:
                 # a 2xx that just returns the served PAGE isn't a state change — an SPA answers 200 with its
