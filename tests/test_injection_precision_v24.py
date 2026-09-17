@@ -113,3 +113,47 @@ def test_csrf_records_the_redirect_location_for_audit():
         assert ctx.evidence.get("redirect_location") == "/pay/next-step"
     finally:
         s.stop()
+
+
+# ── hosthdr: an error page reflects all sorts of things — only a 2xx/3xx reflection can be operative ────
+def _hdr_cls(code):
+    def do_GET(self):
+        if urlparse(self.path).path == "/account":
+            body = ("<html><a href='https://%s/login'>x</a></html>" % self.headers.get("Host", "x")).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"ok")
+    return type("_H%d" % code, (http.server.BaseHTTPRequestHandler,),
+                {"do_GET": do_GET, "log_message": lambda *a: None})
+
+
+def _run_hdr(cls):
+    s = _Serve(cls)
+    try:
+        ctx = type("C", (), {"base_url": s.url, "headers": None, "evidence": {},
+                             "profile": Profile(base_url=s.url, routes=["/account"]),
+                             "client": None})()
+        return host_header_injection(ctx, type("P", (), {"probe": {}})())
+    finally:
+        s.stop()
+
+
+def test_hosthdr_does_not_fire_on_a_404_that_echoes_the_host():
+    """The bye-buy FP: S3's NoSuchBucket answer echoes the injected Host as the bucket name it did not
+    find. An error page reflects all sorts of things; only a 2xx/3xx reflection can be operative. The
+    plot-twist og:image reflection rode a 404 too, so this gate supersedes my initial 'real' call on it —
+    an og:image on a page nothing caches or shares is not a poisoning primitive."""
+    assert _run_hdr(_hdr_cls(404)) is not True
+
+
+def test_hosthdr_still_fires_on_a_200_that_builds_a_url_from_the_host():
+    """Recall twin: the geoiq shape — a 200 page whose link/redirect target is built from the client Host.
+    The zula 301-Location shape fires the same way (a 3xx reflection)."""
+    assert _run_hdr(_hdr_cls(200)) is True

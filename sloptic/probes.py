@@ -6759,6 +6759,11 @@ def host_header_injection(ctx, probe) -> bool:
                     r = c.get(path, headers={hdr: marker})
                 except (httpx.HTTPError, httpx.InvalidURL):
                     continue
+                if r.status_code >= 400:
+                    continue   # an ERROR page reflects all sorts of things — S3's NoSuchBucket answer echoes
+                               # the injected Host as the <BucketName> it looked up and did not find (the
+                               # bye-buy v24 FP at 40 points). Only a 2xx/3xx reflection can be operative: a
+                               # cacheable page or a redirect the app actually built.
                 if marker in r.headers.get("location", "") or marker in r.text:
                     ctx.evidence.update(reflected=True, via=hdr, target=path,
                                         repro=_repro_from_resp(r, matched="injected Host '%s' reflected" % marker))
