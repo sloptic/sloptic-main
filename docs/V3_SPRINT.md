@@ -128,6 +128,12 @@ Fixes. These reclassify or remove rather than fire, so they do not need the disc
   gate either run, but it must precede the re-pricing pass so pricing sees four axes rather than three.
 - **FP backlog**: base44 endpoint attribution, secretscan recall (overlaps item 1 above), perf-load-001's edge
   gate, and dead-controls plus http-correctness, never audited on their own merits.
+- **LANDED 2026-09-17, from the v24 injection audit (classics at 55% precision: 5 real / 6 false):**
+  sqli boolean gets a negative control (FALSE must collapse onto the benign baseline) plus an SSE
+  generator-stream skip (`8aab72b`); csrf treats a cross-host redirect as a bounce and records the
+  redirect Location so 3xx fires are auditable (`4a8fb48`); hosthdr never fires on a 4xx/5xx reflection
+  (`5cefc40`). Replay evidence in the audit: mesh-3d answered all payloads identically, cognify was an
+  LLM SSE stream, governancex 307'd to its canonical domain, bye-buy's S3 404 echoed the bucket name.
 
 ### Stretch: in if the sprint is running ahead, out without argument if not
 
