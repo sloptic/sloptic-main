@@ -1056,6 +1056,22 @@ _PLACEHOLDER = re.compile(
     r"we'?ll be back (soon|shortly)|temporarily (unavailable|down)|service (temporarily )?unavailable|"
     r"site is (down|offline)|parked (domain|free)|future home of|default (web )?page|"
     r"welcome to nginx|apache2? (ubuntu )?default page|\bit works!", re.I)
+# PLATFORM 404 pages served at HTTP 200: the edge answers 200 with its own error page when the deployment
+# does not exist (Netlify "503 - No Server Found" for a deleted deploy, GitHub Pages "There isn't a GitHub
+# Pages site here" on preview/custom-domain setups). The liveness gate sees 200 and grades the PLATFORM's
+# error page: five v24 apps clustered at exactly 12.5 (the header tax on the shell) this way.
+_PLATFORM_404 = re.compile(
+    r"there isn'?t a github pages site here|site not found\b|\bno server found\b|"
+    r"deployment (?:could|can)not be found|deployment_not_found|this deployment does not exist|"
+    r"\b503\b[^\n]{0,30}no server", re.I)
+# A deployment shipping the framework's UNTOUCHED starter page: the entire visible content is the template
+# default (leherg's whole page read "Vite + React + TS" and nothing else). Exact-match only, so it cannot
+# touch a real app that merely mentions a framework name — the page must be NOTHING BUT the default.
+_STARTER_DEFAULTS = frozenset({
+    "vite + react + ts", "vite + react - ts", "vite + vue + ts", "vite + svelte + ts",
+    "vite + solid + ts", "vite + preact + ts", "vite + lit + ts", "vite + vanilla + ts",
+    "create react app", "next.js app", "welcome to your angular app",
+})
 # A broken build/route serving the JS/CSS BUNDLE as the page body — the browser paints raw source as visible
 # text (the dominant Bolt/Netlify break: ~28 of bolt3's 42 DNFs). HTTP 200, so a status check misses it, and
 # it often carries no 'not found' words. These markers are dense in source and ~absent in real UI copy.
@@ -1099,6 +1115,14 @@ def _dead_shell_reason(html: str):
     server-default splash, or a raw source dump. The text patterns check only the PROMINENT top of the visible
     text (low FP — a real app that merely mentions 'coming soon' for a future feature isn't flagged)."""
     vis = _visible_text(html)[:1500]
+    if _PLATFORM_404.search(vis):
+        return "platform 404 served at HTTP 200 (the deployment does not exist)"
+    low = vis.strip().lower()
+    if len(low) <= 200 and any(low.startswith(d) for d in _STARTER_DEFAULTS):
+        return "unmodified starter template (the framework default page, nothing shipped)"
+        # prefix-match, bounded: <title> text survives _visible_text, so the untouched starter reads
+        # "vite + react + ts vite + react + ts". A real app's page carries copy after the title, blowing
+        # the 200-char bound, so only the template default itself matches.
     if _CLIENT_404.search(vis):
         return "client-side 404 (renders 'not found' at HTTP 200)"
     if _PLACEHOLDER.search(vis):

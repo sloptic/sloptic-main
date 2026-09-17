@@ -361,3 +361,23 @@ def test_record_plan_meta_copies_kind_stack_and_features():
     assert result["features"] == [{"name": "scan", "kind": "other"}]
     assert result["stack_profile"] == {"framework": "SwiftUI"}
     assert "dockerfile" not in result       # only the identification fields ride onto the record
+
+
+def test_dead_shell_reason_flags_the_v24_platform_404_and_starter_shells():
+    """The five v24 apps that clustered at 12.5: three are platform error pages served at HTTP 200 and one
+    is the untouched Vite starter. The fifth (envi-seven, a real one-page waste-lookup app) must stay
+    GRADED — it is a tiny app, not a shell."""
+    gh = "<title>Site not found</title><p>Site not found &middot; GitHub Pages 404 There isn't a GitHub Pages site here.</p>"
+    netlify = "<h1>503 - No Server Found</h1><p>ERROR 503 No Server Found</p>"
+    starter = "<title>Vite + React + TS</title><p>Vite + React + TS</p>"
+    assert _dead_shell_reason(gh).startswith("platform 404")
+    assert _dead_shell_reason(netlify).startswith("platform 404")
+    assert _dead_shell_reason(starter).startswith("unmodified starter template")
+
+
+def test_a_real_one_page_app_is_not_a_shell():
+    """Recall twin: envi-seven's whole visible content is genuine product copy. A tiny real app must stay
+    graded — 'small' is not 'dead', and the header tax on it is a real finding."""
+    page = ("<h1>WasteWise+ — Smart Waste Segregation</h1><p>Type any household item to learn its correct "
+            "disposal, why it matters, and environmental impact. Try: plastic cup, old phone.</p>")
+    assert _dead_shell_reason(page) is None
