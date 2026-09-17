@@ -4760,6 +4760,9 @@ def _url_session_token(urls):
             k, v = m.group("k"), m.group("v")
             if _ONE_TIME_QP.search(k):
                 continue
+            if v.startswith(("pk.", "pk_")):
+                continue                         # a PUBLISHABLE key (Mapbox pk.*, Stripe pk_*) is public by
+                                                 # design, the same exclusion secretscan gives Firebase AIza
             if _SESSION_QP_NAME.match(k) and len(v) >= 12:
                 return k, v, ("jwt" if _JWT_VALUE.match(v) else "opaque"), u
             if _JWT_QP_NAME.match(k) and _JWT_VALUE.match(v):
@@ -4767,11 +4770,27 @@ def _url_session_token(urls):
     return None
 
 
-def _candidate_urls(routes, bundle):
-    """URL-ish strings to inspect: the discovered routes, plus anything containing a query string in the
-    served client content (hrefs, string-literal URLs the app builds)."""
-    urls = list(routes)
-    urls += re.findall(r'[^\s"\'<>()]+\?[^\s"\'<>()]+', bundle)
+def _candidate_urls(routes, bundle, origin=""):
+    """URL-ish strings to inspect: the discovered routes (paths the app itself navigated to), plus query-
+    bearing URLs from the served client content. Absolute URLs are kept ONLY when they point at the graded
+    origin: a token in a THIRD party's URL (a Loom embed id, a Mapbox API call) is their parameter, not this
+    app's session, and the two v24 fires were exactly that (a `sid` on loom.com — which reached the routes
+    list through discovery recording an external embed — and an `access_token` on api.mapbox.com)."""
+    origin_host = urllib.parse.urlparse(origin).netloc.lower().removeprefix("www.") if origin else None
+
+    def _own(u):
+        if "://" not in u:
+            return True                          # a relative URL: the app's own by construction
+        try:
+            host = urllib.parse.urlparse(u).netloc.lower().removeprefix("www.")
+        except ValueError:
+            return False
+        return bool(origin_host) and host == origin_host
+
+    urls = [u for u in routes if _own(u)]
+    for m in re.findall(r'[^\s"\'<>()]+\?[^\s"\'<>()]+', bundle):
+        if _own(m):
+            urls.append(m)                       # an absolute URL back at THIS app: its own session surface
     return list(dict.fromkeys(urls))[:400]
 
 
@@ -4852,7 +4871,7 @@ def session_token_in_url(ctx, probe) -> bool | None:
     bundle = ""
     with contextlib.suppress(Exception):
         bundle = _client_bundle(ctx)
-    urls = _candidate_urls(routes, bundle)
+    urls = _candidate_urls(routes, bundle, ctx.base_url)
     if not urls:
         return None
     hit = _url_session_token(urls)

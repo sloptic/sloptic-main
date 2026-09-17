@@ -56,7 +56,7 @@ def test_probe_reads_routes_and_masks_the_value(monkeypatch):
     class P:
         routes = [f"/dashboard?access_token={_JWT}", "/", "/about"]
     class Ctx:
-        profile = P(); evidence = {}
+        profile = P(); evidence = {}; base_url = "https://app.test"
     monkeypatch.setattr(probes, "_client_bundle", lambda ctx: "")
     ctx = Ctx()
     assert probes.session_token_in_url(ctx, None) is True
@@ -68,7 +68,7 @@ def test_clean_when_no_token_in_any_url(monkeypatch):
     class P:
         routes = ["/", "/about", "/pricing?ref=twitter"]
     class Ctx:
-        profile = P(); evidence = {}
+        profile = P(); evidence = {}; base_url = "https://app.test"
     monkeypatch.setattr(probes, "_client_bundle", lambda ctx: '<a href="/login">in</a>')
     assert probes.session_token_in_url(Ctx(), None) is False
 
@@ -76,3 +76,28 @@ def test_clean_when_no_token_in_any_url(monkeypatch):
 def test_session_family_is_active_only():
     from sloptic import safety
     assert not safety.is_passive("sec-session-006")     # the session family is categorically active
+
+
+# ── the two v24 false positives, pinned ─────────────────────────────────────────────────────────────────
+def test_a_third_party_embed_id_is_not_this_apps_session():
+    """The v24 FP: a Loom embed's `sid` parameter was read as a session token. A token in a THIRD party's
+    URL is their parameter; only the graded origin's own URLs are this app's session surface."""
+    loom = "https://www.loom.com/embed/624021c60ce7480c89201e73dd59da81?sid=3995a3f1d15e4b8fa2c30b7d"
+    assert probes._candidate_urls([loom], loom, "https://alto-sigma.vercel.app") == []
+
+
+def test_a_publishable_mapbox_token_is_public_by_design():
+    """The other v24 FP: a Mapbox `access_token=pk.eyJ...` in an api.mapbox.com URL template. Publishable
+    keys ship to the browser on purpose — the same exclusion secretscan gives Firebase AIza."""
+    mb = "https://api.mapbox.com/search/searchbox/v1/retrieve/${k}?access_token=pk.eyJ1IjoiYWJjIn0.9wX"
+    assert probes._candidate_urls([mb], mb, "https://saferoute-chi.vercel.app") == []
+    # and the value rule holds even without the origin filter (a pk. token is public anywhere):
+    assert probes._url_session_token([mb]) is None
+
+
+def test_an_absolute_url_back_at_the_own_origin_still_fires():
+    """Recall twin: the leak class is the app's OWN session in its OWN URLs, including absolute self-links
+    the bundle builds."""
+    own = "https://app.test/dashboard?access_token=" + _JWT
+    assert probes._url_session_token([own]) is not None
+    assert probes._candidate_urls([], own, "https://app.test") == [own]
