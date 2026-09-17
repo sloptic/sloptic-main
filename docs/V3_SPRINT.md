@@ -128,6 +128,16 @@ Fixes. These reclassify or remove rather than fire, so they do not need the disc
   gate either run, but it must precede the re-pricing pass so pricing sees four axes rather than three.
 - **FP backlog**: base44 endpoint attribution, secretscan recall (overlaps item 1 above), perf-load-001's edge
   gate, and dead-controls plus http-correctness, never audited on their own merits.
+- **LANDED 2026-09-17, from the v24 NEW-PROBE audit + the 12.5 shell cluster:**
+  `sec-session-006` filters candidate URLs to the graded origin (both v24 fires were third-party params: a
+  Loom `sid`, a Mapbox `access_token`) and excludes `pk.` publishable keys; `qa-scaffold-001` requires 2+
+  DISTINCT bracket placeholders (backtrack-ten's single `[Your Name]` was deliberate example copy); the 404
+  gate's platform signatures landed in `_dead_shell_reason` — Netlify "No Server Found", GitHub Pages
+  "There isn't a GitHub Pages site here", and the untouched Vite starter, all served at HTTP 200. **The 12.5
+  cluster decomposed on inspection: envi-seven is a REAL one-page app and stays graded** — the assumption
+  that all five were shells died when fetched. Remaining 404-gate work: title-only shells (idea-forge) need
+  the render layer.
+
 - **LANDED 2026-09-17, from the v24 injection audit (classics at 55% precision: 5 real / 6 false):**
   sqli boolean gets a negative control (FALSE must collapse onto the benign baseline) plus an SSE
   generator-stream skip (`8aab72b`); csrf treats a cross-host redirect as a bounce and records the
