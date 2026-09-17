@@ -599,8 +599,8 @@ def _reproduces(send, signal) -> bool:
     return bool(signal(send()))
 
 
-def _tech_boolean(c, method, reqfn) -> bool:
-    """Strict boolean-blind, gated THREE ways against the AI-corpus confounds — a content-reflective search or
+def _tech_boolean(c, method, reqfn, benign=None) -> bool:
+    """Strict boolean-blind, gated FOUR ways against the AI-corpus confounds — a content-reflective search or
     an LLM in the response path can fake a true/false split, and both did on v18 (0/2 scored boolean fires were
     real). (1) NOISE FLOOR: two DIFFERENT inert benign values; if THEY already diverge the output is content-
     driven (an LLM/TTS/proxy varies with the input) -> suppress (error-based still runs). (2) DETERMINISM: the
@@ -609,14 +609,22 @@ def _tech_boolean(c, method, reqfn) -> bool:
     not a boolean, and the old 'reproduce on a second pair' passed because ANY two LLM outputs differ. (3)
     DIRECTIONAL SPLIT: TRUE (OR 1=1, every row) must DOMINATE FALSE (OR 1=2, a subset), reproduced on a second
     pair — roadio's geocoder returned a different-sized place per string (FALSE > TRUE, the wrong direction) and
-    tripped the old symmetric divergence. This is the differential-control form of the causal-specificity
-    invariant above; the three gates together are what a content-reflective endpoint cannot fake."""
+    tripped the old symmetric divergence. (4) NEGATIVE CONTROL: FALSE must MATCH the benign baseline. `1' OR
+    '1'='2' --` is semantically inert — the OR clause is false and the comment eats the tail, so for a genuinely
+    injectable parameter it reduces to the benign query and answers with the SAME result set; a FALSE response
+    that stands on its own means the app is treating the raw string as content, not as SQL (the v24 corpus FP:
+    a flaky edge cache let a search endpoint pass gates 1-3 once, and an LLM paper-search streamed three
+    arbitrary sizes). This is the differential-control form of the causal-specificity invariant above; the four
+    gates together are what a content-reflective endpoint cannot fake."""
     if _diverges(_do(c, method, reqfn(_SQLI_NOISE_A)), _do(c, method, reqfn(_SQLI_NOISE_B))):
         return False   # (1) content-reflective endpoint -> the differential oracle is confounded
     true1 = _do(c, method, reqfn(_SQLI_TRUE))
     if _diverges(true1, _do(c, method, reqfn(_SQLI_TRUE))):
         return False   # (2) identical requests already diverge -> generative/LLM endpoint, not a SQL result set
-    if not _boolean_split(true1, _do(c, method, reqfn(_SQLI_FALSE))):
+    false1 = _do(c, method, reqfn(_SQLI_FALSE))
+    if benign is not None and _diverges(false1, benign):
+        return False   # (4) the negative control: FALSE must collapse onto the benign result set
+    if not _boolean_split(true1, false1):
         return False   # (3) TRUE must select a SUPERSET of FALSE, not merely differ in size (rejects the geocoder)
     return _boolean_split(_do(c, method, reqfn(_SQLI_TRUE)), _do(c, method, reqfn(_SQLI_FALSE)))  # reproduce the split
 
@@ -696,6 +704,11 @@ def api_sqli(ctx, probe) -> bool | None:
                 continue  # proxies a third-party API -> latency/output track the upstream, not a DB (confounded)
             if not _endpoint_is_live(ctx, c, ep.raw_path, method, base):
                 continue  # phantom endpoint (root or per-prefix catch-all shell) -> not a real SQL sink
+            ct = (base.headers.get("content-type") or "").lower()
+            if "text/event-stream" in ct or base.text.lstrip()[:6] == "data:":
+                continue  # a GENERATOR stream (an LLM answering over SSE) is content-driven by definition:
+                          # every content differential is generation variance, not a SQL oracle (the cognify
+                          # v24 FP streamed three arbitrary sizes for benign/true/false at 90 points)
             eps_tested.append(ep.raw_path)
             if budget <= 0:
                 break
@@ -709,11 +722,11 @@ def api_sqli(ctx, probe) -> bool | None:
                 tested = True
                 slots_tested += len(slots)
 
-                def _sqli_send(slot, ep=ep, method=method):
+                def _sqli_send(slot, ep=ep, method=method, benign=base):
                     reqfn = lambda v: _sqli_request(ep, slot, v)
                     try:
                         err, err_pay = _tech_error(c, method, reqfn)
-                        if err or _tech_boolean(c, method, reqfn):
+                        if err or _tech_boolean(c, method, reqfn, benign=benign):
                             return slot, {"via": "error" if err else "boolean", "err": err,
                                           "pay": err_pay if err else _SQLI_TRUE, "reqfn": reqfn,
                                           "method": method, "path": ep.raw_path}
