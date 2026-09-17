@@ -72,3 +72,19 @@ def test_na_when_no_linked_html_reachable():
 def test_it_is_passive():
     from sloptic import safety
     assert safety.is_passive("qa-scaffold-001")          # a normal visitor GET of the app's own linked pages
+
+
+def test_a_single_bracket_placeholder_in_example_copy_does_not_fire():
+    """The backtrack-ten v24 FP: 'your guardians get an alert: "[Your Name] is slouching!"' is DELIBERATE
+    product copy — an example message showing what the alert looks like. One placeholder is example copy;
+    only an UNFILLED TEMPLATE shows several distinct ones."""
+    ctx = _Ctx({"/": _page('<h1>PostureGuard</h1><p>Your guardians get an alert: "[Your Name] is '
+                           'slouching!" Sit up straight!</p>')})
+    assert probes.scaffold_content_on_route(ctx, None) is False
+
+
+def test_multiple_distinct_placeholders_on_one_page_fire():
+    """Recall twin: an unfilled template shows many placeholders at once."""
+    ctx = _Ctx({"/": _page("<p>[Your Name]</p><p>[Company Name]</p><p>[Product Name]</p>")})
+    r = probes.scaffold_content_on_route(ctx, None)
+    assert r is True and "unfilled placeholders" in ctx.evidence["artifact"]

@@ -4804,8 +4804,13 @@ def _candidate_urls(routes, bundle, origin=""):
 # template defaults must CO-OCCUR (a lone "Feature One" heading is not enough) to stay clear of real copy.
 _SCAFFOLD_ARTIFACT = re.compile(
     r"lorem ipsum dolor|as an ai language model|as a large language model|i cannot fulfill that|"
-    r"i'?m sorry,? but i can'?t|\[your name\]|\[your company\]|\[company name\]|\byour name here\b|"
-    r"your company name here|yourname@example\.com|replace this with your|\blorem ipsum\b", re.I)
+    r"i'?m sorry,? but i can'?t|\byour name here\b|your company name here|yourname@example\.com|"
+    r"replace this with your|\blorem ipsum\b", re.I)
+# A SINGLE bracket placeholder is NOT evidence: backtrack-ten's v24 fire was deliberate product copy
+# ("your guardians get an alert: '[Your Name] is slouching!'" — an example message showing what the alert
+# looks like). An UNFILLED TEMPLATE shows many of them, so require 2+ DISTINCT placeholders on one page.
+_SCAFFOLD_BRACKETS = re.compile(r"\[your name\]|\[your company\]|\[company name\]|\[insert[^\]]{0,30}\]"
+                                r"|\[product name\]|\[date\]", re.I)
 _SCAFFOLD_PAIRS = (
     (re.compile(r"\bfeature one\b", re.I), re.compile(r"\bfeature two\b", re.I)),
     (re.compile(r"\bcard title\b", re.I), re.compile(r"\bcard description\b", re.I)),
@@ -4827,6 +4832,9 @@ def _scaffold_hit(text: str) -> str | None:
     m = _SCAFFOLD_ARTIFACT.search(text)
     if m:
         return m.group(0).strip().lower()
+    brackets = {b.group(0).lower() for b in _SCAFFOLD_BRACKETS.finditer(text)}
+    if len(brackets) >= 2:
+        return "unfilled placeholders: " + ", ".join(sorted(brackets)[:3])
     for a, b in _SCAFFOLD_PAIRS:
         if a.search(text) and b.search(text):
             return a.pattern.strip("\\b")

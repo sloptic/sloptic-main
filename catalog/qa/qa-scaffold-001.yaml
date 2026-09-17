@@ -14,6 +14,8 @@ applicability:
 probe:
   predicate: scaffold_content_on_route
   # Fetch each linked route, extract visible text (script/style dropped, tags stripped), and match a strict
-  # deny-list of generator artifacts: lorem ipsum, an LLM's own meta-text, bracket placeholders, and template
-  # defaults (Feature One + Feature Two must co-occur). Never a completeness judgment. N/A when no linked HTML
-  # page was reachable to read.
+  # deny-list of generator artifacts: lorem ipsum, an LLM's own meta-text, and template defaults (Feature One
+  # + Feature Two must co-occur). Bracket placeholders ([Your Name], [Company Name]...) fire only when TWO OR
+  # MORE DISTINCT ones appear on one page: a single one is often deliberate example copy ("[Your Name] is
+  # slouching!" — the backtrack-ten v24 FP). Never a completeness judgment. N/A when no linked HTML page was
+  # reachable to read.
