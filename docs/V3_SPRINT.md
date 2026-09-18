@@ -138,6 +138,13 @@ Fixes. These reclassify or remove rather than fire, so they do not need the disc
   a missing viewport, not marketing). Total-preserving by construction (the damper groups by category, not
   bundle), so it needs no re-grade, verified on the reference app and locked by a dedicated test.** With that,
   every pre-repricing mechanism is in and the re-pricing pass is unblocked — it now prices four axes, not three.
+- **a11y RE-PRICED 2026-09-18: KEPT at 20/12/7/3 (Ian, locked).** The v11 calibration holds post-promotion
+  (critical = half the security ceiling; a11y is the smallest axis at ~18%, decorrelated at 0.18), so the
+  tiers do not change. Two non-score-moving fixes landed alongside: the report-card evidence line now names
+  the failing rules/impacts (`0c9e940`), and the off-score advisory set is persisted on CLEAN a11y outcomes
+  (`28698e1`) so the final run can measure whether any advisory rule (target-size the only real-barrier
+  candidate) earns promotion. The v3.1 probe candidates (DB connection string in the bundle, Neon Data API
+  RLS generalization, Svelte fingerprint) are logged to memory, deferred so v3.0's discovery run stays valid.
 - **FP backlog** — AUDITED 2026-09-17, each on its own merits against the v24 fires. Only ONE was a real
   actionable FP:
   - **base44 endpoint attribution — REAL FP, FIXED (`5c67dee`).** 4 base44 apps carried 131-221 phantom
