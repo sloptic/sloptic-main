@@ -89,3 +89,28 @@ def test_html_is_self_contained(monkeypatch):
     h = rc.to_html(card)
     assert '<div class="rc">' in h and "Expected" in h
     assert "<html" not in h.lower() and "http-equiv" not in h.lower()       # body only, no external refs
+
+
+def test_actual_line_surfaces_list_and_dict_evidence_and_hides_noise():
+    """The 'what we saw' line names the SPECIFIC failing detail: an a11y finding must list its failed rules
+    and impact counts (previously dropped because they are list/dict), and must NOT leak internal scoring
+    noise (penalty_override), the off-score advisory set, the repro request, or the tool-version stamp."""
+    a11y = {"probe_id": "qa-a11y-001", "target": "/", "targets": ["/"], "penalty": 20, "reason": "a11y",
+            "bundle": "accessibility", "category": "accessibility",
+            "evidence": {"violations": 3, "rules": ["color-contrast", "button-name", "image-alt"],
+                         "impacts": {"critical": 2, "serious": 1}, "contrast_shortfall": 0.42,
+                         "engine": "axe-core", "penalty_override": 20.0,
+                         "advisory_a11y": {"rules": ["region"], "impacts": {"moderate": 1}},
+                         "repro": {"method": "GET", "url": "https://x"}, "versions": {"lighthouse": "13.4.1"}}}
+    line = rc._actual(a11y)
+    assert "color-contrast" in line and "button-name" in line          # the failing rules are named
+    assert "critical=2" in line and "serious=1" in line                # impact counts surfaced
+    assert "contrast_shortfall = 0.42" in line
+    for noise in ("penalty_override", "advisory_a11y", "region", "lighthouse", "GET"):
+        assert noise not in line, f"{noise!r} is internal/off-score noise and must not render"
+
+
+def test_actual_line_truncates_long_lists():
+    f = {"probe_id": "p", "evidence": {"rules": [f"r{i}" for i in range(12)]}}
+    line = rc._actual(f)
+    assert "+4 more" in line                                            # 8 shown + "+4 more"

@@ -383,10 +383,33 @@ def _pool_map(catalog_root: str | pathlib.Path) -> dict[str, str]:
         return {}
 
 
+# Evidence keys kept OUT of the "what we saw" line: internal scoring detail (the raw penalty override), the
+# off-score advisory set, the reproduction request (rendered as its own repro block), and the tool-version
+# stamp. Everything else -- INCLUDING lists and shallow dicts -- is surfaced.
+_ACTUAL_SKIP = frozenset({"engine", "penalty_override", "report_only", "advisory_a11y", "repro", "versions",
+                          "na_reason"})
+
+
 def _actual(finding: dict) -> str:
-    """A plain-language 'what we saw' line from the finding evidence + where it fired."""
+    """A plain-language 'what we saw' line from the finding evidence + where it fired. Lists and shallow dicts
+    are rendered, not dropped: for many probes they ARE the specific 'what to fix' -- the failing a11y `rules`
+    and their `impacts` counts, the inert-control `labels`, the exposed backend host lists, the perf `metrics`
+    table. Previously only scalars showed, so an a11y finding read `violations = 3; penalty_override = 20`
+    without ever naming color-contrast or button-name."""
     ev = finding.get("evidence") or {}
-    parts = [f"{k} = {v}" for k, v in ev.items() if k not in ("engine",) and not isinstance(v, (dict, list))]
+    parts = []
+    for k, v in ev.items():
+        if k in _ACTUAL_SKIP or v is None or v == [] or v == {}:
+            continue
+        if isinstance(v, list):
+            shown = ", ".join(str(x) for x in v[:8])
+            parts.append(f"{k}: {shown}" + (f", +{len(v) - 8} more" if len(v) > 8 else ""))
+        elif isinstance(v, dict):
+            inner = ", ".join(f"{kk}={vv}" for kk, vv in v.items() if not isinstance(vv, (dict, list)))
+            if inner:
+                parts.append(f"{k}: {inner}")
+        else:
+            parts.append(f"{k} = {v}")
     detail = "; ".join(parts) if parts else finding.get("reason", "")
     targets = finding.get("targets") or ([finding["target"]] if finding.get("target") else [])
     where = f"  (seen on: {', '.join(str(t) for t in targets[:5])})" if targets else ""
