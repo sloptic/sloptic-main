@@ -8,8 +8,10 @@ so multiple vulnerable endpoints cost more than one but less than linearly.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import inspect
 import os
+import threading
 import time
 from dataclasses import dataclass, field, replace
 
@@ -316,6 +318,56 @@ def _severity_penalty(sev: Severity, ev: dict) -> int:
     return int(min(hi, max(lo, point)))
 
 
+_PROBE_DEADLINE_S = float(os.environ.get("SLOPTIC_PROBE_TIMEOUT", "120"))
+# One probe's wall clock. The v24 discovery run attributed 107 of its 120 timeouts to a SINGLE probe hanging
+# (after 54-88 of 106 had already run fine) and eating the whole 900s budget, DNF-ing a grade that was 80%
+# done. 120s is ~20x a normal probe (whole-battery p95 is 573s over ~106 probes) and env-tunable; a catalog
+# probe may set its own `max_seconds`.
+
+
+def _probe_deadline(probe: Probe) -> float:
+    v = probe.probe.get("max_seconds") if probe.probe else None
+    try:
+        return float(v) if v is not None else _PROBE_DEADLINE_S
+    except (TypeError, ValueError):
+        return _PROBE_DEADLINE_S
+
+
+def _run_bounded(thunk, timeout_s: float):
+    """Run `thunk()` in a daemon thread; return `(result, hung)`.
+
+    This is the GIL-honest per-probe deadline. A hang that is waiting on a SOCKET (an httpx read, a
+    Playwright sync call blocked on the browser) has RELEASED the GIL, so the abandoned thread just stays
+    parked there while the grade continues — one slow probe costs its 120s slice instead of the whole grade,
+    and the probe lands in blocked_probes for the retry pass to recover. A hang that genuinely pins the GIL
+    still wedges the process (the parent's 900s SIGKILL remains the backstop, exactly as before) — this never
+    makes anything worse.
+
+    The thread runs inside a COPY of the submitting context, captured on the caller's thread: the probe's
+    tally, request cap, challenge-onset recorder, trace probe id and egress scope all live in ContextVars,
+    and a fresh thread would read their defaults (the same blindness the fan-out pools had). The copy also
+    flows into any fan-out the probe itself spawns.
+
+    `result is None` with hung=False means the thunk returned None or raised (callers convert to N/A, exactly
+    like the loop's old except)."""
+    box: list = []
+    done = threading.Event()
+    ctx_run = contextvars.copy_context().run
+
+    def _target():
+        try:
+            box.append(ctx_run(thunk))
+        except BaseException:                  # mirrors the loop's old per-probe except; never re-raise here
+            pass
+        finally:
+            done.set()
+
+    threading.Thread(target=_target, daemon=True, name="hl-bounded-probe").start()
+    if done.wait(timeout_s):
+        return (box[0] if box else None), False
+    return None, True                          # abandoned: the daemon thread dies with the process
+
+
 def _run_probe(probe: Probe, ctx: _Ctx, client: httpx.Client, profile: Profile) -> list[Outcome]:
     """Resolve one probe to its outcome(s): applicability gate, then an oracle predicate or a
     declarative fan-out across discovered targets. One Outcome per (probe x target)."""
@@ -581,18 +633,33 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
             # grade's score is order-independent, so this never perturbs a clean grade.
             catalog = sorted(catalog, key=lambda p: safety.order_weight(p.id))
             cat_index = {p.id: i for i, p in enumerate(catalog)}
+            hung_probes: list[str] = []
             for i, probe in enumerate(catalog):
                 set_trace_probe(probe.id)                      # tag every request (for --trace AND the always-on
                 #                                                challenge-onset watch); cheap ContextVar set
                 if on_progress:
                     on_progress(i, total, probe, None)              # starting probe i (0-indexed)
-                try:
-                    probe_outcomes = _run_probe(probe, ctx, client, profile)
-                except Exception:   # a single probe must NEVER DNF the whole grade: run() accumulates outcomes
-                    # and only commits them at the end, so one uncaught edge case (e.g. a multipart repro's
-                    # RequestNotRead — a StreamError, not an httpx.HTTPError, so the declarative fetch guard
-                    # misses it) would abort the loop and discard EVERY finding (179/1043 apps DNF'd this way).
-                    # Degrade the one probe to N/A; the suite is the backstop for a probe that ALWAYS raises.
+
+                def _thunk(probe=probe):
+                    # a single probe must NEVER DNF the whole grade: run() accumulates outcomes and only
+                    # commits them at the end, so one uncaught edge case would abort the loop and discard
+                    # EVERY finding (179/1043 apps DNF'd that way). Degrade the one probe to N/A.
+                    try:
+                        return _run_probe(probe, ctx, client, profile)
+                    except Exception:
+                        return [_outcome(probe, "not_applicable", 0, probe.probe.get("target", ""))]
+
+                if "browser" in probe.applicability.requires:
+                    probe_outcomes = _thunk()   # INLINE: Playwright's sync API is thread-affine (greenlets
+                    hung = False                # bind to the creating thread), so a browser probe moved to a
+                else:                           # fresh thread breaks it — the crawler-wedge lesson. The v24
+                    probe_outcomes, hung = _run_bounded(_thunk, _probe_deadline(probe))
+                if hung:
+                    # the probe blew its own wall clock: record it BLOCKED, not clean — it lands on the record
+                    # (so the audit sees it) and in blocked_probes, where the post-run retry pass recovers it
+                    hung_probes.append(probe.id)
+                    probe_outcomes = []
+                if probe_outcomes is None:
                     probe_outcomes = [_outcome(probe, "not_applicable", 0, probe.probe.get("target", ""))]
                 outcomes.extend(probe_outcomes)
                 if on_progress:
@@ -610,6 +677,10 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
                     end_challenged = False
             else:
                 end_challenged = False
+            if hung_probes:   # probes that blew their own wall clock: blocked, so the retry pass recovers them
+                blocked_probes = sorted(set(blocked_probes) | set(hung_probes))
+                incomplete_axes = sorted(set(incomplete_axes)
+                                         | {p.bundle for p in catalog if p.id in set(hung_probes)})
             req_counts = request_counts() or {}
         if source_dir:   # static source scan (submission zip / --source DIR); absent for a bare --target
             outcomes.append(_source_secret_outcome(source_dir))
