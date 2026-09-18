@@ -446,7 +446,7 @@ def build_card(record: dict, catalog_root: str | pathlib.Path | None = None, org
         return {"url": url, "project": record.get("project"), "dnf": True,
                 "page_state": (record.get("coverage_audit") or {}).get("page_state"),
                 "slop_score": None, "sections": [], "hidden": {"count": 0, "penalty": 0},
-                "passed": [], "cov": record.get("coverage") or {}}
+                "passed": [], "cov": record.get("coverage") or {}, "ruler": record.get("ruler")}
 
     public, hidden = [], []
     for f in findings:
@@ -473,10 +473,25 @@ def build_card(record: dict, catalog_root: str | pathlib.Path | None = None, org
     return {"url": url, "project": record.get("project"), "dnf": False,
             "slop_score": record.get("slop_score"), "axis_slop": record.get("axis_slop") or {},
             "sections": sections, "hidden": hidden_block, "passed": passed_cats, "cov": cov,
-            "winner": record.get("winner")}
+            "winner": record.get("winner"),
+            # the frozen reference this grade's score is quoted against, read from the RECORD (never the current
+            # curve): a stored grade carries the ruler it was produced under, a legacy record predating the
+            # stamp carries None -> the renderer labels it legacy rather than silently reading it as current.
+            "ruler": record.get("ruler")}
 
 
 # ---- renderers -------------------------------------------------------------------------------------
+
+def _ruler_label(card: dict) -> str:
+    """A human label for the frozen reference this grade was produced under. A record predating the stamp has
+    no ruler, and says so, so it is never read as the current one -- the whole point of stamping it."""
+    r = card.get("ruler")
+    if not r:
+        return "Ruler unspecified — this grade predates ruler labeling; not comparable to a current score"
+    if isinstance(r, dict):
+        return "Ruler " + " · ".join(str(v) for v in (r.get("full"), r.get("passive")) if v)
+    return f"Ruler {r}"
+
 
 def to_markdown(card: dict) -> str:
     """Portable markdown rendering of a report card."""
@@ -487,11 +502,13 @@ def to_markdown(card: dict) -> str:
     if card.get("dnf"):
         L.append(f"**Not scored — graded non-functional (`{card.get('page_state')}`).** "
                  "The app didn't present a working surface to test. Get it serving a functional page, then re-grade.")
+        L.append(f"\n_{_ruler_label(card)}_")
         return "\n".join(L)
 
     L.append(f"**Slop score: {card['slop_score']}**  (lower is better — deduction-only)")
     if card.get("axis_slop"):
         L.append("  ·  " + "  ·  ".join(f"{k}: {v}" for k, v in card["axis_slop"].items()))
+    L.append(f"\n_{_ruler_label(card)}_")
     cov = card.get("cov") or {}
     if cov:
         n_fail = sum(len(s["entries"]) for s in card["sections"]) + card["hidden"]["count"]
@@ -555,13 +572,15 @@ def to_html(card: dict) -> str:
     .passed{background:var(--card);border:1px solid var(--line);border-left:3px solid var(--good);border-radius:8px;padding:12px 16px;font-size:14px}
     .hidden{background:var(--card);border:1px dashed var(--line);border-radius:8px;padding:14px 16px;font-size:14px;color:var(--muted)}
     .dnf{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:18px;font-size:15px}
+    .ruler{color:var(--muted);font-size:12px;margin:8px 0 2px;font-style:italic}
     </style>"""
     out = [css, '<div class="rc">', f"<h1>Durability Report Card</h1>",
            f'<div class="url">{e(card["url"])}</div>']
     if card.get("dnf"):
         out.append(f'<div class="dnf"><b>Not scored — graded non-functional '
                    f'({e(str(card.get("page_state")))}).</b> The app didn\'t present a working surface to test. '
-                   "Get it serving a functional page, then re-grade.</div></div>")
+                   "Get it serving a functional page, then re-grade.</div>")
+        out.append(f'<div class="ruler">{e(_ruler_label(card))}</div></div>')
         return "".join(out)
 
     out.append(f'<div class="score">{e(str(card["slop_score"]))}<span style="font-size:15px;color:var(--muted);font-weight:400"> slop · lower is better</span></div>')
@@ -572,6 +591,7 @@ def to_html(card: dict) -> str:
         n_fail = sum(len(s["entries"]) for s in card["sections"]) + card["hidden"]["count"]
         out.append(f'<div class="cov">{e(str(cov.get("probes_applicable","?")))} durability checks applied · '
                    f'{n_fail} flagged · {max(cov.get("probes_applicable",0)-n_fail,0)} passed</div>')
+    out.append(f'<div class="ruler">{e(_ruler_label(card))}</div>')
 
     def block(entry):
         return (f'<div class="f"><div class="t"><span>{e(entry["title"])}</span>'

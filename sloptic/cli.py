@@ -18,6 +18,7 @@ from dataclasses import asdict
 
 from . import browser, egress, runcache, safety
 from .aggregate import CATEGORY_DECAY, contributions
+from .ruler import ruler
 from .catalog import ProbeSelectionError, default_catalog_dir, load_catalog, select_probes
 from .deploy import DockerDeployer, RemoteDeployer, SubprocessDeployer
 from .ingest import SubmissionError, extract_submission
@@ -55,7 +56,9 @@ def _grade_record(report, source: str) -> dict:
            "platform": report.platform, "bot_challenge": report.bot_challenge,
            "challenge_stage": report.challenge_stage, "challenge_onset": report.challenge_onset,
            "request_counts": report.request_counts, "blocked_probes": report.blocked_probes,
-           "incomplete_axes": report.incomplete_axes, "findings": findings}
+           "incomplete_axes": report.incomplete_axes, "findings": findings,
+           "ruler": ruler()}   # the frozen reference this grade is interpreted against, so a stored card never
+    #                            reads as current after the ruler moves (see sloptic.ruler)
     # v2.0 Family 2: carry the OFF-SCORE a11y advisory candidates even when a11y is CLEAN (so not in `findings`).
     # The decorrelated apps are exactly the ones clean on the scored a11y carrier but failing an advisory rule,
     # so the re-grade needs their advisory data to measure decorrelation before promoting any of it to the score.

@@ -48,6 +48,7 @@ from sloptic.scope import off_target  # noqa: E402
 from sloptic.aggregate import CATEGORY_DECAY, _damped_total, contributions  # noqa: E402
 from sloptic.catalog import load_catalog, select_probes  # noqa: E402
 from sloptic import provenance  # noqa: E402
+from sloptic.ruler import ruler  # noqa: E402
 from sloptic.deploy import RemoteDeployer  # noqa: E402
 from sloptic.pipeline import run  # noqa: E402
 from sloptic.schema import profile_from_dict, profile_to_dict  # noqa: E402
@@ -1447,6 +1448,8 @@ def main():
         "concurrency": os.environ.get("HL_CONCURRENCY"),   # set by run_batch; None for a standalone grade
     })
     result = {"contract_version": provenance.CONTRACT_VERSION,   # absent on older rows, and absence means 1
+              "ruler": ruler(),   # the frozen reference this grade is interpreted against (sloptic.ruler): a
+              #                      stored card never reads as current after the ruler moves at a release
               "repo": args.repo, "deployed": False, "attempts_used": 0, "browser": args.browser,
               **({"probe_filter": probe_filter} if probe_filter else {}),
               "source": "url" if args.url_ingest else "repo", "model": args.model, "ts": time.time(),
