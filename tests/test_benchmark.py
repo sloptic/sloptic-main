@@ -16,7 +16,8 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
 import pytest  # noqa: E402
 from benchmark import (  # noqa: E402
-    _axis_applicable, _band, _catalog_index, _key, _percentile_of, _probe_set, _slop_potential, build, rank)
+    _axis_applicable, _band, _catalog_index, _key, _normalized, _percentile_of, _perf_norm_params, _probe_set,
+    _slop_potential, build, rank)
 
 
 def _app(slop, security=0, qa=0, perf=0, applied=None, findings=None, **kw):
@@ -216,3 +217,46 @@ def test_rank_uses_the_exact_fractional_score_not_its_integer_floor():
     res = rank(curve, 21.6, _graded(102, 21.6))
     assert res["percentile"] == 25          # exactly one of four (21.4) is cleaner
     assert res["cleaner_than_pct"] == 75     # the int(21.6)=21 bug would read 0 / 100
+
+
+# --- perf normalization for host-CPU contention (docs/PERF_NORMALIZATION.md) ------------------------------
+
+def _bi(slop, bi, perf=0, **kw):
+    """An app carrying a Lighthouse benchmark_index, for the normalization tests."""
+    return _app(slop, perf=perf, observed_surface={"lighthouse": {"benchmark_index": bi}}, **kw)
+
+
+def test_normalized_adds_perf_slop_for_a_faster_box_and_is_one_sided():
+    params = {"k": 0.013, "bi_ref": 1437, "bi_cap": 600.0}
+    fast = _normalized(_bi(15, 1764, perf=5), params)      # 327 over ref -> +0.013*327 = +4.3
+    assert fast["axis_slop"]["performance"] == 9.3 and fast["slop_score"] == 19.3
+    assert _normalized(_bi(15, 1437, perf=5), params)["slop_score"] == 15      # at ref -> no-op
+    assert _normalized(_bi(15, 1200, perf=5), params)["slop_score"] == 15      # slower -> no-op (one-sided)
+    assert _normalized(_app(15, perf=5), params)["slop_score"] == 15           # no benchmark_index -> no-op
+    # the cap bounds the correction
+    capped = _normalized(_bi(15, 5000, perf=5), params)
+    assert capped["slop_score"] == round(15 + 0.013 * 600.0, 1)
+
+
+def test_build_freezes_perf_norm_only_when_benchmark_index_is_present():
+    plain = build(_corpus(), "t", "s")                     # the corpus rows carry no benchmark_index
+    assert "perf_norm" not in plain                        # -> inert, ranks un-normalized (the 2026.3 case)
+    withbi = build([_bi(s, 1400 + s, perf=s // 4) for s in range(10, 210, 2)], "t", "s")
+    assert withbi["perf_norm"]["k"] == 0.013 and withbi["perf_norm"]["bi_ref"] > 0
+
+
+def test_rank_against_a_curve_without_perf_norm_is_unchanged():
+    # the coherence guarantee: the frozen 2026.3 curve has no perf_norm, so a grade ranks exactly as before.
+    curve = build(_corpus(), "t", "s")
+    app = _bi(40, 1764, perf=20, security=20)               # even a fast-box grade is untouched here
+    before = rank(curve, app["slop_score"], app)
+    assert before["slop"] == 40                             # score NOT normalized against a params-less curve
+
+
+def test_rank_against_a_perf_norm_curve_corrects_a_fast_box_grade():
+    curve = build([_bi(s, 1437, perf=s // 4, security=s // 3) for s in range(10, 210, 2)], "t", "s")
+    assert "perf_norm" in curve
+    fast = _bi(40, 1900, perf=20, security=20)              # graded on a much faster box than the curve's ref
+    out = rank(curve, fast["slop_score"], fast)
+    assert out["slop"] > 40                                 # slop added back -> worse, not the raw 40
+    assert out["axes"]["performance"]["slop"] > 20          # the perf axis specifically is corrected

@@ -208,6 +208,50 @@ def _max_penalty(record: dict) -> float:
     return max((f.get("penalty") or 0 for f in record.get("findings") or []), default=0)
 
 
+# --- perf normalization for host-CPU contention (see docs/PERF_NORMALIZATION.md) --------------------------
+# Perf is the one axis that measures TIME, so a grade on a faster/idler box under-reports perf slop. benchmark_index
+# is Lighthouse's CPU-speed reading; a grade above the reference speed had it too easy and gets slop added back.
+# k is a CONSTANT fit from the v25 A/B in SLOP space (same apps at conc 1 vs 4); bi_ref is the reference contention
+# condition, computed per curve as the population's median benchmark_index and frozen INTO the curve. A curve with
+# no perf_norm (a pre-instrumentation corpus, or the frozen 2026.3) ranks un-normalized -> this is inert until a
+# curve carries params, which is why it is coherent to land before the freeze.
+_PERF_NORM_K = 0.013        # perf slop added back per benchmark_index unit above bi_ref (v25 A/B, slop-space)
+_PERF_NORM_CAP = 600.0      # cap the correction (~8 slop pts) so a wildly-fast box can't over-penalize
+
+
+def _bi_of(record: dict):
+    return ((record.get("observed_surface") or {}).get("lighthouse") or {}).get("benchmark_index")
+
+
+def _perf_norm_params(rows: list):
+    """The normalization params to freeze into a curve: k+cap are constants, bi_ref is this population's median
+    benchmark_index (its contention condition). None when no row carries benchmark_index (a pre-instrumentation
+    corpus) -> the curve gets no params and ranks un-normalized."""
+    bis = sorted(b for r in rows if (b := _bi_of(r)) is not None)
+    if not bis:
+        return None
+    return {"k": _PERF_NORM_K, "bi_ref": round(statistics.median(bis), 1), "bi_cap": _PERF_NORM_CAP}
+
+
+def _normalized(record: dict, params) -> dict:
+    """A shallow copy of `record` with the perf axis slop -- and thus slop_score, since the axes sum to it --
+    corrected for host-CPU contention. A grade on a faster-than-reference box under-reported perf slop, so add
+    it back; a reference-or-slower box, a missing benchmark_index, or no perf axis is a no-op (returns the record
+    unchanged). One-sided: only a faster box is corrected, a slower one is never rewarded."""
+    bi = _bi_of(record)
+    axis = record.get("axis_slop") or {}
+    if not params or bi is None or "performance" not in axis:
+        return record
+    over = min(max(bi - params["bi_ref"], 0.0), params["bi_cap"])
+    if over <= 0:
+        return record
+    add = params["k"] * over
+    rec = dict(record)
+    rec["axis_slop"] = {**axis, "performance": round(axis["performance"] + add, 1)}
+    rec["slop_score"] = round(record.get("slop_score", 0) + add, 1)
+    return rec
+
+
 def _key(slop, has_cat, maxpen, potential, ncats) -> tuple:
     """The rank key, LOWER is better: slop asc; clean (0) before catastrophe (1); SMALLER worst finding
     (max_penalty) asc -- weakest-link, one severe trapdoor beats the same slop spread over moderate findings;
@@ -241,6 +285,12 @@ def build(recs: list, version: str, source: str, status: str = "provisional",
         sys.exit(f"ERROR: no eligible '{probe_set}' rows (need deployed + scored, from the {probe_set} "
                  f"battery, not anchor/subset/dead/DNF). A passive curve needs a --passive-only corpus run.")
     idx = _catalog_index()
+    # Perf normalization for host-CPU contention: compute this population's reference box-speed, then correct
+    # each row's perf slop (and total) BEFORE freezing the distributions, so the curve is built on normalized
+    # perf and a live grade normalized the same way places consistently. Inert when no row carries a
+    # benchmark_index (params is None). See docs/PERF_NORMALIZATION.md.
+    perf_norm = _perf_norm_params(rows)
+    rows = [_normalized(r, perf_norm) for r in rows]
     # the empirical distribution: one [slop, catastrophe(0/1), max_penalty, slop_potential, categories] row per app, no
     # identities. This is what makes the overall percentile exact and the tiebreaks possible; the landmark
     # summaries below stay for human reading and the per-axis (spiky, non-granular) ranks. Rows are sorted by
@@ -255,7 +305,8 @@ def build(recs: list, version: str, source: str, status: str = "provisional",
     # final is the failure mode a versioned reference exists to prevent.
     curve = {"version": version, "source": source, "status": status, "probe_set": probe_set,
              "population": "live hackathon web apps", "n": len(rows), "comparator": list(_COMPARATOR),
-             "overall": _pcts([r["slop_score"] for r in rows]), "axes": {}, "dist": dist}
+             "overall": _pcts([r["slop_score"] for r in rows]), "axes": {}, "dist": dist,
+             **({"perf_norm": perf_norm} if perf_norm else {})}
     for axis in _AXES:
         vals = [(r.get("axis_slop") or {}).get(axis, 0) for r in rows if _axis_applicable(r).get(axis)]
         if vals:
@@ -392,6 +443,14 @@ def rank(curve: dict, score, record: dict | None = None) -> dict:
                 "challenge-cut grade: a bot challenge stopped this battery before it was measured in full, so "
                 "its partial score has no placement on the curve. The score stands as a limited measurement; "
                 "the blocked tail is what a retry pass recovers.")
+    # Normalize the incoming grade for host-CPU contention iff THIS curve was frozen with params (a live grade
+    # on an idle box under-reported perf slop; add it back so it places against the curve's contention
+    # condition). A curve without perf_norm -- the 2026.3 ruler, or any pre-instrumentation build -- is a no-op,
+    # so this is inert until a normalized curve exists. Both the total `score` and the per-axis slop move.
+    perf_norm = curve.get("perf_norm")
+    if record is not None and perf_norm:
+        record = _normalized(record, perf_norm)
+        score = record["slop_score"]
     potential = ncats = None
     if dist is not None and record is not None:
         idx = _catalog_index()
