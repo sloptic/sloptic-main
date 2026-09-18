@@ -1213,6 +1213,16 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
         # those requests.
         endpoints = [e for e in endpoints
                      if _in_base_scope((e.path or "/").split("?")[0], scope_url)]
+        # An endpoint whose CONCRETE path still carries an unresolved {placeholder} is a route TEMPLATE, not a
+        # reachable endpoint. openapi.ingest concretizes its own path params ({id}->1, keeping the braced form
+        # only in raw_path for injection), so a brace surviving in `path` is a raw SDK route string mined from a
+        # JS bundle. base44's /api/apps/{app_id}/entities/{entity_name} scaffold is the dominant case: identical
+        # across every base44 app (it is the PLATFORM's generic entity API, not the team's), unreachable without
+        # the app's real UUID, so requested literally it 404s -- and a 404 counts as reached surface (baseline
+        # < 500), inflating surface_size to ~450 on 4 base44 apps (and 10 others) with phantom endpoints that no
+        # probe can test. Drop them: a concrete endpoint never carries a literal brace, and requesting the
+        # template tests nothing. (raw_path keeps its braces untouched -- that is where injection reads them.)
+        endpoints = [e for e in endpoints if "{" not in (e.path or "")]
         # Baseline each endpoint with a well-formed (read-only GET) request: an env-var-gated endpoint
         # (dummy Supabase/API key) 500s on EVERYTHING, so a baseline 5xx marks it reached-but-DEAD. This
         # separates "healthy-observed" surface (parity's real denominator) from merely "reached", and lets
