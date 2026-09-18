@@ -126,6 +126,14 @@ Fixes. These reclassify or remove rather than fire, so they do not need the disc
   parameter **no caller passes**. X wants sizing from the discovery run's `timeout_phase` data, not a guess.
 - **The a11y axis promotion** plus the qa-seo relabel. Total preserving, so it needs no re-grade and does not
   gate either run, but it must precede the re-pricing pass so pricing sees four axes rather than three.
+- **LANDED 2026-09-17 (the final-run mechanism set):** pool context propagation — the fan-out pools submit
+  through a fresh copy of the submitting context, so the 150-request cap FIRES in the fan-out and challenge
+  onset registers from pooled probes (net's onset became a shared first-writer recorder; a per-submit copy,
+  never one shared Context, since Context.run is single-entry and a shared one killed every concurrent send);
+  a per-probe wall clock (default 120s, env SLOPTIC_PROBE_TIMEOUT, catalog max_seconds) that abandons a hung
+  probe into blocked_probes for the retry pass — browser probes exempt, because Playwright's sync API is
+  thread-affine; and browser top-level navigation scoping via resource_type == "document" (subresources stay
+  unscoped). The a11y axis promotion remains the last pre-repricing item.
 - **FP backlog**: base44 endpoint attribution, secretscan recall (overlaps item 1 above), perf-load-001's edge
   gate, and dead-controls plus http-correctness, never audited on their own merits.
 - **LANDED 2026-09-17, from the v24 NEW-PROBE audit + the 12.5 shell cluster:**
