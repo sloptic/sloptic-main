@@ -245,10 +245,16 @@ history.
 
 ## Open questions to settle inside the sprint
 
-1. **The perf contention A/B.** Grade ~30 apps at concurrency 4, then the same 30 at concurrency 1, compare
-   median Lighthouse performance. `benchmark_index` is now on the record, so the host speed difference is
-   visible directly rather than inferred. An hour or two. If it is a wash, disregard forever; if not, it is a
-   curve design input and you want it before the freeze, not after.
+1. **The perf contention A/B. RESOLVED 2026-09-18 (v25, ~120 apps conc1 vs conc4).** NOT a wash: perf is
+   +6.6 Lighthouse pts / ~4.8 slop optimistic on an idle box (TBT -54%, Speed-Index -19%; security delta 0,
+   qa ~0, so 96% of the effect is the perf axis). Events grade at conc 4 = the curve, so they match; but a
+   SOLO submission runs on an idle box and sloptic.org percentile-ranks + shares solo grades, so the optimism
+   is a real, non-reproducible credential bias (`LIGHTHOUSE_SLOTS` is a cap, not a floor, so it does not fix a
+   lone grade). Fix: **benchmark_index normalization, GO, lands at the freeze** -- spec in
+   `docs/PERF_NORMALIZATION.md`. k = 0.011 fixed from this A/B (a bigger dedicated A/B was dropped as weeks of
+   box time); bi_ref = the final run's median benchmark_index. Perf-axis only; removes ~97% of the systematic
+   bias, leaves the non-directional per-app noise. **Freeze invariant either way: final run at conc 4 +
+   `SLOPTIC_LIGHTHOUSE_SLOTS=3` so the new curve matches the worker.**
 2. **X for the discovery budget.** Read it off the discovery run's `timeout_phase` distribution.
 3. **Is the DNF tail discovery or fan out?** Same source. Settles whether the cap or the budget is the bigger
    capacity win, and neither number should be quoted until it does.
