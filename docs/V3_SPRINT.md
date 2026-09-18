@@ -145,6 +145,12 @@ Fixes. These reclassify or remove rather than fire, so they do not need the disc
   (`28698e1`) so the final run can measure whether any advisory rule (target-size the only real-barrier
   candidate) earns promotion. The v3.1 probe candidates (DB connection string in the bundle, Neon Data API
   RLS generalization, Svelte fingerprint) are logged to memory, deferred so v3.0's discovery run stays valid.
+- **RULER LABEL LANDED 2026-09-18 (`6ad8d4f`), DoD item 4 done.** Every grade record now stamps `ruler`
+  (full 2026.3 · passive-2026.1) from `sloptic/ruler.py`, and the card reads it from the record (never the
+  current curve), so a stored 2.x grade renders "Ruler unspecified -- not comparable" instead of borrowing
+  3.x. **FREEZE CHECKLIST GAINS A STEP: bump `sloptic/ruler.py` FULL/PASSIVE together with the curve files in
+  validation/ and the pyproject version -- test_ruler.py fails CI if the constant drifts from the frozen
+  curve.**
 - **FP backlog** — AUDITED 2026-09-17, each on its own merits against the v24 fires. Only ONE was a real
   actionable FP:
   - **base44 endpoint attribution — REAL FP, FIXED (`5c67dee`).** 4 base44 apps carried 131-221 phantom
