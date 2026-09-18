@@ -138,8 +138,29 @@ Fixes. These reclassify or remove rather than fire, so they do not need the disc
   a missing viewport, not marketing). Total-preserving by construction (the damper groups by category, not
   bundle), so it needs no re-grade, verified on the reference app and locked by a dedicated test.** With that,
   every pre-repricing mechanism is in and the re-pricing pass is unblocked — it now prices four axes, not three.
-- **FP backlog**: base44 endpoint attribution, secretscan recall (overlaps item 1 above), perf-load-001's edge
-  gate, and dead-controls plus http-correctness, never audited on their own merits.
+- **FP backlog** — AUDITED 2026-09-17, each on its own merits against the v24 fires. Only ONE was a real
+  actionable FP:
+  - **base44 endpoint attribution — REAL FP, FIXED (`5c67dee`).** 4 base44 apps carried 131-221 phantom
+    endpoints, all the identical `/api/apps/{app_id}/entities/...` SDK scaffold (the platform's, not the
+    team's), unreachable without the real UUID, all 404, all counted as reached surface (404 < 500) ->
+    surface_size ~450. discovery now drops any endpoint whose CONCRETE path still carries an unresolved
+    `{placeholder}` (openapi concretizes declared params, so a surviving brace is an unresolvable template).
+    No finding moved; the phantom surface is gone.
+  - **secretscan recall — already done, verified.** The provider patterns (`gsk_`/`xai-`/`hf_`/`r8_` + the
+    `sk-ant-` split) are in `secretscan.py`; this overlapped the sec-secrets-003 work and needs nothing more.
+  - **perf-load-001 edge gate — NO FP.** All 4 v24 fires are legitimate: 2 self-hosted nginx apps that 5xx
+    under load, and 2 (pythonanywhere-free, a raw-nginx VPS) that drop a 20-request burst though they answer
+    a lone request in ~0.4s. All four respond 200 at baseline, none is behind a CDN the gate missed, and the
+    design deliberately keeps self-hosted PaaS live (the team owns its capacity). Priced 50 (drops) / 60
+    (5xx). Working as intended.
+  - **dead-controls (qa-deadctrl-001) — SOUND at ~95%.** The 223 fires are dominated by real dead CTAs (dead
+    "sign in"/"log in"/"get started" buttons — the AI-shell tell). The 49 `(unlabeled)` fires spread across
+    normal apps (real dead icon buttons co-occurring with real dead CTAs), not clustered on canvas apps. The
+    one true confounder (canvas/WebGL draw, already in the tp_definition) is ~2 apps; a canvas-pixel watcher
+    is a risky browser change for a 2-app gain right before the freeze -- not taken.
+  - **http-correctness — NO score FP.** qa-http-001 fires at penalty 0 (not scored). qa-http-002 (charset,
+    9 fires) spot-checked live: getsentinel.co and calebgoodman both serve text/html with no header charset
+    and no meta charset in the first 1KB -- real, and the meta-in-first-1KB hardening holds.
 - **LANDED 2026-09-17, from the v24 NEW-PROBE audit + the 12.5 shell cluster:**
   `sec-session-006` filters candidate URLs to the graded origin (both v24 fires were third-party params: a
   Loom `sid`, a Mapbox `access_token`) and excludes `pk.` publishable keys; `qa-scaffold-001` requires 2+
@@ -149,6 +170,12 @@ Fixes. These reclassify or remove rather than fire, so they do not need the disc
   cluster decomposed on inspection: envi-seven is a REAL one-page app and stays graded** — the assumption
   that all five were shells died when fetched. Remaining 404-gate work: title-only shells (idea-forge) need
   the render layer.
+- **LANDED 2026-09-17, the 404 gate's RENDER layer (`8c0a917`):** a non-canvas host whose entry renders under
+  24 visible chars AND captured no forms/endpoints is recorded `render_state = "empty"` and excluded from the
+  curve by `is_shell_only`, the same way a Streamlit canvas shell is -- a probabilistic shell CLASSIFICATION,
+  never a dead-url DNF (a slow-hydrating real SPA can render short too). idea-forge-web renders only its
+  `<title>` "Idea Forge" (10 chars) and scored a phantom 12.5; envi-seven (514 chars of real copy) is spared.
+  This completes the 404 gate's three layers (certain platform-signature, divergence, render).
 
 - **LANDED 2026-09-17, from the v24 injection audit (classics at 55% precision: 5 real / 6 false):**
   sqli boolean gets a negative control (FALSE must collapse onto the benign baseline) plus an SSE
