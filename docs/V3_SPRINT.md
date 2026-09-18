@@ -133,7 +133,11 @@ Fixes. These reclassify or remove rather than fire, so they do not need the disc
   a per-probe wall clock (default 120s, env SLOPTIC_PROBE_TIMEOUT, catalog max_seconds) that abandons a hung
   probe into blocked_probes for the retry pass — browser probes exempt, because Playwright's sync API is
   thread-affine; and browser top-level navigation scoping via resource_type == "document" (subresources stay
-  unscoped). The a11y axis promotion remains the last pre-repricing item.
+  unscoped). **The a11y axis promotion also landed (`53384e9`): accessibility is now its own axis (qa-a11y-001,
+  qa-a11y-002, and qa-seo-001 moved from bundle qa, seo's category relabeled mobile-visibility since it scores
+  a missing viewport, not marketing). Total-preserving by construction (the damper groups by category, not
+  bundle), so it needs no re-grade, verified on the reference app and locked by a dedicated test.** With that,
+  every pre-repricing mechanism is in and the re-pricing pass is unblocked — it now prices four axes, not three.
 - **FP backlog**: base44 endpoint attribution, secretscan recall (overlaps item 1 above), perf-load-001's edge
   gate, and dead-controls plus http-correctness, never audited on their own merits.
 - **LANDED 2026-09-17, from the v24 NEW-PROBE audit + the 12.5 shell cluster:**
