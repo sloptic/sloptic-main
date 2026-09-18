@@ -93,6 +93,16 @@ def test_verdict_evidence_is_trimmed_to_the_light_audit_keys():
     assert ev == {"status": 200, "sensitive_columns": ["email"]}   # repro dropped
 
 
+def test_clean_a11y_verdict_carries_the_off_score_advisory_set():
+    # the advisory (WCAG 2.2 / best-practice) rules ride the CLEAN a11y outcome too, so the corpus can measure
+    # whether an advisory rule fires where the SCORED set is clean -- the decorrelation the promotion needs.
+    # Before this key was whitelisted, the clean-outcome advisory was computed and then dropped here.
+    adv = {"rules": ["region", "target-size"], "impacts": {"moderate": 2}}
+    ev = _verdicts([_o("qa-a11y-001", "clean", bundle="accessibility",
+                       evidence={"violations": 0, "advisory_a11y": adv})])[0]["evidence"]
+    assert ev.get("advisory_a11y") == adv
+
+
 def test_the_grade_script_stamps_verdicts_on_the_row():
     """Guards silent removal, mirroring the contract_version guard: the assembly site must reference _verdicts."""
     src = (pathlib.Path(__file__).resolve().parent.parent / "scripts" / "deploy_and_grade.py").read_text()

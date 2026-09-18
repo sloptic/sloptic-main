@@ -314,7 +314,12 @@ _VERDICT_RANK = {"not_applicable": 0, "clean": 1}   # a probe that JUDGED (clean
 # evidence keys worth keeping on an unfired verdict: bulky repro/response bodies live on FIRES, so a clean/n-a
 # entry keeps only its light audit signal (status, what it measured, WHY it was n/a). Bounds the size blow-up.
 _VERDICT_EV_KEYS = ("na_reason", "status", "records", "sources", "app_sources", "sensitive_columns",
-                    "checked", "tried", "collection", "endpoint", "fails")
+                    "checked", "tried", "collection", "endpoint", "fails",
+                    # advisory_a11y (WCAG 2.2 / best-practice, OFF-SCORE) rides on the CLEAN a11y outcome too, so
+                    # the corpus can measure whether an advisory rule fires on apps the SCORED set misses -- the
+                    # decorrelation the promotion decision needs. Without it here the clean-outcome advisory was
+                    # computed and thrown away, and advisory only ever appeared on already-firing apps.
+                    "advisory_a11y")
 
 
 def _verdicts(outcomes: list) -> list[dict]:
