@@ -83,6 +83,21 @@ _AUTHED_ROUTES = ["/dashboard", "/home", "/app", "/account", "/profile",
 _VENDOR_FIELD = re.compile(r"turnstile|recaptcha|h-?captcha|__requestverification|g-recaptcha", re.I)
 
 
+# A rendered entry below this many VISIBLE chars is a title-only / unhydrated shell: the SPA never populated a
+# body (broken build, failed hydration, or nothing deployed). idea-forge-web renders just its <title> "Idea
+# Forge" (10 chars); a real one-page app renders real copy (envi-seven, 514). Tight so a genuine minimal splash,
+# whose title plus any button/link label already clears this, is spared.
+_EMPTY_RENDER_MAX_CHARS = 24
+
+
+def _render_visible_text(html: str) -> str:
+    """A rendered DOM -> visible text, <script>/<style> stripped (neither paints as page text, and their bodies
+    would false-match as content). Judges a title-only entry; mirrors deploy_and_grade._visible_text without
+    importing from scripts/ into the package."""
+    t = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", " ", html, flags=re.S | re.I)
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", t)).strip()
+
+
 def _auth_triggers(markup: str) -> tuple[bool, bool]:
     """Scan a page's BUTTON/LINK labels (not arbitrary text -> low FP) for a login/signup trigger. Returns
     (has_login_trigger, has_signup_trigger). Catches the button/link/CTA logins a password-form check misses."""
@@ -1247,6 +1262,22 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
             # is_shell_only EXCLUDES from the curve regardless. Return NOW with just the state so the pipeline
             # short-circuits. A 'rendered' shell falls through and is crawled + graded normally.
             return Profile(base_url=base_url, landing_path=start_path, render_state=render_state)
+        if render_state is None and not forms and not endpoints and rendered:
+            # TITLE-ONLY / UNHYDRATED SHELL (the 404-shell gate's render layer): a non-canvas host whose entry
+            # rendered essentially no content AND whose crawl captured no surface. idea-forge-web renders only
+            # its <title> ("Idea Forge", 10 chars), captured 0 forms / 0 endpoints / 0 inputs, and scored ONLY
+            # the header tax on the empty shell -- a phantom 12.5. A real one-page app renders real copy
+            # (envi-seven, 514) or exposes a control, clearing the gate. Recorded render_state 'empty' ->
+            # is_shell_only EXCLUDES it from the reference distribution, and NOT as a dead verdict: a
+            # slow-hydrating real SPA can render short too, so this stays a probabilistic shell CLASSIFICATION,
+            # never a dead-url DNF. Gated tight (no captured surface AND near-zero visible text) so a minimal
+            # splash is spared, and it short-circuits like error/stuck rather than grinding a full battery on
+            # an empty shell. Complements deploy_and_grade._dead_url_reason, whose ghost check needs the entry
+            # and a nonexistent path to render the SAME dead shell -- idea-forge-web's ghost is a real host 404,
+            # so that path cannot catch it.
+            entry_dom = rendered.get(start_path) or next(iter(rendered.values()), "")
+            if entry_dom and len(_render_visible_text(entry_dom)) < _EMPTY_RENDER_MAX_CHARS:
+                return Profile(base_url=base_url, landing_path=start_path, render_state="empty")
         if rendered:
             browser_ok = True  # a real render returned HTML -> the browser actually launched/works
             any_response = True

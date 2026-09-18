@@ -122,7 +122,7 @@ class Profile:
     backend_tables: list[str] = field(default_factory=list)  # managed-backend (Supabase/Firestore) collections the
     #     app's OWN runtime traffic read — OBSERVED, so a minified or dynamically-built table name that never
     #     appears as a bundle string literal is still testable by the RLS probes. Never guessed.
-    render_state: str | None = None  # canvas-shell host (Streamlit) render outcome: rendered|error|stuck; None otherwise
+    render_state: str | None = None  # render outcome: rendered|error|stuck (canvas-shell host) | empty (title-only/unhydrated shell); None otherwise
 
     @property
     def form_endpoints(self) -> list[str]:  # back-compat for predicates that target form actions

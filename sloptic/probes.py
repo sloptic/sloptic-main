@@ -5353,7 +5353,7 @@ def _shell_ok(ctx) -> bool:
     dead (render_state error/stuck). Skipping a known-dead app stops each perf probe re-waiting ~12s on an app
     that will never paint (which stacked up across render_metrics/web_vitals/FCP and DNF'd stuck Streamlit apps
     on the grade timeout). A rendered app (or a non-Streamlit one) still awaits/normal-renders."""
-    return getattr(getattr(ctx, "profile", None), "render_state", None) not in ("error", "stuck")
+    return getattr(getattr(ctx, "profile", None), "render_state", None) not in ("error", "stuck", "empty")
 
 
 

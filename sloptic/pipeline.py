@@ -585,12 +585,13 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
             except Exception:   # best-effort side check: a failed probe fetch must never gate the grade
                 pass
             # SHELL-ONLY SHORT-CIRCUIT: discovery found a canvas-shell host (Streamlit) whose real app did NOT
-            # render — 'error' (crash screen) or 'stuck' (won't come up). The full browser battery would grind the
+            # render -- 'error' (crash screen), 'stuck' (won't come up), or 'empty' (a title-only / unhydrated
+            # entry that rendered nothing and captured no surface). The full browser battery would grind the
             # framework shell (no networkidle, register/upload/domxss all timing out) for ~480s and DNF on the
             # grade timeout — for a record is_shell_only EXCLUDES from the curve regardless. Stop here with the
             # shell state recorded (excluded, never read as a clean grade) instead of burning the budget. A
             # RENDERED shell (render_state 'rendered') falls through and grades its real surface normally.
-            if profile.render_state in ("error", "stuck"):
+            if profile.render_state in ("error", "stuck", "empty"):
                 return Report(slop_score=0, outcomes=[], surface=surface_metrics(profile),
                               platform=platform_id.classify_live(client, origin), trace=trace_sink or [])
             # EAGER EMAIL PRIME: fire the email registration NOW -- before the ~2-3min Lighthouse run and the probe
