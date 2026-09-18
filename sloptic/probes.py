@@ -15,6 +15,7 @@ import html
 import json
 import os
 import re
+import contextvars
 import secrets
 import statistics
 import time
@@ -1482,9 +1483,13 @@ def _fan_out_first(send, specs, oracle, pool=_INJECT_POOL, cap_check=None):
     each other's measured response time into false positives; those probes keep their sequential path."""
     it = iter(specs)
     hit = None
-    # A pool thread starts with an empty Context, so the egress origin scope does not reach it and an
-    # off-origin redirect would carry payloads to a host the grant never covered. Bind it here, on the
-    # submitting thread, while it is still readable. Unscoped lanes get the callable back untouched.
+    # A pool thread starts with an empty Context, so everything the grade keeps in ContextVars — the egress
+    # origin scope, the request tally the per-probe cap reads, the challenge-onset recorder, the trace probe
+    # id — silently reads its default inside the worker (the v24 blind spot: the injection fan out was
+    # uncapped AND its WAF challenges went unrecorded). Submitting through a COPY of the submitting thread's
+    # context hands the worker the live values; shared-object holders (the tally dict, the onset recorder)
+    # make the worker's writes visible back on the main thread. scope_bound stays as the explicit scope
+    # guarantee beside it.
     send = egress.scope_bound(send)
     with ThreadPoolExecutor(max_workers=max(1, pool)) as ex:
         pending = set()
@@ -1496,7 +1501,9 @@ def _fan_out_first(send, specs, oracle, pool=_INJECT_POOL, cap_check=None):
                 nxt = next(it, None)
                 if nxt is None:
                     return
-                pending.add(ex.submit(send, nxt))
+                # a FRESH copy per submit: Context.run is single-entry, and workers reusing one shared
+                # Context object would raise "already entered" on concurrent submits, killing every send
+                pending.add(ex.submit(contextvars.copy_context().run, send, nxt))
         _refill()
         while pending and hit is None:
             done, keep = wait(pending, return_when=FIRST_COMPLETED)
@@ -5656,7 +5663,8 @@ def _fanout(work, n: int):
     The shared concurrency primitive for the self-as-oracle race/load probes."""
     work = egress.scope_bound(work)     # the scope does not cross into a pool thread on its own
     with ThreadPoolExecutor(max_workers=n) as ex:
-        return [f.result() for f in [ex.submit(work) for _ in range(n)]]
+        # a fresh copy per submit — see the single-entry note in _fan_out_first
+        return [f.result() for f in [ex.submit(contextvars.copy_context().run, work) for _ in range(n)]]
 
 
 def _concurrent_creates(base_url, path, cookies, data, n: int = 12):

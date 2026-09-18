@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 from urllib.parse import urlparse
 
 import httpx
@@ -26,6 +27,26 @@ _trace_probe: contextvars.ContextVar = contextvars.ContextVar("hl_trace_probe", 
 # challenge onset: the FIRST probe whose request hit a WAF/challenge status. Always-on (status+header only, no
 # body read -> negligible cost), surfaced only when the grade is CONFIRMED a bot_challenge -> names the probe
 # whose traffic tripped the mitigation, so the corpus can show WHICH probes to gate/reorder on WAF-fronted hosts.
+# The ContextVar holds a SHARED RECORDER, not the string: the request hook runs inside fan-out worker threads,
+# and a ContextVar.set() there writes the worker's COPY, which the main thread never sees (the v24 blind spot —
+# every pooled probe's challenge went unrecorded). The recorder object is created once per grade on the main
+# thread and shared by reference, so worker writes land where the pipeline reads them, exactly like the
+# request tally dict beside it.
+class _OnsetHolder:
+    """One-shot first-writer-wins recorder for the challenge onset probe id."""
+
+    __slots__ = ("probe", "_lock")
+
+    def __init__(self) -> None:
+        self.probe = None
+        self._lock = threading.Lock()
+
+    def record(self, probe_id: str) -> None:
+        with self._lock:
+            if self.probe is None:
+                self.probe = probe_id
+
+
 _challenge_onset: contextvars.ContextVar = contextvars.ContextVar("hl_challenge_onset", default=None)
 # per-probe request TALLY (always-on, cheap): surfaces which probes send abnormally many requests -- the
 # cumulative-volume trigger for a WAF, and the pacing/trim candidates.
@@ -38,26 +59,28 @@ def _watch_challenge(response) -> None:
     if counts is not None:
         p = _trace_probe.get() or "?"
         counts[p] = counts.get(p, 0) + 1
-    if _challenge_onset.get() is not None:
+    onset = _challenge_onset.get()
+    if onset is None or onset.probe is not None:
         return
     h = response.headers
     # a Vercel `deny` is a per-request path block, not an app-wide challenge (see is_bot_challenge) -> never onset
     if "cf-mitigated" in h or "x-vercel-challenge-token" in h or h.get("x-vercel-mitigated") == "challenge":
-        _challenge_onset.set(_trace_probe.get() or "?")
+        onset.record(_trace_probe.get() or "?")
     elif response.status_code in _CHALLENGE_STATUS:
         # BODY-CONFIRM it's a challenge, not a plain auth-403: a challenge/block page carries the markers, an
         # auth 403 does not. A blocked response is small + non-streaming, so reading it here is safe.
         try:
             response.read()
             if is_bot_challenge(response):
-                _challenge_onset.set(_trace_probe.get() or "?")
+                onset.record(_trace_probe.get() or "?")
         except Exception:
             pass
 
 
 def challenge_onset() -> str | None:
     """The probe id whose request first hit a CONFIRMED WAF/challenge response this grade (None if none)."""
-    return _challenge_onset.get()
+    onset = _challenge_onset.get()
+    return onset.probe if onset is not None else None
 
 
 def request_counts() -> dict | None:
@@ -78,7 +101,7 @@ def start_trace(enabled: bool = True) -> list | None:
     sink: list | None = [] if enabled else None
     _trace_sink.set(sink)
     _trace_counts.set({} if enabled else None)
-    _challenge_onset.set(None)   # reset per-grade onset + request tally regardless of --trace (runs every grade)
+    _challenge_onset.set(_OnsetHolder())   # fresh onset + request tally per grade (runs every grade)
     _req_counts.set({})
     return sink
 
