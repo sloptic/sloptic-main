@@ -164,6 +164,15 @@ def _install_egress_filter(target) -> None:
                 route.continue_()
                 return
             port = parts.port or (443 if parts.scheme == "https" else 80)
+            # TOP-LEVEL NAVIGATION is the app itself: when the grade is origin-scoped, the authenticated
+            # crawl must not follow a redirect (a login bounce, a vanity domain move) onto a host the grant
+            # never covered. SUBRESOURCES stay unscoped (a normal page loads fonts and scripts cross-origin;
+            # see egress.host_allowed) — only the document is the app.
+            if (route.request.resource_type == "document" and parts.scheme in ("http", "https")):
+                scope = egress.current_scope()
+                if scope is not None and (host.lower().rstrip(".") != scope[0] or port != scope[1]):
+                    route.abort("blockedbyclient")
+                    return
             if egress.host_allowed(host, port):
                 route.continue_()
             else:

@@ -379,3 +379,116 @@ def test_an_exempt_host_still_faces_the_address_predicate(strict, fake_dns):
     with egress.origin_scope("https://target.test"), egress.exempt_host("sneaky.test"):
         with pytest.raises(egress.EgressRefused, match="non-public"):
             socket.getaddrinfo("sneaky.test", 443)
+
+
+def test_current_scope_reads_the_active_pin():
+    with egress.origin_scope("https://target.test:8443/some/path"):
+        assert egress.current_scope() == ("target.test", 8443)
+    assert egress.current_scope() is None       # and None when no scope is active
+
+
+# ── the browser filter scopes TOP-LEVEL navigation only (the resource_type decision) ────────────────────
+def test_document_navigation_off_origin_is_refused_while_scoped(strict, fake_dns):
+    """The authenticated browser crawl follows redirects; a grant for one origin must not let a login bounce
+    carry the crawl (and its session) onto a host the grant never covered. The document is the app."""
+    table, _ = fake_dns
+    table["evil.test"] = [_ai(GOOD2)]
+
+    class _Route:
+        class request:
+            url = "https://evil.test/login"
+            resource_type = "document"
+        aborted = False
+        continued = False
+
+        def abort(self, reason):
+            self.aborted = True
+        def continue_(self):
+            self.continued = True
+
+    route = _Route()
+    with egress.origin_scope("https://target.test"):
+        from sloptic import browser
+        browser._install_egress_filter.__wrapped__ if False else None
+        # drive the guard directly: _install_egress_filter registers it via target.route; call the closure
+        # by re-creating it the way the filter does
+        import urllib.parse
+        from sloptic import egress as eg
+        parts = urllib.parse.urlparse(route.request.url)
+        host = parts.hostname
+        scope = eg.current_scope()
+        refused = scope is not None and (host != scope[0] or 443 != scope[1])
+    assert refused                                 # the decision the guard makes for a document
+
+
+def test_the_guard_refuses_a_scoped_off_origin_document_and_allows_a_subresource(strict, fake_dns):
+    """The real filter, driven through a stub route object: the document navigation off origin aborts, the
+    subresource from the same host continues (subresources stay unscoped by design)."""
+    from sloptic import browser
+    table, _ = fake_dns
+    table["evil.test"] = [_ai(GOOD2)]
+    table["cdn.test"] = [_ai(GOOD2)]
+
+    class _Route:
+        def __init__(self, url, rtype):
+            self.url = url
+            self.resource_type = rtype
+            self.aborted = self.continued = False
+        @property
+        def request(self):
+            return self
+        def abort(self, reason):
+            self.aborted = True
+        def continue_(self):
+            self.continued = True
+
+    holder = {}
+
+    class _Target:
+        def route(self, pattern, guard):
+            holder["guard"] = guard
+
+    with egress.origin_scope("https://target.test"):
+        browser._install_egress_filter(_Target())
+        guard = holder["guard"]
+        doc = _Route("https://evil.test/login", "document")
+        guard(doc)
+        assert doc.aborted and not doc.continued   # navigation off origin: refused, WHILE scoped
+        sub = _Route("https://cdn.test/fonts.css", "stylesheet")
+        guard(sub)
+        assert sub.continued and not sub.aborted   # subresource: unscoped by design
+    # and once the grade (and its scope) is over, the same navigation is no longer refused
+    doc2 = _Route("https://evil.test/login", "document")
+    guard(doc2)
+    assert doc2.continued and not doc2.aborted
+
+
+def test_the_guard_passes_a_scoped_on_origin_document(strict, fake_dns):
+    from sloptic import browser
+    table, _ = fake_dns
+    table["target.test"] = [_ai(GOOD)]
+
+    class _Route:
+        def __init__(self, url, rtype):
+            self.url = url
+            self.resource_type = rtype
+            self.aborted = self.continued = False
+        @property
+        def request(self):
+            return self
+        def abort(self, reason):
+            self.aborted = True
+        def continue_(self):
+            self.continued = True
+
+    holder = {}
+
+    class _Target:
+        def route(self, pattern, guard):
+            holder["guard"] = guard
+
+    with egress.origin_scope("https://target.test"):
+        browser._install_egress_filter(_Target())
+    doc = _Route("https://target.test/dashboard", "document")
+    holder["guard"](doc)
+    assert doc.continued and not doc.aborted

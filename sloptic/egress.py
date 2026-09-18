@@ -123,6 +123,13 @@ def origin_scope(origin: str):
         _origin_scope.reset(tok)
 
 
+def current_scope() -> tuple[str, int] | None:
+    """The active origin scope on THIS thread, or None. Read by the browser route filter to scope its
+    TOP-LEVEL navigations (see browser._install_egress_filter): a grant for one origin authorizes grading
+    that origin, and a redirect must not carry the authenticated crawl somewhere the grant never covered."""
+    return _origin_scope.get()
+
+
 @contextlib.contextmanager
 def exempt_host(host: str):
     """Allow ONE fixed host past the origin pin for the duration of the block.
