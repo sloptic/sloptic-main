@@ -180,7 +180,7 @@ def test_pipeline_withholds_grade_on_a_challenge(challenge_url):
     # transparency: nothing ran, so the WHOLE battery is blocked and EVERY axis is incomplete -> a score of 0
     # here must never read as "clean". A severe probe is explicitly on the blocked list, not silently absent.
     assert set(report.blocked_probes) == {p.id for p in catalog}
-    assert set(report.incomplete_axes) == {"security", "qa", "performance"}
+    assert set(report.incomplete_axes) == {"security", "qa", "accessibility", "performance"}
     assert "sec-cmdi-001" in report.blocked_probes
 
 

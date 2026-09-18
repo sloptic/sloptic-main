@@ -50,8 +50,9 @@ from sloptic.eligibility import (is_limited_battery, is_shell_only, is_ungradeab
                                  is_wrong_owner, wrong_owner_reason)
 _DEFAULT_CURVE = _HERE.parent / "validation" / "benchmark-curve.json"
 _PASSIVE_CURVE = _HERE.parent / "validation" / "benchmark-curve-passive.json"
-_AXES = ("security", "qa", "performance")
-_PREFIX = {"sec-": "security", "qa-": "qa", "perf-": "performance"}
+_AXES = ("security", "qa", "accessibility", "performance")
+_PREFIX = {"sec-": "security", "qa-a11y": "accessibility", "qa-seo": "accessibility",
+           "qa-": "qa", "perf-": "performance"}   # longest prefixes FIRST: qa-a11y/qa-seo are the accessibility carve-out, every other qa- probe stays qa
 _LANDMARKS = (10, 25, 50, 75, 90, 95, 99)
 # A fired probe in one of these classes means "not certifiable", independent of rank: the app is exploitable
 # now, and a favourable comparison to equally-broken peers is not a mitigation.

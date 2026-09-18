@@ -85,7 +85,7 @@ def _coverage_text(report) -> str:
 def _axis_line(report) -> str:
     # per-axis decomposition of the total (unbounded, same units); subtotals sum to slop_score. An axis a
     # challenge cut short is flagged ⚠ — its subtotal is a floor (untested probes could only ADD slop).
-    order = ["security", "qa", "performance"]
+    order = ["security", "qa", "accessibility", "performance"]
     inc = set(report.incomplete_axes or [])
     parts = [f"{b} {report.axis_slop.get(b, 0)}{' ⚠' if b in inc else ''}"
              for b in order if b in report.axis_slop or b in inc]
@@ -103,12 +103,22 @@ def _fully_na_axes(report):
         if b:
             ran[b] += v.get("ran", 0)
             na[b] += v.get("na", 0)
-    prefix = {"security": "sec-", "qa": "qa-", "performance": "perf-"}
+    # probe-id prefixes per axis, LONGEST/most-specific first: qa-a11y and qa-seo are the accessibility
+    # carve-out and must not be claimed by the qa- prefix they happen to share.
+    prefix = {"security": ("sec-",), "accessibility": ("qa-a11y", "qa-seo"),
+              "qa": ("qa-",), "performance": ("perf-",)}
+
+    def _axis_of(pid: str):
+        for axis, pres in prefix.items():
+            if pid.startswith(pres):
+                return axis
+        return None
+
     out = []
-    for axis in ("security", "qa", "performance"):
+    for axis in ("security", "qa", "accessibility", "performance"):
         if ran[axis] == 0 and na[axis] > 0:      # had probes, none ran -> a silently deleted axis
             reasons = Counter(r for pid, r in (c.get("na_reasons_by_probe") or {}).items()
-                              if pid.startswith(prefix[axis]))
+                              if _axis_of(pid) == axis)
             top = reasons.most_common(1)
             out.append((axis, na[axis], top[0][0] if top else "unknown"))
     return out
@@ -206,7 +216,7 @@ def _score_breakdown_text(report, decay: float = CATEGORY_DECAY) -> str:
 
     lines = ["  how the score is built"
              "   (variant group fires once at its max · then within a category each further hit ×%.1f)" % decay, ""]
-    order = {"security": 0, "qa": 1, "performance": 2}
+    order = {"security": 0, "qa": 2, "accessibility": 1, "performance": 3}
     bundles = sorted({b for b, _ in cat_pens}, key=lambda b: order.get(b, 9))
     bundle_sub = {}
     for bundle in bundles:

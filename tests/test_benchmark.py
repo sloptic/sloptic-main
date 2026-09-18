@@ -23,7 +23,7 @@ def _app(slop, security=0, qa=0, perf=0, applied=None, findings=None, **kw):
     rec = {"deployed": True, "slop_score": slop,
            "axis_slop": {"security": security, "qa": qa, "performance": perf},
            "coverage": {"applied": applied if applied is not None
-                        else ["sec-headers-001", "qa-a11y-001", "perf-cwv-001"]},
+                        else ["sec-headers-001", "qa-crash-010", "qa-a11y-001", "perf-cwv-001"]},
            "findings": findings or []}
     rec.update(kw)
     return rec
@@ -73,7 +73,8 @@ def test_an_axis_with_no_applicable_surface_is_unranked_not_well_ranked():
     # the trap: an app whose auth surface was never reachable has security slop 0, which would out-rank an
     # app that HAD the surface and got it right. Absence of a finding is not a pass.
     curve = build(_corpus(), "t", "s")
-    dark = _app(20, security=0, qa=20, applied=["qa-a11y-001", "perf-cwv-001"])   # no sec-* probe applied
+    # qa-crash-010: a probe that stayed qa after the v3.0 promotion (qa-a11y-001 moved to accessibility)
+    dark = _app(20, security=0, qa=20, applied=["qa-crash-010", "perf-cwv-001"])  # no sec-* probe applied
     res = rank(curve, 20, dark)
     assert res["axes"]["security"] == {"applicable": False}
     assert res["axes"]["qa"]["applicable"] is True and "percentile" in res["axes"]["qa"]

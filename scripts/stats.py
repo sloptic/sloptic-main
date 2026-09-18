@@ -1489,7 +1489,7 @@ def corpus_json(recs: list) -> dict:
                     "top_modes": [[float(v), k] for v, k in modes.most_common(8)]}
 
     # 5  axis split: each axis's share of total slop + its full spread
-    axes = ("security", "qa", "performance")
+    axes = ("security", "qa", "accessibility", "performance")
     axv = {a: [(r.get("axis_slop") or {}).get(a, 0) or 0 for r in graded] for a in axes}
     grand = sum(sum(v) for v in axv.values()) or 1
     axis_split = {a: {"share_pct": round(100 * sum(axv[a]) / grand, 1), **_stats(axv[a])} for a in axes}

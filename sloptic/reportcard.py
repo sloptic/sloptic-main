@@ -360,7 +360,8 @@ _GENERIC = ("A durability check for this issue passed on well-built apps.",
             "",  # filled from the finding's own `reason`
             "Review the observed evidence below and address the underlying issue.")
 
-_AXIS_TITLE = {"security": "Security", "qa": "Quality & Correctness", "performance": "Performance"}
+_AXIS_TITLE = {"security": "Security", "accessibility": "Accessibility",
+               "qa": "Quality & Correctness", "performance": "Performance"}
 
 
 def card_copy(probe_id: str, reason: str = "") -> tuple[str, str, str]:

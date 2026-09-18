@@ -39,6 +39,22 @@ def test_distinct_categories_sum_in_full():
     assert compute_slop_score(outs) == 20
 
 
+def test_the_a11y_axis_promotion_is_total_preserving():
+    """v3.0 relabels the a11y probes from bundle qa to bundle accessibility. The damper groups by CATEGORY,
+    and bundle never enters it, so the promotion MUST leave every per-app total identical and only
+    re-partition the axis subtotals (which still sum to that same total). A future change that let bundle
+    leak into the score would break this and silently move the ruler at the freeze."""
+    a11y_qa = _o("qa-a11y-001", "accessibility", 20, bundle="qa")
+    a11y_ax = _o("qa-a11y-001", "accessibility", 20, bundle="accessibility")
+    rest = [_o("x", "crash", 30, bundle="qa"), _o("y", "injection", 40, bundle="security")]
+    before, after = [a11y_qa] + rest, [a11y_ax] + rest
+    assert compute_slop_score(before) == compute_slop_score(after)      # total unchanged
+    b_ax, a_ax = compute_axis_slop(before), compute_axis_slop(after)
+    assert sum(b_ax.values()) == sum(a_ax.values())                    # same total, re-partitioned
+    assert "accessibility" not in b_ax and a_ax["accessibility"] == 20.0
+    assert a_ax["qa"] == b_ax["qa"] - 20.0                             # the 20 moved out of qa, intact
+
+
 def test_clean_and_na_contribute_zero():
     outs = [_o("a", "cat1", 10, outcome="clean"),
             _o("b", "cat2", 10, outcome="not_applicable")]

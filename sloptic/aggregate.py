@@ -8,7 +8,7 @@ dampers (a variant group fires once at its max; repeated instances within a cate
   decaying marginal penalty (the worst counts full; each additional one at `decay**i`), so a
   class of mistake is noted with breadth rather than multiplied linearly.
 
-Per-bundle ordering (security >> qa > performance) is NOT a runtime multiplier here — it is
+Per-bundle ordering (security >> qa / accessibility / performance) is NOT a runtime multiplier here — it is
 encoded in the per-probe penalty magnitudes (calibration), so applying it again would
 double-count.
 """
@@ -150,7 +150,7 @@ def compute_slop_score(outcomes: list[Outcome], decay: float = CATEGORY_DECAY) -
 
 
 def compute_axis_slop(outcomes: list[Outcome], decay: float = CATEGORY_DECAY) -> dict[str, float]:
-    """The damped slop subtotal per bundle (security / qa / performance) — unbounded, lower = better, in
+    """The damped slop subtotal per bundle (security / qa / accessibility / performance) — unbounded, lower = better, in
     the SAME units as slop_score (1 decimal). A pure decomposition, not a reweighting: every category belongs to
     one bundle, so the subtotals sum to slop_score. No caps, no axis multipliers, no 0-100 normalization."""
     fired = _escalate_corroborated([o for o in outcomes if o.outcome == "slop_detected"])   # same as slop_score

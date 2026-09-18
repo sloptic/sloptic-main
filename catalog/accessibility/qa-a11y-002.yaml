@@ -1,5 +1,5 @@
 id: qa-a11y-002
-bundle: qa
+bundle: accessibility
 category: accessibility
 variant_group_id: qa-a11y   # same flaw as qa-a11y-001 (browser), two detection methods -> fire once
 pool: public
