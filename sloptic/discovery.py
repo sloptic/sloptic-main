@@ -1238,6 +1238,7 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
 
     browser_ok = False
     render_state = None        # Streamlit render outcome (rendered|error|stuck) -> the capture-based shell_only signal
+    entry_render_chars = None  # visible-text size of the ENTRY render, for the title-only shell check at the end
     backend_tables: list = []  # managed-backend tables the app's own runtime traffic read (RLS probe input)
     host_tiers: dict = {}     # off-score: where the app's runtime traffic goes (same-origin / BaaS / vendor /
     if render is not None:    # other off-origin) — populated from the observed net once the browser render runs
@@ -1272,22 +1273,12 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
             # is_shell_only EXCLUDES from the curve regardless. Return NOW with just the state so the pipeline
             # short-circuits. A 'rendered' shell falls through and is crawled + graded normally.
             return Profile(base_url=base_url, landing_path=start_path, render_state=render_state)
-        if render_state is None and not forms and not endpoints and rendered:
-            # TITLE-ONLY / UNHYDRATED SHELL (the 404-shell gate's render layer): a non-canvas host whose entry
-            # rendered essentially no content AND whose crawl captured no surface. idea-forge-web renders only
-            # its <title> ("Idea Forge", 10 chars), captured 0 forms / 0 endpoints / 0 inputs, and scored ONLY
-            # the header tax on the empty shell -- a phantom 12.5. A real one-page app renders real copy
-            # (envi-seven, 514) or exposes a control, clearing the gate. Recorded render_state 'empty' ->
-            # is_shell_only EXCLUDES it from the reference distribution, and NOT as a dead verdict: a
-            # slow-hydrating real SPA can render short too, so this stays a probabilistic shell CLASSIFICATION,
-            # never a dead-url DNF. Gated tight (no captured surface AND near-zero visible text) so a minimal
-            # splash is spared, and it short-circuits like error/stuck rather than grinding a full battery on
-            # an empty shell. Complements deploy_and_grade._dead_url_reason, whose ghost check needs the entry
-            # and a nonexistent path to render the SAME dead shell -- idea-forge-web's ghost is a real host 404,
-            # so that path cannot catch it.
+        if render_state is None and rendered:
+            # Capture the ENTRY render's visible-text size for the title-only shell check, which is evaluated
+            # at the END of discovery (not here) so a thin SPA whose real forms/inputs live on sub-routes is
+            # judged on its FULL harvested surface, never short-circuited before phase 2 renders those routes.
             entry_dom = rendered.get(start_path) or next(iter(rendered.values()), "")
-            if entry_dom and len(_render_visible_text(entry_dom)) < _EMPTY_RENDER_MAX_CHARS:
-                return Profile(base_url=base_url, landing_path=start_path, render_state="empty")
+            entry_render_chars = len(_render_visible_text(entry_dom)) if entry_dom else None
         if rendered:
             browser_ok = True  # a real render returned HTML -> the browser actually launched/works
             any_response = True
@@ -1527,6 +1518,21 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
                     landing_path = start_path
         except (httpx.HTTPError, httpx.InvalidURL):
             pass
+    # TITLE-ONLY / UNHYDRATED SHELL (the 404-shell gate's render layer): after the FULL crawl + render, a
+    # non-canvas host (render_state None) whose entry rendered under _EMPTY_RENDER_MAX_CHARS visible chars AND
+    # that harvested NO surface at all -- no forms, no endpoints, no route beyond the entry -- is a parked or
+    # broken SPA. idea-forge-web renders only its <title> "Idea Forge" (10 chars) with 0 forms / 0 endpoints;
+    # a real one-page app renders real copy (envi-seven, 514) or exposes a control. render_state 'empty' ->
+    # is_shell_only EXCLUDES it from the reference distribution, a probabilistic shell CLASSIFICATION, never a
+    # dead-url DNF (a slow-hydrating real SPA can render short too). Judged HERE on the full surface so a thin
+    # entry whose forms live on sub-routes is spared. Complements deploy_and_grade._dead_url_reason, whose
+    # ghost check needs entry==ghost to render the SAME dead shell -- idea-forge-web's ghost is a real host
+    # 404, so only this catches it.
+    if (render_state is None and entry_render_chars is not None
+            and entry_render_chars < _EMPTY_RENDER_MAX_CHARS
+            and not forms and not endpoints
+            and not [r for r in routes if r not in (start_path, "/")]):
+        render_state = "empty"
     return Profile(base_url=base_url, landing_path=landing_path, routes=list(routes), forms=forms,
                    capabilities=capabilities, endpoints=endpoints, host_tiers=host_tiers,
                    backend_tables=backend_tables, render_state=render_state)
