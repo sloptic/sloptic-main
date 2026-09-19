@@ -5548,6 +5548,12 @@ def a11y_violations_present(ctx, probe) -> bool:
         impacts[level] = impacts.get(level, 0) + 1
     ctx.evidence.update(violations=len(scored), rules=sorted({v["id"] for v in scored})[:15],
                         impacts=impacts, engine="axe-core", penalty_override=_a11y_penalty(impacts, contrast_pen))
+    # WHERE each rule failed (off-score, report-card only): a few example CSS selectors per rule, so the card
+    # can say "text is too low-contrast to read (at .hero h1)" instead of just naming the rule. Never enters
+    # the score, which counts rules, not nodes.
+    locations = {v["id"]: v["nodes"][:3] for v in scored if v.get("nodes")}
+    if locations:
+        ctx.evidence["locations"] = locations
     if worst_shortfall is not None:
         ctx.evidence["contrast_shortfall"] = round(worst_shortfall, 2)
     if advisory:   # OFF-SCORE: captured for the 2026.3 re-grade to measure decorrelation, never scored here

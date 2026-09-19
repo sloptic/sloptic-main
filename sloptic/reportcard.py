@@ -401,6 +401,7 @@ _ACTUAL_SKIP = frozenset({
     "third_party", "cross_origin_subresources", "threshold", "sources",
     "value_kind", "cwe",                                                      # jargon the reason already conveys
     "violations",                                    # a11y: a bare count, redundant with the named rules below
+    "locations",                                     # a11y: consumed inline by the rules rendering, not on its own
 })
 
 # Accessibility is the single most common finding (~64% of apps) and the least self-explanatory, because axe
@@ -455,9 +456,16 @@ def _actual(finding: dict) -> str:
         if k in _ACTUAL_SKIP or isinstance(v, bool) or v is None or v == [] or v == {}:
             continue
         if isinstance(v, list):
-            if k == "rules":                          # a11y axe rule ids -> plain language, no "rules:" prefix
-                shown = ", ".join(_a11y_rule(x) for x in v[:8])
-                parts.append(shown + (f", +{len(v) - 8} more" if len(v) > 8 else ""))
+            if k == "rules":                          # a11y axe rule ids -> plain language + WHERE each fired
+                locs = ev.get("locations") or {}
+                items = []
+                for x in v[:8]:
+                    desc = _a11y_rule(x)
+                    where = locs.get(x) or []
+                    if where:
+                        desc += f" (at {', '.join(str(w) for w in where[:2])})"
+                    items.append(desc)
+                parts.append(", ".join(items) + (f", +{len(v) - 8} more" if len(v) > 8 else ""))
                 continue
             shown = ", ".join(str(x) for x in v[:8])
             parts.append(f"{k}: {shown}" + (f", +{len(v) - 8} more" if len(v) > 8 else ""))

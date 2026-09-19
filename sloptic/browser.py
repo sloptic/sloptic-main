@@ -1998,6 +1998,17 @@ def _contrast_data(violation) -> list:
 
 
 @_browser_guarded
+def _node_loc(node: dict) -> str:
+    """A compact 'where' for one axe violation node: its most-specific CSS selector. axe `target` is a list of
+    selectors (nested as a list-of-lists when the element is inside an iframe); the last entry is the element
+    itself. This is what points a developer at the exact element that failed rather than the whole page."""
+    t = node.get("target") or []
+    sel = t[-1] if t else ""
+    if isinstance(sel, list):
+        sel = " ".join(str(x) for x in sel)
+    return str(sel)[:80]
+
+
 def a11y_violations(url: str, headers=None, timeout: float = 12.0) -> list | None:
     """Render url, inject axe-core, and return its violations as [{id, impact, tags}] — the WCAG 2 A/AA SCORED
     ruleset (~100 rules incl. contrast, ARIA, structure) PLUS the Family-2 advisory candidates (WCAG 2.2 AA +
@@ -2025,7 +2036,11 @@ def a11y_violations(url: str, headers=None, timeout: float = 12.0) -> list | Non
                     "rules: {'target-size': {enabled: true}}})" % json.dumps(_AXE_WCAG_TAGS + _AXE_ADVISORY_TAGS))
                 out = []
                 for v in results.get("violations", []):
-                    rec = {"id": v["id"], "impact": v.get("impact"), "tags": v.get("tags") or []}
+                    rec = {"id": v["id"], "impact": v.get("impact"), "tags": v.get("tags") or [],
+                           # WHERE each violation is, not just that it exists: axe gives every failing node a
+                           # CSS selector, which is what a developer needs to find the element. A few examples
+                           # per rule is enough for the report card (the score counts rules, never nodes).
+                           "nodes": [loc for n in (v.get("nodes") or [])[:4] if (loc := _node_loc(n))]}
                     if v["id"] == "color-contrast":
                         # axe fixes this rule's impact at "serious" regardless of HOW unreadable the text is,
                         # so 4.4:1 (a hair under AA) and 1.1:1 (effectively invisible) arrive identical. Keep

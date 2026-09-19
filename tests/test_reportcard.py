@@ -144,3 +144,19 @@ def test_actual_drops_bare_boolean_flags():
     line = rc._actual(f)
     assert "origin = http://x.example" in line
     assert "no_tls" not in line and "upgrades_to_https" not in line
+
+
+def test_a11y_line_shows_where_each_violation_occurred():
+    # the point of the card: the exact element, not just that a violation exists. axe gives a CSS selector
+    # per failing node; the line names the rule AND where it fired.
+    from sloptic.browser import _node_loc
+    assert _node_loc({"target": ["button.cta"]}) == "button.cta"
+    assert _node_loc({"target": [["#frame", "input#email"]]}) == "#frame input#email"   # iframe-nested
+    ev = {"rules": ["color-contrast", "label"], "impacts": {"serious": 1, "critical": 1},
+          "locations": {"color-contrast": [".hero h1", "button.cta"], "label": ["#email"]}}
+    line = rc._actual({"probe_id": "qa-a11y-001", "target": "/", "evidence": ev})
+    assert "text is too low-contrast to read (at .hero h1, button.cta)" in line
+    assert "a form field has no label (at #email)" in line
+    assert "locations" not in line                       # the raw dict is consumed inline, not dumped
+    # a record without locations (pre-capture) still renders the rule cleanly, no crash
+    assert "a form field has no label" in rc._actual({"probe_id": "qa-a11y-001", "evidence": {"rules": ["label"]}})
