@@ -103,11 +103,22 @@ def test_actual_line_surfaces_list_and_dict_evidence_and_hides_noise():
                          "advisory_a11y": {"rules": ["region"], "impacts": {"moderate": 1}},
                          "repro": {"method": "GET", "url": "https://x"}, "versions": {"lighthouse": "13.4.1"}}}
     line = rc._actual(a11y)
-    assert "color-contrast" in line and "button-name" in line          # the failing rules are named
-    assert "critical=2" in line and "serious=1" in line                # impact counts surfaced
+    # the failing rules are named in PLAIN LANGUAGE, not as raw axe ids
+    assert "text is too low-contrast to read" in line and "a button has no readable label" in line
+    assert "color-contrast" not in line and "button-name" not in line   # the raw slugs are gone
+    assert "critical=2" in line and "serious=1" in line                 # impact counts surfaced
     assert "contrast_shortfall = 0.42" in line
     for noise in ("penalty_override", "advisory_a11y", "region", "lighthouse", "GET"):
         assert noise not in line, f"{noise!r} is internal/off-score noise and must not render"
+
+
+def test_a11y_rule_ids_translate_to_plain_language_with_a_graceful_fallback():
+    seen = rc._actual({"probe_id": "qa-a11y-001", "evidence": {"violations": 2,
+                        "rules": ["image-alt", "label"], "impacts": {"critical": 2}}})
+    assert "an image is missing alt text" in seen and "a form field has no label" in seen
+    assert "violations" not in seen                          # the bare count is dropped, the named rules replace it
+    # an unmapped (future) axe rule degrades to its de-hyphenated id, never a raw slug or a crash
+    assert "some new rule" in rc._actual({"probe_id": "qa-a11y-001", "evidence": {"rules": ["some-new-rule"]}})
 
 
 def test_actual_line_truncates_long_lists():

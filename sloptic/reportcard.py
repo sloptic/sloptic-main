@@ -400,7 +400,47 @@ _ACTUAL_SKIP = frozenset({
     "keys_checked", "google_key_candidates", "links_checked", "first_party",  # counters a reader won't act on
     "third_party", "cross_origin_subresources", "threshold", "sources",
     "value_kind", "cwe",                                                      # jargon the reason already conveys
+    "violations",                                    # a11y: a bare count, redundant with the named rules below
 })
+
+# Accessibility is the single most common finding (~64% of apps) and the least self-explanatory, because axe
+# reports raw rule IDs (`button-name`, `color-contrast`) that mean nothing to a builder. Translate the ones the
+# corpus actually produces (these ~28 cover it; the top 16 are ~97%) into what is actually wrong. An unmapped
+# rule falls back to its de-hyphenated id, so a new axe rule degrades gracefully rather than showing a raw slug.
+_A11Y_RULE_HUMAN = {
+    "color-contrast": "text is too low-contrast to read",
+    "button-name": "a button has no readable label",
+    "meta-viewport": "the page blocks zoom (the viewport tag disables scaling)",
+    "label": "a form field has no label",
+    "select-name": "a dropdown has no label",
+    "link-name": "a link has no readable text",
+    "html-has-lang": "the page doesn't declare its language",
+    "scrollable-region-focusable": "a scrollable area can't be reached by keyboard",
+    "document-title": "the page has no title",
+    "image-alt": "an image is missing alt text",
+    "svg-img-alt": "an SVG image has no text alternative",
+    "nested-interactive": "interactive controls are nested inside each other",
+    "link-in-text-block": "a link isn't distinguishable from the text around it",
+    "frame-title": "an embedded frame has no title",
+    "aria-input-field-name": "an input has no accessible name",
+    "aria-command-name": "a control has no accessible name",
+    "aria-progressbar-name": "a progress bar has no accessible name",
+    "aria-prohibited-attr": "an element uses an ARIA attribute it isn't allowed",
+    "aria-hidden-focus": "a focusable element is hidden from screen readers",
+    "aria-valid-attr-value": "an ARIA attribute has an invalid value",
+    "aria-allowed-attr": "an element uses an ARIA attribute it isn't allowed",
+    "aria-required-children": "an ARIA role is missing required child elements",
+    "aria-roles": "an element uses an invalid ARIA role",
+    "list": "a list isn't marked up correctly",
+    "listitem": "a list item isn't inside a proper list",
+    "definition-list": "a definition list isn't marked up correctly",
+    "dlitem": "a definition-list item isn't inside a proper list",
+    "meta-refresh": "the page auto-refreshes, which can trap users",
+}
+
+
+def _a11y_rule(rule: str) -> str:
+    return _A11Y_RULE_HUMAN.get(rule, str(rule).replace("-", " "))
 
 
 def _actual(finding: dict) -> str:
@@ -415,6 +455,10 @@ def _actual(finding: dict) -> str:
         if k in _ACTUAL_SKIP or isinstance(v, bool) or v is None or v == [] or v == {}:
             continue
         if isinstance(v, list):
+            if k == "rules":                          # a11y axe rule ids -> plain language, no "rules:" prefix
+                shown = ", ".join(_a11y_rule(x) for x in v[:8])
+                parts.append(shown + (f", +{len(v) - 8} more" if len(v) > 8 else ""))
+                continue
             shown = ", ".join(str(x) for x in v[:8])
             parts.append(f"{k}: {shown}" + (f", +{len(v) - 8} more" if len(v) > 8 else ""))
         elif isinstance(v, dict):
