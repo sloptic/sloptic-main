@@ -114,3 +114,22 @@ def test_actual_line_truncates_long_lists():
     f = {"probe_id": "p", "evidence": {"rules": [f"r{i}" for i in range(12)]}}
     line = rc._actual(f)
     assert "+4 more" in line                                            # 8 shown + "+4 more"
+
+
+def test_actual_falls_back_to_reason_when_evidence_is_only_request_metadata():
+    # a missing-header finding used to read "status = 200; elapsed_ms = 18" -- request metadata that says
+    # nothing about the absent header. With metadata skipped, the line falls back to the finding's reason.
+    f = {"probe_id": "sec-headers-002", "reason": "missing header: content-security-policy", "penalty": 8,
+         "evidence": {"status": 200, "elapsed_ms": 18}}
+    assert rc._actual(f).startswith("missing header: content-security-policy")
+    assert "status" not in rc._actual(f) and "elapsed_ms" not in rc._actual(f)
+
+
+def test_actual_drops_bare_boolean_flags():
+    # a flag like no_tls=True / render_broken=False only restates the finding in machine terms; the origin
+    # (the finding-specific value) stays.
+    f = {"probe_id": "sec-tls-001", "reason": "served over plain http", "penalty": 30,
+         "evidence": {"no_tls": True, "upgrades_to_https": False, "origin": "http://x.example"}}
+    line = rc._actual(f)
+    assert "origin = http://x.example" in line
+    assert "no_tls" not in line and "upgrades_to_https" not in line

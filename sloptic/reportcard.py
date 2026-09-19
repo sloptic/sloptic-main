@@ -383,23 +383,36 @@ def _pool_map(catalog_root: str | pathlib.Path) -> dict[str, str]:
         return {}
 
 
-# Evidence keys kept OUT of the "what we saw" line: internal scoring detail (the raw penalty override), the
-# off-score advisory set, the reproduction request (rendered as its own repro block), and the tool-version
-# stamp. Everything else -- INCLUDING lists and shallow dicts -- is surfaced.
-_ACTUAL_SKIP = frozenset({"engine", "penalty_override", "report_only", "advisory_a11y", "repro", "versions",
-                          "na_reason"})
+# Evidence keys kept OUT of the "what we saw" line, so it reads as the finding rather than a debug dump. This
+# is the SINGLE source of "what we saw" (the site renders `actual` and no longer dumps raw evidence beside it),
+# so the line has to carry the specific detail and nothing else. Dropped:
+#   - scoring / rendering internals and large blobs handled elsewhere;
+#   - REQUEST METADATA that is not the finding (a missing-header finding was reading `status = 200; elapsed_ms
+#     = 18`, which says nothing about the absent header -- with these gone the line falls back to the reason);
+#   - PERF scoring internals (the `metrics` dict carries the real numbers);
+#   - bookkeeping COUNTERS a reader does not act on.
+# Boolean values are dropped wholesale: a flag like `no_tls = True` / `render_broken = False` only restates the
+# finding (already shown as the reason) in machine terms.
+_ACTUAL_SKIP = frozenset({
+    "engine", "penalty_override", "report_only", "advisory_a11y", "repro", "versions", "na_reason", "reason",
+    "status", "elapsed_ms", "content_len", "content_type", "target",          # request metadata, not the finding
+    "runs", "tier", "score", "audit", "display",                              # perf internals (metrics dict wins)
+    "keys_checked", "google_key_candidates", "links_checked", "first_party",  # counters a reader won't act on
+    "third_party", "cross_origin_subresources", "threshold", "sources",
+    "value_kind", "cwe",                                                      # jargon the reason already conveys
+})
 
 
 def _actual(finding: dict) -> str:
     """A plain-language 'what we saw' line from the finding evidence + where it fired. Lists and shallow dicts
-    are rendered, not dropped: for many probes they ARE the specific 'what to fix' -- the failing a11y `rules`
-    and their `impacts` counts, the inert-control `labels`, the exposed backend host lists, the perf `metrics`
-    table. Previously only scalars showed, so an a11y finding read `violations = 3; penalty_override = 20`
-    without ever naming color-contrast or button-name."""
+    are rendered (the failing a11y `rules` and their `impacts`, the inert-control `labels`, the exposed backend
+    host, the perf `metrics`); request metadata, scoring internals, and bare boolean flags are dropped so the
+    line reads as the finding, not a debug dump. When nothing finding-specific is left (a header was simply
+    absent), it falls back to the finding's own `reason` rather than showing `status = 200`."""
     ev = finding.get("evidence") or {}
     parts = []
     for k, v in ev.items():
-        if k in _ACTUAL_SKIP or v is None or v == [] or v == {}:
+        if k in _ACTUAL_SKIP or isinstance(v, bool) or v is None or v == [] or v == {}:
             continue
         if isinstance(v, list):
             shown = ", ".join(str(x) for x in v[:8])
