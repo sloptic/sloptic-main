@@ -5387,6 +5387,8 @@ def console_errors_present(ctx, probe) -> bool:
     ctx.evidence.update(js_errors=res["total"], first_party=res["first_party"],
                         third_party=res["third_party"], sources=res.get("sources"),
                         engine="pageerror+console")
+    if res.get("examples"):        # the actual error text (off-score) so the card shows WHAT threw, not just a count
+        ctx.evidence["errors"] = res["examples"]
     if res["first_party"] <= 0:
         return False
     broken = _console_broken_render(res)

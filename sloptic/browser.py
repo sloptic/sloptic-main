@@ -2116,12 +2116,14 @@ def _console_failure(text: str, origin: str) -> str | None:
 def _tally_console(pageerrors: list, console_errors_text: list, origin: str) -> dict:
     """Fold pageerror throws + curated console.error failures into first/third/total counts. Factored out (pure)
     for testing. `sources` records how many first-party came from each channel, so a widened fire is auditable."""
-    pe_fp = sum(1 for msg, stack in pageerrors if _first_party_error(msg, stack, origin))
-    classes = [_console_failure(t, origin) for t in console_errors_text]
-    c_fp = sum(1 for c in classes if c == "first")
-    c_tp = sum(1 for c in classes if c == "third")
+    pe_fp_msgs = [msg for msg, stack in pageerrors if _first_party_error(msg, stack, origin)]
+    c_fp_msgs = [t for t in console_errors_text if _console_failure(t, origin) == "first"]
+    c_tp = sum(1 for t in console_errors_text if _console_failure(t, origin) == "third")
+    pe_fp, c_fp = len(pe_fp_msgs), len(c_fp_msgs)
     return {"first_party": pe_fp + c_fp, "third_party": (len(pageerrors) - pe_fp) + c_tp,
-            "total": len(pageerrors) + c_fp + c_tp, "sources": {"pageerror": pe_fp, "console": c_fp}}
+            "total": len(pageerrors) + c_fp + c_tp, "sources": {"pageerror": pe_fp, "console": c_fp},
+            # the actual first-party error TEXT (truncated), so the card shows WHAT failed, not just a count
+            "examples": [m.strip()[:140] for m in (pe_fp_msgs + c_fp_msgs)[:3] if m and m.strip()]}
 
 
 @_browser_guarded

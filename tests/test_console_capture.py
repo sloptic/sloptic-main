@@ -50,6 +50,10 @@ def test_tally_folds_console_failures_into_first_party():
     assert res["third_party"] == 1          # the third-party CSP block
     assert res["total"] == 3                # 1 pageerror + 2 classified console (the 404 is dropped)
     assert res["sources"] == {"pageerror": 1, "console": 1}
+    # the actual first-party error TEXT is captured (off-score) so the card shows WHAT threw, not just a count;
+    # the counts above are unchanged by this.
+    assert res["examples"] == ["TypeError: x is not a function",
+                               "Hydration failed because the initial UI does not match"]
 
 
 def test_tally_without_console_matches_the_old_pageerror_only_behavior():
