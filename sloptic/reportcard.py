@@ -396,7 +396,7 @@ def _pool_map(catalog_root: str | pathlib.Path) -> dict[str, str]:
 _ACTUAL_SKIP = frozenset({
     "engine", "penalty_override", "report_only", "advisory_a11y", "repro", "versions", "na_reason", "reason",
     "status", "elapsed_ms", "content_len", "content_type", "target",          # request metadata, not the finding
-    "runs", "tier", "score", "audit", "display",                              # perf internals (metrics dict wins)
+    "runs", "tier", "score",                          # perf composite internals (audit/display name the finding)
     "keys_checked", "google_key_candidates", "links_checked", "first_party",  # counters a reader won't act on
     "third_party", "cross_origin_subresources", "threshold", "sources",
     "value_kind", "cwe",                                                      # jargon the reason already conveys
@@ -444,6 +444,16 @@ def _a11y_rule(rule: str) -> str:
     return _A11Y_RULE_HUMAN.get(rule, str(rule).replace("-", " "))
 
 
+# The hand-rolled perf probes report a bare `value`; without a label + unit "value = 7954031" is unreadable.
+# Keyed by probe id because `value` is also a token elsewhere (sec-session-006), which must stay verbatim.
+_PERF_VALUE = {
+    "perf-weight-001": ("total page weight", lambda v: f"{float(v) / 1_000_000:.1f} MB"),
+    "perf-ttfb-001": ("server response time", lambda v: f"{int(float(v))} ms"),
+    "perf-requests-001": ("network requests", lambda v: f"{int(float(v))}"),
+    "perf-dom-001": ("DOM elements", lambda v: f"{int(float(v))}"),
+}
+
+
 def _actual(finding: dict) -> str:
     """A plain-language 'what we saw' line from the finding evidence + where it fired. Lists and shallow dicts
     are rendered (the failing a11y `rules` and their `impacts`, the inert-control `labels`, the exposed backend
@@ -451,10 +461,21 @@ def _actual(finding: dict) -> str:
     line reads as the finding, not a debug dump. When nothing finding-specific is left (a header was simply
     absent), it falls back to the finding's own `reason` rather than showing `status = 200`."""
     ev = finding.get("evidence") or {}
+    pid = finding.get("probe_id", "")
     parts = []
     for k, v in ev.items():
-        if k in _ACTUAL_SKIP or isinstance(v, bool) or v is None or v == [] or v == {}:
+        if k in _ACTUAL_SKIP or isinstance(v, bool) or v is None or v == "" or v == [] or v == {}:
             continue
+        if k == "value":
+            if ev.get("display"):                      # a perf audit with Lighthouse's own human string -> use it
+                continue
+            if pid in _PERF_VALUE:                     # a bare-number perf probe -> label it with its unit
+                label, fmt = _PERF_VALUE[pid]
+                try:
+                    parts.append(f"{label}: {fmt(v)}")
+                    continue
+                except (TypeError, ValueError):
+                    pass                               # non-numeric -> fall through to the generic render
         if isinstance(v, list):
             if k == "rules":                          # a11y axe rule ids -> plain language + WHERE each fired
                 locs = ev.get("locations") or {}
