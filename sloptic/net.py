@@ -46,6 +46,10 @@ class _OnsetHolder:
             if self.probe is None:
                 self.probe = probe_id
 
+    def reset(self) -> None:
+        with self._lock:
+            self.probe = None
+
 
 _challenge_onset: contextvars.ContextVar = contextvars.ContextVar("hl_challenge_onset", default=None)
 # per-probe request TALLY (always-on, cheap): surfaces which probes send abnormally many requests -- the
@@ -81,6 +85,16 @@ def challenge_onset() -> str | None:
     """The probe id whose request first hit a CONFIRMED WAF/challenge response this grade (None if none)."""
     onset = _challenge_onset.get()
     return onset.probe if onset is not None else None
+
+
+def reset_challenge_onset() -> None:
+    """Clear a recorded onset so a later block can re-record. The pipeline calls this once it has CONFIRMED the
+    challenge was a per-path WAF block (Cloudflare's 1020 "Attention Required" on a sensitive path like /.env)
+    while the ORIGIN stays reachable: a per-path block must not halt the grade, mirroring the Vercel `deny`
+    carve-out. An app-wide block leaves the onset set and halts as before."""
+    onset = _challenge_onset.get()
+    if onset is not None:
+        onset.reset()
 
 
 def request_counts() -> dict | None:

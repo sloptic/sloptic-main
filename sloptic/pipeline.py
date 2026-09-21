@@ -26,7 +26,7 @@ from . import auth, egress, lighthouse, platform_id, safety, secretscan
 from .aggregate import compute_axis_slop, compute_slop_score, coverage_metrics
 from .deploy import Deployer
 from .discovery import discover, surface_metrics
-from .net import challenge_onset, is_bot_challenge, make_client, request_counts, set_trace_probe, start_trace
+from .net import challenge_onset, is_bot_challenge, make_client, request_counts, reset_challenge_onset, set_trace_probe, start_trace
 
 # A late-challenge grade is kept only if at least this fraction of the catalog ran BEFORE the WAF tripped (so
 # most outcomes saw the real app). Below it, too much of the grade is contaminated -> withhold like an entry challenge.
@@ -368,6 +368,18 @@ def _run_bounded(thunk, timeout_s: float):
     return None, True                          # abandoned: the daemon thread dies with the process
 
 
+def _app_wide_challenge(client: httpx.Client, origin: str) -> bool:
+    """A challenge marker tripped mid-grade: is it APP-WIDE, or a PER-PATH WAF block (Cloudflare's 1020 on a
+    sensitive path like /.env, a Vercel `deny`) with the app itself still fully reachable? Confirm against the
+    ORIGIN. Fail CLOSED -- an origin we cannot reach counts as app-wide -- so an app-wide block is never scored
+    as a false clean. The CF 1020 page carries no distinguishing header (unlike Vercel `deny`), so re-fetching
+    the origin is the only reliable discriminator."""
+    try:
+        return is_bot_challenge(client.get(origin))
+    except Exception:
+        return True
+
+
 def _run_probe(probe: Probe, ctx: _Ctx, client: httpx.Client, profile: Profile) -> list[Outcome]:
     """Resolve one probe to its outcome(s): applicability gate, then an oracle predicate or a
     declarative fan-out across discovered targets. One Outcome per (probe x target)."""
@@ -665,8 +677,13 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
                 outcomes.extend(probe_outcomes)
                 if on_progress:
                     on_progress(i + 1, total, probe, probe_outcomes)  # done: i+1 probes completed
-                if challenge_onset():   # a CONFIRMED challenge tripped during/before this probe -> STOP: every
-                    break               # request past here hits the interstitial, not the app (and stops hammering)
+                if challenge_onset():
+                    # A confirmed challenge tripped on this probe's request. Halt ONLY if it is app-wide: a
+                    # per-path WAF block (Cloudflare 1020 on /.env, a Vercel deny) leaves the app reachable, so
+                    # halting there abandons the rest of the gradeable battery. Confirm against the origin.
+                    if _app_wide_challenge(client, origin):
+                        break             # app-wide: every request past here hits the interstitial, not the app
+                    reset_challenge_onset()   # per-path block on a reachable app -> keep grading the battery
             # OFF-SCORE diagnostic: identify the hosting platform + AI builder from one origin fetch (headers +
             # served HTML). Inside the client block so it reuses the session; never raises -> never DNFs a grade.
             plat = platform_id.classify_live(client, origin)
