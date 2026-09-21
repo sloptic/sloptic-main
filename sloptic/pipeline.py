@@ -678,10 +678,6 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
                     end_challenged = False
             else:
                 end_challenged = False
-            if hung_probes:   # probes that blew their own wall clock: blocked, so the retry pass recovers them
-                blocked_probes = sorted(set(blocked_probes) | set(hung_probes))
-                incomplete_axes = sorted(set(incomplete_axes)
-                                         | {p.bundle for p in catalog if p.id in set(hung_probes)})
             req_counts = request_counts() or {}
         if source_dir:   # static source scan (submission zip / --source DIR); absent for a bare --target
             outcomes.append(_source_secret_outcome(source_dir))
@@ -704,6 +700,13 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
             stage = "limited" if onset_idx < _MIN_VALID_FRACTION * total else "late"
         elif end_challenged:
             bot_challenge, stage = True, "late"
+        if hung_probes:   # per-probe-deadline abandonments (a probe blew its 120s wall): mark them blocked so the
+            # retry pass recovers them, and their axes incomplete. Merged HERE, after the challenge-onset finalize
+            # sets blocked_probes/incomplete_axes -- doing it before that init (as it once did) read an unbound
+            # `blocked_probes` and crashed the grade whenever a probe hung (UnboundLocalError, 71 apps in v25).
+            blocked_probes = sorted(set(blocked_probes) | set(hung_probes))
+            incomplete_axes = sorted(set(incomplete_axes)
+                                     | {p.bundle for p in catalog if p.id in set(hung_probes)})
         surface = surface_metrics(profile)
         if ctx.lighthouse:   # capture the Lighthouse performance score (0-100) onto the record -- the perf axis
             perf = lighthouse.perf_score(ctx.lighthouse)   # already grades on it; this surfaces it for the stats.

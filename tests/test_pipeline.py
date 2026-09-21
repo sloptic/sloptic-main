@@ -370,3 +370,16 @@ def test_register_reuses_a_seeded_crawl_session_instead_of_registering_again(mon
         assert "_a" in calls
     finally:
         client.close()
+
+
+def test_a_hung_probe_does_not_crash_the_grade_and_lands_in_blocked_probes(monkeypatch):
+    # Regression (v25: 71 apps DNF'd this way): the per-probe deadline's hung-probe handling read
+    # `blocked_probes` before it was initialized in the finalize, so ANY probe that blew its wall clock crashed
+    # the whole grade with UnboundLocalError instead of being abandoned. Force every bounded probe to report
+    # hung and assert the grade still COMPLETES, with the hung probes recorded blocked (for the retry pass).
+    import sloptic.pipeline as pl
+    monkeypatch.setattr(pl, "_run_bounded", lambda thunk, timeout: (None, True))
+    report = run(SubprocessDeployer(str(REFS / "vulnerable" / "app.py")), _catalog())
+    assert report is not None                       # did NOT crash (the bug was an UnboundLocalError here)
+    assert report.blocked_probes                    # hung probes recorded blocked, not silently lost
+    assert report.incomplete_axes                   # and their axes flagged incomplete
