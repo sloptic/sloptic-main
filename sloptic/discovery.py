@@ -1528,6 +1528,13 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
     # entry whose forms live on sub-routes is spared. Complements deploy_and_grade._dead_url_reason, whose
     # ghost check needs entry==ghost to render the SAME dead shell -- idea-forge-web's ghost is a real host
     # 404, so only this catches it.
+    # Re-drop unresolved {placeholder} templates at the FINAL chokepoint. The crawl-phase filter above runs
+    # before the render / mining / perceive phases re-add endpoints (obs_eps, mined, conv, searches, perceived),
+    # and a SPA that loads its SDK at runtime -- base44's /api/apps/{app_id}/... scaffold -- re-introduces the
+    # braced templates there, so the earlier filter alone left them on the surface. A concrete endpoint never
+    # carries a literal brace and requesting the template tests nothing; off-score (surface_size is not in the
+    # curve), but it keeps the reported surface honest and lets the empty-shell check below see a true count.
+    endpoints = [e for e in endpoints if "{" not in (e.path or "")]
     if (render_state is None and entry_render_chars is not None
             and entry_render_chars < _EMPTY_RENDER_MAX_CHARS
             and not forms and not endpoints
