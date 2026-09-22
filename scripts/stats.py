@@ -295,6 +295,29 @@ def app_audit(recs, query):
         _app_audit_one(r)
 
 
+def _devpost_line(r):
+    """The Devpost provenance for --app: which hackathon the app entered (if any), its submission link, and
+    whether it won. All three are already on the record (run_batch threads hackathon/project/winner via --meta
+    and the urls file); this just surfaces them. A Devpost hackathon lives at <slug>.devpost.com and a
+    submission is the project's devpost.com/software/<name> URL."""
+    hack = r.get("hackathon")
+    proj = r.get("project")
+    won = r.get("winner")
+    proj_is_url = bool(proj) and str(proj).startswith("http")
+    if (not hack or hack == "(unlabeled)") and not proj_is_url:
+        return "      devpost: (not from a hackathon submission)"
+    parts = []
+    if hack and hack != "(unlabeled)":
+        slug_ok = bool(re.fullmatch(r"[a-z0-9-]+", hack))
+        parts.append(f"hackathon https://{hack}.devpost.com" if slug_ok else f"hackathon {hack}")
+    if proj_is_url:
+        parts.append(f"submission {proj}")
+    elif proj:
+        parts.append(f"project {proj}")
+    parts.append("WON" if won is True else "did not win" if won is False else "won: unknown")
+    return "      devpost: " + " | ".join(parts)
+
+
 def _app_audit_one(r):
     """Render one record. Fired findings first (heaviest penalty last so the tail is the headline), then the
     applied-but-clean probes, the N/A probes with their reasons, and the coverage / challenge context."""
@@ -308,6 +331,7 @@ def _app_audit_one(r):
           + (f" | {total:.0f}s" if isinstance(total, (int, float)) else "")
           + (f" | graded_origin={(r.get('observed_surface') or {}).get('graded_origin')}" if (r.get('observed_surface') or {}).get('graded_origin') else ""))
 
+    print(_devpost_line(r))
     if r.get("slop_score") is None:      # a DNF: the audit question is WHY it died
         why = r.get("deploy_error") or "no score recorded"
         print(f"      DNF: {why}")
