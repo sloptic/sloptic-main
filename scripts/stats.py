@@ -441,6 +441,58 @@ def lighthouse_scores(recs):
                             "pct_green": round(100 * green / len(xs), 1) if xs else None}}
 
 
+def _hk_row(r):
+    """One app's line in a --hackathon roster: slop (or DNF), win flag, app link, devpost submission link."""
+    slop = r.get("slop_score")
+    score = f"{slop:7.1f}" if slop is not None else "    DNF"
+    won = "WON" if r.get("winner") is True else "   "
+    app = r.get("url") or r.get("repo") or "(unknown)"
+    proj = r.get("project")
+    dp = proj if proj and str(proj).startswith("http") else "-"
+    return f"    {score}  {won}  {app}   {dp}"
+
+
+def hackathon_audit(recs, query):
+    """--hackathon: one hackathon's roster. A 5-number summary + mean/stdev over its GRADED apps' slop, then
+    every app (app link, devpost submission, slop, win) best-first, so --app can drill into any of them.
+    Matches a fragment of the hackathon slug, case-insensitive."""
+    q = query.lower()
+    hits = [r for r in recs if q in (r.get("hackathon") or "").lower()]
+    if not hits:
+        avail = sorted({r.get("hackathon") for r in recs if r.get("hackathon")})
+        print(f"\n=== hackathon: {query} ===  0 records")
+        print("  (try a fragment of a slug: " + ", ".join(avail[:6]) + (" ..." if len(avail) > 6 else "") + ")")
+        return
+    slugs = sorted({r.get("hackathon") or "(unlabeled)" for r in hits})
+    if len(slugs) > 1:
+        c = Counter(r.get("hackathon") or "(unlabeled)" for r in hits)
+        print(f"\n=== hackathon: {query} ===  matched {len(slugs)} hackathons -- narrow the fragment:")
+        for s in slugs:
+            print(f"    {c[s]:4d}  {s}")
+        return
+    slug = slugs[0]
+    graded = sorted((r for r in hits if _is_graded(r)), key=lambda r: r["slop_score"])
+    dnf = [r for r in hits if not _is_graded(r)]
+    winners = sum(1 for r in hits if r.get("winner") is True)
+    print(f"\n=== hackathon: {slug} ===  {len(hits)} apps  ({len(graded)} graded, {len(dnf)} DNF, {winners} winners)")
+    scores = [r["slop_score"] for r in graded]
+    if scores:
+        q1, q3 = (statistics.quantiles(scores, n=4, method="inclusive")[0::2]
+                  if len(scores) >= 2 else (scores[0], scores[0]))
+        sd = statistics.stdev(scores) if len(scores) >= 2 else 0.0
+        print(f"  slop:  min {scores[0]:.1f}  p25 {q1:.1f}  median {statistics.median(scores):.1f}"
+              f"  p75 {q3:.1f}  max {scores[-1]:.1f}    mean {statistics.mean(scores):.1f}  stdev {sd:.1f}")
+    else:
+        print("  slop:  (no graded apps)")
+    print(f"\n    {'slop':>7}  won  app link / devpost submission")
+    for r in graded:
+        print(_hk_row(r))
+    if dnf:
+        print(f"    --- not in the curve ({len(dnf)}: DNF / shell / limited / challenge) ---")
+        for r in sorted(dnf, key=lambda x: (x.get("slop_score") is None, x.get("slop_score") or 0)):
+            print(_hk_row(r))
+
+
 def by_hackathon(recs):
     """Roll the Devpost hackathon slug on each record up into stats grouped by hackathon: submissions, deploy%
     (REPO apps only -- URL apps aren't deploy tested), graded count, slop median/mean/stdev, winner count, and the
@@ -1757,6 +1809,7 @@ def main():
     ap.add_argument("results", help="the JSONL from deploy_and_grade --record (or a filled worksheet, with --tally)")
     ap.add_argument("--audit", metavar="PROBE", help="list every app + evidence where PROBE fired, then exit")
     ap.add_argument("--app", metavar="URL", help="audit ONE app: every probe that fired (penalty, contribution, target, reason, repro), plus clean / n-a / blocked and coverage, then exit")
+    ap.add_argument("--hackathon", metavar="SLUG", help="one hackathon roster: a 5-number slop summary + mean/stdev, then every app (link, devpost submission, slop, win), then exit. Matches a slug fragment")
     ap.add_argument("--category", metavar="CAT",
                     help="aggregate one category across the corpus (e.g. exposure, accessibility), grouped by "
                          "category instead of by probe, then exit")
@@ -1843,6 +1896,9 @@ def main():
         return
     if args.app:
         app_audit(recs, args.app)
+        return
+    if args.hackathon:
+        hackathon_audit(recs, args.hackathon)
         return
     if args.category:
         audit_category(recs, args.category)
