@@ -446,6 +446,16 @@ one separately.
 
 ## 8. Reproducibility
 
+The run file, `multihacksv26retried.jsonl`, is not published. Each record carries the app's URL and the
+evidence behind its findings, including where a leaked credential or an open table sits, so releasing it
+would hand out a list of exploitable apps. What is public: the aggregate figures
+(`validation/corpus-figures-active.json`), every plotted value and test result (`docs/charts/*.csv`), the
+frozen curve (`validation/benchmark-curve.json`), the grader, and the event list in Appendix A.
+
+A rerun cannot match this one exactly in any case. The apps are live, and they change or disappear. A new run
+over the Appendix A events measures the same population at a later date. With the run file, these commands
+regenerate every number and figure:
+
 ```sh
 # the numbers
 uv run python scripts/stats.py multihacksv26retried.jsonl --all           # full text report
