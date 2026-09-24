@@ -16,7 +16,7 @@ stamped value, not a file read, is the source of truth wherever an installed gra
 from __future__ import annotations
 
 # The full-battery reference and the passive-battery reference, versioned independently.
-FULL = "2026.3"
+FULL = "2026.4"
 PASSIVE = "passive-2026.1"
 
 
