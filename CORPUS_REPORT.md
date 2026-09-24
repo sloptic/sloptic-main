@@ -1,4 +1,4 @@
-# How Well Do Hackathon Web Apps Hold Up?
+# Durability of Hackathon Web Apps
 
 ### A black box study of 1,579 live apps from 80 hackathons
 
@@ -61,9 +61,9 @@ live URL. That gave 2,685 apps. Most events are North American university hackat
 rest are in Europe, Latin America and Asia Pacific. One 2023 edition stays in as an older reference point.
 These apps are young, small, and built in a day or two. They are not a sample of production software.
 
-### 2.2 From 2,685 URLs to 1,579 grades
+### 2.2 Attrition
 
-![Where 2,685 submissions went](docs/charts/fig01_funnel.png)
+![Submission outcomes](docs/charts/fig01_funnel.png)
 
 | outcome | apps | share of attempted |
 |---|---:|---:|
@@ -131,7 +131,7 @@ not correct for multiple comparisons. Appendix B lists every test.
 
 ## 4. Results
 
-### 4.1 The distribution (RQ1)
+### 4.1 Score distribution (RQ1)
 
 ![Slop score distribution](docs/charts/fig02_distribution.png)
 
@@ -153,9 +153,9 @@ The distribution has one peak and a long right tail. No app scored 0, and the lo
 The most common score is 13.7, shared by 83 apps (5.3%). That is what the four missing security headers cost
 on their own. 45 apps have no finding except missing headers.
 
-### 4.2 What the score is made of (RQ1)
+### 4.2 Score composition (RQ1)
 
-![Axis share and per app subtotals](docs/charts/fig03_axes.png)
+![Slop by axis](docs/charts/fig03_axes.png)
 
 | axis | share of all slop | median | mean | apps with any |
 |---|---:|---:|---:|---:|
@@ -179,9 +179,9 @@ performance, and quality against performance is −0.01. Lighthouse score agains
 gives ρ = −0.07. The axes measure different things, and a good score on one predicts almost nothing about
 the others.
 
-### 4.3 What fires
+### 4.3 Fire frequency
 
-![Fire frequency](docs/charts/fig05_fire_frequency.png)
+![Most frequent findings](docs/charts/fig05_fire_frequency.png)
 
 The four header probes fire on 90 to 98% of apps. 1,550 of 1,579 apps (98.2%) send no Content Security
 Policy. A probe that fires on nearly everyone is close to a constant: it costs every app about the same and
@@ -213,7 +213,7 @@ The acute tier is mostly broken apps, not hacked ones. Of the 506 critical findi
 the red (178 apps), a crash on malformed input (137), and a client bundle pointing at a backend real visitors
 cannot reach (23). A password reset email that never arrives accounts for 15.
 
-### 4.5 The exploitable slice (RQ2)
+### 4.5 Exploitable findings (RQ2)
 
 ![Exploitable apps by class](docs/charts/fig07_exploitable.png)
 
@@ -258,7 +258,7 @@ Both builders offer Supabase as a built in backend, and many of their apps ship 
 
 ### 4.7 Winners (RQ4)
 
-![Winners against non winners](docs/charts/fig08_winners.png)
+![Median slop, winners and non winners](docs/charts/fig08_winners.png)
 
 The dataset records which apps won a prize at their event. 247 of the graded apps did.
 
@@ -324,7 +324,7 @@ The injection probes show the cost. `sec-cmdi-001` applied to 934 apps, sent a m
 and fired on none. On a population of static frontends behind a web application firewall, a zero fire rate
 for injection means the probes found nothing to inject into. It does not mean the code is safe.
 
-### 4.10 Inside performance and accessibility
+### 4.10 Performance and accessibility detail
 
 ![Lighthouse performance scores](docs/charts/fig10_lighthouse.png)
 
@@ -344,7 +344,7 @@ Servers answer fast, since most apps sit on a CDN edge, and layouts hold still. 
 what it ships. The median flagged page weighs 4.1 MB, and the heaviest weighs 124 MB. Mean blocking time is
 8.1 seconds against a median of 320 ms, because a few apps lock the main thread for minutes.
 
-![Accessibility rules](docs/charts/fig11_a11y_rules.png)
+![Accessibility violations by axe rule](docs/charts/fig11_a11y_rules.png)
 
 1,034 apps (65.5%) have an accessibility violation. Color contrast accounts for 80.5% of them. Unlabeled
 buttons follow at 13.7%, then a viewport that blocks zoom (7.1%) and unlabeled form fields (6.6%). Missing
@@ -404,7 +404,7 @@ times as often.
 Winning does not predict durability. The axes are independent, so a durability score has to report each
 one separately.
 
-## 8. Reproducing this report
+## 8. Reproducibility
 
 ```sh
 # the numbers
@@ -426,7 +426,7 @@ uv run python scripts/benchmark.py rank --results app.jsonl
 - [Veracode, Spring 2026 GenAI Code Security update](https://www.veracode.com/blog/spring-2026-genai-code-security/)
 - [Cloud Security Alliance, AI generated code vulnerability research note (2026)](https://labs.cloudsecurityalliance.org/research/csa-research-note-ai-codegen-vulnerability-debt-20260406-csa/)
 
-## Appendix A: the 80 hackathons
+## Appendix A: Hackathons
 
 Devpost event slugs, as ingested:
 
@@ -453,7 +453,7 @@ biggest-little-hackathon-2026  ellehacks-2026  hackrpi-2025          vibe-coder-
 codecrunch-305hackathon-fall25  henhacks-2026  hack-for-humanity-26  hack-for-humanity-2026
 ```
 
-## Appendix B: hypothesis tests
+## Appendix B: Hypothesis tests
 
 From `docs/charts/tests.csv`.
 
