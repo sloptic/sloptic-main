@@ -63,8 +63,13 @@ severity.**
   floor, a no account benefits screener that bottoms out the curve on merit.
 - **Accessibility is now its own axis**, about 18% of all corpus slop, so the site can finally say "your app
   is inaccessible" separately from "your app is broken."
-- **Winners still ship more slop**: median 52.5 against 47.5 for non winners (11% higher), and their
-  Lighthouse scores run lower too (median 78 against 83). Polished demos ship more JavaScript.
+- **AI builders leave the backend open.** Lovable and Bolt apps are no sloppier overall (p = 0.16), but 11
+  of 82 (13.4%) expose their managed backend, against 9 of 1,497 hand built apps (0.6%): about 22 times the
+  rate (p < 10⁻⁹).
+- **Winners are no cleaner.** Median slop is 52.7 against 47.6 for non winners, but that gap is not
+  significant (p = 0.22). On security, quality and accessibility the two groups are equal. The one real
+  difference is performance: winners score lower on Lighthouse (median 78 against 84, p = 0.003). Do not
+  say "winners ship more slop"; say "winning does not predict durability." Source: `CORPUS_REPORT.md` 4.7.
 - **Password recovery that never arrives.** Apps built on a managed auth provider's default mailer, which only
   delivers to the project's own team, lock every real user out of account recovery. Users care that the email
   never came, not why. That is a clean, relatable durability story.
