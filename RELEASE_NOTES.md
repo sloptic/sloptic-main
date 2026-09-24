@@ -1,4 +1,4 @@
-# Sloptic v2.2.0
+# Sloptic v3.0.0
 
 Sloptic grades any deployed web app, whatever its stack or purpose, and returns one
 **slop score** you can compare across apps (lower is better, `0` means nothing found),
@@ -10,6 +10,61 @@ Versions 1.1 and 1.2 kept the 2026.1 curve, so grades stayed comparable and the 
 precision and diagnostics. Version 2.0 is different: it is a **new ruler**. New probe families and
 continuous scoring changed what the number measures, and the reference curve moved to **2026.3**, so
 a 2.0 score does not compare to a 1.x one. A 2.0 percentile is quoted against 2026.3. Version 2.1 keeps that 2026.3 ruler, so a 2.1 grade compares directly to a 2.0 one, and it adds the egress sandbox the hosted service needs to accept public URL submissions safely. Version 2.2 keeps it as well, and spends its changes on the crawl, on a second frozen curve for the passive battery, and on the client the hosted service needs to verify an event.
+
+Version 3.0 is the next **new ruler**. Accessibility becomes its own axis, performance is corrected for the speed of the box that measured it, and new detection reaches classes the 2.x battery could not, so the reference curves move to **2026.4** (full) and **passive-2026.2** (passive). A 3.0 score does not compare to a 2.x one, and a 3.0 percentile is quoted against 2026.4.
+
+## What's new in 3.0.0
+
+- **A new ruler, and accessibility as its own axis.** The score now splits four ways, security, quality,
+  accessibility and performance, and the four subtotals still sum exactly to the slop score. Accessibility
+  made up a large share of the quality number while it sat inside it, so a team could not tell an
+  inaccessible app from a broken one; it now reports on its own, priced as before. The full curve **2026.4** is final, frozen from a
+  run of 2,685 live hackathon apps, 1,579 of them curve eligible. The middle of the distribution barely moved
+  (median 48.4 against 2026.3's 50.0) while the upper tail grew (95th percentile 140 against 130), which is
+  what new detection reaching more apps should look like.
+- **Performance corrected for the box that measured it.** Lighthouse's default throttling models the network
+  but never slows the real CPU; it runs the trace at the host's actual speed and multiplies CPU time by a fixed
+  factor, so a busy grading box scores an app worse through no fault of the app. A controlled comparison found
+  a lone grade on an idle box about 6.6 Lighthouse points kinder than the same app graded four at a time.
+  Every grade now records the host speed Lighthouse measured (`benchmark_index`), and the curve carries a
+  normalization fitted from that comparison, so a solo submission ranks fairly against a population graded
+  in parallel. Performance axis only; the other three are untouched.
+- **The ruler travels with the grade.** Every record is stamped with the curves it was scored against, and
+  the report card prints them, so a stored grade never silently reads as current after the ruler moves. A
+  grade that predates the stamp reads as unspecified, never as the current ruler.
+- **A per path WAF block no longer ends the grade.** An edge that blocks one sensitive path (a firewall
+  refusing `/.env`) while serving the app normally used to read as a challenge on the whole app, and the grade
+  stopped there. The grader now re-fetches the origin before halting: a reachable app keeps grading, and only
+  an app wide challenge, or an origin that cannot be reached at all, halts. On one hosting platform, 70 apps
+  that were cut short at exactly that path in the previous run are now graded in full, with none challenged.
+- **New detection.**
+  - A Gemini key found in a bundle is confirmed against Google with one free call instead of guessed from its
+    format. It spends a request against the owner's credential, so it runs only where ownership is attested.
+    The secret patterns also cover the 2026 model providers and name an Anthropic key correctly.
+  - A Supabase Storage bucket an anonymous client can list, where per user paths expose other users' files.
+    A now redundant CVE probe is dropped.
+  - A reusable session token carried in a URL query string, where it leaks into history, logs and referrers.
+  - A linked page still showing generator boilerplate. Two distinct placeholders on one page are required, so
+    deliberate example copy does not fire.
+- **Precision.** The boolean SQL injection oracle now requires a negative control and skips generator streams.
+  A cross host redirect after a CSRF attempt reads as a bounce, not an acceptance. Host header injection never
+  fires on an error response. A session token counts only on the graded origin's own URLs. Platform error
+  pages, starter templates and title only shells are no longer graded as apps. Unresolved `{placeholder}`
+  endpoint templates are dropped before any probe sees them. An app that redirects is graded at the origin it
+  settles on. Five more third party hosts are excluded from the curve: a hosted presentation, a package
+  registry, two app store listings, and a no code site builder.
+- **One slow probe costs its own time, not the grade.** Each non browser probe runs against its own wall clock,
+  and one that overruns lands in `blocked_probes` for the retry pass instead of consuming the whole grade. The
+  path that handled that overrun also had a bug that crashed the entire grade; it is fixed. The injection
+  fan out now runs inside the context of the thread that submitted it, the browser's top level navigation is
+  scoped to the graded origin, and a grade that times out records the phase, probe and progress where it died.
+- **The report card says what went wrong.** The line under each finding now states the finding and its
+  failing detail rather than raw evidence. Accessibility rule ids read in plain language, with the element each
+  violation occurred on. Console errors are quoted, not just counted. The performance audit is named and its
+  value labeled.
+- **Tooling.** `scripts/stats.py --app` audits one app end to end, including the Devpost event, submission and
+  whether it won. `--hackathon` prints one event's roster with a five number slop summary. The committed corpus
+  figures now read their version from the ruler, so they cannot lag the frozen curve.
 
 ## What's new in 2.2.0
 
@@ -157,9 +212,9 @@ a 2.0 score does not compare to a 1.x one. A 2.0 percentile is quoted against 20
 - **Catastrophe gate.** An exploitable-now class (SQL injection, a served secret file, a
   world readable managed backend) is reported as an absolute gate whatever the rank says. A
   favorable comparison to equally-broken peers never launders it.
-- **102 probes across three axes.** Security (60), quality and correctness (29), and
-  performance (13). Each axis reports its own damped subtotal, and the three sum exactly
-  to the slop score.
+- **106 probes across four axes.** Security (63), quality and correctness (27),
+  accessibility (3), and performance (13). Each axis reports its own damped subtotal, and the
+  four sum exactly to the slop score.
 - **Deduction-only and risk-priced.** No positive credit, no 0-to-100 ceiling. Each
   penalty is frequency times severity. A probe's detection variants collapse to one
   finding, and repeated instances of one category have diminishing marginal penalty, so a
@@ -185,18 +240,27 @@ systematic drift; 2.0 adds probes while keeping determinism, so the movement tha
 places where black box nondeterminism is unavoidable, stateful browser behavior, Core Web Vitals
 timing, and the security tail behind authentication.
 
+Across two consecutive 3.0 corpus runs, on the 906 apps graded unchallenged both times, individual
+verdicts barely moved. Of the verdicts that fired in either run, the security header probes flipped in under
+1 percent of cases, accessibility in 2 percent, crash resistance in 3 percent. The one material source of
+per app noise is the Lighthouse score near its 90 point pass line, where about 15 percent of those verdicts
+flip between runs; it is priced as a continuous
+shortfall rather than a hard verdict for that reason.
+
 Correctness is anchored two ways: a fixed set of reference apps with a known answer key (the
 vulnerable app must accrue slop, the hardened app must score `0`), and a recall benchmark of scenarios
 tagged with a CWE. `uv run pytest -q` runs the calibration suite.
 
-## Frozen reference curve: 2026.3
+## Frozen reference curves: 2026.4 and passive-2026.2
 
-This release ships reference curve **2026.3** (provisional), frozen from a corpus run of 1,625
-live web apps. It stores the full score distribution as anonymous per app rows (score, whether a
-catastrophe fired, the single worst finding, worst case slop defended, surface breadth) with no per
-app identity, so a percentile is exact with no interpolation, and ties resolve the same way every
-time. A percentile is always quoted against a named curve version, so the claim is
-checkable and does not drift as the population changes.
+This release ships the full reference curve **2026.4** (final), frozen from a corpus run of 2,685 live
+hackathon apps, 1,579 of them eligible for the curve, and the passive floor curve **passive-2026.2**, frozen
+from its own run of the passive battery over the same corpus. Each stores its full score distribution as
+anonymous per app rows (score, whether a catastrophe fired, the single worst finding, worst case slop
+defended, surface breadth) with no per app identity, so a percentile is exact with no interpolation and ties
+resolve the same way every time. A percentile is always quoted against a named curve version, so the claim is
+checkable and does not drift as the population changes. The full curve also carries its performance
+normalization, so a grade is ranked as if measured on the population's box.
 
 ## Scope, honestly
 
