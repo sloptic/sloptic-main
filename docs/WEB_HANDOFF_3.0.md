@@ -67,8 +67,9 @@ severity.**
   of 82 (13.4%) expose their managed backend, against 9 of 1,497 hand built apps (0.6%): about 22 times the
   rate (p < 10⁻⁹).
 - **Winners are no cleaner.** Median slop is 52.7 against 47.6 for non winners, but that gap is not
-  significant (p = 0.22). On security, quality and accessibility the two groups are equal. The one real
-  difference is performance: winners score lower on Lighthouse (median 78 against 84, p = 0.003). Do not
+  significant (p = 0.22). Winners crash, leak, and ship dead controls at the same rates as everyone else. The
+  one real difference is performance: winners ship heavier pages (21% flagged for page weight against 12%)
+  and score lower on Lighthouse (median 78 against 84, p = 0.003). Do not
   say "winners ship more slop"; say "winning does not predict durability." Source: `CORPUS_REPORT.md` 4.7.
 - **Password recovery that never arrives.** Apps built on a managed auth provider's default mailer, which only
   delivers to the project's own team, lock every real user out of account recovery. Users care that the email
