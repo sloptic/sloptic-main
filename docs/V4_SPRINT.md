@@ -27,17 +27,13 @@ battery, it moves the ruler and waits for 4.0.** Everything else ships whenever 
 
 When an idea shows up, it goes on this page immediately. Captured, not shipped.
 
-## New constraint: the grader is live
+## Measurement runs with the grader down (decided)
 
-v3 measured with the grader down. From 3.0 the Dell serves sloptic.org, so v4's roughly 7.6 days of box time
-(two full runs plus a passive run, per the v3 capacity table) competes with live grading. **Decide before
-November**, in this order of preference:
-
-1. **A second box for corpus runs.** Cleanest: measurement never touches the live grader. It must match the
-   Dell's CPU class or the perf axis shifts (perf_norm corrects box speed, but only against the frozen bi_ref).
-2. **Downtime windows between events.** December is quiet, which is another reason to aim there.
-3. **Concurrency 2 pinned with `taskset -c 0,1`.** Keeps the site up, but is not comparable to history, so a
-   perf shift cannot be attributed. Last resort.
+From 3.0 the Dell also serves sloptic.org, and v4's roughly 7.6 days of box time (two full runs plus a
+passive run, per the v3 capacity table) needs the whole box. **Decided 2026-09-24: the grader goes down for
+corpus runs, intentionally**, exactly as in v3. That keeps every run at concurrency 4 on the same box, so the
+curves stay comparable with history and perf_norm's bi_ref stays valid. It is also one more reason the runs
+belong in a quiet window between seasons, not mid event.
 
 ## Timeline
 
