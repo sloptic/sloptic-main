@@ -1523,7 +1523,7 @@ def timing_json(recs: list) -> dict:
     }
 
 
-def corpus_json(recs: list) -> dict:
+def corpus_json(recs: list, corpus_id: str = "unspecified") -> dict:
     """The full CORPUS_REPORT picture as ONE aggregate JSON, so the report prose and the sloptic.org
     /findings page quote a single source and cannot drift. Renders what the default report prints, but
     AGGREGATE ONLY: no app names, URLs, hosts, keys, or per-app rows (event slugs, platform, builder,
@@ -1780,7 +1780,7 @@ def corpus_json(recs: list) -> dict:
         "version": version,
         "probe_set": probe_set,
         "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
-        "provenance": {"corpus_id": "multihacksv23", "run_date": run_date, "n_apps": n, "n_events": len(ev),
+        "provenance": {"corpus_id": corpus_id, "run_date": run_date, "n_apps": n, "n_events": len(ev),
                        "n_probes": n_probes, "catalog_fingerprint": cat_fp, "curve_version": curve, "probe_set": probe_set,
                        "attempted": attempted},
         "reach": {"attempted": attempted, "graded": n},
@@ -1854,7 +1854,7 @@ def main():
     if not recs:
         sys.exit("no records")
     if args.corpus_json:
-        cj = corpus_json(recs)
+        cj = corpus_json(recs, corpus_id=pathlib.Path(args.results).stem)
         out = args.corpus_json
         if out == "__AUTO__":   # default: name by the detected battery (active = full, passive = 44-probe floor)
             out = "validation/corpus-figures-%s.json" % ("passive" if cj["probe_set"] == "passive" else "active")
@@ -1905,8 +1905,6 @@ def main():
         audit_category(recs, args.category)
         return
     if args.charts:
-        import pathlib
-
         from charts import render_all
         written = render_all(recs, run_name=pathlib.Path(args.results).name)
         print(f"wrote {len(written)} charts + sibling CSVs to docs/charts/ (run: {pathlib.Path(args.results).name})")
