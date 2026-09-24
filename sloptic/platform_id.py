@@ -158,11 +158,17 @@ _WRONG_OWNER_SUFFIX = {
     "onedrive.live.com": "file-share",   # a OneDrive file/folder share
     "vercel.com": "vendor-dashboard",    # the Vercel DASHBOARD (vercel.com/<team>/<proj>); *.vercel.app deploys
     #                                      are NOT caught (they end .vercel.app, not .vercel.com)
+    # v26 sweep of curve-eligible hosts: a third party's page graded in place of a submission
+    "prezi.com": "presentation",         # a Prezi deck (grades Prezi, down to its own signup flow)
+    "pypi.org": "package-registry",      # a PyPI project page, not a deployed app
+    "play.google.com": "app-store",      # a Google Play listing (docs/drive/sites.google.com were already here)
+    "testflight.apple.com": "app-store", # a TestFlight invite page
     # TIER 2: no-code site/app builders (the surface is the platform's, not the team's)
     "softr.app": "no-code-site", "wixsite.com": "no-code-site", "wix.com": "no-code-site",
     "wix-vibe.com": "no-code-site", "wix-vibe-site.com": "no-code-site",
     "framer.app": "no-code-site", "framer.website": "no-code-site", "framer.media": "no-code-site",
     "carrd.co": "no-code-site", "glide.page": "no-code-site", "glideapp.io": "no-code-site",
+    "figma.site": "no-code-site",        # Figma Sites (v26): the same tier as framer.app / wixsite.com
     "bubbleapps.io": "no-code-site", "retool.app": "no-code-site",
 }
 

@@ -75,6 +75,11 @@ def test_wrong_owner_host_flags_third_party_and_editor_surfaces():
         "www.tella.tv": "video-demo",                        # v20: a Tella demo VIDEO
         "onedrive.live.com": "file-share",                   # v20: a OneDrive share
         "vercel.com": "vendor-dashboard",                    # v20: the Vercel dashboard (NOT a *.vercel.app deploy)
+        "prezi.com": "presentation",                         # v26: a Prezi deck
+        "pypi.org": "package-registry",                      # v26: a PyPI project page
+        "play.google.com": "app-store",                      # v26: a Google Play listing
+        "testflight.apple.com": "app-store",                 # v26: a TestFlight invite
+        "sadly-camp-78163766.figma.site": "no-code-site",    # v26: Figma Sites
     }
     for host, cat in cases.items():
         assert wrong_owner_host(host) == cat, host
@@ -84,7 +89,8 @@ def test_wrong_owner_host_keeps_first_party_apps():
     # real code hosts + AI-code-generators that emit owned code + tiiny (team's uploaded dist) are NOT wrong-owner
     for host in ("mappy-ai.vercel.app", "app.onrender.com", "x.up.railway.app", "user.github.io",
                  "punya.base44.app", "myapp.lovable.app", "cool.bolt.host", "myapp.tiiny.site",
-                 "myapp.elasticbeanstalk.com"):     # elasticbeanstalk/EC2 run the team's own app -> kept
+                 "myapp.elasticbeanstalk.com",
+                 "app-dn4wgk0h8c1t.appmedo.com", "butterfly-11b075f3.aedify.ai"):   # AI builders hosting generated code -> kept     # elasticbeanstalk/EC2 run the team's own app -> kept
         assert wrong_owner_host(host) is None, host
 
 
