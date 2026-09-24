@@ -28,7 +28,8 @@ anonymous reads.
 
 Three comparisons stand out. AI builder apps are no sloppier overall (p = 0.16), but they leave their backend
 open about 22 times as often as hand built apps (13.4% against 0.6%, p < 10⁻⁹). Hackathon winners are no cleaner than the apps they
-beat. They are equal on everything except performance, where they are measurably worse (p = 0.001). The four
+beat. They match their peers on crashes, leaks, dead controls and every other security or quality measure,
+and differ only on performance: their pages are heavier and slower (p = 0.001). The four
 axes of the score are close to independent (every pairwise |ρ| ≤ 0.14), so a fast app tells you almost nothing about
 whether it is secure or accessible.
 
@@ -206,7 +207,8 @@ probes applied somewhere and never fired.
 | minor (1 to 10) | 327 | 20.7% |
 
 58.1% of apps (918) are significant: their worst finding is serious or above. The median worst finding is 27
-(Q1 12, Q3 46.1).
+(Q1 12, Q3 46.1). Performance and accessibility account for much of that. Counting only security and quality
+findings, 31.5% of apps (498) are significant and 17.4% (275) are acute.
 
 The acute tier is mostly broken apps, not hacked ones. Of the 506 critical findings, 43.1% are quality and
 36.2% are performance, which leaves 20.8% for security. The top critical findings are a Lighthouse score in
@@ -270,14 +272,50 @@ The dataset records which apps won a prize at their event. 247 of the graded app
 | median Lighthouse score | 78 | 83.5 | 0.003 |
 | median observed surface size | 26 | 25 | 0.70 |
 
-Winners score 11% higher on median slop, but the gap is not significant. The breakdown explains it. On
-security, quality and accessibility combined, the two groups are the same. The whole gap is performance:
-winners have a lower Lighthouse score (30.2% reach green against 36.8%) and nearly twice the median
-performance slop.
+Winners score 11% higher on median slop, but the gap is not significant. The whole difference is
+performance: winners have a lower Lighthouse score (30.2% reach green against 36.8%) and nearly twice the
+median performance slop.
 
-One guess is that winners are bigger apps with more surface for slop to land on. The data does not support
-that. Their observed surface is the same size. They are slower, not larger. Judges reward the idea, the demo
-and the pitch, and none of those predicts whether an app holds up.
+Outside performance, the groups are the same. The tie is not an artifact of the header findings, which
+cost every app about the same. The findings that vary between apps occur at the same rates.
+
+| finding | winners | non winners | p |
+|---|---:|---:|---:|
+| crash on malformed input | 6.9% | 9.0% | 0.33 |
+| dead control | 13.0% | 13.7% | 0.84 |
+| secret in the bundle | 3.6% | 2.6% | 0.39 |
+| exploitable | 5.3% | 4.7% | 0.63 |
+| worst security or quality finding above 20 | 32.0% | 31.5% | 0.88 |
+| worst security or quality finding above 40 | 17.0% | 17.5% | 0.93 |
+
+The last two rows set aside performance and accessibility and ask how often an app's worst security or
+quality problem is significant or acute. The answer is the same for both groups. The one gap outside
+performance is accessibility: 59.5% of winners have a finding against 67.3% of non winners (p = 0.019).
+That is one of many comparisons here and does not survive correction, so we treat it as exploratory.
+
+Winners ship heavier pages. Winners are no bigger by observed surface, which counts routes, forms and
+endpoints. They carry more weight in the browser.
+
+| measure | winners | non winners | p |
+|---|---:|---:|---:|
+| page weight audit flagged | 21.1% | 12.2% | 0.0004 |
+| total blocking time, median | 440 ms | 300 ms | 0.003 |
+| largest contentful paint, median | 4.4 s | 3.9 s | 0.06 |
+| first contentful paint, median | 2.5 s | 2.7 s | 0.69 |
+| time to first byte, median | 20 ms | 20 ms | 0.81 |
+
+The paint and timing medians cover only apps below 90, since green apps record no metrics. The server
+answers equally fast and first paint is the same. The difference comes after: more bytes and more main
+thread work, which fits the maps, 3D scenes and animation that demo well.
+
+The gap survives two controls. The grading box was equally loaded for both groups (median
+`benchmark_index` 1452 against 1437, p = 0.32), so grading conditions do not explain it. Event mix does not
+either. In the 29 events with at least three winners and three non winners, winners carry more performance
+slop in 21 (Wilcoxon p = 0.027) and a lower Lighthouse score in 19 (p = 0.04). Slop outside performance
+splits 12 to 17 (p = 0.97), and the acute share splits 12 to 15 (p = 0.92).
+
+Judges pick apps that match their peers on durability and run heavier in the browser. Judges reward the
+idea, the demo and the pitch, and none of those predicts whether an app holds up.
 
 ### 4.8 Platforms and events
 
@@ -387,10 +425,12 @@ without the axis breakdown, and judging cannot stand in for a durability check.
 - **Performance varies between runs.** Lighthouse verdicts flip on about 15% of apps from run to run near the
   90 line. Header findings flip on under 1%, accessibility on 2%, crash findings on 3% (906 apps graded
   twice).
-- **Multiple comparisons.** We ran ten hypothesis tests and six axis correlations without correction. A
-  Bonferroni correction over all sixteen (threshold 0.003) keeps the backend exposure, platform, surface size
-  and winner performance axis results. The winner Lighthouse gap (p = 0.0034) falls just outside it, and the
-  event result (p = 0.03) is not significant.
+- **Multiple comparisons.** We ran 29 hypothesis tests and six axis correlations without correction. A
+  Bonferroni correction over all 35 (threshold 0.0014) keeps five results: backend exposure by builder,
+  slop by platform, slop against surface size, the winner performance axis, and the winner page weight rate.
+  The winner Lighthouse and blocking time gaps (p ≈ 0.003) and the within event results (p ≈ 0.03) fall
+  outside it. They agree with the corrected results and we read them as supporting evidence. The null
+  results, including every winner comparison outside performance, do not depend on correction.
 - **One population.** These are hackathon apps. The results do not describe production software.
 - **Intent is out of scope.** The grader measures failures that count against any app. It does not judge
   whether an idea is good.
@@ -455,7 +495,7 @@ codecrunch-305hackathon-fall25  henhacks-2026  hack-for-humanity-26  hack-for-hu
 
 ## Appendix B: Hypothesis tests
 
-From `docs/charts/tests.csv`.
+From `docs/charts/tests.csv`, plus the three winner slop rows from `docs/charts/fig08_winners.csv`.
 
 | hypothesis | test | n | p | detail |
 |---|---|---|---:|---|
@@ -466,6 +506,25 @@ From `docs/charts/tests.csv`.
 | performance axis, winners vs non winners | Mann-Whitney U, two sided | 247 / 1,332 | 0.001 | medians 10.9 vs 5.8 |
 | Lighthouse score, winners vs non winners | Mann-Whitney U, two sided | 242 / 1,296 | 0.0034 | medians 78 vs 83.5 |
 | surface size, winners vs non winners | Mann-Whitney U, two sided | 247 / 1,332 | 0.70 | medians 26 vs 25 |
+| crash on malformed input, winners vs non winners | Fisher exact | 247 / 1,332 | 0.33 | 6.9% vs 9.0% |
+| dead control, winners vs non winners | Fisher exact | 247 / 1,332 | 0.84 | 13.0% vs 13.7% |
+| secret in the bundle, winners vs non winners | Fisher exact | 247 / 1,332 | 0.39 | 3.6% vs 2.6% |
+| exploitable, winners vs non winners | Fisher exact | 247 / 1,332 | 0.63 | 5.3% vs 4.7% |
+| worst security or quality finding above 20 | Fisher exact | 247 / 1,332 | 0.88 | 32.0% vs 31.5% |
+| worst security or quality finding above 40 | Fisher exact | 247 / 1,332 | 0.93 | 17.0% vs 17.5% |
+| any accessibility finding (exploratory) | Fisher exact | 247 / 1,332 | 0.019 | 59.5% vs 67.3% |
+| Lighthouse below 90, winners vs non winners | Fisher exact | 247 / 1,332 | 0.015 | 69.6% vs 61.5% |
+| page weight audit flagged, winners vs non winners | Fisher exact | 247 / 1,332 | 0.0004 | 21.1% vs 12.2% |
+| total blocking time, apps below 90 | Mann-Whitney U, two sided | 171 / 812 | 0.003 | medians 440 vs 300 ms |
+| largest contentful paint, apps below 90 | Mann-Whitney U, two sided | 171 / 812 | 0.06 | medians 4.4 vs 3.9 s |
+| first contentful paint, apps below 90 | Mann-Whitney U, two sided | 171 / 812 | 0.69 | medians 2.5 vs 2.7 s |
+| time to first byte, apps below 90 | Mann-Whitney U, two sided | 171 / 813 | 0.81 | medians 20 vs 20 ms |
+| grading box load, winners vs non winners | Mann-Whitney U, two sided | 247 / 1,332 | 0.32 | medians 1452 vs 1437 |
+| within event: performance axis | Wilcoxon signed rank | 29 events | 0.027 | winners higher in 21 of 29 |
+| within event: Lighthouse score | Wilcoxon signed rank | 29 events | 0.04 | winners lower in 19 of 29 |
+| within event: slop outside performance | Wilcoxon signed rank | 29 events | 0.97 | winners higher in 12, lower in 17 |
+| within event: worst security or quality above 20 | Wilcoxon signed rank | 29 events | 0.42 | winners higher in 20, lower in 9 |
+| within event: worst security or quality above 40 | Wilcoxon signed rank | 29 events | 0.92 | winners higher in 12, lower in 15 |
 | slop across host platforms (n ≥ 10) | Kruskal-Wallis | 10 groups, 1,565 | 3.7 × 10⁻⁶ | |
 | slop across events (n ≥ 10) | Kruskal-Wallis | 49 groups, 1,410 | 0.03 | |
 | slop vs observed surface size | Spearman | 1,579 | 2.9 × 10⁻⁸ | ρ = 0.14 |

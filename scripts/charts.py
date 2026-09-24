@@ -432,6 +432,95 @@ def fig_reach(ctx, fj):
 
 
 # ---- hypothesis tests the report quotes -----------------------------------------------------------------
+def _lh_metric(r, mid, unit):
+    """A Lighthouse metric parsed from the perf-lighthouse-001 evidence string (same parse as stats.py). Present
+    only when the app scored below 90, since green apps carry no perf finding."""
+    import re
+    for f in r.get("findings") or []:
+        if f.get("probe_id") == "perf-lighthouse-001":
+            raw = (((f.get("evidence") or {}).get("metrics") or {}).get(mid) or "")
+            m = re.search(r"(\d+(?:\.\d+)?)\s*(ms|s)?", raw.replace("\u00a0", " ").replace(",", ""))
+            if not m:
+                return None
+            v, u = float(m.group(1)), m.group(2) or ""
+            if unit == "s":
+                return v / 1000 if u == "ms" else v
+            return v * 1000 if (unit == "ms" and u == "s") else v
+    return None
+
+
+def _winner_tests(graded, W, N, ss):
+    """RQ4 follow ups: do winners differ on anything besides performance, and what makes them slower?"""
+    rows = []
+
+    def rate(label, pred, note=""):
+        a, b = sum(map(pred, W)), sum(map(pred, N))
+        p = ss.fisher_exact([[a, len(W) - a], [b, len(N) - b]]).pvalue
+        rows.append([f"winners vs non winners: {label}", "Fisher exact, two sided", len(W), len(N), float(p),
+                     f"{a}/{len(W)} ({100 * a / len(W):.1f}%) vs {b}/{len(N)} ({100 * b / len(N):.1f}%){note}"])
+
+    def fired(prefix):
+        return lambda r: any(f["probe_id"].startswith(prefix) for f in r.get("findings") or [] if _scored(f))
+
+    def worst_sec_qa(r):
+        return max([f.get("penalty") or 0 for f in r.get("findings") or [] if _scored(f)
+                    and f.get("bundle") in ("security", "qa")] or [0])
+
+    from benchmark import _has_catastrophe
+    rate("crash on malformed input", fired("qa-crash"))
+    rate("dead control", fired("qa-deadctrl"))
+    rate("secret in the bundle", fired("sec-secrets"))
+    rate("exploitable", _has_catastrophe)
+    rate("worst security or quality finding above 20", lambda r: worst_sec_qa(r) > 20)
+    rate("worst security or quality finding above 40", lambda r: worst_sec_qa(r) > 40)
+    rate("any accessibility finding", fired("qa-a11y"), ", exploratory")
+    rate("Lighthouse below 90", fired("perf-lighthouse"))
+    rate("page weight audit flagged", lambda r: any(f.get("probe_id") == "perf-weight-001"
+                                                    for f in r.get("findings") or []))
+    wf = [r for r in W if fired("perf-lighthouse")(r)]
+    nf = [r for r in N if fired("perf-lighthouse")(r)]
+    for mid, lab, unit in [("total-blocking-time", "total blocking time (ms)", "ms"),
+                           ("largest-contentful-paint", "largest contentful paint (s)", "s"),
+                           ("first-contentful-paint", "first contentful paint (s)", "s"),
+                           ("server-response-time", "time to first byte (ms)", "ms")]:
+        a = [x for x in (_lh_metric(r, mid, unit) for r in wf) if x is not None]
+        b = [x for x in (_lh_metric(r, mid, unit) for r in nf) if x is not None]
+        rows.append([f"winners vs non winners: {lab}, apps below 90 only", "Mann-Whitney U, two sided", len(a),
+                     len(b), float(ss.mannwhitneyu(a, b, alternative="two-sided").pvalue),
+                     f"medians {statistics.median(a):g} vs {statistics.median(b):g}"])
+    bench = lambda r: ((r.get("observed_surface") or {}).get("lighthouse") or {}).get("benchmark_index")  # noqa: E731
+    a, b = [x for x in map(bench, W) if x], [x for x in map(bench, N) if x]
+    rows.append(["winners vs non winners: grading box load (benchmark_index)", "Mann-Whitney U, two sided",
+                 len(a), len(b), float(ss.mannwhitneyu(a, b, alternative="two-sided").pvalue),
+                 f"medians {statistics.median(a):g} vs {statistics.median(b):g}"])
+    ev = defaultdict(list)
+    for r in graded:
+        ev[r.get("hackathon")].append(r)
+    pairs = [([r for r in rs if r.get("winner") is True], [r for r in rs if r.get("winner") is False])
+             for rs in ev.values()]
+    pairs = [(w, n) for w, n in pairs if len(w) >= 3 and len(n) >= 3]
+    within = [("performance axis, median", lambda xs: statistics.median(_axis(r, "performance") for r in xs)),
+              ("slop outside performance, median",
+               lambda xs: statistics.median(r["slop_score"] - _axis(r, "performance") for r in xs)),
+              ("share with worst security or quality finding above 20",
+               lambda xs: sum(worst_sec_qa(r) > 20 for r in xs) / len(xs)),
+              ("share with worst security or quality finding above 40",
+               lambda xs: sum(worst_sec_qa(r) > 40 for r in xs) / len(xs))]
+    for lab, fn in within:
+        d = [fn(w) - fn(n) for w, n in pairs]
+        nz = [x for x in d if x != 0]
+        rows.append([f"within event, winners minus non winners: {lab}", "Wilcoxon signed rank", len(pairs), "",
+                     float(ss.wilcoxon(nz).pvalue),
+                     f"winners higher in {sum(x > 0 for x in d)}, lower in {sum(x < 0 for x in d)}, "
+                     f"tied {len(d) - len(nz)} (events with 3+ of each)"])
+    lh = lambda xs: statistics.median(s for s in map(_lh, xs) if s is not None)  # noqa: E731
+    d = [lh(w) - lh(n) for w, n in pairs if any(_lh(r) is not None for r in w) and any(_lh(r) is not None for r in n)]
+    rows.append(["within event, winners minus non winners: Lighthouse score, median", "Wilcoxon signed rank",
+                 len(d), "", float(ss.wilcoxon([x for x in d if x != 0]).pvalue),
+                 f"winners higher in {sum(x > 0 for x in d)}, lower in {sum(x < 0 for x in d)}"])
+    return rows
+
+
 def tests(ctx, graded, ss):
     rows = []
     bld = lambda r: (r.get("platform") or {}).get("builder") or "hand"   # noqa: E731
@@ -457,6 +546,7 @@ def tests(ctx, graded, ss):
     rows.append(["observed surface size, winners vs non winners", "Mann-Whitney U, two sided", len(W), len(N),
                  float(ss.mannwhitneyu(list(map(sz, W)), list(map(sz, N)), alternative="two-sided").pvalue),
                  f"medians {statistics.median(map(sz, W))} vs {statistics.median(map(sz, N))}"])
+    rows += _winner_tests(graded, W, N, ss)
     by = defaultdict(list)
     for r in graded:
         by[(r.get("platform") or {}).get("host_platform") or "unknown"].append(r["slop_score"])
