@@ -251,10 +251,14 @@ history.
    SOLO submission runs on an idle box and sloptic.org percentile-ranks + shares solo grades, so the optimism
    is a real, non-reproducible credential bias (`LIGHTHOUSE_SLOTS` is a cap, not a floor, so it does not fix a
    lone grade). Fix: **benchmark_index normalization, GO, lands at the freeze** -- spec in
-   `docs/PERF_NORMALIZATION.md`. k = 0.011 fixed from this A/B (a bigger dedicated A/B was dropped as weeks of
+   `docs/PERF_NORMALIZATION.md`. k = 0.013 (slop space) fixed from this A/B (a bigger dedicated A/B was dropped as weeks of
    box time); bi_ref = the final run's median benchmark_index. Perf-axis only; removes ~97% of the systematic
    bias, leaves the non-directional per-app noise. **Freeze invariant either way: final run at conc 4 +
    `SLOPTIC_LIGHTHOUSE_SLOTS=3` so the new curve matches the worker.**
-2. **X for the discovery budget.** Read it off the discovery run's `timeout_phase` distribution.
-3. **Is the DNF tail discovery or fan out?** Same source. Settles whether the cap or the budget is the bigger
-   capacity win, and neither number should be quoted until it does.
+2. **X for the discovery budget. RESOLVED (v25 base, v26 confirms): discovery is not the bottleneck.** Of 115
+   grade timeouts (6.2% of deployed), 103 died in the probes phase at a median 72 of 106 probes done; only 12
+   died in discovery. No discovery budget change is warranted.
+3. **Is the DNF tail discovery or fan out? RESOLVED: neither alone; it is scale times latency in the probe
+   loop.** Slow apps expose more endpoints, so every per target probe multiplies (about 2.3x the requests),
+   and each request is about 1.75x slower. No single probe dominates. The remaining split (probe loop vs
+   Lighthouse and render time) needs per phase timing, which is a v4 fast track item (`docs/V4_SPRINT.md`).
