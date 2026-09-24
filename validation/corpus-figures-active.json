@@ -1,140 +1,140 @@
 {
-  "version": "corpus-2026.3",
+  "version": "corpus-2026.4",
   "probe_set": "full",
-  "generated_at": "2026-09-01T18:23:42+00:00",
+  "generated_at": "2026-09-24T19:58:44+00:00",
   "provenance": {
     "corpus_id": "multihacksv23",
-    "run_date": "2026-08-27",
-    "n_apps": 1625,
+    "run_date": "2026-09-23",
+    "n_apps": 1579,
     "n_events": 80,
-    "n_probes": 102,
-    "catalog_fingerprint": "bfc247b720a6",
-    "curve_version": "2026.3",
+    "n_probes": 106,
+    "catalog_fingerprint": "22bf6778dae6",
+    "curve_version": "2026.4",
     "probe_set": "full",
     "attempted": 2685
   },
   "reach": {
     "attempted": 2685,
-    "graded": 1625
+    "graded": 1579
   },
   "attrition": {
     "attempted": 2685,
-    "graded": 1625,
-    "graded_pct": 60.5,
-    "dnf": 1060,
+    "graded": 1579,
+    "graded_pct": 58.8,
+    "dnf": 1106,
     "dnf_by_reason": {
-      "dead URL (link rot / 4xx / 5xx)": 757,
-      "ungraded (grade aborted / timed out)": 113,
-      "other": 100,
-      "entry challenge (WAF withheld the grade)": 90
+      "dead URL (link rot / 4xx / 5xx)": 800,
+      "other": 155,
+      "ungraded (grade aborted / timed out)": 117,
+      "entry challenge (WAF withheld the grade)": 34
     },
-    "clean_zero": 1,
-    "clean_pct": 0.1,
-    "bot_challenged": 780,
-    "bot_challenged_pct": 29.1
+    "clean_zero": 0,
+    "clean_pct": 0.0,
+    "bot_challenged": 588,
+    "bot_challenged_pct": 21.9
   },
   "distribution": {
-    "n": 1625,
-    "median": 50.0,
-    "stdev": 38.0,
-    "min": 0.0,
-    "max": 239.1,
-    "q1": 29.6,
-    "q3": 77.4,
-    "mean": 58.5,
-    "p90": 108.2,
-    "p99": 179.9,
+    "n": 1579,
+    "median": 48.0,
+    "stdev": 40.4,
+    "min": 1.0,
+    "max": 337.5,
+    "q1": 27.6,
+    "q3": 78.2,
+    "mean": 58.6,
+    "p90": 115.5,
+    "p99": 178.7,
     "bin_width": 10,
     "bins": [
       [
         0,
         10,
-        4
+        5
       ],
       [
         10,
         20,
-        199
+        223
       ],
       [
         20,
         30,
-        210
+        215
       ],
       [
         30,
         40,
-        197
+        189
       ],
       [
         40,
         50,
-        201
+        185
       ],
       [
         50,
         60,
-        169
+        135
       ],
       [
         60,
         70,
-        139
+        134
       ],
       [
         70,
         80,
-        128
+        116
       ],
       [
         80,
         90,
-        78
+        81
       ],
       [
         90,
         100,
-        74
+        67
       ],
       [
         100,
         110,
-        71
+        49
       ],
       [
         110,
         120,
-        31
+        44
       ],
       [
         120,
         130,
-        42
+        36
       ],
       [
         130,
         140,
-        18
+        21
       ],
       [
         140,
         150,
-        16
+        25
       ],
       [
         150,
         160,
-        12
+        14
       ],
       [
         160,
         170,
-        9
+        14
       ],
       [
         170,
         180,
-        11
+        10
       ],
       [
         180,
@@ -144,7 +144,7 @@
       [
         190,
         200,
-        4
+        3
       ],
       [
         200,
@@ -159,84 +159,145 @@
       [
         220,
         230,
-        2
+        1
       ],
       [
         230,
         240,
+        0
+      ],
+      [
+        240,
+        250,
+        1
+      ],
+      [
+        250,
+        260,
+        0
+      ],
+      [
+        260,
+        270,
+        1
+      ],
+      [
+        270,
+        280,
+        0
+      ],
+      [
+        280,
+        290,
+        0
+      ],
+      [
+        290,
+        300,
+        0
+      ],
+      [
+        300,
+        310,
+        0
+      ],
+      [
+        310,
+        320,
+        0
+      ],
+      [
+        320,
+        330,
+        0
+      ],
+      [
+        330,
+        340,
         1
       ]
     ],
-    "distinct": 849,
-    "pct_unique": 52.2,
+    "distinct": 832,
+    "pct_unique": 52.7,
     "top_modes": [
       [
         13.7,
-        64
-      ],
-      [
-        13.4,
-        11
+        83
       ],
       [
         33.7,
-        11
+        17
+      ],
+      [
+        13.4,
+        13
       ],
       [
         13.6,
-        10
+        13
       ],
       [
-        43.0,
-        10
-      ],
-      [
-        48.7,
-        10
+        43.7,
+        12
       ],
       [
         13.5,
+        11
+      ],
+      [
+        48.7,
         9
       ],
       [
-        11.0,
-        7
+        43.0,
+        8
       ]
     ]
   },
   "axis_split": {
     "security": {
-      "share_pct": 31.5,
-      "n": 1625,
+      "share_pct": 34.6,
+      "n": 1579,
       "median": 13.7,
-      "stdev": 16.6,
+      "stdev": 21.9,
       "min": 0,
-      "max": 133.9,
+      "max": 277.6,
       "q1": 13.7,
       "q3": 13.7,
-      "mean": 18.4
+      "mean": 20.3
     },
     "qa": {
-      "share_pct": 40.6,
-      "n": 1625,
-      "median": 14.5,
-      "stdev": 27.2,
+      "share_pct": 22.6,
+      "n": 1579,
+      "median": 0,
+      "stdev": 24.3,
       "min": 0,
-      "max": 165.1,
+      "max": 140.0,
       "q1": 0.0,
-      "q3": 33.7,
-      "mean": 23.8
+      "q3": 30.0,
+      "mean": 13.3
+    },
+    "accessibility": {
+      "share_pct": 18.3,
+      "n": 1579,
+      "median": 9.5,
+      "stdev": 10.5,
+      "min": 0,
+      "max": 51.8,
+      "q1": 0.0,
+      "q3": 20.0,
+      "mean": 10.7
     },
     "performance": {
-      "share_pct": 27.9,
-      "n": 1625,
-      "median": 10.6,
-      "stdev": 17.9,
+      "share_pct": 24.4,
+      "n": 1579,
+      "median": 6.5,
+      "stdev": 17.7,
       "min": 0,
-      "max": 69.2,
+      "max": 67.2,
       "q1": 0.0,
-      "q3": 27.4,
-      "mean": 16.3
+      "q3": 23.7,
+      "mean": 14.3
     }
   },
   "severity": {
@@ -246,29 +307,29 @@
         "key": "acute",
         "label": "Acute",
         "threshold": "worst finding priced above 40",
-        "apps": 420,
-        "pct": 25.8,
+        "apps": 435,
+        "pct": 27.5,
         "definition": "Severe issues that noticeably degrade the user experience or allow attacker access, such as crashes, unusable pages, or exposed backends."
       },
       {
         "key": "significant",
         "label": "Significant",
         "threshold": "worst finding priced 21 or more",
-        "apps": 957,
-        "pct": 58.9,
+        "apps": 904,
+        "pct": 57.3,
         "definition": "Findings that are not just cosmetic, such as dead controls, broken links, missing rate limits, overly slow pages."
       },
       {
         "key": "floor",
         "label": "Hygiene",
         "threshold": "virtually every graded app",
-        "apps": 1624,
-        "pct": 99.9,
+        "apps": 1579,
+        "pct": 100.0,
         "definition": "E.g. missing headers, poor accessibility, orange Lighthouse score; the things people often skip."
       }
     ],
-    "exploitable_apps": 47,
-    "exploitable_pct": 2.9,
+    "exploitable_apps": 75,
+    "exploitable_pct": 4.7,
     "exploitable_definition": "Catastrophic vulnerabilities that an attacker can exploit today.",
     "tier_bands": {
       "critical": "41+",
@@ -279,43 +340,60 @@
     },
     "tiers": {
       "critical": {
-        "findings": 485,
-        "apps": 420,
-        "pct_apps": 25.8,
+        "findings": 506,
+        "apps": 435,
+        "pct_apps": 27.5,
+        "per_app": {
+          "mean": 1.2,
+          "median": 1,
+          "sd": 0.4,
+          "min": 1,
+          "max": 5
+        },
+        "expected_per_app": {
+          "E": 0.32,
+          "var": 0.32,
+          "sd": 0.57
+        }
+      },
+      "severe": {
+        "findings": 224,
+        "apps": 212,
+        "pct_apps": 13.4,
+        "per_app": {
+          "mean": 1.1,
+          "median": 1.0,
+          "sd": 0.2,
+          "min": 1,
+          "max": 2
+        },
+        "expected_per_app": {
+          "E": 0.14,
+          "var": 0.14,
+          "sd": 0.37
+        }
+      },
+      "serious": {
+        "findings": 607,
+        "apps": 520,
+        "pct_apps": 32.9,
         "per_app": {
           "mean": 1.2,
           "median": 1.0,
           "sd": 0.4,
           "min": 1,
-          "max": 4
+          "max": 3
         },
         "expected_per_app": {
-          "E": 0.3,
-          "var": 0.3,
-          "sd": 0.55
+          "E": 0.38,
+          "var": 0.36,
+          "sd": 0.6
         }
       },
-      "severe": {
-        "findings": 267,
-        "apps": 248,
-        "pct_apps": 15.3,
-        "per_app": {
-          "mean": 1.1,
-          "median": 1.0,
-          "sd": 0.3,
-          "min": 1,
-          "max": 2
-        },
-        "expected_per_app": {
-          "E": 0.16,
-          "var": 0.16,
-          "sd": 0.4
-        }
-      },
-      "serious": {
-        "findings": 660,
-        "apps": 563,
-        "pct_apps": 34.6,
+      "moderate": {
+        "findings": 832,
+        "apps": 709,
+        "pct_apps": 44.9,
         "per_app": {
           "mean": 1.2,
           "median": 1,
@@ -324,544 +402,461 @@
           "max": 3
         },
         "expected_per_app": {
-          "E": 0.41,
-          "var": 0.37,
-          "sd": 0.61
-        }
-      },
-      "moderate": {
-        "findings": 893,
-        "apps": 757,
-        "pct_apps": 46.6,
-        "per_app": {
-          "mean": 1.2,
-          "median": 1,
-          "sd": 0.4,
-          "min": 1,
-          "max": 4
-        },
-        "expected_per_app": {
-          "E": 0.55,
-          "var": 0.42,
-          "sd": 0.65
+          "E": 0.53,
+          "var": 0.41,
+          "sd": 0.64
         }
       },
       "minor": {
-        "findings": 7076,
-        "apps": 1618,
-        "pct_apps": 99.6,
+        "findings": 6852,
+        "apps": 1575,
+        "pct_apps": 99.7,
         "per_app": {
           "mean": 4.4,
-          "median": 4.0,
+          "median": 4,
           "sd": 1.0,
           "min": 1,
-          "max": 7
+          "max": 8
         },
         "expected_per_app": {
-          "E": 4.35,
-          "var": 0.99,
-          "sd": 1.0
+          "E": 4.34,
+          "var": 0.95,
+          "sd": 0.98
         }
       }
     },
     "acute_axis_composition": {
       "quality": {
-        "findings": 211,
-        "pct": 43.5
+        "findings": 218,
+        "pct": 43.1
       },
       "performance": {
-        "findings": 205,
-        "pct": 42.3
+        "findings": 183,
+        "pct": 36.2
       },
       "security": {
-        "findings": 69,
-        "pct": 14.2
+        "findings": 105,
+        "pct": 20.8
       }
     },
     "worst_finding": {
-      "n": 1625,
-      "min": 0,
-      "median": 27.4,
-      "q1": 12.7,
-      "q3": 42.2,
+      "n": 1579,
+      "min": 1.0,
+      "median": 27.0,
+      "q1": 12.0,
+      "q3": 46.1,
       "max": 98.0,
-      "mean": 30.3
+      "mean": 31.0
     }
   },
   "lighthouse": {
     "overall": {
-      "n": 1571,
-      "min": 21,
-      "q1": 62,
-      "median": 79,
-      "q3": 90,
+      "n": 1538,
+      "min": 23,
+      "q1": 66,
+      "median": 83,
+      "q3": 93,
       "max": 100,
-      "mean": 74.7,
-      "stdev": 19.4,
-      "green_n": 450,
-      "pct_green": 28.6
+      "mean": 77.3,
+      "stdev": 19.2,
+      "green_n": 550,
+      "pct_green": 35.8
     },
     "winners": {
-      "n": 246,
+      "n": 242,
       "min": 23,
-      "q1": 56,
-      "median": 74,
-      "q3": 89,
-      "max": 100,
-      "mean": 71.2,
-      "stdev": 20.7,
-      "green_n": 61,
-      "pct_green": 24.8
-    },
-    "non_winners": {
-      "n": 1325,
-      "min": 21,
-      "q1": 63,
-      "median": 80,
+      "q1": 60,
+      "median": 78,
       "q3": 91,
       "max": 100,
-      "mean": 75.3,
-      "stdev": 19.0,
-      "green_n": 389,
-      "pct_green": 29.4
+      "mean": 73.5,
+      "stdev": 21.1,
+      "green_n": 73,
+      "pct_green": 30.2
+    },
+    "non_winners": {
+      "n": 1296,
+      "min": 23,
+      "q1": 67,
+      "median": 84,
+      "q3": 93,
+      "max": 100,
+      "mean": 78.1,
+      "stdev": 18.8,
+      "green_n": 477,
+      "pct_green": 36.8
     }
   },
   "axis_independence": {
-    "perf_vs_nonperf_slop_rho": -0.071,
-    "n": 1571,
+    "perf_vs_nonperf_slop_rho": -0.072,
+    "n": 1538,
     "note": "Spearman rho of Lighthouse performance against slop with the performance axis removed. Near 0 means performance quality does not predict the rest of the slop, so the axes are close to independent. Correlating against total slop would be tautological, since Lighthouse is essentially the perf axis."
   },
   "winners": {
     "winner": {
-      "n": 253,
-      "median": 54.9,
-      "mean": 60.7
+      "n": 247,
+      "median": 52.7,
+      "mean": 60.6
     },
     "non_winner": {
-      "n": 1372,
-      "median": 49.1,
-      "mean": 58.1
+      "n": 1332,
+      "median": 47.6,
+      "mean": 58.2
     },
-    "delta_pct": 11.8
+    "delta_pct": 10.7
   },
   "by_event": [
     {
+      "event": "byte-hacks",
+      "n": 2,
+      "median": 116.3,
+      "stdev": 41.2,
+      "min": 87.2,
+      "max": 145.4,
+      "q1": 72.7,
+      "q3": 159.9,
+      "mean": 116.3
+    },
+    {
       "event": "hack-brown-2026",
-      "n": 13,
-      "median": 105.8,
-      "stdev": 45.3,
+      "n": 12,
+      "median": 101.8,
+      "stdev": 41.5,
       "min": 13.4,
-      "max": 130.9,
-      "q1": 33.5,
-      "q3": 122.0,
-      "mean": 83.7
+      "max": 121.0,
+      "q1": 32.3,
+      "q3": 114.8,
+      "mean": 81.4
     },
     {
       "event": "civic-hacks",
       "n": 5,
       "median": 83.0,
-      "stdev": 36.9,
-      "min": 30.0,
-      "max": 123.1,
-      "q1": 38.9,
-      "q3": 107.9,
-      "mean": 75.3
-    },
-    {
-      "event": "ellehacks-2026",
-      "n": 14,
-      "median": 79.6,
-      "stdev": 37.5,
-      "min": 29.5,
-      "max": 150.4,
-      "q1": 50.5,
-      "q3": 117.6,
-      "mean": 84.5
-    },
-    {
-      "event": "ds-x",
-      "n": 3,
-      "median": 71.8,
-      "stdev": 44.4,
-      "min": 14.4,
-      "max": 101.7,
-      "q1": 14.4,
-      "q3": 101.7,
-      "mean": 62.6
+      "stdev": 37.1,
+      "min": 25.6,
+      "max": 123.8,
+      "q1": 41.7,
+      "q3": 108.7,
+      "mean": 76.7
     },
     {
       "event": "luddyhacks",
       "n": 4,
-      "median": 70.4,
-      "stdev": 48.7,
+      "median": 80.5,
+      "stdev": 73.2,
       "min": 26.3,
-      "max": 135.6,
-      "q1": 31.7,
-      "q3": 125.0,
-      "mean": 75.7
+      "max": 186.0,
+      "q1": 30.7,
+      "q3": 168.8,
+      "mean": 93.3
+    },
+    {
+      "event": "devfest-2026",
+      "n": 7,
+      "median": 80.1,
+      "stdev": 59.4,
+      "min": 29.7,
+      "max": 211.8,
+      "q1": 43.5,
+      "q3": 89.5,
+      "mean": 86.5
+    },
+    {
+      "event": "hacknyu-2025",
+      "n": 9,
+      "median": 77.9,
+      "stdev": 35.7,
+      "min": 15.5,
+      "max": 125.2,
+      "q1": 41.9,
+      "q3": 101.2,
+      "mean": 71.2
+    },
+    {
+      "event": "interhackbcn",
+      "n": 9,
+      "median": 71.2,
+      "stdev": 32.8,
+      "min": 23.7,
+      "max": 103.2,
+      "q1": 24.5,
+      "q3": 94.5,
+      "mean": 61.8
+    },
+    {
+      "event": "ellehacks-2026",
+      "n": 14,
+      "median": 71.0,
+      "stdev": 39.0,
+      "min": 29.5,
+      "max": 152.1,
+      "q1": 47.0,
+      "q3": 119.3,
+      "mean": 82.1
     },
     {
       "event": "kenthackit",
       "n": 1,
-      "median": 69.5,
+      "median": 68.5,
       "stdev": 0.0,
-      "min": 69.5,
-      "max": 69.5,
-      "q1": 69.5,
-      "q3": 69.5,
-      "mean": 69.5
-    },
-    {
-      "event": "hacklahoma-2026",
-      "n": 8,
-      "median": 68.6,
-      "stdev": 37.3,
-      "min": 13.7,
-      "max": 107.1,
-      "q1": 20.1,
-      "q3": 95.9,
-      "mean": 59.5
-    },
-    {
-      "event": "civic-hacks-2026",
-      "n": 5,
-      "median": 68.4,
-      "stdev": 43.3,
-      "min": 13.7,
-      "max": 108.9,
-      "q1": 19.2,
-      "q3": 105.1,
-      "mean": 63.4
-    },
-    {
-      "event": "hackeurope",
-      "n": 37,
-      "median": 67.5,
-      "stdev": 55.6,
-      "min": 17.8,
-      "max": 227.8,
-      "q1": 40.6,
-      "q3": 99.0,
-      "mean": 81.7
-    },
-    {
-      "event": "stem-connect-fall2025",
-      "n": 4,
-      "median": 67.3,
-      "stdev": 17.2,
-      "min": 38.2,
-      "max": 75.8,
-      "q1": 44.0,
-      "q3": 75.2,
-      "mean": 62.2
-    },
-    {
-      "event": "devfest-2026",
-      "n": 8,
-      "median": 65.3,
-      "stdev": 60.8,
-      "min": 24.5,
-      "max": 214.6,
-      "q1": 33.1,
-      "q3": 85.2,
-      "mean": 76.4
-    },
-    {
-      "event": "byte-hacks",
-      "n": 2,
-      "median": 64.8,
-      "stdev": 16.6,
-      "min": 53.1,
-      "max": 76.6,
-      "q1": 47.2,
-      "q3": 82.5,
-      "mean": 64.8
-    },
-    {
-      "event": "hackrpi-2025",
-      "n": 12,
-      "median": 63.4,
-      "stdev": 36.6,
-      "min": 15.8,
-      "max": 131.3,
-      "q1": 28.9,
-      "q3": 89.7,
-      "mean": 63.6
-    },
-    {
-      "event": "hacknyu-2025",
-      "n": 8,
-      "median": 63.2,
-      "stdev": 38.0,
-      "min": 15.5,
-      "max": 125.1,
-      "q1": 36.9,
-      "q3": 103.2,
+      "min": 68.5,
+      "max": 68.5,
+      "q1": 68.5,
+      "q3": 68.5,
       "mean": 68.5
     },
     {
       "event": "diamondhacks-2026",
       "n": 27,
-      "median": 62.7,
-      "stdev": 28.5,
+      "median": 67.9,
+      "stdev": 42.9,
       "min": 13.0,
-      "max": 116.5,
-      "q1": 32.7,
-      "q3": 79.6,
-      "mean": 58.5
-    },
-    {
-      "event": "uwb-hacks-the-future",
-      "n": 17,
-      "median": 62.7,
-      "stdev": 40.9,
-      "min": 11.0,
-      "max": 157.6,
-      "q1": 33.8,
-      "q3": 86.2,
-      "mean": 65.6
-    },
-    {
-      "event": "hack-mit-2023",
-      "n": 13,
-      "median": 62.6,
-      "stdev": 32.0,
-      "min": 29.7,
-      "max": 126.7,
-      "q1": 48.0,
-      "q3": 98.0,
-      "mean": 70.8
-    },
-    {
-      "event": "hackprinceton-fall-2025",
-      "n": 33,
-      "median": 62.5,
-      "stdev": 34.7,
-      "min": 18.2,
-      "max": 144.1,
-      "q1": 40.2,
-      "q3": 87.8,
-      "mean": 65.4
-    },
-    {
-      "event": "deltahacks-12",
-      "n": 21,
-      "median": 62.1,
-      "stdev": 37.5,
-      "min": 13.7,
-      "max": 159.5,
-      "q1": 32.5,
-      "q3": 72.5,
-      "mean": 61.8
-    },
-    {
-      "event": "nwhacks-2026",
-      "n": 29,
-      "median": 60.9,
-      "stdev": 34.2,
-      "min": 11.7,
-      "max": 121.4,
+      "max": 208.5,
       "q1": 31.7,
-      "q3": 95.3,
-      "mean": 62.4
+      "q3": 80.4,
+      "mean": 64.5
     },
     {
-      "event": "hackgt-12",
-      "n": 26,
-      "median": 60.7,
-      "stdev": 39.5,
-      "min": 13.7,
-      "max": 170.0,
-      "q1": 38.9,
-      "q3": 81.9,
-      "mean": 65.0
-    },
-    {
-      "event": "imaginehack2026",
-      "n": 7,
-      "median": 59.7,
-      "stdev": 69.5,
-      "min": 27.0,
-      "max": 199.7,
-      "q1": 33.6,
-      "q3": 168.7,
-      "mean": 89.6
-    },
-    {
-      "event": "uncommon-hacks-2026",
-      "n": 1,
-      "median": 58.9,
-      "stdev": 0.0,
-      "min": 58.9,
-      "max": 58.9,
-      "q1": 58.9,
-      "q3": 58.9,
-      "mean": 58.9
+      "event": "hackcwru-012025",
+      "n": 4,
+      "median": 65.2,
+      "stdev": 21.6,
+      "min": 41.7,
+      "max": 91.6,
+      "q1": 45.4,
+      "q3": 87.2,
+      "mean": 65.9
     },
     {
       "event": "bigred-hacks-2025",
       "n": 9,
-      "median": 58.5,
-      "stdev": 35.2,
+      "median": 64.7,
+      "stdev": 51.1,
       "min": 13.5,
-      "max": 107.8,
-      "q1": 28.7,
-      "q3": 96.1,
-      "mean": 60.3
+      "max": 150.2,
+      "q1": 25.9,
+      "q3": 121.9,
+      "mean": 72.8
     },
     {
-      "event": "devleague-2026",
-      "n": 14,
-      "median": 58.5,
-      "stdev": 38.5,
-      "min": 14.5,
-      "max": 141.5,
-      "q1": 29.5,
-      "q3": 85.2,
-      "mean": 63.3
-    },
-    {
-      "event": "hack-for-humanity-26",
-      "n": 21,
-      "median": 57.2,
-      "stdev": 60.6,
-      "min": 12.5,
-      "max": 239.1,
-      "q1": 22.3,
-      "q3": 115.8,
-      "mean": 73.7
-    },
-    {
-      "event": "mhacks-2025",
-      "n": 16,
-      "median": 57.0,
-      "stdev": 37.2,
-      "min": 14.7,
-      "max": 155.6,
-      "q1": 42.2,
-      "q3": 78.3,
-      "mean": 63.4
-    },
-    {
-      "event": "hackharvard-2025",
-      "n": 38,
-      "median": 56.5,
-      "stdev": 41.4,
-      "min": 11.0,
-      "max": 181.8,
-      "q1": 28.6,
-      "q3": 76.0,
-      "mean": 59.9
-    },
-    {
-      "event": "treehacks-2026",
-      "n": 105,
-      "median": 56.4,
-      "stdev": 37.1,
-      "min": 13.5,
-      "max": 176.2,
-      "q1": 33.4,
-      "q3": 91.0,
-      "mean": 63.7
-    },
-    {
-      "event": "hacklondon-2026",
-      "n": 10,
-      "median": 56.2,
-      "stdev": 36.3,
-      "min": 25.5,
-      "max": 120.5,
-      "q1": 29.9,
-      "q3": 103.0,
-      "mean": 63.2
-    },
-    {
-      "event": "boilermake-xii",
-      "n": 9,
-      "median": 56.1,
-      "stdev": 39.9,
-      "min": 25.7,
-      "max": 147.1,
-      "q1": 31.3,
-      "q3": 93.2,
-      "mean": 68.6
-    },
-    {
-      "event": "hackku26",
-      "n": 14,
-      "median": 55.8,
-      "stdev": 28.9,
-      "min": 13.0,
-      "max": 101.4,
-      "q1": 31.7,
-      "q3": 85.5,
-      "mean": 56.2
-    },
-    {
-      "event": "hackillinois-2026",
-      "n": 48,
-      "median": 54.8,
-      "stdev": 46.5,
-      "min": 11.0,
-      "max": 211.8,
-      "q1": 41.2,
-      "q3": 86.6,
-      "mean": 70.9
-    },
-    {
-      "event": "vibe-coder-hackathon",
-      "n": 21,
-      "median": 54.4,
-      "stdev": 45.1,
-      "min": 13.4,
-      "max": 198.3,
-      "q1": 18.0,
-      "q3": 79.7,
-      "mean": 59.9
-    },
-    {
-      "event": "henhacks-2026",
-      "n": 19,
-      "median": 54.2,
-      "stdev": 36.7,
-      "min": 13.4,
-      "max": 133.5,
-      "q1": 28.3,
-      "q3": 78.2,
-      "mean": 57.4
-    },
-    {
-      "event": "hackrice-15",
-      "n": 20,
-      "median": 53.8,
-      "stdev": 41.9,
-      "min": 20.4,
-      "max": 167.8,
-      "q1": 34.6,
-      "q3": 88.8,
-      "mean": 67.4
-    },
-    {
-      "event": "terrahacks-2025",
-      "n": 12,
-      "median": 53.5,
-      "stdev": 39.5,
-      "min": 13.7,
-      "max": 141.4,
-      "q1": 39.7,
-      "q3": 101.2,
-      "mean": 65.0
+      "event": "hackpsu-spring-2026",
+      "n": 15,
+      "median": 64.7,
+      "stdev": 32.4,
+      "min": 16.8,
+      "max": 139.4,
+      "q1": 29.6,
+      "q3": 76.7,
+      "mean": 59.8
     },
     {
       "event": "swamphacks-xi",
       "n": 18,
-      "median": 53.2,
-      "stdev": 45.5,
+      "median": 63.3,
+      "stdev": 46.6,
       "min": 11.7,
-      "max": 155.8,
+      "max": 154.0,
       "q1": 13.7,
-      "q3": 73.7,
-      "mean": 55.8
+      "q3": 83.4,
+      "mean": 58.3
+    },
+    {
+      "event": "hack-mit-2023",
+      "n": 13,
+      "median": 62.9,
+      "stdev": 32.8,
+      "min": 34.4,
+      "max": 126.7,
+      "q1": 43.6,
+      "q3": 106.8,
+      "mean": 72.7
+    },
+    {
+      "event": "hackgt-12",
+      "n": 25,
+      "median": 61.7,
+      "stdev": 39.8,
+      "min": 13.7,
+      "max": 170.7,
+      "q1": 34.0,
+      "q3": 79.5,
+      "mean": 63.2
+    },
+    {
+      "event": "deltahacks-12",
+      "n": 20,
+      "median": 61.2,
+      "stdev": 35.4,
+      "min": 13.7,
+      "max": 135.2,
+      "q1": 30.6,
+      "q3": 76.9,
+      "mean": 62.5
+    },
+    {
+      "event": "hacklahoma-2026",
+      "n": 7,
+      "median": 61.2,
+      "stdev": 55.1,
+      "min": 13.7,
+      "max": 149.0,
+      "q1": 13.7,
+      "q3": 117.7,
+      "mean": 68.8
+    },
+    {
+      "event": "stem-connect-fall2025",
+      "n": 5,
+      "median": 60.2,
+      "stdev": 23.3,
+      "min": 21.8,
+      "max": 73.4,
+      "q1": 27.5,
+      "q3": 72.3,
+      "mean": 51.9
+    },
+    {
+      "event": "biggest-little-hackathon-2026",
+      "n": 1,
+      "median": 59.0,
+      "stdev": 0.0,
+      "min": 59.0,
+      "max": 59.0,
+      "q1": 59.0,
+      "q3": 59.0,
+      "mean": 59.0
+    },
+    {
+      "event": "newhacks-2025",
+      "n": 8,
+      "median": 59.0,
+      "stdev": 23.2,
+      "min": 15.4,
+      "max": 87.8,
+      "q1": 42.1,
+      "q3": 77.2,
+      "mean": 57.4
+    },
+    {
+      "event": "terrahacks-2025",
+      "n": 12,
+      "median": 57.2,
+      "stdev": 48.9,
+      "min": 13.7,
+      "max": 177.5,
+      "q1": 45.7,
+      "q3": 118.3,
+      "mean": 76.8
+    },
+    {
+      "event": "hack-arizona-2026",
+      "n": 11,
+      "median": 57.0,
+      "stdev": 44.4,
+      "min": 11.0,
+      "max": 163.4,
+      "q1": 18.6,
+      "q3": 68.7,
+      "mean": 58.0
+    },
+    {
+      "event": "hackillinois-2026",
+      "n": 44,
+      "median": 56.8,
+      "stdev": 38.8,
+      "min": 11.0,
+      "max": 172.0,
+      "q1": 36.6,
+      "q3": 86.6,
+      "mean": 65.9
+    },
+    {
+      "event": "hackku26",
+      "n": 14,
+      "median": 56.8,
+      "stdev": 26.4,
+      "min": 13.0,
+      "max": 98.1,
+      "q1": 39.5,
+      "q3": 83.4,
+      "mean": 57.1
+    },
+    {
+      "event": "hack4her-mty",
+      "n": 7,
+      "median": 55.9,
+      "stdev": 47.8,
+      "min": 16.1,
+      "max": 134.1,
+      "q1": 19.9,
+      "q3": 120.7,
+      "mean": 62.9
+    },
+    {
+      "event": "hackeurope",
+      "n": 41,
+      "median": 55.0,
+      "stdev": 57.6,
+      "min": 12.0,
+      "max": 249.7,
+      "q1": 35.0,
+      "q3": 106.6,
+      "mean": 77.4
+    },
+    {
+      "event": "vibe-coder-hackathon",
+      "n": 20,
+      "median": 54.5,
+      "stdev": 45.9,
+      "min": 13.4,
+      "max": 198.6,
+      "q1": 17.8,
+      "q3": 83.1,
+      "mean": 59.5
+    },
+    {
+      "event": "hack-for-humanity-26",
+      "n": 20,
+      "median": 54.0,
+      "stdev": 47.4,
+      "min": 12.5,
+      "max": 169.7,
+      "q1": 24.2,
+      "q3": 98.5,
+      "mean": 63.5
+    },
+    {
+      "event": "henhacks-2026",
+      "n": 18,
+      "median": 53.7,
+      "stdev": 55.5,
+      "min": 13.4,
+      "max": 216.3,
+      "q1": 25.1,
+      "q3": 105.5,
+      "mean": 68.6
+    },
+    {
+      "event": "hackrice-15",
+      "n": 19,
+      "median": 53.7,
+      "stdev": 44.3,
+      "min": 20.5,
+      "max": 169.7,
+      "q1": 36.0,
+      "q3": 106.7,
+      "mean": 70.4
+    },
+    {
+      "event": "hacktech-by-caltech-2026",
+      "n": 18,
+      "median": 53.3,
+      "stdev": 29.2,
+      "min": 13.7,
+      "max": 116.8,
+      "q1": 36.5,
+      "q3": 77.4,
+      "mean": 56.2
     },
     {
       "event": "codecrunch-305hackathon-fall25",
@@ -875,444 +870,499 @@
       "mean": 52.8
     },
     {
-      "event": "ai-hackathon-2026",
-      "n": 60,
-      "median": 52.6,
-      "stdev": 32.6,
-      "min": 13.6,
-      "max": 166.0,
-      "q1": 34.8,
-      "q3": 77.5,
-      "mean": 57.2
+      "event": "hackharvard-2025",
+      "n": 37,
+      "median": 52.7,
+      "stdev": 51.4,
+      "min": 11.0,
+      "max": 266.9,
+      "q1": 30.9,
+      "q3": 82.4,
+      "mean": 63.9
     },
     {
-      "event": "hackduke-code-for-good-2026",
-      "n": 8,
-      "median": 52.2,
-      "stdev": 22.0,
-      "min": 32.6,
-      "max": 101.9,
-      "q1": 46.4,
-      "q3": 74.5,
-      "mean": 58.8
+      "event": "treehacks-2026",
+      "n": 103,
+      "median": 52.5,
+      "stdev": 37.8,
+      "min": 13.5,
+      "max": 182.9,
+      "q1": 30.4,
+      "q3": 90.5,
+      "mean": 61.9
     },
     {
       "event": "usaii-global-ai-hackathon-2026",
-      "n": 248,
-      "median": 52.0,
-      "stdev": 40.5,
-      "min": 0.0,
-      "max": 228.7,
-      "q1": 30.7,
-      "q3": 78.6,
-      "mean": 61.1
+      "n": 239,
+      "median": 52.3,
+      "stdev": 45.7,
+      "min": 1.0,
+      "max": 337.5,
+      "q1": 28.5,
+      "q3": 85.5,
+      "mean": 62.7
     },
     {
-      "event": "hack4her-mty",
-      "n": 8,
-      "median": 51.3,
-      "stdev": 43.9,
-      "min": 16.1,
-      "max": 129.5,
-      "q1": 25.4,
-      "q3": 111.8,
-      "mean": 62.5
+      "event": "nwhacks-2026",
+      "n": 29,
+      "median": 51.7,
+      "stdev": 38.6,
+      "min": 11.7,
+      "max": 160.6,
+      "q1": 28.6,
+      "q3": 95.2,
+      "mean": 61.3
+    },
+    {
+      "event": "uwb-hacks-the-future",
+      "n": 16,
+      "median": 51.4,
+      "stdev": 42.4,
+      "min": 11.0,
+      "max": 156.1,
+      "q1": 34.0,
+      "q3": 79.4,
+      "mean": 62.2
+    },
+    {
+      "event": "mhacks-2025",
+      "n": 14,
+      "median": 50.5,
+      "stdev": 53.7,
+      "min": 13.7,
+      "max": 178.7,
+      "q1": 24.1,
+      "q3": 87.8,
+      "mean": 66.2
+    },
+    {
+      "event": "la-hacks-2025",
+      "n": 9,
+      "median": 49.8,
+      "stdev": 39.5,
+      "min": 23.4,
+      "max": 129.1,
+      "q1": 37.5,
+      "q3": 112.2,
+      "mean": 70.7
     },
     {
       "event": "hackmty2025",
       "n": 22,
-      "median": 51.2,
-      "stdev": 32.4,
+      "median": 48.5,
+      "stdev": 41.1,
       "min": 18.8,
-      "max": 179.9,
-      "q1": 32.8,
-      "q3": 63.0,
-      "mean": 53.8
-    },
-    {
-      "event": "hack-western-12",
-      "n": 14,
-      "median": 51.1,
-      "stdev": 30.9,
-      "min": 17.1,
-      "max": 139.5,
-      "q1": 34.2,
-      "q3": 71.5,
-      "mean": 56.4
-    },
-    {
-      "event": "nus-fintech-summit-2026",
-      "n": 9,
-      "median": 49.6,
-      "stdev": 48.5,
-      "min": 13.6,
-      "max": 175.0,
-      "q1": 23.7,
-      "q3": 55.7,
-      "mean": 53.0
-    },
-    {
-      "event": "hacktech-by-caltech-2026",
-      "n": 18,
-      "median": 48.7,
-      "stdev": 28.8,
-      "min": 11.0,
-      "max": 116.8,
-      "q1": 31.2,
-      "q3": 59.4,
-      "mean": 50.4
-    },
-    {
-      "event": "innovation-hacks-2",
-      "n": 33,
-      "median": 48.7,
-      "stdev": 35.0,
-      "min": 20.5,
-      "max": 175.4,
-      "q1": 30.3,
-      "q3": 73.5,
-      "mean": 58.0
-    },
-    {
-      "event": "emory-hacks-2025-fall",
-      "n": 4,
-      "median": 47.9,
-      "stdev": 7.4,
-      "min": 42.5,
-      "max": 58.7,
-      "q1": 43.0,
-      "q3": 56.9,
-      "mean": 49.2
-    },
-    {
-      "event": "hackbeanpot2025",
-      "n": 4,
-      "median": 46.6,
-      "stdev": 33.2,
-      "min": 13.7,
-      "max": 78.7,
-      "q1": 15.8,
-      "q3": 76.8,
-      "mean": 46.4
-    },
-    {
-      "event": "hackpsu-spring-2026",
-      "n": 17,
-      "median": 46.4,
-      "stdev": 26.5,
-      "min": 9.2,
-      "max": 91.9,
-      "q1": 22.4,
-      "q3": 69.4,
-      "mean": 46.3
+      "max": 177.8,
+      "q1": 32.5,
+      "q3": 71.8,
+      "mean": 58.6
     },
     {
       "event": "vthacks-13",
       "n": 14,
-      "median": 46.2,
+      "median": 47.8,
       "stdev": 35.1,
       "min": 9.8,
       "max": 128.0,
-      "q1": 23.7,
-      "q3": 78.1,
-      "mean": 53.0
+      "q1": 23.1,
+      "q3": 79.3,
+      "mean": 53.1
     },
     {
-      "event": "hack-arizona-2026",
+      "event": "boilermake-xii",
+      "n": 9,
+      "median": 47.6,
+      "stdev": 38.5,
+      "min": 25.7,
+      "max": 148.5,
+      "q1": 31.3,
+      "q3": 74.9,
+      "mean": 60.2
+    },
+    {
+      "event": "hacklondon-2026",
       "n": 10,
-      "median": 46.1,
-      "stdev": 44.7,
+      "median": 47.4,
+      "stdev": 36.2,
       "min": 11.0,
-      "max": 164.7,
-      "q1": 22.2,
-      "q3": 75.9,
-      "mean": 55.3
+      "max": 114.6,
+      "q1": 25.1,
+      "q3": 90.9,
+      "mean": 56.0
     },
     {
-      "event": "hackupc-2026",
-      "n": 15,
-      "median": 45.7,
-      "stdev": 38.3,
-      "min": 13.5,
-      "max": 158.8,
-      "q1": 35.9,
-      "q3": 62.6,
-      "mean": 55.1
+      "event": "hackduke-code-for-good-2026",
+      "n": 9,
+      "median": 46.2,
+      "stdev": 14.7,
+      "min": 38.9,
+      "max": 79.0,
+      "q1": 42.8,
+      "q3": 67.4,
+      "mean": 53.6
+    },
+    {
+      "event": "hackrpi-2025",
+      "n": 12,
+      "median": 46.2,
+      "stdev": 31.8,
+      "min": 13.6,
+      "max": 118.7,
+      "q1": 25.3,
+      "q3": 80.2,
+      "mean": 52.0
+    },
+    {
+      "event": "ai-hackathon-2026",
+      "n": 54,
+      "median": 45.9,
+      "stdev": 32.4,
+      "min": 13.6,
+      "max": 172.0,
+      "q1": 24.5,
+      "q3": 77.8,
+      "mean": 52.6
+    },
+    {
+      "event": "emory-hacks-2025-fall",
+      "n": 4,
+      "median": 45.6,
+      "stdev": 8.6,
+      "min": 39.2,
+      "max": 58.7,
+      "q1": 40.0,
+      "q3": 56.2,
+      "mean": 47.3
     },
     {
       "event": "hacktx2025",
       "n": 22,
-      "median": 45.0,
-      "stdev": 34.8,
+      "median": 45.1,
+      "stdev": 39.9,
       "min": 13.4,
-      "max": 134.2,
-      "q1": 32.4,
-      "q3": 87.5,
-      "mean": 57.7
-    },
-    {
-      "event": "hackcwru-012025",
-      "n": 5,
-      "median": 44.6,
-      "stdev": 31.0,
-      "min": 23.5,
-      "max": 100.8,
-      "q1": 26.1,
-      "q3": 79.8,
-      "mean": 51.2
-    },
-    {
-      "event": "steminate-hacks-2026",
-      "n": 25,
-      "median": 43.3,
-      "stdev": 21.7,
-      "min": 13.7,
-      "max": 94.7,
-      "q1": 30.4,
-      "q3": 57.5,
-      "mean": 46.7
-    },
-    {
-      "event": "interhackbcn",
-      "n": 9,
-      "median": 43.0,
-      "stdev": 30.2,
-      "min": 21.2,
-      "max": 100.0,
-      "q1": 24.1,
-      "q3": 82.1,
-      "mean": 54.1
-    },
-    {
-      "event": "hacknc-2025",
-      "n": 22,
-      "median": 42.0,
-      "stdev": 29.1,
-      "min": 13.4,
-      "max": 126.2,
-      "q1": 30.6,
-      "q3": 77.7,
-      "mean": 50.2
-    },
-    {
-      "event": "hack-brooklyn-2026",
-      "n": 8,
-      "median": 41.8,
-      "stdev": 36.1,
-      "min": 13.7,
-      "max": 101.4,
-      "q1": 16.4,
-      "q3": 91.8,
-      "mean": 51.1
-    },
-    {
-      "event": "newhacks-2025",
-      "n": 9,
-      "median": 41.7,
-      "stdev": 25.5,
-      "min": 15.2,
-      "max": 88.6,
-      "q1": 40.2,
-      "q3": 82.8,
-      "mean": 55.2
-    },
-    {
-      "event": "hackumass-xiii",
-      "n": 20,
-      "median": 41.0,
-      "stdev": 40.6,
-      "min": 10.7,
-      "max": 142.3,
-      "q1": 16.0,
-      "q3": 71.8,
-      "mean": 53.2
-    },
-    {
-      "event": "unihack2026",
-      "n": 57,
-      "median": 40.6,
-      "stdev": 33.1,
-      "min": 13.7,
-      "max": 146.6,
-      "q1": 25.0,
-      "q3": 72.8,
-      "mean": 52.5
+      "max": 139.0,
+      "q1": 23.9,
+      "q3": 87.0,
+      "mean": 59.4
     },
     {
       "event": "sb-hacks-xii",
-      "n": 17,
-      "median": 40.3,
-      "stdev": 24.3,
-      "min": 12.5,
-      "max": 90.8,
-      "q1": 22.2,
-      "q3": 68.3,
-      "mean": 44.0
+      "n": 18,
+      "median": 45.0,
+      "stdev": 36.4,
+      "min": 12.1,
+      "max": 164.1,
+      "q1": 25.6,
+      "q3": 66.4,
+      "mean": 51.0
+    },
+    {
+      "event": "nus-fintech-summit-2026",
+      "n": 9,
+      "median": 45.0,
+      "stdev": 51.1,
+      "min": 13.6,
+      "max": 176.8,
+      "q1": 19.9,
+      "q3": 74.5,
+      "mean": 56.7
+    },
+    {
+      "event": "hackprinceton-fall-2025",
+      "n": 34,
+      "median": 44.3,
+      "stdev": 38.0,
+      "min": 13.7,
+      "max": 151.1,
+      "q1": 24.6,
+      "q3": 84.4,
+      "mean": 58.2
+    },
+    {
+      "event": "civic-hacks-2026",
+      "n": 4,
+      "median": 44.1,
+      "stdev": 30.8,
+      "min": 13.7,
+      "max": 72.4,
+      "q1": 15.4,
+      "q3": 71.2,
+      "mean": 43.6
+    },
+    {
+      "event": "steminate-hacks-2026",
+      "n": 26,
+      "median": 43.9,
+      "stdev": 23.8,
+      "min": 13.7,
+      "max": 104.4,
+      "q1": 27.8,
+      "q3": 61.2,
+      "mean": 47.3
+    },
+    {
+      "event": "hack-western-12",
+      "n": 13,
+      "median": 43.7,
+      "stdev": 43.8,
+      "min": 15.9,
+      "max": 152.7,
+      "q1": 28.8,
+      "q3": 78.7,
+      "mean": 60.1
+    },
+    {
+      "event": "hacknc-2025",
+      "n": 23,
+      "median": 43.7,
+      "stdev": 30.8,
+      "min": 13.4,
+      "max": 142.2,
+      "q1": 26.7,
+      "q3": 74.7,
+      "mean": 48.9
+    },
+    {
+      "event": "imaginehack2026",
+      "n": 7,
+      "median": 43.0,
+      "stdev": 72.6,
+      "min": 23.2,
+      "max": 199.7,
+      "q1": 33.6,
+      "q3": 168.7,
+      "mean": 89.6
+    },
+    {
+      "event": "devleague-2026",
+      "n": 14,
+      "median": 42.8,
+      "stdev": 33.3,
+      "min": 13.5,
+      "max": 118.8,
+      "q1": 25.0,
+      "q3": 79.0,
+      "mean": 54.7
+    },
+    {
+      "event": "hackupc-2026",
+      "n": 13,
+      "median": 41.9,
+      "stdev": 42.2,
+      "min": 13.5,
+      "max": 160.3,
+      "q1": 24.8,
+      "q3": 52.9,
+      "mean": 51.2
+    },
+    {
+      "event": "innovation-hacks-2",
+      "n": 35,
+      "median": 41.8,
+      "stdev": 34.1,
+      "min": 13.7,
+      "max": 178.5,
+      "q1": 29.0,
+      "q3": 72.3,
+      "mean": 53.2
     },
     {
       "event": "hacknroll2026",
       "n": 41,
-      "median": 40.0,
-      "stdev": 30.2,
-      "min": 13.7,
-      "max": 170.6,
-      "q1": 27.6,
-      "q3": 52.8,
-      "mean": 45.4
-    },
-    {
-      "event": "la-hacks-2026",
-      "n": 43,
       "median": 39.9,
-      "stdev": 30.0,
-      "min": 13.4,
-      "max": 129.9,
-      "q1": 24.7,
-      "q3": 70.5,
-      "mean": 50.6
-    },
-    {
-      "event": "vibehack-london-2026",
-      "n": 23,
-      "median": 39.4,
-      "stdev": 29.2,
-      "min": 11.0,
-      "max": 97.2,
-      "q1": 22.2,
-      "q3": 75.2,
+      "stdev": 29.8,
+      "min": 9.2,
+      "max": 166.6,
+      "q1": 25.9,
+      "q3": 52.8,
       "mean": 44.7
     },
     {
-      "event": "uofthacks-13",
-      "n": 21,
-      "median": 37.9,
-      "stdev": 29.8,
-      "min": 13.4,
-      "max": 121.2,
-      "q1": 28.8,
-      "q3": 77.0,
-      "mean": 49.5
+      "event": "uncommon-hacks-2026",
+      "n": 3,
+      "median": 39.9,
+      "stdev": 23.7,
+      "min": 28.6,
+      "max": 74.2,
+      "q1": 28.6,
+      "q3": 74.2,
+      "mean": 47.6
     },
     {
-      "event": "cs-girlies-wellness-hackathon",
-      "n": 37,
-      "median": 37.9,
-      "stdev": 39.8,
-      "min": 13.6,
-      "max": 189.2,
-      "q1": 21.0,
-      "q3": 67.9,
-      "mean": 51.3
+      "event": "hackumass-xiii",
+      "n": 21,
+      "median": 39.7,
+      "stdev": 39.7,
+      "min": 10.7,
+      "max": 141.8,
+      "q1": 16.9,
+      "q3": 68.5,
+      "mean": 51.1
     },
     {
       "event": "beaverhacks",
       "n": 10,
-      "median": 37.1,
-      "stdev": 25.7,
-      "min": 16.0,
-      "max": 84.4,
-      "q1": 19.1,
-      "q3": 71.7,
-      "mean": 41.9
+      "median": 39.5,
+      "stdev": 33.9,
+      "min": 13.5,
+      "max": 120.3,
+      "q1": 18.4,
+      "q3": 71.9,
+      "mean": 47.9
     },
     {
-      "event": "jumbohack-2026",
-      "n": 7,
-      "median": 35.8,
-      "stdev": 9.4,
-      "min": 19.6,
-      "max": 44.3,
-      "q1": 24.2,
-      "q3": 43.0,
-      "mean": 34.4
-    },
-    {
-      "event": "bostonhacks-2025",
-      "n": 12,
-      "median": 34.8,
-      "stdev": 30.3,
+      "event": "uofthacks-13",
+      "n": 20,
+      "median": 38.9,
+      "stdev": 36.6,
       "min": 13.7,
-      "max": 105.3,
-      "q1": 24.8,
-      "q3": 66.4,
-      "mean": 45.0
+      "max": 139.4,
+      "q1": 21.8,
+      "q3": 82.1,
+      "mean": 52.1
     },
     {
-      "event": "la-hacks-2025",
-      "n": 10,
-      "median": 33.7,
-      "stdev": 31.5,
-      "min": 15.0,
-      "max": 126.0,
-      "q1": 25.1,
-      "q3": 49.0,
-      "mean": 42.2
+      "event": "la-hacks-2026",
+      "n": 43,
+      "median": 38.1,
+      "stdev": 34.3,
+      "min": 13.4,
+      "max": 154.1,
+      "q1": 25.5,
+      "q3": 71.2,
+      "mean": 51.0
     },
     {
       "event": "wildhacks-2026",
-      "n": 23,
-      "median": 30.2,
-      "stdev": 25.5,
+      "n": 21,
+      "median": 37.9,
+      "stdev": 28.7,
       "min": 13.5,
-      "max": 97.7,
-      "q1": 18.8,
-      "q3": 57.8,
-      "mean": 40.7
+      "max": 110.5,
+      "q1": 17.8,
+      "q3": 62.9,
+      "mean": 43.1
     },
     {
       "event": "hack-for-humanity-2026",
-      "n": 5,
-      "median": 29.3,
-      "stdev": 22.1,
-      "min": 14.4,
-      "max": 71.5,
-      "q1": 21.4,
-      "q3": 60.0,
-      "mean": 38.4
+      "n": 4,
+      "median": 37.7,
+      "stdev": 17.5,
+      "min": 28.4,
+      "max": 65.5,
+      "q1": 28.6,
+      "q3": 60.6,
+      "mean": 42.3
+    },
+    {
+      "event": "cs-girlies-wellness-hackathon",
+      "n": 31,
+      "median": 36.8,
+      "stdev": 36.3,
+      "min": 13.6,
+      "max": 149.2,
+      "q1": 19.8,
+      "q3": 61.4,
+      "mean": 47.4
+    },
+    {
+      "event": "unihack2026",
+      "n": 52,
+      "median": 35.9,
+      "stdev": 26.7,
+      "min": 13.7,
+      "max": 116.8,
+      "q1": 23.6,
+      "q3": 63.4,
+      "mean": 45.5
     },
     {
       "event": "jumbohack-2025",
-      "n": 5,
-      "median": 28.7,
-      "stdev": 62.2,
+      "n": 4,
+      "median": 34.1,
+      "stdev": 67.5,
       "min": 13.7,
-      "max": 160.9,
-      "q1": 13.7,
-      "q3": 100.9,
-      "mean": 51.6
+      "max": 160.7,
+      "q1": 17.4,
+      "q3": 130.4,
+      "mean": 60.6
+    },
+    {
+      "event": "bostonhacks-2025",
+      "n": 13,
+      "median": 32.9,
+      "stdev": 35.0,
+      "min": 13.7,
+      "max": 115.3,
+      "q1": 24.6,
+      "q3": 79.8,
+      "mean": 49.4
+    },
+    {
+      "event": "jumbohack-2026",
+      "n": 8,
+      "median": 30.3,
+      "stdev": 11.1,
+      "min": 19.6,
+      "max": 51.5,
+      "q1": 23.9,
+      "q3": 42.6,
+      "mean": 32.7
     },
     {
       "event": "oregonhacks",
-      "n": 31,
-      "median": 28.3,
-      "stdev": 34.7,
+      "n": 28,
+      "median": 26.8,
+      "stdev": 36.7,
       "min": 13.0,
-      "max": 137.4,
-      "q1": 19.9,
-      "q3": 51.2,
-      "mean": 43.0
+      "max": 137.5,
+      "q1": 14.5,
+      "q3": 57.0,
+      "mean": 43.1
     },
     {
-      "event": "biggest-little-hackathon-2026",
-      "n": 1,
-      "median": 26.7,
-      "stdev": 0.0,
-      "min": 26.7,
-      "max": 26.7,
-      "q1": 26.7,
-      "q3": 26.7,
-      "mean": 26.7
+      "event": "vibehack-london-2026",
+      "n": 21,
+      "median": 26.4,
+      "stdev": 24.8,
+      "min": 11.0,
+      "max": 95.7,
+      "q1": 20.1,
+      "q3": 59.8,
+      "mean": 38.6
+    },
+    {
+      "event": "hackbeanpot2025",
+      "n": 3,
+      "median": 22.2,
+      "stdev": 28.2,
+      "min": 13.7,
+      "max": 66.2,
+      "q1": 13.7,
+      "q3": 66.2,
+      "mean": 34.0
     },
     {
       "event": "hackdartmouth-xi",
-      "n": 3,
-      "median": 21.2,
-      "stdev": 7.5,
+      "n": 4,
+      "median": 21.9,
+      "stdev": 11.0,
       "min": 13.4,
-      "max": 28.4,
-      "q1": 13.4,
-      "q3": 28.4,
-      "mean": 21.0
+      "max": 34.6,
+      "q1": 13.5,
+      "q3": 33.5,
+      "mean": 22.9
+    },
+    {
+      "event": "hack-brooklyn-2026",
+      "n": 8,
+      "median": 21.0,
+      "stdev": 45.4,
+      "min": 9.5,
+      "max": 126.2,
+      "q1": 13.7,
+      "q3": 90.0,
+      "mean": 47.1
     },
     {
       "event": "hack-ireland-2025",
@@ -1324,152 +1374,151 @@
       "q1": 19.5,
       "q3": 19.5,
       "mean": 19.5
+    },
+    {
+      "event": "ds-x",
+      "n": 3,
+      "median": 19.4,
+      "stdev": 49.3,
+      "min": 13.5,
+      "max": 101.7,
+      "q1": 13.5,
+      "q3": 101.7,
+      "mean": 44.9
     }
   ],
   "by_stack": [
     {
       "stack": "cloudflare-pages",
-      "n": 15,
+      "n": 13,
       "median": 45.1,
-      "stdev": 28.6,
+      "stdev": 26.2,
       "min": 11.0,
-      "max": 126.0,
-      "q1": 31.1,
-      "q3": 65.1,
-      "mean": 47.8,
-      "probes_applied_median": 47
-    },
-    {
-      "stack": "github-pages",
-      "n": 96,
-      "median": 45.2,
-      "stdev": 32.1,
-      "min": 12.5,
-      "max": 150.4,
-      "q1": 23.9,
-      "q3": 67.6,
-      "mean": 51.9,
-      "probes_applied_median": 55.5
+      "max": 92.6,
+      "q1": 13.3,
+      "q3": 61.6,
+      "mean": 41.1,
+      "probes_applied_median": 50
     },
     {
       "stack": "vercel",
-      "n": 1058,
-      "median": 45.6,
-      "stdev": 35.2,
+      "n": 1057,
+      "median": 45.4,
+      "stdev": 36.9,
       "min": 8.0,
-      "max": 227.8,
-      "q1": 27.2,
-      "q3": 74.5,
-      "mean": 54.6,
-      "probes_applied_median": 51.0
+      "max": 266.9,
+      "q1": 25.6,
+      "q3": 75.8,
+      "mean": 54.8,
+      "probes_applied_median": 54
+    },
+    {
+      "stack": "github-pages",
+      "n": 87,
+      "median": 46.4,
+      "stdev": 34.3,
+      "min": 12.5,
+      "max": 152.7,
+      "q1": 25.0,
+      "q3": 72.2,
+      "mean": 53.8,
+      "probes_applied_median": 57
+    },
+    {
+      "stack": "render",
+      "n": 60,
+      "median": 48.0,
+      "stdev": 42.3,
+      "min": 1.0,
+      "max": 168.7,
+      "q1": 28.2,
+      "q3": 93.0,
+      "mean": 61.2,
+      "probes_applied_median": 63.0
+    },
+    {
+      "stack": "lovable",
+      "n": 70,
+      "median": 51.4,
+      "stdev": 54.9,
+      "min": 11.0,
+      "max": 217.7,
+      "q1": 30.5,
+      "q3": 89.0,
+      "mean": 69.5,
+      "probes_applied_median": 56.0
     },
     {
       "stack": "cloudflare-workers",
       "n": 13,
-      "median": 54.3,
-      "stdev": 44.0,
+      "median": 53.3,
+      "stdev": 35.2,
       "min": 13.7,
-      "max": 189.2,
-      "q1": 32.5,
-      "q3": 74.3,
-      "mean": 61.0,
-      "probes_applied_median": 59
+      "max": 149.2,
+      "q1": 32.2,
+      "q3": 78.1,
+      "mean": 57.7,
+      "probes_applied_median": 62
     },
     {
       "stack": "netlify",
-      "n": 115,
-      "median": 54.8,
-      "stdev": 39.2,
+      "n": 112,
+      "median": 53.8,
+      "stdev": 53.8,
       "min": 13.5,
-      "max": 207.4,
-      "q1": 32.4,
-      "q3": 81.9,
-      "mean": 62.8,
-      "probes_applied_median": 55
-    },
-    {
-      "stack": "lovable",
-      "n": 69,
-      "median": 55.3,
-      "stdev": 52.7,
-      "min": 11.0,
-      "max": 214.8,
-      "q1": 33.6,
-      "q3": 90.4,
-      "mean": 72.2,
-      "probes_applied_median": 53
-    },
-    {
-      "stack": "render",
-      "n": 57,
-      "median": 59.8,
-      "stdev": 41.7,
-      "min": 0.0,
-      "max": 168.7,
-      "q1": 36.1,
-      "q3": 98.7,
-      "mean": 67.5,
-      "probes_applied_median": 60
-    },
-    {
-      "stack": "railway",
-      "n": 12,
-      "median": 64.0,
-      "stdev": 28.6,
-      "min": 11.7,
-      "max": 92.6,
-      "q1": 19.7,
-      "q3": 74.3,
-      "mean": 52.8,
-      "probes_applied_median": 60.5
+      "max": 337.5,
+      "q1": 31.4,
+      "q3": 91.4,
+      "mean": 70.4,
+      "probes_applied_median": 56.0
     },
     {
       "stack": "firebase",
-      "n": 29,
-      "median": 66.7,
-      "stdev": 33.0,
-      "min": 12.5,
-      "max": 125.7,
-      "q1": 38.3,
-      "q3": 90.0,
-      "mean": 65.9,
-      "probes_applied_median": 49
+      "n": 28,
+      "median": 63.9,
+      "stdev": 41.8,
+      "min": 13.7,
+      "max": 216.3,
+      "q1": 37.9,
+      "q3": 86.8,
+      "mean": 69.1,
+      "probes_applied_median": 52.0
     },
     {
-      "stack": "base44",
-      "n": 13,
-      "median": 68.8,
-      "stdev": 30.3,
-      "min": 13.7,
-      "max": 141.9,
-      "q1": 48.0,
-      "q3": 75.0,
-      "mean": 64.6,
-      "probes_applied_median": 65
+      "stack": "railway",
+      "n": 8,
+      "median": 66.0,
+      "stdev": 30.8,
+      "min": 11.7,
+      "max": 91.9,
+      "q1": 22.8,
+      "q3": 83.5,
+      "mean": 57.8,
+      "probes_applied_median": 60.5
     },
     {
       "stack": "google-cloud-run",
-      "n": 19,
-      "median": 68.8,
-      "stdev": 46.1,
+      "n": 15,
+      "median": 66.3,
+      "stdev": 21.7,
       "min": 13.7,
-      "max": 239.1,
-      "q1": 60.9,
-      "q3": 90.0,
-      "mean": 82.2,
-      "probes_applied_median": 50
+      "max": 105.5,
+      "q1": 56.5,
+      "q3": 83.1,
+      "mean": 66.1,
+      "probes_applied_median": 52
     },
     {
       "stack": "unknown",
-      "n": 126,
-      "median": 69.8,
+      "n": 110,
+      "median": 70.6,
       "stdev": 44.8,
-      "min": 9.2,
-      "max": 228.7,
-      "q1": 41.6,
-      "q3": 101.2,
-      "mean": 77.0,
-      "probes_applied_median": 53.0
+      "min": 12.7,
+      "max": 249.7,
+      "q1": 41.1,
+      "q3": 100.2,
+      "mean": 75.5,
+      "probes_applied_median": 56.0
     }
   ],
   "by_stack_excluded": [
@@ -1477,54 +1526,69 @@
       "stack": "streamlit",
       "apps": 82,
       "reason": "canvas-shell host: the grade measures the framework, not the app"
+    },
+    {
+      "stack": "unknown",
+      "apps": 2,
+      "reason": "canvas-shell host: the grade measures the framework, not the app"
+    },
+    {
+      "stack": "github-pages",
+      "apps": 1,
+      "reason": "canvas-shell host: the grade measures the framework, not the app"
+    },
+    {
+      "stack": "firebase",
+      "apps": 1,
+      "reason": "canvas-shell host: the grade measures the framework, not the app"
     }
   ],
   "by_builder": [
     {
       "builder": "hand built",
-      "n": 1543,
-      "median": 49.7,
-      "stdev": 36.8,
-      "min": 0.0,
-      "max": 239.1,
-      "q1": 29.3,
-      "q3": 76.8,
-      "mean": 57.7
+      "n": 1497,
+      "median": 47.9,
+      "stdev": 39.3,
+      "min": 1.0,
+      "max": 337.5,
+      "q1": 27.4,
+      "q3": 78.0,
+      "mean": 57.9
     },
     {
       "builder": "lovable",
-      "n": 71,
-      "median": 52.6,
-      "stdev": 52.5,
+      "n": 73,
+      "median": 50.2,
+      "stdev": 54.5,
       "min": 11.0,
-      "max": 214.8,
-      "q1": 33.4,
-      "q3": 89.1,
-      "mean": 71.0
+      "max": 217.7,
+      "q1": 30.5,
+      "q3": 89.3,
+      "mean": 69.0
     },
     {
       "builder": "bolt",
-      "n": 11,
-      "median": 68.9,
-      "stdev": 60.5,
+      "n": 9,
+      "median": 55.2,
+      "stdev": 67.9,
       "min": 23.7,
-      "max": 207.4,
-      "q1": 53.7,
-      "q3": 107.1,
-      "mean": 91.8
+      "max": 207.9,
+      "q1": 40.2,
+      "q3": 145.4,
+      "mean": 86.6
     }
   ],
   "star_finding": {
     "key": "managed_backend_exposure",
-    "apps": 18,
-    "pct": 1.1,
+    "apps": 16,
+    "pct": 1.0,
     "breakdown": {
-      "supabase": 14,
+      "supabase": 13,
       "firebase": 0,
-      "bulk_records": 7,
-      "with_pii_columns": 3,
+      "bulk_records": 5,
+      "with_pii_columns": 2,
       "with_password_column": 0,
-      "with_email_column": 2
+      "with_email_column": 1
     }
   },
   "fire_frequency": [
@@ -1532,111 +1596,118 @@
       "probe_id": "sec-headers-002",
       "bundle": "security",
       "category": "security-headers",
-      "apps": 1594,
-      "pct": 98.1
+      "apps": 1550,
+      "pct": 98.2
     },
     {
       "probe_id": "sec-headers-004",
       "bundle": "security",
       "category": "security-headers",
-      "apps": 1569,
-      "pct": 96.6
-    },
-    {
-      "probe_id": "sec-headers-001",
-      "bundle": "security",
-      "category": "security-headers",
-      "apps": 1468,
-      "pct": 90.3
+      "apps": 1528,
+      "pct": 96.8
     },
     {
       "probe_id": "sec-headers-005",
       "bundle": "security",
       "category": "security-headers",
-      "apps": 1464,
-      "pct": 90.1
+      "apps": 1430,
+      "pct": 90.6
+    },
+    {
+      "probe_id": "sec-headers-001",
+      "bundle": "security",
+      "category": "security-headers",
+      "apps": 1428,
+      "pct": 90.4
+    },
+    {
+      "probe_id": "qa-a11y-001",
+      "bundle": "accessibility",
+      "category": "accessibility",
+      "apps": 1034,
+      "pct": 65.5
     },
     {
       "probe_id": "perf-lighthouse-001",
       "bundle": "performance",
       "category": "overall",
-      "apps": 1155,
-      "pct": 71.1
-    },
-    {
-      "probe_id": "qa-a11y-001",
-      "bundle": "qa",
-      "category": "accessibility",
-      "apps": 1087,
-      "pct": 66.9
+      "apps": 991,
+      "pct": 62.8
     },
     {
       "probe_id": "qa-deadctrl-001",
       "bundle": "qa",
       "category": "dead-controls",
-      "apps": 218,
-      "pct": 13.4
+      "apps": 214,
+      "pct": 13.6
     },
     {
       "probe_id": "sec-sri-001",
       "bundle": "security",
       "category": "supply-chain",
-      "apps": 199,
-      "pct": 12.2
+      "apps": 182,
+      "pct": 11.5
     },
     {
       "probe_id": "qa-crash-010",
       "bundle": "qa",
       "category": "crash-resistance",
-      "apps": 128,
-      "pct": 7.9
+      "apps": 137,
+      "pct": 8.7
     },
     {
       "probe_id": "sec-headers-003",
       "bundle": "security",
       "category": "security-headers",
       "apps": 76,
-      "pct": 4.7
+      "pct": 4.8
     },
     {
       "probe_id": "sec-exposure-006",
       "bundle": "security",
       "category": "exposure",
-      "apps": 56,
-      "pct": 3.4
+      "apps": 57,
+      "pct": 3.6
     },
     {
       "probe_id": "qa-console-001",
       "bundle": "qa",
       "category": "console-errors",
-      "apps": 40,
-      "pct": 2.5
-    },
-    {
-      "probe_id": "qa-seo-001",
-      "bundle": "qa",
-      "category": "seo",
-      "apps": 31,
-      "pct": 1.9
+      "apps": 41,
+      "pct": 2.6
     },
     {
       "probe_id": "qa-links-001",
       "bundle": "qa",
       "category": "broken-links",
-      "apps": 30,
+      "apps": 29,
       "pct": 1.8
+    },
+    {
+      "probe_id": "qa-seo-001",
+      "bundle": "accessibility",
+      "category": "mobile-visibility",
+      "apps": 28,
+      "pct": 1.8
+    },
+    {
+      "probe_id": "sec-secrets-003",
+      "bundle": "security",
+      "category": "secrets-exposure",
+      "apps": 27,
+      "pct": 1.7
     },
     {
       "probe_id": "qa-deploy-001",
       "bundle": "qa",
       "category": "availability",
       "apps": 23,
-      "pct": 1.4
+      "pct": 1.5
     },
     {
-      "probe_id": "sec-backend-001",
+      "probe_id": "sec-ratelimit-001",
       "bundle": "security",
-      "category": "backend-exposure",
+      "category": "rate-limiting",
       "apps": 18,
       "pct": 1.1
     },
@@ -1645,19 +1716,26 @@
       "bundle": "qa",
       "category": "ui-honesty",
       "apps": 17,
-      "pct": 1.0
+      "pct": 1.1
     },
     {
       "probe_id": "sec-csp-001",
       "bundle": "security",
       "category": "security-headers",
       "apps": 17,
+      "pct": 1.1
+    },
+    {
+      "probe_id": "sec-secrets-001",
+      "bundle": "security",
+      "category": "secrets-exposure",
+      "apps": 16,
       "pct": 1.0
     },
     {
-      "probe_id": "sec-ratelimit-001",
+      "probe_id": "sec-backend-001",
       "bundle": "security",
-      "category": "rate-limiting",
+      "category": "backend-exposure",
       "apps": 16,
       "pct": 1.0
     },
@@ -1665,41 +1743,41 @@
       "probe_id": "qa-reset-001",
       "bundle": "qa",
       "category": "password-reset",
-      "apps": 16,
-      "pct": 1.0
-    },
-    {
-      "probe_id": "qa-backnav-001",
-      "bundle": "qa",
-      "category": "ui-honesty",
       "apps": 15,
       "pct": 0.9
-    },
-    {
-      "probe_id": "sec-tls-001",
-      "bundle": "security",
-      "category": "transport-security",
-      "apps": 13,
-      "pct": 0.8
-    },
-    {
-      "probe_id": "qa-email-001",
-      "bundle": "qa",
-      "category": "email-verification",
-      "apps": 12,
-      "pct": 0.7
-    },
-    {
-      "probe_id": "sec-secrets-001",
-      "bundle": "security",
-      "category": "secrets-exposure",
-      "apps": 11,
-      "pct": 0.7
     },
     {
       "probe_id": "sec-secrets-002",
       "bundle": "security",
       "category": "secrets-exposure",
+      "apps": 14,
+      "pct": 0.9
+    },
+    {
+      "probe_id": "qa-backnav-001",
+      "bundle": "qa",
+      "category": "ui-honesty",
+      "apps": 12,
+      "pct": 0.8
+    },
+    {
+      "probe_id": "sec-tls-001",
+      "bundle": "security",
+      "category": "transport-security",
+      "apps": 12,
+      "pct": 0.8
+    },
+    {
+      "probe_id": "qa-a11y-002",
+      "bundle": "accessibility",
+      "category": "accessibility",
+      "apps": 10,
+      "pct": 0.6
+    },
+    {
+      "probe_id": "qa-email-001",
+      "bundle": "qa",
+      "category": "email-verification",
       "apps": 10,
       "pct": 0.6
     },
@@ -1714,15 +1792,8 @@
       "probe_id": "qa-http-002",
       "bundle": "qa",
       "category": "http-conformance",
-      "apps": 8,
-      "pct": 0.5
-    },
-    {
-      "probe_id": "sec-session-002",
-      "bundle": "security",
-      "category": "session",
-      "apps": 8,
-      "pct": 0.5
+      "apps": 9,
+      "pct": 0.6
     },
     {
       "probe_id": "sec-exposure-003",
@@ -1739,44 +1810,51 @@
       "pct": 0.4
     },
     {
-      "probe_id": "sec-hosthdr-001",
+      "probe_id": "sec-session-002",
       "bundle": "security",
-      "category": "host-header",
-      "apps": 5,
-      "pct": 0.3
-    },
-    {
-      "probe_id": "qa-a11y-002",
-      "bundle": "qa",
-      "category": "accessibility",
-      "apps": 5,
-      "pct": 0.3
-    },
-    {
-      "probe_id": "qa-input-002",
-      "bundle": "qa",
-      "category": "input-validation",
-      "apps": 4,
-      "pct": 0.2
-    },
-    {
-      "probe_id": "sec-headers-006",
-      "bundle": "security",
-      "category": "security-headers",
-      "apps": 3,
-      "pct": 0.2
+      "category": "session",
+      "apps": 6,
+      "pct": 0.4
     },
     {
       "probe_id": "perf-load-001",
       "bundle": "performance",
       "category": "load-resilience",
+      "apps": 5,
+      "pct": 0.3
+    },
+    {
+      "probe_id": "sec-session-003",
+      "bundle": "security",
+      "category": "session",
       "apps": 3,
       "pct": 0.2
     },
     {
-      "probe_id": "sec-session-001",
+      "probe_id": "sec-xss-002",
+      "bundle": "security",
+      "category": "xss",
+      "apps": 3,
+      "pct": 0.2
+    },
+    {
+      "probe_id": "sec-session-005",
       "bundle": "security",
       "category": "session",
+      "apps": 3,
+      "pct": 0.2
+    },
+    {
+      "probe_id": "sec-backend-004",
+      "bundle": "security",
+      "category": "backend-exposure",
+      "apps": 3,
+      "pct": 0.2
+    },
+    {
+      "probe_id": "qa-input-002",
+      "bundle": "qa",
+      "category": "input-validation",
       "apps": 3,
       "pct": 0.2
     },
@@ -1802,13 +1880,6 @@
       "pct": 0.1
     },
     {
-      "probe_id": "sec-session-003",
-      "bundle": "security",
-      "category": "session",
-      "apps": 2,
-      "pct": 0.1
-    },
-    {
       "probe_id": "sec-backend-002",
       "bundle": "security",
       "category": "access-control",
@@ -1823,23 +1894,16 @@
       "pct": 0.1
     },
     {
-      "probe_id": "sec-exposure-008",
+      "probe_id": "sec-deps-001",
       "bundle": "security",
-      "category": "data-exposure",
+      "category": "dependency",
       "apps": 2,
       "pct": 0.1
     },
     {
-      "probe_id": "sec-session-005",
-      "bundle": "security",
-      "category": "session",
-      "apps": 2,
-      "pct": 0.1
-    },
-    {
-      "probe_id": "sec-dos-001",
-      "bundle": "security",
-      "category": "dos-resistance",
+      "probe_id": "qa-chunk-001",
+      "bundle": "qa",
+      "category": "ui-honesty",
       "apps": 2,
       "pct": 0.1
     },
@@ -1851,13 +1915,6 @@
       "pct": 0.1
     },
     {
-      "probe_id": "sec-csrf-001",
-      "bundle": "security",
-      "category": "csrf",
-      "apps": 2,
-      "pct": 0.1
-    },
-    {
       "probe_id": "sec-exposure-009",
       "bundle": "security",
       "category": "exposure",
@@ -1865,16 +1922,9 @@
       "pct": 0.1
     },
     {
-      "probe_id": "sec-xss-002",
-      "bundle": "security",
-      "category": "xss",
-      "apps": 1,
-      "pct": 0.1
-    },
-    {
-      "probe_id": "sec-deps-001",
-      "bundle": "security",
-      "category": "dependency",
+      "probe_id": "qa-scaffold-001",
+      "bundle": "qa",
+      "category": "scaffold-content",
       "apps": 1,
       "pct": 0.1
     },
@@ -1893,13 +1943,6 @@
       "pct": 0.1
     },
     {
-      "probe_id": "sec-authbypass-001",
-      "bundle": "security",
-      "category": "access-control",
-      "apps": 1,
-      "pct": 0.1
-    },
-    {
       "probe_id": "qa-integrity-002",
       "bundle": "qa",
       "category": "data-integrity",
@@ -1907,16 +1950,23 @@
       "pct": 0.1
     },
     {
-      "probe_id": "qa-chunk-001",
-      "bundle": "qa",
-      "category": "ui-honesty",
+      "probe_id": "sec-dos-001",
+      "bundle": "security",
+      "category": "dos-resistance",
       "apps": 1,
       "pct": 0.1
     },
     {
-      "probe_id": "sec-cmdi-001",
+      "probe_id": "sec-hosthdr-001",
       "bundle": "security",
-      "category": "command-injection",
+      "category": "host-header",
+      "apps": 1,
+      "pct": 0.1
+    },
+    {
+      "probe_id": "sec-sqli-004",
+      "bundle": "security",
+      "category": "sql-injection",
       "apps": 1,
       "pct": 0.1
     },
@@ -1926,33 +1976,52 @@
       "category": "mixed-content",
       "apps": 1,
       "pct": 0.1
+    },
+    {
+      "probe_id": "sec-session-001",
+      "bundle": "security",
+      "category": "session",
+      "apps": 1,
+      "pct": 0.1
+    },
+    {
+      "probe_id": "sec-csrf-001",
+      "bundle": "security",
+      "category": "csrf",
+      "apps": 1,
+      "pct": 0.1
     }
   ],
   "category_concentration": [
     {
       "category": "overall",
-      "slop": 26343.8,
-      "pct": 27.7
+      "slop": 22298.4,
+      "pct": 24.1
     },
     {
       "category": "security-headers",
-      "slop": 21454.7,
+      "slop": 20872.0,
       "pct": 22.6
     },
     {
       "category": "accessibility",
-      "slop": 17502.8,
-      "pct": 18.4
+      "slop": 16690.2,
+      "pct": 18.1
     },
     {
       "category": "crash-resistance",
-      "slop": 7040.0,
-      "pct": 7.4
+      "slop": 7535.0,
+      "pct": 8.2
     },
     {
       "category": "dead-controls",
-      "slop": 6760.0,
-      "pct": 7.1
+      "slop": 6680.0,
+      "pct": 7.2
+    },
+    {
+      "category": "secrets-exposure",
+      "slop": 3996.0,
+      "pct": 4.3
     },
     {
       "category": "availability",
@@ -1961,93 +2030,93 @@
     },
     {
       "category": "supply-chain",
-      "slop": 1990.0,
-      "pct": 2.1
+      "slop": 1820.0,
+      "pct": 2.0
     },
     {
       "category": "backend-exposure",
-      "slop": 1708.0,
-      "pct": 1.8
+      "slop": 1762.0,
+      "pct": 1.9
     },
     {
       "category": "exposure",
-      "slop": 1468.0,
-      "pct": 1.5
+      "slop": 1483.0,
+      "pct": 1.6
     },
     {
       "category": "broken-links",
-      "slop": 1144.2,
+      "slop": 1113.6,
       "pct": 1.2
     },
     {
-      "category": "secrets-exposure",
-      "slop": 1050.0,
-      "pct": 1.1
-    },
-    {
       "category": "ui-honesty",
-      "slop": 1001.0,
+      "slop": 971.0,
       "pct": 1.1
     },
     {
       "category": "password-reset",
-      "slop": 960.0,
+      "slop": 900.0,
       "pct": 1.0
     },
     {
       "category": "console-errors",
-      "slop": 720.0,
+      "slop": 738.0,
       "pct": 0.8
     },
     {
-      "category": "email-verification",
-      "slop": 663.0,
-      "pct": 0.7
+      "category": "rate-limiting",
+      "slop": 540.0,
+      "pct": 0.6
     },
     {
-      "category": "rate-limiting",
-      "slop": 480.0,
-      "pct": 0.5
+      "category": "email-verification",
+      "slop": 519.0,
+      "pct": 0.6
     },
     {
       "category": "transport-security",
-      "slop": 390.0,
+      "slop": 360.0,
       "pct": 0.4
     },
     {
-      "category": "seo",
-      "slop": 310.0,
+      "category": "mobile-visibility",
+      "slop": 280.0,
+      "pct": 0.3
+    },
+    {
+      "category": "load-resilience",
+      "slop": 270.0,
+      "pct": 0.3
+    },
+    {
+      "category": "xss",
+      "slop": 255.0,
       "pct": 0.3
     },
     {
       "category": "input-validation",
-      "slop": 288.0,
-      "pct": 0.3
-    },
-    {
-      "category": "data-exposure",
-      "slop": 250.0,
-      "pct": 0.3
-    },
-    {
-      "category": "access-control",
-      "slop": 246.0,
-      "pct": 0.3
-    },
-    {
-      "category": "host-header",
-      "slop": 200.0,
+      "slop": 216.0,
       "pct": 0.2
     },
     {
       "category": "session",
-      "slop": 190.2,
+      "slop": 168.0,
       "pct": 0.2
     },
     {
-      "category": "load-resilience",
-      "slop": 180.0,
+      "category": "access-control",
+      "slop": 156.0,
       "pct": 0.2
+    },
+    {
+      "category": "dependency",
+      "slop": 126.0,
+      "pct": 0.1
+    },
+    {
+      "category": "http-conformance",
+      "slop": 90.0,
+      "pct": 0.1
     },
     {
       "category": "cors",
@@ -2055,23 +2124,8 @@
       "pct": 0.1
     },
     {
-      "category": "csrf",
+      "category": "sql-injection",
       "slop": 90.0,
-      "pct": 0.1
-    },
-    {
-      "category": "command-injection",
-      "slop": 90.0,
-      "pct": 0.1
-    },
-    {
-      "category": "xss",
-      "slop": 85.0,
-      "pct": 0.1
-    },
-    {
-      "category": "http-conformance",
-      "slop": 80.0,
       "pct": 0.1
     },
     {
@@ -2080,23 +2134,38 @@
       "pct": 0.1
     },
     {
+      "category": "data-exposure",
+      "slop": 70.0,
+      "pct": 0.1
+    },
+    {
       "category": "data-integrity",
       "slop": 69.0,
       "pct": 0.1
     },
     {
-      "category": "dependency",
-      "slop": 65.0,
-      "pct": 0.1
+      "category": "csrf",
+      "slop": 45.0,
+      "pct": 0.0
     },
     {
-      "category": "dos-resistance",
-      "slop": 30.0,
+      "category": "host-header",
+      "slop": 40.0,
       "pct": 0.0
     },
     {
       "category": "error-hygiene",
       "slop": 25.0,
+      "pct": 0.0
+    },
+    {
+      "category": "dos-resistance",
+      "slop": 15.0,
+      "pct": 0.0
+    },
+    {
+      "category": "scaffold-content",
+      "slop": 12.0,
       "pct": 0.0
     },
     {
@@ -2106,41 +2175,41 @@
     }
   ],
   "backend_tier": {
-    "n": 1106,
-    "same_origin": 670,
-    "own_backend": 203,
-    "managed_baas": 173,
-    "vendor": 222,
-    "opaque": 190
+    "n": 1052,
+    "same_origin": 636,
+    "own_backend": 195,
+    "managed_baas": 169,
+    "vendor": 207,
+    "opaque": 162
   },
   "auth_surface": {
-    "n": 1625,
-    "has_login": 611,
-    "has_signup": 495,
-    "self_registerable": 233,
-    "has_sso": 184,
-    "sso_only": 115,
-    "no_auth": 908,
+    "n": 1579,
+    "has_login": 589,
+    "has_signup": 491,
+    "self_registerable": 226,
+    "has_sso": 176,
+    "sso_only": 114,
+    "no_auth": 883,
     "partition": {
-      "no_auth": 908,
-      "login_only": 141,
-      "sso_only": 117,
-      "signup_undrivable": 226,
-      "password_only": 166,
-      "password_and_sso": 67
+      "no_auth": 883,
+      "login_only": 133,
+      "signup_undrivable": 222,
+      "password_only": 165,
+      "sso_only": 115,
+      "password_and_sso": 61
     },
     "sso_providers": {
-      "google": 147,
-      "microsoft": 3,
+      "google": 136,
+      "microsoft": 2,
       "oauth": 41,
-      "apple": 9,
-      "github": 21,
-      "facebook": 4,
-      "linkedin": 3
+      "github": 15,
+      "apple": 6,
+      "facebook": 2,
+      "linkedin": 1
     },
     "captcha": {
-      "recaptcha": 15,
-      "turnstile": 7
+      "recaptcha": 14,
+      "turnstile": 2
     }
   },
   "notes": {

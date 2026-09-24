@@ -47,6 +47,7 @@ sys.path.insert(0, str(_ROOT))
 
 from sloptic.aggregate import CATEGORY_DECAY, _damped_total  # noqa: E402
 from sloptic.catalog import load_catalog  # noqa: E402
+from sloptic.ruler import FULL as _RULER_FULL, PASSIVE as _RULER_PASSIVE  # noqa: E402
 from sloptic.eligibility import (is_limited_battery, is_shell_only,  # noqa: E402
                                  is_ungradeable_challenge, is_wrong_owner)
 from sloptic.schema import Outcome  # noqa: E402
@@ -1540,7 +1541,7 @@ def corpus_json(recs: list) -> dict:
     # which battery produced this corpus (full 102 or passive 44), so version + curve self-label correctly
     _np = _passive_full_counts()[0]   # load the catalog ONCE, not per record
     probe_set = Counter(_probe_set(r, _np) for r in graded).most_common(1)[0][0]
-    curve = "passive-2026.1" if probe_set == "passive" else "2026.3"
+    curve = _RULER_PASSIVE if probe_set == "passive" else _RULER_FULL   # from sloptic.ruler: the frozen ruler, so figures never drift from the curve
     version = "corpus-" + curve
 
     def pctl(p):   # curve-consistent percentile (matches benchmark._pcts + the frozen 2026.3 curve)
