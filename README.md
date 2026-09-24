@@ -55,15 +55,16 @@ the app's purpose. That boundary is deliberate. Humans carry intent, Sloptic car
 machine can judge objectively. It will never tell you whether a feature is good. It tells you whether
 the app holds up.
 
-The catalog is **100+ probes** across three axes.
+The catalog is **100+ probes** across four axes.
 
 | axis | examples |
 |------|----------|
 | **security** | managed backend exposure (Supabase or Firebase RLS), exposed `.env` / `.git` / secrets in the bundle, missing rate limiting, header, CORS, and redirect defenses, and the injection classes (SQLi, XSS, SSTI, path traversal, SSRF) |
-| **qa** | accessibility (axe-core, tiered by severity), controls that do nothing, crashes on malformed input, broken links, soft 404s, a dev build shipped to production, content type honesty |
+| **qa** | controls that do nothing, crashes on malformed input, broken links, soft 404s, a dev build shipped to production, content type honesty, password recovery that never arrives |
+| **accessibility** | axe-core on the rendered page, tiered by severity: text too faint to read, buttons and fields with no accessible name, missing labels, a page with no language or title |
 | **performance** | Lighthouse, run locally at a pinned version, giving the overall performance score and the Core Web Vitals it reports (LCP, CLS, TBT, load time), throttled and scored as the median of three runs |
 
-Each axis reports its own damped subtotal, and the three sum exactly to the slop score.
+Each axis reports its own damped subtotal, and the four sum exactly to the slop score.
 
 Performance is the one axis Sloptic does not measure with probes of its own. It defers to Lighthouse,
 run locally at a pinned version, because a hand written timing probe cannot match years of calibration
