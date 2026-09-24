@@ -1592,7 +1592,7 @@ def corpus_json(recs: list, corpus_id: str = "unspecified") -> dict:
     worst = [max([float(f["penalty"]) for f in r.get("findings", []) if _scored(f)] or [0]) for r in graded]
     ws = sorted(worst)
     acute = sum(1 for w in worst if w > 40)
-    signif = sum(1 for w in worst if w >= 21)
+    signif = sum(1 for w in worst if w > 20)   # same cut as _severity_tier's serious band (penalties are continuous)
     floor_apps = sum(1 for w in worst if w > 0)   # apps with ANY finding -> "virtually every app", NOT a hardcoded 100%
     exploit = sum(1 for r in graded if _has_catastrophe(r))
     comp = Counter()
@@ -1609,7 +1609,7 @@ def corpus_json(recs: list, corpus_id: str = "unspecified") -> dict:
              "pct": round(100 * acute / n, 1),
              "definition": "Severe issues that noticeably degrade the user experience or allow attacker "
                            "access, such as crashes, unusable pages, or exposed backends."},
-            {"key": "significant", "label": "Significant", "threshold": "worst finding priced 21 or more",
+            {"key": "significant", "label": "Significant", "threshold": "worst finding priced above 20",
              "apps": signif, "pct": round(100 * signif / n, 1),
              "definition": "Findings that are not just cosmetic, such as dead controls, broken links, "
                            "missing rate limits, overly slow pages."},
