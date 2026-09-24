@@ -38,6 +38,12 @@ PROBE_LABEL = {
     "sec-secrets-003": "Google key that reaches Gemini",
 }
 
+AXE_LABEL = {"color-contrast": "Text contrast too low", "button-name": "Button with no name",
+             "meta-viewport": "Zoom disabled", "label": "Form field with no label",
+             "select-name": "Dropdown with no name", "link-name": "Link with no text",
+             "html-has-lang": "No page language", "document-title": "No page title",
+             "scrollable-region-focusable": "Scroll area unreachable by keyboard", "image-alt": "Image with no alt text"}
+
 # the exploitable classes, by the category of the gating finding
 EXPLOIT_CLASS = {"secrets-exposure": "Live credential in the bundle", "backend-exposure": "Open managed backend",
                  "exposure": "Served .git or hidden file", "xss": "Stored XSS",
@@ -75,8 +81,8 @@ class _Ctx:
 
     def finish(self, fig, name):
         fig.tight_layout(rect=(0, 0.05, 1, 1))
-        fig.text(0.5, 0.015, f"{self.run}   ·   sloptic {self.ver}   ·   n = {self.n:,} curve eligible apps   ·   "
-                 f"scripts/charts.py", ha="center", va="bottom", fontsize=9, color=MUTED)
+        fig.text(0.5, 0.015, f"Source: {self.run}, Sloptic {self.ver}, n = {self.n:,} curve eligible apps",
+                 ha="center", va="bottom", fontsize=9, color=MUTED)
         fig.savefig(self.out / f"{name}.png", facecolor="white")
         self.plt.close(fig)
 
@@ -134,7 +140,7 @@ def fig_funnel(ctx, fj):
              "entry challenge (WAF withheld the grade)": "Bot challenge at entry"}
     rows = [("Attempted (live URL on Devpost)", a["attempted"]), ("Graded, curve eligible", a["graded"])]
     rows += [(names.get(k, k), v) for k, v in sorted(dnf.items(), key=lambda x: -x[1])]
-    _hbar(ctx, "fig01_funnel", "Where 2,685 submissions went", [r[0] for r in rows], [r[1] for r in rows],
+    _hbar(ctx, "fig01_funnel", "Submission outcomes", [r[0] for r in rows], [r[1] for r in rows],
           "apps", lambda v: f"{v:,}  ({100 * v / a['attempted']:.0f}%)", highlight=lambda i: i == 1,
           xmax=a["attempted"] * 1.45,
           csv_rows=[[r[0], r[1], round(100 * r[1] / a["attempted"], 1)] for r in rows],
@@ -152,16 +158,18 @@ def fig_distribution(ctx, fj):
     for key, lab, col in [("q1", "Q1", FAINT), ("median", "median", ACCENT), ("q3", "Q3", FAINT),
                           ("p90", "p90", FAINT)]:
         v = d[key]
-        ax.axvline(v, color=col, lw=2.2 if key == "median" else 1.3, ls="-" if key == "median" else (0, (3, 3)),
-                   zorder=4)
-        ax.text(v, top * (1.12 if key == "median" else 1.02), f"{lab} {v:.0f}", color=col, fontsize=12,
-                fontweight="bold", ha="center", va="bottom")
+        med = key == "median"
+        # dashed lines stop below the median label row so no label crosses a line
+        ax.vlines(v, 0, top * (1.1 if med else 1.0), color=col, lw=2.2 if med else 1.3,
+                  linestyles="-" if med else (0, (3, 3)), zorder=4)
+        ax.text(v + (-1.5 if key == "q1" else 1.5), top * (1.12 if med else 1.02), f"{lab} {v:.0f}", color=col,
+                fontsize=12, fontweight="bold", ha="right" if key == "q1" else "left", va="bottom")
     ax.set_ylim(0, top * 1.24)
-    ax.text(248, top * 0.25, f"{tail} app(s) above 250\n(max {d['max']:.0f})", ha="right", fontsize=11,
+    ax.text(248, top * 0.25, f"{tail} {'app' if tail == 1 else 'apps'} above 250\n(max {d['max']:.0f})", ha="right", fontsize=11,
             color=FAINT)
     ax.set_xlabel("slop score, 10 point bins (lower is better)")
     ax.set_ylabel("apps")
-    ax.set_title("Slop is right skewed with a long tail", loc="left", pad=12)
+    ax.set_title("Slop score distribution", loc="left", pad=12)
     _style(ax)
     ctx.finish(fig, "fig02_distribution")
     _write_csv(ctx.out / "fig02_distribution.csv", ["bin_low", "bin_high", "apps"], d["bins"])
@@ -194,7 +202,7 @@ def fig_axes(ctx, fj, graded):
     a2.set_xticks(range(1, len(order) + 1))
     a2.set_xticklabels([AXIS_LABEL[a] for a in order], fontsize=12)
     a2.set_ylabel("axis subtotal per app")
-    a2.set_title("Per app subtotal (outliers hidden)", loc="left", pad=10, fontsize=16)
+    a2.set_title("Subtotal per app, outliers hidden", loc="left", pad=10, fontsize=16)
     _style(a2)
     ctx.finish(fig, "fig03_axes")
     _write_csv(ctx.out / "fig03_axes.csv", ["axis", "share_pct", "median", "q1", "q3", "mean", "max"],
@@ -221,7 +229,7 @@ def fig_axis_corr(ctx, graded, ss):
             ax.text(j, i, f"{m[i][j]:.2f}", ha="center", va="center", fontsize=14, fontweight="bold",
                     color="white" if m[i][j] > 0.6 else INK)
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    ax.set_title("The axes barely correlate (Spearman ρ)", loc="left", pad=12, fontsize=17)
+    ax.set_title("Axis correlation, Spearman ρ", loc="left", pad=12, fontsize=17)
     ax.tick_params(length=0)
     for s in ax.spines.values():
         s.set_visible(False)
@@ -233,7 +241,7 @@ def fig_axis_corr(ctx, graded, ss):
 # ---- fig 5: fire frequency -----------------------------------------------------------------------------
 def fig_fire_frequency(ctx, fj, top=14):
     ff = fj["fire_frequency"][:top]
-    _hbar(ctx, "fig05_fire_frequency", "What fires, and how often",
+    _hbar(ctx, "fig05_fire_frequency", "Most frequent findings",
           [PROBE_LABEL.get(f["probe_id"], f["probe_id"]) for f in ff], [f["pct"] for f in ff],
           "% of graded apps", lambda v: f"{v:.0f}%" if v >= 10 else f"{v:.1f}%",
           highlight=lambda i: ff[i]["probe_id"].startswith("sec-headers"), xmax=112, size=(10, 7),
@@ -248,7 +256,7 @@ def fig_worst_finding(ctx, graded):
     worst = [max((f.get("penalty") or 0 for f in r.get("findings") or [] if _scored(f)), default=0) for r in graded]
     counts = [sum(1 for w in worst if lo < w <= hi) for _, lo, hi in bands]
     n = len(graded)
-    _hbar(ctx, "fig06_worst_finding", "Each app's single worst finding", [b[0] for b in bands], counts,
+    _hbar(ctx, "fig06_worst_finding", "Worst finding per app", [b[0] for b in bands], counts,
           "apps (each app counted once, in its worst band)", lambda v: f"{v:,}  ({100 * v / n:.0f}%)",
           highlight=lambda i: i == 4,
           csv_rows=[[b[0], c, round(100 * c / n, 1)] for b, c in zip(bands, counts)],
@@ -268,7 +276,7 @@ def fig_exploitable(ctx, graded):
             for c in cats:
                 per[EXPLOIT_CLASS.get(c, c)] += 1
     rows = per.most_common()
-    _hbar(ctx, "fig07_exploitable", f"The {apps} exploitable apps, by class", [r[0] for r in rows],
+    _hbar(ctx, "fig07_exploitable", f"Exploitable apps by class (n = {apps})", [r[0] for r in rows],
           [r[1] for r in rows], "apps (an app with two classes counts in both)", lambda v: f"{v}",
           highlight=lambda i: i < 2, csv_rows=[[r[0], r[1]] for r in rows] + [["distinct_apps", apps]],
           csv_header=["class", "apps"])
@@ -305,7 +313,7 @@ def fig_winners(ctx, graded, ss):
     ax.set_xticklabels([r[0] for r in rows])
     ax.set_ylabel("median slop")
     ax.legend(frameon=False, loc="upper right", fontsize=12)
-    ax.set_title("Winners differ only on performance", loc="left", pad=12)
+    ax.set_title("Median slop, winners and non winners", loc="left", pad=12)
     _style(ax)
     ctx.finish(fig, "fig08_winners")
     _write_csv(ctx.out / "fig08_winners.csv", ["component", "winner_median", "non_winner_median",
@@ -327,10 +335,7 @@ def fig_stack(ctx, graded, min_n=10):
     for w in bp["whiskers"] + bp["caps"]:
         w.set(color=MUTED, linewidth=1.3)
     ax.set_yticks(range(1, len(keep) + 1))
-    ax.set_yticklabels([f"{k}  (n = {len(v)})" for k, v in keep], fontsize=12)
-    for i, (_, v) in enumerate(keep, start=1):
-        ax.text(statistics.median(v), i + 0.36, f"{statistics.median(v):.0f}", ha="center", fontsize=11,
-                color=ACCENT, fontweight="bold")
+    ax.set_yticklabels([f"{k}  (n = {len(v)}, median {statistics.median(v):.0f})" for k, v in keep], fontsize=12)
     ax.set_xlabel("slop score (outliers hidden)")
     ax.set_title("Slop by host platform", loc="left", pad=12)
     _style(ax, "x")
@@ -353,13 +358,14 @@ def fig_lighthouse(ctx, fj, graded):
     ax.bar([lo + 2.5 for lo in edges[:-1]], counts, width=4.6, color=colors, zorder=3)
     top = max(counts)
     ax.axvline(o["median"], color=INK, lw=2, zorder=4)
-    ax.text(o["median"], top * 1.04, f"median {o['median']}", ha="center", fontsize=12, fontweight="bold")
-    ax.text(97, top * 0.8, f"{o['pct_green']:.0f}% green\n(90+)", ha="center", fontsize=12, color="#16a34a",
+    ax.text(o["median"] - 1, top * 1.06, f"median {o['median']}", ha="right", va="bottom", fontsize=12,
             fontweight="bold")
-    ax.set_ylim(0, top * 1.16)
+    ax.text(95, top * 1.06, f"{o['pct_green']:.0f}% green (90+)", ha="center", va="bottom", fontsize=12,
+            color="#16a34a", fontweight="bold")
+    ax.set_ylim(0, top * 1.2)
     ax.set_xlabel("Lighthouse performance score (mobile, simulated throttling)")
     ax.set_ylabel("apps")
-    ax.set_title("Most apps land orange", loc="left", pad=12)
+    ax.set_title("Lighthouse performance scores", loc="left", pad=12)
     _style(ax)
     ctx.finish(fig, "fig10_lighthouse")
     _write_csv(ctx.out / "fig10_lighthouse.csv", ["bin_low", "bin_high", "apps"],
@@ -381,7 +387,7 @@ def fig_a11y(ctx, graded, top=8):
             fired += 1
             rules.update(seen)
     rows = rules.most_common(top)
-    _hbar(ctx, "fig11_a11y_rules", "Accessibility is mostly a contrast problem", [r[0] for r in rows],
+    _hbar(ctx, "fig11_a11y_rules", "Accessibility violations by axe rule", [AXE_LABEL.get(r[0], r[0]) for r in rows],
           [100 * r[1] / fired for r in rows], f"% of the {fired:,} apps with an axe finding",
           lambda v: f"{v:.0f}%", highlight=lambda i: i == 0, xmax=100,
           csv_rows=[[r[0], r[1], round(100 * r[1] / fired, 1)] for r in rows],
@@ -403,7 +409,7 @@ def fig_reach(ctx, fj):
     fig, (a1, a2) = ctx.plt.subplots(1, 2, figsize=(13, 5.4))
     for ax, rows, lab, total, hi, title in [
             (a1, [(names[k], v) for k, v in arows], "apps", au["n"],
-             lambda k: "drivable" in k, "Auth shape (partition)"),
+             lambda k: "drivable" in k, "Auth shape"),
             (a2, [(tnames[k], v) for k, v in brows], "apps with traffic, tiers overlap", bt["n"],
              lambda k: k == "Own backend", "Backend tier")]:
         y = list(range(len(rows)))
