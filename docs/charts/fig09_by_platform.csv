@@ -1,0 +1,11 @@
+platform,n,median,q1,q3
+cloudflare-pages,13,45.1,13.3,61.6
+vercel,1057,45.4,25.6,75.8
+github-pages,87,46.4,25.0,72.2
+render,60,48.0,28.2,93.0
+lovable,70,51.4,30.5,89.0
+cloudflare-workers,13,53.3,32.2,78.1
+netlify,112,53.8,31.4,91.4
+firebase,28,63.9,37.9,86.8
+google-cloud-run,15,66.3,56.5,83.1
+unknown,110,70.6,41.1,100.2

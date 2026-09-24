@@ -1,0 +1,10 @@
+hypothesis,test,n_a,n_b,p_value,detail
+lovable slop > hand built slop,"Mann-Whitney U, one sided",73,1497,0.16367279209817054,
+"backend exposure rate, AI built vs hand built","Fisher exact, two sided",82,1497,4.3615143975455224e-10,"11/82 vs 9/1497, odds ratio 25.6"
+"Lighthouse score, winners vs non winners","Mann-Whitney U, two sided",242,1296,0.0033755346039335762,medians 78.0 vs 83.5
+"observed surface size, winners vs non winners","Mann-Whitney U, two sided",247,1332,0.7048489279864978,medians 26 vs 25.0
+slop differs across host platforms (n >= 10),Kruskal-Wallis,10,1565,3.7262798100293014e-06,
+slop differs across events (n >= 10),Kruskal-Wallis,49,1410,0.029859959748410773,
+slop vs observed surface size,Spearman,1579,,2.8633698123329688e-08,rho 0.139
+distribution shape,sample skewness / excess kurtosis,1579,,,"skew 1.40, excess kurtosis 2.94"
+"median slop, 95% bootstrap CI","percentile bootstrap, 2000 resamples, seed 0",1579,,,45.9 to 51.0

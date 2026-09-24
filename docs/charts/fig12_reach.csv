@@ -1,0 +1,12 @@
+panel,group,apps,n
+auth,no_auth,883,1579
+auth,signup_undrivable,222,1579
+auth,password_only,165,1579
+auth,login_only,133,1579
+auth,sso_only,115,1579
+auth,password_and_sso,61,1579
+backend_tier,same_origin,636,1052
+backend_tier,vendor,207,1052
+backend_tier,own_backend,195,1052
+backend_tier,managed_baas,169,1052
+backend_tier,opaque,162,1052

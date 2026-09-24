@@ -1,0 +1,15 @@
+probe_id,label,apps,pct
+sec-headers-002,No Content-Security-Policy,1550,98.2
+sec-headers-004,No clickjacking defense,1528,96.8
+sec-headers-005,No Referrer-Policy,1430,90.6
+sec-headers-001,No X-Content-Type-Options,1428,90.4
+qa-a11y-001,Accessibility violation (axe),1034,65.5
+perf-lighthouse-001,Lighthouse performance below 90,991,62.8
+qa-deadctrl-001,A control that does nothing,214,13.6
+sec-sri-001,Third party script without SRI,182,11.5
+qa-crash-010,Crash on malformed input,137,8.7
+sec-headers-003,No HSTS,76,4.8
+sec-exposure-006,Source maps shipped,57,3.6
+qa-console-001,Uncaught JavaScript error,41,2.6
+qa-links-001,Broken internal link,29,1.8
+qa-seo-001,Missing basic meta tags,28,1.8
