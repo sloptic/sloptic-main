@@ -7,9 +7,9 @@ unchanged from `WEB_HANDOFF_2.0.md` (assertive, no em dashes, no hyphenated word
 ## The one line status
 
 Sloptic **3.0.0** is a **new ruler**: full curve **2026.4** (final, 1,579 curve eligible apps from a 2,685 app
-run) and passive curve **passive-2026.2** (frozen from its own passive battery run, in progress now). A 3.0
-score does not compare to a 2.x one. Sequencing: the passive run finishes, `passive-2026.2` freezes, Ian pushes
-the `v3.0.0` tag (the tag publishes to PyPI automatically), then the site pins it.
+run) and passive curve **passive-2026.2** (final, 1,702 curve eligible apps from its own 45 probe passive run
+over the same URLs). A 3.0 score does not compare to a 2.x one. Sequencing: Ian pushes the `v3.0.0` tag (the
+tag publishes to PyPI automatically), then the site pins it.
 
 ## What the site must change to consume 3.0
 
@@ -30,8 +30,9 @@ the `v3.0.0` tag (the tag publishes to PyPI automatically), then the site pins i
    free: the "what we saw" line states the finding, accessibility rules read in plain language with the element
    each violation occurred on, console errors are quoted, the perf audit is named. A custom renderer needs the
    new evidence fields (accessibility `rules` and `locations`, console `examples`).
-7. **Re-vendor the corpus figures.** `validation/corpus-figures-active.json` is now `corpus-2026.4` (n=1,579).
-   The passive figures refresh when the passive curve freezes. The findings page should read numbers from these
+7. **Re-vendor the corpus figures.** `validation/corpus-figures-active.json` is now `corpus-2026.4` (n=1,579)
+   and `validation/corpus-figures-passive.json` is `corpus-passive-2026.2` (n=1,702). `provenance.n_probes`
+   reads 106 in the active file and 45 in the passive one: the battery that ran, not the catalog. The findings page should read numbers from these
    files, never transcribe them.
 8. **Keep the worker as is.** `MAX_CONCURRENT_GRADES=4` with `LIGHTHOUSE_SLOTS=3` matches how the curve was
    measured.
@@ -80,6 +81,9 @@ severity.**
 
 ## Operational notes
 
+- **Passive grades rarely meet bot protection.** In the passive corpus run, 1.4% of records were challenged,
+  against 21.9% for the full battery, and Vercel challenged 3 of 1,146 apps instead of 553 of 1,107. The
+  anonymous tier should expect clean grades; the challenge path mostly matters for verified full grades.
 - **The grader goes down during corpus runs, on purpose**, so every run keeps the whole box at concurrency 4.
   The next window is the v4.0 measurement in November. A maintenance notice beats a silent outage.
 - **3.x releases will not move the ruler.** Only 4.0 does (target early December, see `docs/V4_SPRINT.md`), so

@@ -11,7 +11,7 @@ precision and diagnostics. Version 2.0 is different: it is a **new ruler**. New 
 continuous scoring changed what the number measures, and the reference curve moved to **2026.3**, so
 a 2.0 score does not compare to a 1.x one. A 2.0 percentile is quoted against 2026.3. Version 2.1 keeps that 2026.3 ruler, so a 2.1 grade compares directly to a 2.0 one, and it adds the egress sandbox the hosted service needs to accept public URL submissions safely. Version 2.2 keeps it as well, and spends its changes on the crawl, on a second frozen curve for the passive battery, and on the client the hosted service needs to verify an event.
 
-Version 3.0 is the next **new ruler**. Accessibility becomes its own axis, performance is corrected for the speed of the box that measured it, and new detection reaches classes the 2.x battery could not, so the reference curves move to **2026.4** (full) and **passive-2026.2** (passive). A 3.0 score does not compare to a 2.x one, and a 3.0 percentile is quoted against 2026.4.
+Version 3.0 is the next **new ruler**. Accessibility becomes its own axis, performance is corrected for the speed of the box that measured it, and new detection reaches classes the 2.x battery could not, so the reference curves move to **2026.4** (full) and **passive-2026.2** (passive). A 3.0 score does not compare to a 2.x one, and a 3.0 percentile is quoted against 2026.4, or against passive-2026.2 for a passive grade.
 
 ## What's new in 3.0.0
 
@@ -22,6 +22,13 @@ Version 3.0 is the next **new ruler**. Accessibility becomes its own axis, perfo
   run of 2,685 live hackathon apps, 1,579 of them curve eligible. The middle of the distribution barely moved
   (median 48.4 against 2026.3's 50.0) while the upper tail grew (95th percentile 140 against 130), which is
   what new detection reaching more apps should look like.
+- **A passive curve from its own run.** `passive-2026.2` is final, frozen from a run of the 45 probe passive
+  battery over the same 2,685 apps, 1,702 of them curve eligible. Its landmarks sit close to passive-2026.1
+  (median 39.8 against 39.0), and it now carries its own performance normalization. On the 1,563 apps graded
+  in both runs, passive scores track the full run's passive slice at a Spearman correlation of 0.955. Passive
+  grades also rarely meet bot protection: 1.4% of passive records were challenged, against 21.9% in the full
+  run, and Vercel challenged 3 of its 1,146 apps instead of 553 of 1,107. Its challenge reacts to active probe
+  volume, not to reading a page.
 - **Performance corrected for the box that measured it.** Lighthouse's default throttling models the network
   but never slows the real CPU; it runs the trace at the host's actual speed and multiplies CPU time by a fixed
   factor, so a busy grading box scores an app worse through no fault of the app. A controlled comparison found
@@ -260,11 +267,11 @@ tagged with a CWE. `uv run pytest -q` runs the calibration suite.
 
 This release ships the full reference curve **2026.4** (final), frozen from a corpus run of 2,685 live
 hackathon apps, 1,579 of them eligible for the curve, and the passive floor curve **passive-2026.2**, frozen
-from its own run of the passive battery over the same corpus. Each stores its full score distribution as
+from its own run of the 45 probe passive battery over the same corpus, with 1,702 eligible apps. Each stores its full score distribution as
 anonymous per app rows (score, whether a catastrophe fired, the single worst finding, worst case slop
 defended, surface breadth) with no per app identity, so a percentile is exact with no interpolation and ties
 resolve the same way every time. A percentile is always quoted against a named curve version, so the claim is
-checkable and does not drift as the population changes. The full curve also carries its performance
+checkable and does not drift as the population changes. Both curves carry their own performance
 normalization, so a grade is ranked as if measured on the population's box.
 
 ## Scope, honestly

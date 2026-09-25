@@ -150,10 +150,10 @@ on pinned Lighthouse 13.4.1 (mobile preset, median of three runs).
 ### 3.2 The reference curve
 
 This run is the frozen reference curve `2026.4`. Every full battery grade, on sloptic.org or from the package,
-becomes a percentile against it. Passive grades rank against a separate curve frozen from a passive battery
-run. The curve applies a small performance correction for how busy the grading box was
-(`docs/PERF_NORMALIZATION.md`), so its median is 48.4. The tables in this report use raw scores, where the
-median is 48.0.
+becomes a percentile against it. Passive grades rank against a separate curve, `passive-2026.2`, frozen from a
+run of the 45 probe passive battery over the same URLs (1,702 eligible apps). The curve applies a small
+performance correction for how busy the grading box was (`docs/PERF_NORMALIZATION.md`), so its median is 48.4.
+The tables in this report use raw scores, where the median is 48.0.
 
 ### 3.3 Severity
 
