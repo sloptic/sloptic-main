@@ -27,3 +27,9 @@ slop differs across events (n >= 10),Kruskal-Wallis,49,1410,0.029859959748410773
 slop vs observed surface size,Spearman,1579,,2.8633698123329688e-08,rho 0.139
 distribution shape,sample skewness / excess kurtosis,1579,,,"skew 1.40, excess kurtosis 2.94"
 "median slop, 95% bootstrap CI","percentile bootstrap, 2000 resamples, seed 0",1579,,,45.9 to 51.0
+RQ6: event median slop vs host QS 2026 rank,"Spearman, events",54,,0.8177505174003579,"rho -0.032, 95% CI -0.30 to 0.24 (QS rank 1 is best, so a negative rho would mean better ranked hosts are sloppier)"
+RQ6: event median slop vs Devpost participants,"Spearman, events",65,,0.6382117845685473,rho 0.059
+"RQ6: event median slop, admissions gate: yes vs no","Mann-Whitney U, events",14,51,0.40663706951853906,median of event medians 46.9 vs 51.7
+"RQ6: event median slop, mlh member: yes vs no","Mann-Whitney U, events",42,23,0.018285438335861662,median of event medians 52.2 vs 43.9
+"RQ6: event median slop, format: in_person vs online","Mann-Whitney U, events",56,9,0.20655164115774882,median of event medians 51.0 vs 45.0
+"RQ6: event median slop, host: university vs independent","Mann-Whitney U, events",54,11,0.5577967494014071,median of event medians 50.1 vs 52.3

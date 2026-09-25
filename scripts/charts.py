@@ -522,7 +522,7 @@ def _winner_tests(graded, W, N, ss):
     return rows
 
 
-def tests(ctx, graded, ss):
+def tests(ctx, graded, ss, extra=()):
     rows = []
     bld = lambda r: (r.get("platform") or {}).get("builder") or "hand"   # noqa: E731
     hand = [r["slop_score"] for r in graded if bld(r) == "hand"]
@@ -571,7 +571,92 @@ def tests(ctx, graded, ss):
     boot = sorted(statistics.median(rng.choices(scores, k=len(scores))) for _ in range(2000))
     rows.append(["median slop, 95% bootstrap CI", "percentile bootstrap, 2000 resamples, seed 0", len(graded),
                  "", "", f"{boot[50]:.1f} to {boot[1949]:.1f}"])
+    rows += list(extra)
     _write_csv(ctx.out / "tests.csv", ["hypothesis", "test", "n_a", "n_b", "p_value", "detail"], rows)
+    return rows
+
+
+# ---- RQ6: event prestige and selectivity ---------------------------------------------------------------
+EVENTS_CSV = Path(__file__).resolve().parent.parent / "validation" / "event-attributes.csv"
+MIN_EVENT_APPS = 5
+
+
+def _event_table(graded):
+    """Per event: graded app count and median slop, joined to the coded attributes. Events below MIN_EVENT_APPS
+    and the anonymized dataset's withheld group are left out."""
+    if not EVENTS_CSV.exists():
+        return []
+    attrs = {r["slug"]: r for r in csv.DictReader(open(EVENTS_CSV))}
+    by = defaultdict(list)
+    for r in graded:
+        if r.get("hackathon") in attrs:
+            by[r["hackathon"]].append(r["slop_score"])
+    return [{**attrs[e], "n": len(v), "median": statistics.median(v)} for e, v in by.items()
+            if len(v) >= MIN_EVENT_APPS]
+
+
+_FACTORS = [("admissions_gate", "Admissions gate", "yes", "no"), ("mlh_member", "MLH member", "yes", "no"),
+            ("format", "Format", "in_person", "online"), ("host_kind", "Host", "university", "independent")]
+
+
+def fig_prestige(ctx, graded, ss):
+    ev = _event_table(graded)
+    if not ev:
+        return []
+    rows = []
+    ranked = [e for e in ev if e["qs_2026_value"]]
+    x = [float(e["qs_2026_value"]) for e in ranked]
+    y = [e["median"] for e in ranked]
+    rho, p = ss.spearmanr(x, y)
+    import math
+    half = 1.96 / math.sqrt(len(ranked) - 3)   # Fisher z interval: how large a correlation the null rules out
+    lo, hi = math.tanh(math.atanh(float(rho)) - half), math.tanh(math.atanh(float(rho)) + half)
+    rows.append(["RQ6: event median slop vs host QS 2026 rank", "Spearman, events", len(ranked), "", float(p),
+                 f"rho {float(rho):.3f}, 95% CI {lo:.2f} to {hi:.2f} (QS rank 1 is best, so a negative rho would "
+                 f"mean better ranked hosts are sloppier)"])
+    size = [(float(e["devpost_participants"]), e["median"]) for e in ev if e["devpost_participants"]]
+    rho2, p2 = ss.spearmanr([a for a, _ in size], [b for _, b in size])
+    rows.append(["RQ6: event median slop vs Devpost participants", "Spearman, events", len(size), "", float(p2),
+                 f"rho {float(rho2):.3f}"])
+    for key, label, a_val, b_val in _FACTORS:
+        a = [e["median"] for e in ev if e[key] == a_val]
+        b = [e["median"] for e in ev if e[key] == b_val]
+        rows.append([f"RQ6: event median slop, {label.lower()}: {a_val} vs {b_val}", "Mann-Whitney U, events",
+                     len(a), len(b), float(ss.mannwhitneyu(a, b, alternative="two-sided").pvalue),
+                     f"median of event medians {statistics.median(a):.1f} vs {statistics.median(b):.1f}"])
+
+    fig, (a1, a2) = ctx.plt.subplots(1, 2, figsize=(13.5, 5.8), gridspec_kw={"width_ratios": [1.25, 1]})
+    gate = [e["admissions_gate"] == "yes" for e in ranked]
+    a1.scatter(x, y, s=[18 + 3 * e["n"] for e in ranked], c=[ACCENT if g else MUTED for g in gate],
+               alpha=0.85, edgecolors="white", linewidths=0.8, zorder=3)
+    a1.set_xscale("log")
+    a1.set_xlabel("host university, QS World University Rankings 2026 (log scale)\n"
+                  "blue: admissions gate, grey: open, size: graded apps")
+    a1.set_ylabel("event median slop")
+    a1.set_title(f"Event median slop by host rank (ρ = {float(rho):.2f})", loc="left", pad=10, fontsize=15)
+    _style(a1)
+    xs = []
+    for i, (key, label, a_val, b_val) in enumerate(_FACTORS):
+        for j, val in enumerate((a_val, b_val)):
+            pts = [e["median"] for e in ev if e[key] == val]
+            xpos = i * 3 + j
+            xs.append((xpos, f"{val.replace('_', ' ')}\n(n = {len(pts)})"))
+            jit = [xpos + ((k * 37) % 11 - 5) * 0.04 for k in range(len(pts))]
+            a2.scatter(jit, pts, s=16, color=ACCENT if j == 0 else MUTED, alpha=0.8, zorder=3)
+            if pts:
+                a2.hlines(statistics.median(pts), xpos - 0.3, xpos + 0.3, color=INK, lw=2, zorder=4)
+        a2.text(i * 3 + 0.5, 1.0, label, transform=a2.get_xaxis_transform(), ha="center", va="bottom",
+                fontsize=11, color=FAINT)
+    a2.set_xticks([t for t, _ in xs])
+    a2.set_xticklabels([l for _, l in xs], fontsize=9)
+    a2.set_ylabel("event median slop")
+    a2.set_title("Event median slop by event type", loc="left", pad=22, fontsize=15)
+    _style(a2)
+    ctx.finish(fig, "fig13_prestige")
+    _write_csv(ctx.out / "fig13_prestige.csv", ["slug", "n", "median_slop", "qs_2026_value", "admissions_gate",
+                                                "mlh_member", "format", "host_kind", "devpost_participants"],
+               [[e["slug"], e["n"], round(e["median"], 1), e["qs_2026_value"], e["admissions_gate"],
+                 e["mlh_member"], e["format"], e["host_kind"], e["devpost_participants"]] for e in ev])
     return rows
 
 
@@ -608,5 +693,5 @@ def render_all(graded, figures, out_dir="docs/charts", run_name="run.jsonl"):
     fig_lighthouse(ctx, figures, graded)
     fig_a11y(ctx, graded)
     fig_reach(ctx, figures)
-    tests(ctx, graded, ss)
+    tests(ctx, graded, ss, extra=fig_prestige(ctx, graded, ss))
     return sorted(str(p) for p in out.glob("*") if p.suffix in (".png", ".csv"))
