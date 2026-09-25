@@ -454,13 +454,14 @@ page language and missing titles are rare (under 4%).
 
 ## 5. Discussion
 
-Most of what this report measures is invisible from where a team sits. Lighthouse loads each app as a mid
-range phone on slow 4G would: 150 ms round trips, 1.6 Mbps down, and CPU work slowed four times. The team
-builds and demos on a fast laptop, where a 4 MB page appears instantly. Contrast failures, which account for
-80.5% of apps with an accessibility finding, are invisible to builders with good eyesight on a bright screen,
-and an unlabeled button is invisible to anyone who never hears the page read aloud. A crash on malformed input
-needs input no one on the team types, a dead control needs a click the demo never makes, and a missing header
-or a leaked key leaves the page working. Slop is how an app looks from the seats its team never sits in.
+Slop, as this report measures it, is whatever counts against an app no matter what the app does. Most of it is
+invisible from where the team sits, which is how it ships. Lighthouse loads each app as a mid range phone on
+slow 4G would: 150 ms round trips, 1.6 Mbps down, and CPU work slowed four times. The team builds and demos on
+a fast laptop, where a 4 MB page appears instantly. Contrast failures, which account for 80.5% of apps with an
+accessibility finding, are invisible to builders with good eyesight on a bright screen, and an unlabeled
+button is invisible to anyone who never hears the page read aloud. A crash on malformed input needs input no
+one on the team types, a dead control needs a click the demo never makes, and a missing header or a leaked key
+leaves the page working.
 
 The typical app works but skips basic hygiene: it sends no security headers, ships a heavy bundle, and has
 text that fails contrast. Past that floor, 58% of apps have at least one real problem, such as a dead button,

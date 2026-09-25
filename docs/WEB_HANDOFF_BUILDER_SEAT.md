@@ -1,7 +1,8 @@
 # Handoff: the builder's seat, for sloptic.org
 
-Bring one idea from the corpus report onto the site: **slop is how an app looks from the seats its team
-never sits in.** Written 2026-09-25 from the sloptic-main session. The source is `CORPUS_REPORT.md`, Section 5,
+Bring one idea from the corpus report onto the site: **slop ships because it is invisible from the seats the
+team sits in.** This explains why teams miss slop. It does not redefine it: slop stays what the site already
+says, the failures that count against any app no matter what it does. Written 2026-09-25 from the sloptic-main session. The source is `CORPUS_REPORT.md`, Section 5,
 first paragraph. Voice rules are unchanged from `WEB_HANDOFF_2.0.md`: assertive, no em dashes, no hyphenated
 words in public copy, no "genuinely", and none of the AI tells the report was cleaned of (no "not X, it's Y"
 contrasts, no summary sentence that repeats the one before it).
@@ -15,7 +16,8 @@ news about their users.
 
 ## The rationale
 
-Nearly every major failure Sloptic finds is invisible from where the team works:
+Sloptic grades only failures that are wrong on any app, whatever it is for. Nearly every major one is also
+invisible from where the team works:
 
 | failure | invisible because | what Sloptic does instead |
 |---|---|---|
@@ -36,9 +38,9 @@ Nearly every major failure Sloptic finds is invisible from where the team works:
      to you."
 2. **An explainer**, linked from those lines, for "Why is my score bad when my app is fast?" Two short
    paragraphs: the table above in prose, then the throttling numbers.
-3. **Landing page.** One sentence can carry the pitch: "Sloptic shows you your app from the seats your team
-   never sits in." Use it near the top, not as the headline, because the headline should still say what
-   Sloptic does.
+3. **Landing page.** One supporting sentence: "Sloptic shows you your app from the seats your team never
+   sits in." Place it under the definition of slop, never in place of it. The headline keeps saying what
+   Sloptic grades: what is wrong on any app, whatever it does.
 
 ## Facts to use, with sources
 
