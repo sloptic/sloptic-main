@@ -495,7 +495,8 @@ def _winner_tests(graded, W, N, ss):
                  f"medians {statistics.median(a):g} vs {statistics.median(b):g}"])
     ev = defaultdict(list)
     for r in graded:
-        ev[r.get("hackathon")].append(r)
+        if r.get("hackathon") != "withheld":   # the anonymized dataset withholds exploitable apps' events
+            ev[r.get("hackathon")].append(r)
     pairs = [([r for r in rs if r.get("winner") is True], [r for r in rs if r.get("winner") is False])
              for rs in ev.values()]
     pairs = [(w, n) for w, n in pairs if len(w) >= 3 and len(n) >= 3]
@@ -555,7 +556,8 @@ def tests(ctx, graded, ss):
                  float(ss.kruskal(*grp).pvalue), ""])
     ev = defaultdict(list)
     for r in graded:
-        ev[r.get("hackathon")].append(r["slop_score"])
+        if r.get("hackathon") != "withheld":
+            ev[r.get("hackathon")].append(r["slop_score"])
     eg = [v for v in ev.values() if len(v) >= 10]
     rows.append(["slop differs across events (n >= 10)", "Kruskal-Wallis", len(eg), sum(map(len, eg)),
                  float(ss.kruskal(*eg).pvalue), ""])

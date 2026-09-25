@@ -68,6 +68,13 @@ _ABSOLUTE_PROBES = {"sec-exposure-001", "sec-exposure-002", "sec-exposure-003", 
                     "sec-exposure-007"}
 
 
+def _read_text(path) -> str:
+    """A run file, plain or gzipped (the published anonymized dataset ships as .jsonl.gz)."""
+    import gzip
+    p = pathlib.Path(path)
+    return gzip.decompress(p.read_bytes()).decode() if p.name.endswith(".gz") else p.read_text()
+
+
 def _is_gate(finding: dict) -> bool:
     """A fired finding meaning 'exploitable now', reported whatever the rank: an absolute-gate category, or a
     named secret-file exposure inside the mixed `exposure` category."""
@@ -558,7 +565,7 @@ def main() -> None:
     args = ap.parse_args()
 
     if args.cmd == "build":
-        recs = [json.loads(l) for l in pathlib.Path(args.results).read_text().splitlines() if l.strip()]
+        recs = [json.loads(l) for l in _read_text(args.results).splitlines() if l.strip()]
         probe_set = "passive" if args.passive else "full"
         out = args.out or (str(_PASSIVE_CURVE) if args.passive else str(_DEFAULT_CURVE))
         curve = build(recs, args.version, pathlib.Path(args.results).name, args.status, probe_set=probe_set)
@@ -578,7 +585,7 @@ def main() -> None:
     curve = json.loads(pathlib.Path(args.curve).read_text())
     record = None
     if args.results:
-        rows = [json.loads(l) for l in pathlib.Path(args.results).read_text().splitlines() if l.strip()]
+        rows = [json.loads(l) for l in _read_text(args.results).splitlines() if l.strip()]
         cands = [r for r in rows if not args.app or args.app in str(r.get("repo", "")) + str(r.get("project", ""))]
         cands = [r for r in cands if r.get("slop_score") is not None]
         if not cands:

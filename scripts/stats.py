@@ -34,6 +34,7 @@ platform / backend tier / bot challenge / request volume / email diagnostics.
 """
 import argparse
 import csv
+import gzip
 import json
 import pathlib
 import random
@@ -73,7 +74,9 @@ def load(path):
     record's "repo" field = its TARGET (a github URL for repo grades, a live URL for url grades), so a
     submission graded BOTH ways keeps both rows (the targets are distinct), they're separate lenses."""
     recs = {}
-    for line in pathlib.Path(path).read_text().splitlines():
+    text = (gzip.decompress(pathlib.Path(path).read_bytes()).decode() if str(path).endswith(".gz")
+            else pathlib.Path(path).read_text())   # the published anonymized dataset ships gzipped
+    for line in text.splitlines():
         if not line.strip():
             continue
         try:
@@ -1854,7 +1857,7 @@ def main():
     if not recs:
         sys.exit("no records")
     if args.corpus_json:
-        cj = corpus_json(recs, corpus_id=pathlib.Path(args.results).stem)
+        cj = corpus_json(recs, corpus_id=pathlib.Path(args.results).name.split(".jsonl")[0])
         out = args.corpus_json
         if out == "__AUTO__":   # default: name by the detected battery (active = full, passive = 44-probe floor)
             out = "validation/corpus-figures-%s.json" % ("passive" if cj["probe_set"] == "passive" else "active")
@@ -1907,7 +1910,7 @@ def main():
     if args.charts:
         from charts import render_all
         run = pathlib.Path(args.results)
-        written = render_all([r for r in recs if _is_graded(r)], corpus_json(recs, corpus_id=run.stem),
+        written = render_all([r for r in recs if _is_graded(r)], corpus_json(recs, corpus_id=run.name.split(".jsonl")[0]),
                              run_name=run.name)
         print(f"wrote {len(written)} charts + sibling CSVs to docs/charts/ (run: {pathlib.Path(args.results).name})")
         for p in written:
