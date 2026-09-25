@@ -16,7 +16,9 @@
 
 We graded every live web app we could find in the Devpost galleries of 80 hackathons. Of 2,685 submissions
 with a URL, 1,579 produced a valid grade. We used Sloptic, a grader that probes an app from the outside and
-returns a slop score: the sum of deductions for failures that count against any app. Lower is better.
+returns a slop score: the sum of deductions for failures that count against any app. Lower is better. Sloptic
+is open source and runs as a public service at sloptic.org, where teams grade their own apps and organizers
+grade their events. This corpus is the reference population those grades are ranked against.
 
 The median app scores 48.0 and no app scores 0. About two thirds of all slop comes from three sources:
 missing security headers, accessibility failures, and Lighthouse performance below 90. Each of the four
@@ -46,7 +48,10 @@ Cloud Security Alliance put the share of AI generated solutions with a design fl
 62%.
 
 We took the opposite view. A user, an attacker, or a judge sees a running app with no source and no spec. We
-wanted to know what failure looks like from there, across a large population of deployed apps.
+wanted to know what failure looks like from there, across a large population of deployed apps. We did it with
+Sloptic, the grader behind sloptic.org, which teams and hackathon organizers use to grade their own apps.
+Every percentile Sloptic reports is a rank against the curve frozen from this corpus, so the study also
+documents that reference population.
 
 We asked six questions.
 
@@ -144,9 +149,11 @@ on pinned Lighthouse 13.4.1 (mobile preset, median of three runs).
 
 ### 3.2 The reference curve
 
-This run is the frozen reference curve `2026.4`. A single grade becomes a percentile against it. The curve
-applies a small performance correction for how busy the grading box was (`docs/PERF_NORMALIZATION.md`), so
-its median is 48.4. The tables in this report use raw scores, where the median is 48.0.
+This run is the frozen reference curve `2026.4`. Every full battery grade, on sloptic.org or from the package,
+becomes a percentile against it. Passive grades rank against a separate curve frozen from a passive battery
+run. The curve applies a small performance correction for how busy the grading box was
+(`docs/PERF_NORMALIZATION.md`), so its median is 48.4. The tables in this report use raw scores, where the
+median is 48.0.
 
 ### 3.3 Severity
 
