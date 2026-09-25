@@ -2,7 +2,7 @@
 
 ### A black box study of 1,579 live apps from 80 hackathons
 
-**Curve:** `2026.4` (final) · **Instrument:** Sloptic 3.0, a deductions only black box grader · **Run:** `multihacksv26retried.jsonl`, graded 2026-09-21 to 2026-09-23 · **Data:** `validation/corpus-figures-active.json`, figures in `docs/charts/`
+**Curve:** `2026.4` (final) · **Instrument:** Sloptic 3.0, a deductions only black box grader · **Run:** `multihacksv26retried.jsonl`, graded 2026-09-21 to 2026-09-23 · **Data:** `multihacksv26-anon.jsonl.gz` (v3.0.0 release), `validation/corpus-figures-active.json`, figures in `docs/charts/`
 
 > Every number here comes from `scripts/stats.py` run on the file above. The aggregate figures are in
 > `validation/corpus-figures-active.json` (`--corpus-json`). The figures and every hypothesis test are in
@@ -446,26 +446,45 @@ one separately.
 
 ## 8. Reproducibility
 
-The run file, `multihacksv26retried.jsonl`, is not published. Each record carries the app's URL and the
-evidence behind its findings, including where a leaked credential or an open table sits, so releasing it
-would hand out a list of exploitable apps. What is public: the aggregate figures
-(`validation/corpus-figures-active.json`), every plotted value and test result (`docs/charts/*.csv`), the
-frozen curve (`validation/benchmark-curve.json`), the grader, and the event list in Appendix A.
+The raw run file, `multihacksv26retried.jsonl`, is not published. Each record carries the app's URL, its hosts,
+session cookies, and the evidence behind its findings, including where a leaked credential or an open table
+sits. Releasing it would hand out a list of exploitable apps.
 
-A rerun cannot match this one exactly in any case. The apps are live, and they change or disappear. A new run
-over the Appendix A events measures the same population at a later date. With the run file, these commands
-regenerate every number and figure:
+We publish an anonymized version instead: `multihacksv26-anon.jsonl.gz` (2.7 MB), attached to the `v3.0.0`
+GitHub release and built by `scripts/anonymize_run.py`. It keeps every record, including the dead and
+excluded ones, and the fields the analysis reads. It drops URLs, hosts, project names, cookies, routes, and all
+finding evidence except numbers, flags, Lighthouse metrics and axe rule ids. Column names in open tables are
+reduced to the categories we count (email, password). Every app gets a random id.
+
+One more field is withheld. On the 82 records with an exploitable finding, the event is replaced with
+`withheld`, so the file never says which event holds an exploitable app. Winner flags stay.
+
+The anonymized file reproduces every number and figure in this report, the frozen curve included, with one
+exception. Results grouped by event shift, because 75 graded apps lose their event:
+
+| result | this report | anonymized file |
+|---|---:|---:|
+| slop across events, Kruskal-Wallis p | 0.03 | 0.08 |
+| within event: performance axis (winners higher / lower) | 21 / 8, p = 0.027 | 18 / 11, p = 0.05 |
+| within event: Lighthouse score (winners higher / lower) | 10 / 19, p = 0.04 | 11 / 17, p = 0.12 |
+| within event: slop outside performance | p = 0.97 | p = 0.93 |
+
+The per event medians in Section 4.8 also move for the 41 events that had an exploitable app. The headline
+winner results in Section 4.7 do not depend on events and reproduce exactly.
+
+No rerun can match this one exactly. The apps are live, and they change or disappear. A new run over the
+Appendix A events measures the same population at a later date.
 
 ```sh
 # the numbers
-uv run python scripts/stats.py multihacksv26retried.jsonl --all           # full text report
-uv run python scripts/stats.py multihacksv26retried.jsonl --corpus-json   # validation/corpus-figures-active.json
+uv run python scripts/stats.py multihacksv26-anon.jsonl.gz --all           # full text report
+uv run python scripts/stats.py multihacksv26-anon.jsonl.gz --corpus-json   # the figures JSON
 
 # the figures and tests.csv
-uv run --with matplotlib --with scipy python scripts/stats.py multihacksv26retried.jsonl --charts
+uv run --with matplotlib --with scipy python scripts/stats.py multihacksv26-anon.jsonl.gz --charts
 
 # the frozen curve, and ranking one app against it
-uv run python scripts/benchmark.py build multihacksv26retried.jsonl --version 2026.4 --status final
+uv run python scripts/benchmark.py build multihacksv26-anon.jsonl.gz --version 2026.4 --status final --out curve.json
 uv run python -m sloptic.cli --target https://your-app.example.com --out app.jsonl
 uv run python scripts/benchmark.py rank --results app.jsonl
 ```
