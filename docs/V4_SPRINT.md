@@ -105,6 +105,14 @@ belong in a quiet window between seasons, not mid event.
 - **Lighthouse median of 5** to cut the flicker at the 90 line (~15% of perf verdicts flip run to run). Costs
   Lighthouse runtime, so weigh it against the timeout tail.
 
+### Research (off the ruler)
+
+- **A pre-AI comparison corpus.** The v26 corpus has one pre-AI edition (HackMIT 2023, 13 graded apps), too
+  few to compare eras. Ian will assemble a separate dataset of hackathons held at least four years ago (2022
+  and earlier) and grade it with the same battery. Survivors that old are few (link rot reaches 48% past
+  eighteen months in v26), so size the slug list for attrition. Report it next to `CORPUS_REPORT.md`, never
+  folded into the reference curve.
+
 ## Decided, do not reopen
 
 - **No Vercel pacing** (2026-09-22). Their WAF is good; the soft late challenge is accepted.
