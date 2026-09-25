@@ -92,3 +92,4 @@ severity.**
 - `validation/corpus-figures-active.json`, `validation/corpus-figures-passive.json`
 - `docs/PERF_NORMALIZATION.md`, `sloptic/ruler.py`, `sloptic/reportcard.py`
 - `docs/V4_SPRINT.md` for what is coming next
+- `docs/WEB_HANDOFF_BUILDER_SEAT.md` for the "builder's seat" copy on the results page and landing page
