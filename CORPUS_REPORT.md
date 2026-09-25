@@ -15,8 +15,7 @@
 
 We graded every live web app we could find in the Devpost galleries of 80 hackathons. Of 2,685 submissions
 with a URL, 1,579 produced a valid grade. We used Sloptic, a grader that probes an app from the outside and
-returns a slop score: the sum of deductions for failures that count against any app, whatever it is for. Lower
-is better.
+returns a slop score: the sum of deductions for failures that count against any app. Lower is better.
 
 The median app scores 48.0 and no app scores 0. About two thirds of all slop comes from three sources:
 missing security headers, accessibility failures, and Lighthouse performance below 90. Each of the four
@@ -27,11 +26,10 @@ today. Most of those ship a live API credential in their client code or leave a 
 anonymous reads.
 
 Three comparisons stand out. AI builder apps are no sloppier overall (p = 0.16), but they leave their backend
-open about 22 times as often as hand built apps (13.4% against 0.6%, p < 10⁻⁹). Hackathon winners are no cleaner than the apps they
-beat. They match their peers on crashes, leaks, dead controls and every other security or quality measure,
-and differ only on performance: their pages are heavier and slower (p = 0.001). The four
-axes of the score are close to independent (every pairwise |ρ| ≤ 0.14), so a fast app tells you almost nothing about
-whether it is secure or accessible.
+open about 22 times as often as hand built apps (13.4% against 0.6%, p < 10⁻⁹). Hackathon winners are no
+cleaner than the apps they beat. They match their peers on crashes, leaks, dead controls and every other
+security or quality measure, and differ only on performance: their pages are heavier and slower (p = 0.001).
+The four axes of the score are close to independent (every pairwise |ρ| ≤ 0.14).
 
 Event prestige predicts nothing either. Across 54 university hosted events, the host's QS World University
 Ranking does not correlate with the event's median slop (ρ = −0.03, p = 0.82). Admissions gates, event size
@@ -47,7 +45,7 @@ Cloud Security Alliance put the share of AI generated solutions with a design fl
 62%.
 
 We took the opposite view. A user, an attacker, or a judge sees a running app with no source and no spec. We
-wanted to know what failure looks like from there, measured across a large population of real deployed apps.
+wanted to know what failure looks like from there, across a large population of deployed apps.
 
 We asked six questions.
 
@@ -65,7 +63,7 @@ We asked six questions.
 We scraped the public galleries of 80 Devpost hackathons (Appendix A) and kept every submission that listed a
 live URL. That gave 2,685 apps. Most events are North American university hackathons from 2025 and 2026. The
 rest are in Europe, Latin America and Asia Pacific. One 2023 edition stays in as an older reference point.
-These apps are young, small, and built in a day or two. They are not a sample of production software.
+These apps are young, small, and built in a day or two.
 
 ### 2.2 Attrition
 
@@ -79,14 +77,13 @@ These apps are young, small, and built in a day or two. They are not a sample of
 | timed out or aborted | 117 | 4.4% |
 | bot challenge at entry | 34 | 1.3% |
 
-Almost 30% of the links were dead, lost to expired domains and free tiers that spun down. That makes the
-graded set a survivor sample: these are the apps that stayed up.
+Almost 30% of the links were dead. The graded set is a survivor sample.
 
-1,740 URLs returned a score. We excluded 161 of them from the curve under rules fixed before this run. 86
-were canvas shells, mostly Streamlit, where the grader measures the framework and not the app. 48 hit a bot
-challenge before 60% of the battery ran. 21 pointed at a third party page (a slide deck, a package registry,
-an app store listing) and not the team's own app. 6 were challenged at entry. Every statistic below uses the
-1,579 eligible apps unless it says otherwise.
+1,740 URLs returned a score. We excluded 161 of them from the curve under rules fixed before this run. 86 were
+canvas shells, mostly Streamlit, which show the framework and not the app. 48 hit a bot challenge before 60%
+of the battery ran. 21 pointed at a third party page (a slide deck, a package registry, an app store listing)
+and not the team's own app. 6 were challenged at entry. Every statistic below uses the 1,579 eligible apps
+unless it says otherwise.
 
 ### 2.3 Bot challenges
 
@@ -114,9 +111,9 @@ codes against scores. Every code comes from an external source by a fixed rule.
 from 1 (MIT) to the 1001 to 1200 band. 18 events have an admissions gate, 47 are MLH members, and 10 ran
 online.
 
-The admissions gate is narrower than selectivity. Some events select applicants without saying so on
-Devpost. HackMIT, for example, admits by application but shows no gate on Devpost. Others use the field only to limit registration ("Indiana
-University students only"), which our rule reads as no gate.
+The admissions gate is narrower than selectivity. HackMIT, for example, admits by application but shows no
+gate on Devpost. Other events use the field only to limit registration ("Indiana University students only"),
+which our rule reads as no gate.
 
 ## 3. Method
 
@@ -125,8 +122,7 @@ University students only"), which our rule reads as no gate.
 Sloptic reads no source and needs no spec. It crawls and renders the app, maps its routes, forms and
 endpoints, then runs a fixed battery of 106 probes. Each probe tests one failure that counts against any app:
 a missing security header, a crash on malformed input, a control that does nothing, a live credential in the
-bundle, a database open to anonymous reads. A probe that does not apply returns N/A with a reason. It never
-passes silently.
+bundle, a database open to anonymous reads. A probe that does not apply returns N/A with a reason.
 
 Each finding carries a penalty priced as frequency times severity. The penalties sum to the slop score, which
 has no upper bound. Two dampers keep one flaw from counting many times: techniques that detect the same flaw
@@ -179,8 +175,7 @@ them and report all six.
 | skewness / excess kurtosis | 1.40 / 2.94 |
 | distinct values | 832 (52.7%) |
 
-The distribution has one peak and a long right tail. No app scored 0, and the lowest scored 1.0. The mean sits
-10 points above the median because of the tail.
+The distribution has one peak and a long right tail. No app scored 0, and the lowest scored 1.0.
 
 The most common score is 13.7, shared by 83 apps (5.3%). That is what the four missing security headers cost
 on their own. 45 apps have no finding except missing headers.
@@ -208,18 +203,16 @@ secrets exposure (4.3%).
 
 The axes barely move together. The strongest pairwise Spearman correlation is 0.14, between security and
 performance, and quality against performance is −0.01. Lighthouse score against all slop outside performance
-gives ρ = −0.07. The axes measure different things, and a good score on one predicts almost nothing about
-the others.
+gives ρ = −0.07.
 
 ### 4.3 Fire frequency
 
 ![Most frequent findings](docs/charts/fig05_fire_frequency.png)
 
-The four header probes fire on 90 to 98% of apps. 1,550 of 1,579 apps (98.2%) send no Content Security
-Policy. A probe that fires on nearly everyone is close to a constant: it costs every app about the same and
-barely changes the ranking. The spread comes from the middle of the chart. Accessibility fires on 65.5% of
-apps, Lighthouse below 90 on 62.8%, a dead control on 13.6%, an unpinned third party script on 11.5%, and a
-crash on malformed input on 8.7%.
+The four header probes fire on 90 to 98% of apps. 1,550 of 1,579 apps (98.2%) send no Content Security Policy.
+A probe that fires on nearly every app barely changes the ranking. The spread comes from the middle of the
+chart: accessibility fires on 65.5% of apps, Lighthouse below 90 on 62.8%, a dead control on 13.6%, an
+unpinned third party script on 11.5%, and a crash on malformed input on 8.7%.
 
 Four probes never applied to any app: `qa-race-001`, `qa-race-002`, `sec-idor-002` and `sec-idor-003`. Each
 needs a surface (a drivable signup, or a create and read API pair) that no app exposed to us. Another 45
@@ -241,10 +234,10 @@ probes applied somewhere and never fired.
 (Q1 12, Q3 46.1). Performance and accessibility account for much of that. Counting only security and quality
 findings, 31.5% of apps (498) are significant and 17.4% (275) are acute.
 
-The acute tier is mostly broken apps, not hacked ones. Of the 506 critical findings, 43.1% are quality and
-36.2% are performance, which leaves 20.8% for security. The top critical findings are a Lighthouse score in
-the red (178 apps), a crash on malformed input (137), and a client bundle pointing at a backend real visitors
-cannot reach (23). A password reset email that never arrives accounts for 15.
+Most of the acute tier is functional failure. Of the 506 critical findings, 43.1% are quality and 36.2% are
+performance, which leaves 20.8% for security. The top critical findings are a Lighthouse score in the red (178
+apps), a crash on malformed input (137), and a client bundle pointing at a backend real visitors cannot reach
+(23). A password reset email that never arrives accounts for 15.
 
 ### 4.5 Exploitable findings (RQ2)
 
@@ -263,13 +256,13 @@ cannot reach (23). A password reset email that never arrives accounts for 15.
 | SQL injection | 1 |
 
 An app with two classes counts in both rows. The largest class is a live credential shipped to the browser.
-The most common case, on 27 apps, is a Google API key that can call the Gemini API, so anyone who opens the
-page can spend the team's quota. The second class is a Supabase or Firebase database left open. On 16 apps,
-row level security was off, so an anonymous client could read or write rows. On 5 of them it could read
-records in bulk. Every backend finding is confirmed by a live request, not inferred from configuration.
+The most common case, on 27 apps, is a Google API key that can call the Gemini API. The second class is a
+Supabase or Firebase database left open. On 16 apps, row level security was off and an anonymous client could
+read or write rows; on 5 of them it could read records in bulk. Every backend finding is confirmed by a live
+request.
 
-Classic injection barely registers: one SQL injection and three stored XSS. That reflects reach more than
-safety, as Section 4.10 shows.
+Classic injection barely registers: one SQL injection and three stored XSS. Section 4.10 shows this is a limit
+of reach.
 
 ### 4.6 AI builders (RQ3)
 
@@ -286,8 +279,7 @@ Bolt has only 9 apps, too few to test.
 
 The difference is in the backend. 11 of the 82 AI builder apps (13.4%) have an exposed managed backend,
 against 9 of 1,497 hand built apps (0.6%). That is about 22 times the rate (odds ratio 25.6, Fisher's exact
-test, p = 4.4 × 10⁻¹⁰).
-Both builders offer Supabase as a built in backend, and many of their apps ship tables with no access rules.
+test, p = 4.4 × 10⁻¹⁰). Both builders offer Supabase as a built in backend.
 
 ### 4.7 Winners (RQ4)
 
@@ -307,8 +299,7 @@ Winners score 11% higher on median slop, but the gap is not significant. The who
 performance: winners have a lower Lighthouse score (30.2% reach green against 36.8%) and nearly twice the
 median performance slop.
 
-Outside performance, the groups are the same. The tie is not an artifact of the header findings, which
-cost every app about the same. The findings that vary between apps occur at the same rates.
+Outside performance, the groups are the same. That holds for the findings that vary most between apps:
 
 | finding | winners | non winners | p |
 |---|---:|---:|---:|
@@ -319,13 +310,11 @@ cost every app about the same. The findings that vary between apps occur at the 
 | worst security or quality finding above 20 | 32.0% | 31.5% | 0.88 |
 | worst security or quality finding above 40 | 17.0% | 17.5% | 0.93 |
 
-The last two rows set aside performance and accessibility and ask how often an app's worst security or
-quality problem is significant or acute. The answer is the same for both groups. The one gap outside
-performance is accessibility: 59.5% of winners have a finding against 67.3% of non winners (p = 0.019).
-That is one of many comparisons here and does not survive correction, so we treat it as exploratory.
+The last two rows count only security and quality findings. The one gap outside performance is accessibility:
+59.5% of winners have a finding against 67.3% of non winners (p = 0.019). It does not survive correction, so
+we treat it as exploratory.
 
-Winners ship heavier pages. Winners are no bigger by observed surface, which counts routes, forms and
-endpoints. They carry more weight in the browser.
+Winners ship heavier pages, though their observed surface (routes, forms and endpoints) is no larger.
 
 | measure | winners | non winners | p |
 |---|---:|---:|---:|
@@ -335,32 +324,29 @@ endpoints. They carry more weight in the browser.
 | first contentful paint, median | 2.5 s | 2.7 s | 0.69 |
 | time to first byte, median | 20 ms | 20 ms | 0.81 |
 
-The paint and timing medians cover only apps below 90, since green apps record no metrics. The server
-answers equally fast and first paint is the same. The difference comes after: more bytes and more main
-thread work, which fits the maps, 3D scenes and animation that demo well.
+The paint and timing medians cover only apps below 90, since green apps record no metrics. Server response and
+first paint are equal. Winners differ in page weight and main thread work.
 
-The gap survives two controls. The grading box was equally loaded for both groups (median
-`benchmark_index` 1452 against 1437, p = 0.32), so grading conditions do not explain it. Event mix does not
-either. In the 29 events with at least three winners and three non winners, winners carry more performance
-slop in 21 (Wilcoxon p = 0.027) and a lower Lighthouse score in 19 (p = 0.04). Slop outside performance
-splits 12 to 17 (p = 0.97), and the acute share splits 12 to 15 (p = 0.92).
+The gap survives two controls. Grading conditions do not explain it: the box was equally loaded for both
+groups (median `benchmark_index` 1452 against 1437, p = 0.32). Event mix does not either. In the 29 events
+with at least three winners and three non winners, winners carry more performance slop in 21 (Wilcoxon p =
+0.027) and a lower Lighthouse score in 19 (p = 0.04). Slop outside performance splits 12 to 17 (p = 0.97), and
+the acute share splits 12 to 15 (p = 0.92).
 
-Judges pick apps that match their peers on durability and run heavier in the browser. Judges reward the
-idea, the demo and the pitch, and none of those predicts whether an app holds up.
+Judges pick apps that match their peers on durability and run heavier in the browser.
 
 ### 4.8 Platforms and events
 
 ![Slop by host platform](docs/charts/fig09_by_platform.png)
 
-Slop differs by host platform (Kruskal-Wallis across the 10 platforms with at least 10 apps, p = 3.7 ×
-10⁻⁶). Static hosts sit lowest: Cloudflare Pages at a median of 45.1, Vercel at 45.4 (1,057 apps) and GitHub
-Pages at 46.4. Hosts that run a backend sit higher: Firebase at 63.9 and Google Cloud Run at 66.3. Apps on
-unidentified hosts, mostly custom domains, have the highest median at 70.6. A backend means more surface, and
-more surface means more room for failure. Across all apps, slop correlates weakly with observed surface size
-(ρ = 0.14, p < 10⁻⁷).
+Slop differs by host platform (Kruskal-Wallis across the 10 platforms with at least 10 apps, p = 3.7 × 10⁻⁶).
+Static hosts sit lowest: Cloudflare Pages at a median of 45.1, Vercel at 45.4 (1,057 apps) and GitHub Pages at
+46.4. Hosts that run a backend sit higher: Firebase at 63.9 and Google Cloud Run at 66.3. Apps on unidentified
+hosts, mostly custom domains, have the highest median at 70.6. Across all apps, slop correlates weakly with
+observed surface size (ρ = 0.14, p < 10⁻⁷).
 
-Events differ less. Among the 49 events with at least 10 graded apps, the medians range from 26.4 to 101.8.
-A Kruskal-Wallis test gives p = 0.03, which is weak evidence after this many comparisons.
+Events differ less. Among the 49 events with at least 10 graded apps, the medians range from 26.4 to 101.8. A
+Kruskal-Wallis test gives p = 0.03, weak evidence given the number of tests.
 
 | sloppiest events (median) | | cleanest events (median) | |
 |---|---:|---|---:|
@@ -389,17 +375,15 @@ None of the prestige or selectivity measures predicts how well an event's apps h
 
 The QS result is a clean null. The tested hosts run from MIT, Stanford and Harvard (ranked 1, 3 and 5) to
 universities ranked near 700, and their events' median slop does not move with rank. The confidence interval
-rules out any correlation stronger than about 0.3 in either direction. Events that screen their
-applicants do no better than open ones, and big events do no better than small ones.
+rules out any correlation stronger than about 0.3 in either direction.
 
 The one difference points the other way: MLH member events are sloppier, 52.2 against 43.9. We treat it as
-a lead, not a result. All 9 online events and 10 of the 11 independent ones are non MLH, so the comparison
+a lead. All 9 online events and 10 of the 11 independent ones are non MLH, so the comparison
 mixes in format and host. Among in person university events alone, the gap shrinks to 51.7 against 41.5 (12
 non MLH events, p = 0.06). It also fails the multiple comparison correction in Section 6.
 
 These are event level tests with modest power, so they cannot exclude a small prestige effect. They do show
-that prestige is not a useful predictor. Knowing which university hosted an event, how selective it was, or
-how large it was tells you little about whether its apps will crash, leak or load slowly.
+that prestige is not a useful predictor.
 
 ### 4.10 Reach (RQ5)
 
@@ -410,7 +394,7 @@ A black box grader only tests what it can reach, and three things limit that her
 Most apps have no backend we can attack. We observed runtime traffic on 1,052 apps. Only 195 of them (19%)
 call a backend of their own that the grader can probe. 169 (16%) use a managed backend, which the grader can
 only test through its access rules. The largest tier is same origin traffic (636 apps, 60%), typical of a
-static frontend. The tiers overlap, because one app can talk to several.
+static frontend. The tiers overlap.
 
 Most apps have no account we can create. 883 apps (56%) have no auth at all. Only 226 (14%) offer a password
 signup the grader can complete. Of those 226, 13 had a finding behind the login. The most common was a
@@ -420,15 +404,14 @@ Bot challenges limit the rest. On 161 apps the security axis is incompletely tes
 
 The injection probes show the cost. `sec-cmdi-001` applied to 934 apps, sent a median of 74 requests to each,
 and fired on none. On a population of static frontends behind a web application firewall, a zero fire rate
-for injection means the probes found nothing to inject into. It does not mean the code is safe.
+means the probes found nothing to inject into.
 
 ### 4.11 Performance and accessibility detail
 
 ![Lighthouse performance scores](docs/charts/fig10_lighthouse.png)
 
-The median Lighthouse score is 83 (Q1 66, Q3 93, n = 1,538). 35.8% of apps reach green (90 or above) and
-carry no performance slop. The metrics point at the client, not the server. Among the 991 apps with a
-performance finding:
+The median Lighthouse score is 83 (Q1 66, Q3 93, n = 1,538). 35.8% of apps reach green (90 or above) and carry
+no performance slop. Among the 991 apps with a performance finding:
 
 | metric | median | worst |
 |---|---:|---:|
@@ -438,45 +421,38 @@ performance finding:
 | largest contentful paint | 4.0 s | 125.9 s |
 | total blocking time | 320 ms | 167.8 s |
 
-Servers answer fast, since most apps sit on a CDN edge, and layouts hold still. The page is slow because of
-what it ships. The median flagged page weighs 4.1 MB, and the heaviest weighs 124 MB. Mean blocking time is
-8.1 seconds against a median of 320 ms, because a few apps lock the main thread for minutes.
+Servers answer in a median 20 ms, and layouts hold still. The slow part is what the page ships. The median
+flagged page weighs 4.1 MB, and the heaviest weighs 124 MB. A few apps block the main thread for minutes (up
+to 168 s).
 
 ![Accessibility violations by axe rule](docs/charts/fig11_a11y_rules.png)
 
 1,034 apps (65.5%) have an accessibility violation. Color contrast accounts for 80.5% of them. Unlabeled
 buttons follow at 13.7%, then a viewport that blocks zoom (7.1%) and unlabeled form fields (6.6%). Missing
-page language and missing titles are rare (under 4%), because modern scaffolds generate them. Contrast is the
-one rule a scaffold cannot fix, since the team picks the colors.
+page language and missing titles are rare (under 4%).
 
 ## 5. Discussion
 
-The typical app in this corpus works, and it lacks the basic hygiene that no demo exercises. It sends no
-security headers. It ships a heavy bundle. Its text fails contrast. Past that floor, 58% of apps have at least
-one real problem: a dead button, a crash on bad input, a page that takes seconds to paint, a reset email that
-never comes. Each is a small fix, and each is invisible in a demo that clicks only the buttons that work.
+The typical app works but skips basic hygiene: it sends no security headers, ships a heavy bundle, and has
+text that fails contrast. Past that floor, 58% of apps have at least one real problem, such as a dead button,
+a crash on bad input, a slow page, or a reset email that never comes. A demo that clicks only the working
+buttons shows none of them.
 
-Exploitable flaws are rarer, at 4.7%, and they concentrate in two places. Teams paste API keys into client
-code, and AI builders connect a database without access rules. Both are configuration mistakes, not coding
-mistakes. A grader finds them by reading what the app ships and asking the backend one question.
+Exploitable flaws are rarer, at 4.7%, and concentrate in two places: API keys pasted into client code, and
+databases connected without access rules. Both are configuration mistakes.
 
-Worst case slop puts the numbers in scale. If every probe that applied to an app had fired at its highest
-rung, the median app would score 2,078. Its actual median score is 48.0, so it realizes 2.2% of its possible
-slop. The problem is not a few disastrous apps. It is a thin, universal layer of neglect.
+If every probe that applied to an app had fired at its highest rung, the median app would score 2,078. It
+scores 48.0, or 2.2% of that. Slop is a thin layer spread across nearly every app.
 
-The comparisons carry a practical point. Winning a hackathon says nothing about durability, the AI builder
-risk is specific to the backend, and the four axes are independent. One number cannot summarize an app
-without the axis breakdown, and judging cannot stand in for a durability check.
+Winning a hackathon says nothing about durability, the AI builder risk sits in the backend, and the four axes
+are independent. A single number needs its axis breakdown, and judging cannot replace a durability check.
 
-Prestige cannot stand in for one either. The events with the most selective admissions and the best known host
-universities produce apps that hold up no better than an open online event's. Every filter a hackathon
-applies (who gets in, who wins, where it is held) measures something other than whether the app works for a
-stranger.
+Prestige cannot replace one either. Who gets in, who wins, and where the event is held all measure something
+other than whether the app works.
 
 ## 6. Limitations
 
-- **Survivor bias.** 30% of links were dead before we graded them. The graded apps are the ones that stayed
-  up.
+- **Survivor bias.** 30% of links were dead before we graded them.
 - **Unauthenticated surface.** We reached a login protected surface on at most 14% of apps. Flaws behind a
   login are undercounted, so the exploitable rate is a lower bound.
 - **Injection is unreachable here.** Most apps are static frontends, and a firewall challenged the heavy
@@ -484,7 +460,7 @@ stranger.
 - **Precision is partly audited.** The automatic audit found none of its known false positive classes among
   14,254 findings on all 1,734 scored records, but it has rules for only some probes: 62% of the penalty
   inside the score comes from probes without one. Most of that is presence checks (a header is missing, a
-  control does nothing), where false positives are structurally rare. Every managed backend finding is
+  control does nothing), where false positives are rare. Every managed backend finding is
   confirmed by a live request.
 - **Recall is unaudited.** We have no ground truth for what the grader missed.
 - **Performance varies between runs.** Lighthouse verdicts flip on about 15% of apps from run to run near the
@@ -543,8 +519,8 @@ The per event medians in Section 4.8 also move for the 41 events that had an exp
 tests stay null on the anonymized file. The headline winner results in Section 4.7 do not depend on events and
 reproduce exactly.
 
-No rerun can match this one exactly. The apps are live, and they change or disappear. A new run over the
-Appendix A events measures the same population at a later date.
+No rerun can match this one exactly, since the apps change or disappear. A new run over the Appendix A events
+measures the same population at a later date.
 
 ```sh
 # the numbers
