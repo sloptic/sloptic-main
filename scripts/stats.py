@@ -1766,7 +1766,7 @@ def corpus_json(recs: list, corpus_id: str = "unspecified") -> dict:
     try:
         cat = load_catalog(str(_ROOT / "catalog"))
         cat_fp = hashlib.sha256("|".join(f"{p.id}:{p.penalty}" for p in sorted(cat, key=lambda x: x.id)).encode()).hexdigest()[:12]
-        n_probes = len(cat)
+        n_probes = _np if probe_set == "passive" else len(cat)   # the battery that ran, not the whole catalog
     except Exception:
         cat_fp, n_probes = None, None
     notes = {

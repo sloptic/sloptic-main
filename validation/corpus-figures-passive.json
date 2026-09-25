@@ -1,13 +1,13 @@
 {
   "version": "corpus-passive-2026.2",
   "probe_set": "passive",
-  "generated_at": "2026-09-25T17:31:25+00:00",
+  "generated_at": "2026-09-25T17:31:45+00:00",
   "provenance": {
     "corpus_id": "multihacksv26passiveretry",
     "run_date": "2026-09-25",
     "n_apps": 1702,
     "n_events": 80,
-    "n_probes": 106,
+    "n_probes": 45,
     "catalog_fingerprint": "22bf6778dae6",
     "curve_version": "passive-2026.2",
     "probe_set": "passive",
