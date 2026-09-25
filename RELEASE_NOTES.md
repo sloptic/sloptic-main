@@ -65,6 +65,11 @@ Version 3.0 is the next **new ruler**. Accessibility becomes its own axis, perfo
 - **Tooling.** `scripts/stats.py --app` audits one app end to end, including the Devpost event, submission and
   whether it won. `--hackathon` prints one event's roster with a five number slop summary. The committed corpus
   figures now read their version from the ruler, so they cannot lag the frozen curve.
+- **An anonymized corpus dataset.** `multihacksv26-anon.jsonl.gz`, attached to this release, is the 2026.4 run
+  with no URLs, hosts, names, cookies or exploit detail, and with the event withheld on every exploitable
+  app. `stats.py` and `benchmark.py` read it directly, and it rebuilds the 2026.4 curve exactly.
+  `scripts/anonymize_run.py` builds it. `CORPUS_REPORT.md` is rewritten on this data with figures and
+  significance tests.
 
 ## What's new in 2.2.0
 
