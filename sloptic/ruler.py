@@ -17,7 +17,7 @@ from __future__ import annotations
 
 # The full-battery reference and the passive-battery reference, versioned independently.
 FULL = "2026.4"
-PASSIVE = "passive-2026.1"
+PASSIVE = "passive-2026.2"
 
 
 def ruler() -> dict:
