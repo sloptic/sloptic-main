@@ -71,6 +71,9 @@ severity.**
   one real difference is performance: winners ship heavier pages (21% flagged for page weight against 12%)
   and score lower on Lighthouse (median 78 against 84, p = 0.003). Do not
   say "winners ship more slop"; say "winning does not predict durability." Source: `CORPUS_REPORT.md` 4.7.
+- **Prestige predicts nothing.** Across 54 university hosted events, the host's QS 2026 rank does not
+  correlate with the event's median slop (ρ = −0.03, p = 0.82), from MIT and Stanford down to hosts ranked
+  near 700. Admissions gates, size and format make no difference either. Source: `CORPUS_REPORT.md` 4.9.
 - **Password recovery that never arrives.** Apps built on a managed auth provider's default mailer, which only
   delivers to the project's own team, lock every real user out of account recovery. Users care that the email
   never came, not why. That is a clean, relatable durability story.

@@ -33,6 +33,10 @@ and differ only on performance: their pages are heavier and slower (p = 0.001). 
 axes of the score are close to independent (every pairwise |ρ| ≤ 0.14), so a fast app tells you almost nothing about
 whether it is secure or accessible.
 
+Event prestige predicts nothing either. Across 54 university hosted events, the host's QS World University
+Ranking does not correlate with the event's median slop (ρ = −0.03, p = 0.82). Admissions gates, event size
+and format make no difference.
+
 ---
 
 ## 1. Introduction
@@ -45,13 +49,14 @@ Cloud Security Alliance put the share of AI generated solutions with a design fl
 We took the opposite view. A user, an attacker, or a judge sees a running app with no source and no spec. We
 wanted to know what failure looks like from there, measured across a large population of real deployed apps.
 
-We asked five questions.
+We asked six questions.
 
 - **RQ1.** What does the distribution of slop look like, and what is it made of?
 - **RQ2.** How much of it is exploitable, and what kind?
 - **RQ3.** Do apps built with an AI app builder carry more slop than hand built ones?
 - **RQ4.** Do hackathon winners hold up better than the apps they beat?
 - **RQ5.** How much of each app can a black box grader reach?
+- **RQ6.** Do prestigious or selective events produce apps that hold up better?
 
 ## 2. Data
 
@@ -91,6 +96,28 @@ complete and kept. On 162 kept apps an axis is marked incompletely tested becaus
 its probes (security on 161 of them). The heavy probes tripped it most: `sec-dos-001` (131), `sec-upload-002`
 (79), `sec-cmdi-001` (69) and `sec-hosthdr-001` (55).
 
+### 2.4 Event attributes
+
+For RQ6 we coded each of the 80 events, in `validation/event-attributes.csv`, before comparing any of the
+codes against scores. Every code comes from an external source by a fixed rule.
+
+| attribute | source | rule |
+|---|---|---|
+| host university | Devpost location and organizer | the university whose campus hosts the event, or whose student body runs it; otherwise independent |
+| QS rank | QS World University Rankings 2026 | the host's printed rank, the midpoint of a band, or the parent's rank for a campus QS does not list separately |
+| admissions gate | Devpost eligibility text | yes when it says accept, admit, approve, apply, application or invited |
+| MLH member | MLH season listings, 2024 to 2026 | the same event appears within three days of its Devpost start date |
+| format | Devpost location | online when Devpost lists the event as online |
+| size | Devpost | registered participants |
+
+67 events have a university host (59 distinct universities), and 66 of those have a QS rank. The ranks run
+from 1 (MIT) to the 1001 to 1200 band. 18 events have an admissions gate, 47 are MLH members, and 10 ran
+online.
+
+The admissions gate is narrower than selectivity. Some events select applicants without saying so on
+Devpost. HackMIT, for example, admits by application but shows no gate on Devpost. Others use the field only to limit registration ("Indiana
+University students only"), which our rule reads as no gate.
+
 ## 3. Method
 
 ### 3.1 The instrument
@@ -129,6 +156,10 @@ Slop is skewed, so we compare groups with rank tests: Mann-Whitney U for two gro
 several. For rates we use Fisher's exact test. For association we use Spearman's ρ. The confidence interval
 on the median is a percentile bootstrap (2,000 resamples, seed 0). We treat p < 0.05 as significant and did
 not correct for multiple comparisons. Appendix B lists every test.
+
+RQ6 compares events, not apps, since apps from one event are not independent. The outcome is each event's
+median slop, over the 65 events with at least five graded apps. We fixed the six RQ6 tests before running
+them and report all six.
 
 ## 4. Results
 
@@ -238,7 +269,7 @@ row level security was off, so an anonymous client could read or write rows. On 
 records in bulk. Every backend finding is confirmed by a live request, not inferred from configuration.
 
 Classic injection barely registers: one SQL injection and three stored XSS. That reflects reach more than
-safety, as Section 4.9 shows.
+safety, as Section 4.10 shows.
 
 ### 4.6 AI builders (RQ3)
 
@@ -339,9 +370,38 @@ A Kruskal-Wallis test gives p = 0.03, which is weak evidence after this many com
 | `hackpsu-spring-2026` (n 15) | 64.7 | `unihack2026` (n 52) | 35.9 |
 | `swamphacks-xi` (n 18) | 63.3 | `cs-girlies-wellness-hackathon` (n 31) | 36.8 |
 
-The largest and best known events land in the middle.
+The largest and best known events land in the middle. Section 4.9 tests that directly.
 
-### 4.9 Reach (RQ5)
+### 4.9 Prestige and selectivity (RQ6)
+
+![Event median slop by host rank and event type](docs/charts/fig13_prestige.png)
+
+None of the prestige or selectivity measures predicts how well an event's apps hold up.
+
+| measure | result | p |
+|---|---|---:|
+| host QS 2026 rank (54 ranked events) | ρ = −0.03 (95% CI −0.30 to 0.24) | 0.82 |
+| Devpost participants (65 events) | ρ = 0.06 | 0.64 |
+| admissions gate: yes (14) vs no (51) | median 46.9 vs 51.7 | 0.41 |
+| MLH member: yes (42) vs no (23) | median 52.2 vs 43.9 | 0.018 |
+| format: in person (56) vs online (9) | median 51.0 vs 45.0 | 0.21 |
+| host: university (54) vs independent (11) | median 50.1 vs 52.3 | 0.56 |
+
+The QS result is a clean null. The tested hosts run from MIT, Stanford and Harvard (ranked 1, 3 and 5) to
+universities ranked near 700, and their events' median slop does not move with rank. The confidence interval
+rules out any correlation stronger than about 0.3 in either direction. Events that screen their
+applicants do no better than open ones, and big events do no better than small ones.
+
+The one difference points the other way: MLH member events are sloppier, 52.2 against 43.9. We treat it as
+a lead, not a result. All 9 online events and 10 of the 11 independent ones are non MLH, so the comparison
+mixes in format and host. Among in person university events alone, the gap shrinks to 51.7 against 41.5 (12
+non MLH events, p = 0.06). It also fails the multiple comparison correction in Section 6.
+
+These are event level tests with modest power, so they cannot exclude a small prestige effect. They do show
+that prestige is not a useful predictor. Knowing which university hosted an event, how selective it was, or
+how large it was tells you little about whether its apps will crash, leak or load slowly.
+
+### 4.10 Reach (RQ5)
 
 ![Auth shape and backend tier](docs/charts/fig12_reach.png)
 
@@ -362,7 +422,7 @@ The injection probes show the cost. `sec-cmdi-001` applied to 934 apps, sent a m
 and fired on none. On a population of static frontends behind a web application firewall, a zero fire rate
 for injection means the probes found nothing to inject into. It does not mean the code is safe.
 
-### 4.10 Performance and accessibility detail
+### 4.11 Performance and accessibility detail
 
 ![Lighthouse performance scores](docs/charts/fig10_lighthouse.png)
 
@@ -408,6 +468,11 @@ The comparisons carry a practical point. Winning a hackathon says nothing about 
 risk is specific to the backend, and the four axes are independent. One number cannot summarize an app
 without the axis breakdown, and judging cannot stand in for a durability check.
 
+Prestige cannot stand in for one either. The events with the most selective admissions and the best known host
+universities produce apps that hold up no better than an open online event's. Every filter a hackathon
+applies (who gets in, who wins, where it is held) measures something other than whether the app works for a
+stranger.
+
 ## 6. Limitations
 
 - **Survivor bias.** 30% of links were dead before we graded them. The graded apps are the ones that stayed
@@ -425,12 +490,15 @@ without the axis breakdown, and judging cannot stand in for a durability check.
 - **Performance varies between runs.** Lighthouse verdicts flip on about 15% of apps from run to run near the
   90 line. Header findings flip on under 1%, accessibility on 2%, crash findings on 3% (906 apps graded
   twice).
-- **Multiple comparisons.** We ran 29 hypothesis tests and six axis correlations without correction. A
-  Bonferroni correction over all 35 (threshold 0.0014) keeps five results: backend exposure by builder,
+- **Multiple comparisons.** We ran 35 hypothesis tests and six axis correlations without correction. A
+  Bonferroni correction over all 41 (threshold 0.0012) keeps five results: backend exposure by builder,
   slop by platform, slop against surface size, the winner performance axis, and the winner page weight rate.
   The winner Lighthouse and blocking time gaps (p ≈ 0.003) and the within event results (p ≈ 0.03) fall
-  outside it. They agree with the corrected results and we read them as supporting evidence. The null
-  results, including every winner comparison outside performance, do not depend on correction.
+  outside it. They agree with the corrected results and we read them as supporting evidence. The MLH
+  difference (p = 0.018) also falls outside it. The null results, including every winner comparison outside
+  performance and every prestige measure, do not depend on correction.
+- **Event coding.** The admissions gate reads Devpost's eligibility text, which misses events that select
+  applicants elsewhere. The QS rank measures the host university's standing, not the event's.
 - **One population.** These are hackathon apps. The results do not describe production software.
 - **Intent is out of scope.** The grader measures failures that count against any app. It does not judge
   whether an idea is good.
@@ -441,8 +509,8 @@ Seen from outside, hackathon web apps mostly fail the same way. The floor is mis
 functional problems are common, and exploitable flaws are rare and clustered in leaked keys and open
 databases. AI builders do not make apps sloppier overall, but their apps leave the backend open about 22
 times as often.
-Winning does not predict durability. The axes are independent, so a durability score has to report each
-one separately.
+Winning does not predict durability, and neither does the prestige or selectivity of the event. The axes
+are independent, so a durability score has to report each one separately.
 
 ## 8. Reproducibility
 
@@ -468,9 +536,12 @@ exception. Results grouped by event shift, because 75 graded apps lose their eve
 | within event: performance axis (winners higher / lower) | 21 / 8, p = 0.027 | 18 / 11, p = 0.05 |
 | within event: Lighthouse score (winners higher / lower) | 10 / 19, p = 0.04 | 11 / 17, p = 0.12 |
 | within event: slop outside performance | p = 0.97 | p = 0.93 |
+| RQ6: host QS rank | ρ = −0.03, p = 0.82 | ρ = −0.13, p = 0.35 |
+| RQ6: MLH member vs not | p = 0.018 | p = 0.029 |
 
-The per event medians in Section 4.8 also move for the 41 events that had an exploitable app. The headline
-winner results in Section 4.7 do not depend on events and reproduce exactly.
+The per event medians in Section 4.8 also move for the 41 events that had an exploitable app. The other RQ6
+tests stay null on the anonymized file. The headline winner results in Section 4.7 do not depend on events and
+reproduce exactly.
 
 No rerun can match this one exactly. The apps are live, and they change or disappear. A new run over the
 Appendix A events measures the same population at a later date.
@@ -554,6 +625,12 @@ From `docs/charts/tests.csv`, plus the three winner slop rows from `docs/charts/
 | within event: slop outside performance | Wilcoxon signed rank | 29 events | 0.97 | winners higher in 12, lower in 17 |
 | within event: worst security or quality above 20 | Wilcoxon signed rank | 29 events | 0.42 | winners higher in 20, lower in 9 |
 | within event: worst security or quality above 40 | Wilcoxon signed rank | 29 events | 0.92 | winners higher in 12, lower in 15 |
+| event median slop vs host QS 2026 rank | Spearman, events | 54 | 0.82 | ρ = −0.03, 95% CI −0.30 to 0.24 |
+| event median slop vs Devpost participants | Spearman, events | 65 | 0.64 | ρ = 0.06 |
+| admissions gate, yes vs no | Mann-Whitney U, events | 14 / 51 | 0.41 | medians 46.9 vs 51.7 |
+| MLH member, yes vs no | Mann-Whitney U, events | 42 / 23 | 0.018 | medians 52.2 vs 43.9 |
+| format, in person vs online | Mann-Whitney U, events | 56 / 9 | 0.21 | medians 51.0 vs 45.0 |
+| host, university vs independent | Mann-Whitney U, events | 54 / 11 | 0.56 | medians 50.1 vs 52.3 |
 | slop across host platforms (n ≥ 10) | Kruskal-Wallis | 10 groups, 1,565 | 3.7 × 10⁻⁶ | |
 | slop across events (n ≥ 10) | Kruskal-Wallis | 49 groups, 1,410 | 0.03 | |
 | slop vs observed surface size | Spearman | 1,579 | 2.9 × 10⁻⁸ | ρ = 0.14 |
