@@ -1832,6 +1832,9 @@ def main():
     ap.add_argument("--charts", action="store_true",
                     help="render the CORPUS_REPORT figures (+ sibling CSVs and tests.csv) to docs/charts/, then exit "
                          "(needs matplotlib + scipy: `uv run --with matplotlib --with scipy`)")
+    ap.add_argument("--repeat", metavar="PREV",
+                    help="with --charts: a second run of the same corpus; writes run to run verdict flip rates to "
+                         "docs/charts/reliability.csv")
     # --- PARITY mode (cross stack visibility): observed vs expected surface, blind spots ---
     ap.add_argument("--parity", action="store_true", help="run the cross stack PARITY dashboard instead of the report")
     ap.add_argument("--by", default="routing", choices=["routing", "framework", "api_style"],
@@ -1910,8 +1913,9 @@ def main():
     if args.charts:
         from charts import render_all
         run = pathlib.Path(args.results)
+        prev = [r for r in load(args.repeat) if _is_graded(r)] if args.repeat else None
         written = render_all([r for r in recs if _is_graded(r)], corpus_json(recs, corpus_id=run.name.split(".jsonl")[0]),
-                             run_name=run.name)
+                             run_name=run.name, recs=recs, prev=prev)
         print(f"wrote {len(written)} charts + sibling CSVs to docs/charts/ (run: {pathlib.Path(args.results).name})")
         for p in written:
             print("  " + p)

@@ -33,3 +33,6 @@ RQ6: event median slop vs Devpost participants,"Spearman, events",65,,0.63821178
 "RQ6: event median slop, mlh member: yes vs no","Mann-Whitney U, events",42,23,0.018285438335861662,median of event medians 52.2 vs 43.9
 "RQ6: event median slop, format: in_person vs online","Mann-Whitney U, events",56,9,0.20655164115774882,median of event medians 51.0 vs 45.0
 "RQ6: event median slop, host: university vs independent","Mann-Whitney U, events",54,11,0.5577967494014071,median of event medians 50.1 vs 52.3
+"link rot: dead URL vs months since the event, per URL",point biserial,2676,,9.975854081215452e-07,"r 0.094; URLs from one event are not independent, see the event test"
+link rot: event dead URL rate vs event age,"Spearman, events with 10+ URLs",71,,0.24874502264811524,rho 0.139
+survivors: event median slop vs event age,"Spearman, events with 5+ graded apps",64,,0.05256186643488192,rho 0.243

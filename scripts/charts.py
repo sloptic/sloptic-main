@@ -625,7 +625,7 @@ def fig_prestige(ctx, graded, ss):
                      len(a), len(b), float(ss.mannwhitneyu(a, b, alternative="two-sided").pvalue),
                      f"median of event medians {statistics.median(a):.1f} vs {statistics.median(b):.1f}"])
 
-    fig, (a1, a2) = ctx.plt.subplots(1, 2, figsize=(13.5, 5.8), gridspec_kw={"width_ratios": [1.25, 1]})
+    fig, (a1, a2) = ctx.plt.subplots(1, 2, figsize=(14.5, 5.8), gridspec_kw={"width_ratios": [1, 1.15]})
     gate = [e["admissions_gate"] == "yes" for e in ranked]
     a1.scatter(x, y, s=[18 + 3 * e["n"] for e in ranked], c=[ACCENT if g else MUTED for g in gate],
                alpha=0.85, edgecolors="white", linewidths=0.8, zorder=3)
@@ -639,16 +639,17 @@ def fig_prestige(ctx, graded, ss):
     for i, (key, label, a_val, b_val) in enumerate(_FACTORS):
         for j, val in enumerate((a_val, b_val)):
             pts = [e["median"] for e in ev if e[key] == val]
-            xpos = i * 3 + j
-            xs.append((xpos, f"{val.replace('_', ' ')}\n(n = {len(pts)})"))
-            jit = [xpos + ((k * 37) % 11 - 5) * 0.04 for k in range(len(pts))]
+            xpos = i * 3.6 + j * 1.5
+            xs.append((xpos, f"{val.replace('_', ' ')}\n{len(pts)}"))
+            jit = [xpos + ((k * 37) % 11 - 5) * 0.05 for k in range(len(pts))]
             a2.scatter(jit, pts, s=16, color=ACCENT if j == 0 else MUTED, alpha=0.8, zorder=3)
             if pts:
-                a2.hlines(statistics.median(pts), xpos - 0.3, xpos + 0.3, color=INK, lw=2, zorder=4)
-        a2.text(i * 3 + 0.5, 1.0, label, transform=a2.get_xaxis_transform(), ha="center", va="bottom",
+                a2.hlines(statistics.median(pts), xpos - 0.4, xpos + 0.4, color=INK, lw=2, zorder=4)
+        a2.text(i * 3.6 + 0.75, 1.0, label, transform=a2.get_xaxis_transform(), ha="center", va="bottom",
                 fontsize=11, color=FAINT)
     a2.set_xticks([t for t, _ in xs])
     a2.set_xticklabels([l for _, l in xs], fontsize=9)
+    a2.set_xlabel("group and number of events")
     a2.set_ylabel("event median slop")
     a2.set_title("Event median slop by event type", loc="left", pad=22, fontsize=15)
     _style(a2)
@@ -660,7 +661,109 @@ def fig_prestige(ctx, graded, ss):
     return rows
 
 
-def render_all(graded, figures, out_dir="docs/charts", run_name="run.jsonl"):
+# ---- link rot and run to run reliability --------------------------------------------------------------
+def _event_start(dates):
+    """Devpost's submission period ("Feb 14 - 15, 2026") -> its start date, or None when it has no day."""
+    import datetime as dt
+    import re
+    m = re.match(r"([A-Z][a-z]{2}) (\d{1,2})", dates or "")
+    y = re.search(r"(20\d\d)", dates or "")
+    if not (m and y):
+        return None
+    return dt.date(int(y.group(1)), dt.datetime.strptime(m.group(1), "%b").month, int(m.group(2)))
+
+
+_ROT_BINS = [(0, 3), (3, 6), (6, 9), (9, 12), (12, 18), (18, 60)]
+
+
+def fig_link_rot(ctx, recs, ss, graded=()):
+    """Share of submitted URLs that were dead at grading time, by months between the event and the grade."""
+    import datetime as dt
+    import math
+    if not EVENTS_CSV.exists():
+        return []
+    start = {r["slug"]: _event_start(r["dates"]) for r in csv.DictReader(open(EVENTS_CSV))}
+    pts = []   # (months since event, dead, event)
+    for r in recs:
+        d0, ts = start.get(r.get("hackathon")), r.get("ts")
+        if d0 and ts:
+            months = (dt.datetime.fromtimestamp(ts, dt.timezone.utc).date() - d0).days / 30.44
+            pts.append((months, bool(r.get("dead_url")), r["hackathon"]))
+    rows, labels, rates, errs = [], [], [], [[], []]
+    for lo, hi in _ROT_BINS:
+        g = [dead for m, dead, _ in pts if lo <= m < hi]
+        n, k = len(g), sum(g)
+        z = 1.96   # Wilson 95% interval
+        c = (k + z * z / 2) / (n + z * z)
+        h = z * math.sqrt(k * (n - k) / n + z * z / 4) / (n + z * z)
+        rate = 100 * k / n
+        labels.append(f"{lo} to {hi}" if hi < 60 else f"{lo}+")
+        rates.append(rate)
+        errs[0].append(rate - 100 * (c - h))
+        errs[1].append(100 * (c + h) - rate)
+        rows.append([labels[-1], n, k, round(rate, 1), round(100 * (c - h), 1), round(100 * (c + h), 1)])
+    fig, ax = ctx.plt.subplots(figsize=(10, 5.6))
+    x = list(range(len(rates)))
+    ax.bar(x, rates, width=0.62, color=MUTED, zorder=3)
+    ax.errorbar(x, rates, yerr=errs, fmt="none", ecolor=INK, elinewidth=1.3, capsize=5, zorder=4)
+    top = max(r + e for r, e in zip(rates, errs[1]))
+    for xi, r, row in zip(x, rates, rows):
+        ax.text(xi, top * 1.04, f"{r:.0f}%\nn = {row[1]:,}", ha="center", va="bottom", fontsize=11, color=INK)
+    ax.set_ylim(0, top * 1.28)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.set_xlabel("months between the event and the grade")
+    ax.set_ylabel("dead links, % of submitted URLs (95% CI)")
+    ax.set_title("Dead links by event age", loc="left", pad=12)
+    _style(ax)
+    ctx.finish(fig, "fig14_link_rot")
+    _write_csv(ctx.out / "fig14_link_rot.csv", ["months", "urls", "dead", "dead_pct", "ci_low", "ci_high"], rows)
+    out = []
+    r_pb, p_pb = ss.pointbiserialr([dead for _, dead, _ in pts], [m for m, _, _ in pts])
+    out.append(["link rot: dead URL vs months since the event, per URL", "point biserial", len(pts), "",
+                float(p_pb), f"r {float(r_pb):.3f}; URLs from one event are not independent, see the event test"])
+    by = defaultdict(list)
+    for m, dead, e in pts:
+        by[e].append((m, dead))
+    ev = [(statistics.mean(m for m, _ in v), sum(d for _, d in v) / len(v)) for v in by.values() if len(v) >= 10]
+    rho, p = ss.spearmanr([a for a, _ in ev], [b for _, b in ev])
+    out.append(["link rot: event dead URL rate vs event age", "Spearman, events with 10+ URLs", len(ev), "",
+                float(p), f"rho {float(rho):.3f}"])
+    age = {e: statistics.mean(m for m, _ in v) for e, v in by.items()}
+    gs = defaultdict(list)
+    for r in graded:
+        if r.get("hackathon") in age:
+            gs[r["hackathon"]].append(r["slop_score"])
+    sv = [(age[e], statistics.median(v)) for e, v in gs.items() if len(v) >= MIN_EVENT_APPS]
+    rho2, p2 = ss.spearmanr([a for a, _ in sv], [b for _, b in sv])
+    out.append(["survivors: event median slop vs event age", "Spearman, events with 5+ graded apps", len(sv), "",
+                float(p2), f"rho {float(rho2):.3f}"])
+    return out
+
+
+def reliability(ctx, graded, prev):
+    """Run to run stability: on apps graded (curve eligible, unchallenged) in both runs, the share of probe verdicts
+    that fired in one run but not the other, by probe family. Needs a second run of the same corpus."""
+    fam = lambda p: ("security headers" if p.startswith("sec-headers") else "accessibility (axe)" if p == "qa-a11y-001"  # noqa: E731
+                     else "crash resistance" if p.startswith("qa-crash") else "Lighthouse below 90"
+                     if p == "perf-lighthouse-001" else "all other probes")
+    cur = {r["repo"]: r for r in graded if not r.get("bot_challenge")}
+    old = {r["repo"]: r for r in prev if not r.get("bot_challenge")}
+    both = [k for k in cur if k in old]
+    agg = defaultdict(lambda: [0, 0])
+    for k in both:
+        a = {f["probe_id"] for f in cur[k].get("findings") or [] if _scored(f)}
+        b = {f["probe_id"] for f in old[k].get("findings") or [] if _scored(f)}
+        for pid in a | b:
+            agg[fam(pid)][0] += 1
+            agg[fam(pid)][1] += (pid in a) != (pid in b)
+    rows = [[f, len(both), n, k, round(100 * k / n, 1)] for f, (n, k) in sorted(agg.items(), key=lambda x: -x[1][0])]
+    _write_csv(ctx.out / "reliability.csv", ["probe_family", "apps_in_both_runs", "verdicts_fired_in_either",
+                                             "flipped", "flip_pct"], rows)
+    return rows
+
+
+def render_all(graded, figures, out_dir="docs/charts", run_name="run.jsonl", recs=None, prev=None):
     """Render every report figure (+ sibling CSVs) and tests.csv into out_dir. `graded` is the curve eligible
     population (stats._is_graded) and `figures` is corpus_json() over the same run."""
     try:
@@ -693,5 +796,10 @@ def render_all(graded, figures, out_dir="docs/charts", run_name="run.jsonl"):
     fig_lighthouse(ctx, figures, graded)
     fig_a11y(ctx, graded)
     fig_reach(ctx, figures)
-    tests(ctx, graded, ss, extra=fig_prestige(ctx, graded, ss))
+    extra = fig_prestige(ctx, graded, ss)
+    if recs is not None:
+        extra += fig_link_rot(ctx, recs, ss, graded)
+    if prev is not None:
+        reliability(ctx, graded, prev)
+    tests(ctx, graded, ss, extra=extra)
     return sorted(str(p) for p in out.glob("*") if p.suffix in (".png", ".csv"))
