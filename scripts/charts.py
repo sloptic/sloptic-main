@@ -763,6 +763,26 @@ def reliability(ctx, graded, prev):
     return rows
 
 
+def severity_breakdown(ctx, graded):
+    """Which probes put apps in the acute (>40) and significant (>20) tiers, counting only security and quality
+    findings, and how many qualifying probes each such app has. Explains how single digit probes add up."""
+    rows, summary = [], []
+    for tier, cut in (("acute", 40), ("significant", 20)):
+        per, by_count, apps = Counter(), Counter(), 0
+        for r in graded:
+            hits = {f["probe_id"] for f in r.get("findings") or [] if _scored(f)
+                    and f.get("bundle") in ("security", "qa") and (f.get("penalty") or 0) > cut}
+            if hits:
+                apps += 1
+                by_count[len(hits)] += 1
+                per.update(hits)
+        rows += [[tier, pid, c, round(100 * c / len(graded), 1)] for pid, c in per.most_common()]
+        summary.append([tier, apps, len(per), by_count[1], round(100 * by_count[1] / apps, 1)])
+    _write_csv(ctx.out / "severity_breakdown.csv", ["tier", "probe_id", "apps", "pct_of_graded"], rows)
+    _write_csv(ctx.out / "severity_breakdown_summary.csv",
+               ["tier", "apps", "probes_contributing", "apps_with_one_probe", "pct_with_one_probe"], summary)
+
+
 def render_all(graded, figures, out_dir="docs/charts", run_name="run.jsonl", recs=None, prev=None):
     """Render every report figure (+ sibling CSVs) and tests.csv into out_dir. `graded` is the curve eligible
     population (stats._is_graded) and `figures` is corpus_json() over the same run."""
@@ -796,6 +816,7 @@ def render_all(graded, figures, out_dir="docs/charts", run_name="run.jsonl", rec
     fig_lighthouse(ctx, figures, graded)
     fig_a11y(ctx, graded)
     fig_reach(ctx, figures)
+    severity_breakdown(ctx, graded)
     extra = fig_prestige(ctx, graded, ss)
     if recs is not None:
         extra += fig_link_rot(ctx, recs, ss, graded)

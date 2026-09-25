@@ -251,6 +251,10 @@ probes applied somewhere and never fired.
 (Q1 12, Q3 46.1). Performance and accessibility account for much of that. Counting only security and quality
 findings, 31.5% of apps (498) are significant and 17.4% (275) are acute.
 
+No single probe drives those tiers. 25 probes put an app in the acute tier, and a crash on malformed input
+accounts for half of those apps; the rest each reach under 2% of the corpus. 85% of acute apps and 81% of
+significant ones fail on exactly one probe (`docs/charts/severity_breakdown.csv`).
+
 Most of the acute tier is functional failure. Of the 506 critical findings, 43.1% are quality and 36.2% are
 performance, which leaves 20.8% for security. The top critical findings are a Lighthouse score in the red (178
 apps), a crash on malformed input (137), and a client bundle pointing at a backend real visitors cannot reach
