@@ -4,7 +4,8 @@
 
 **Curve:** `2026.4` (final) · **Instrument:** Sloptic 3.0, a deductions only black box grader · **Run:** `multihacksv26retried.jsonl`, graded 2026-09-21 to 2026-09-23 · **Data:** `multihacksv26-anon.jsonl.gz` (v3.0.0 release), `validation/corpus-figures-active.json`, figures in `docs/charts/`
 
-> Every number here comes from `scripts/stats.py` run on the file above. The aggregate figures are in
+> Every number here comes from `scripts/stats.py` run on the file above, except the run to run flip rates in
+> Section 6, which compare it with the previous run (`multihacksv25c2.jsonl`). The aggregate figures are in
 > `validation/corpus-figures-active.json` (`--corpus-json`). The figures and every hypothesis test are in
 > `docs/charts/` (`--charts`), and each image has a CSV next to it with the exact values it plots.
 > Nothing in this report names an app or a team.
@@ -77,7 +78,16 @@ These apps are young, small, and built in a day or two.
 | timed out or aborted | 117 | 4.4% |
 | bot challenge at entry | 34 | 1.3% |
 
-Almost 30% of the links were dead. The graded set is a survivor sample.
+Almost 30% of the links were dead. The graded set is a survivor sample, and the dead share grows with the
+time since the event:
+
+![Dead links by event age](docs/charts/fig14_link_rot.png)
+
+Under three months after an event, 15% of links were dead. From three to twelve months the share held near
+29%, and past eighteen months it reached 48%. Per URL, the trend is strong (p < 10⁻⁶), but URLs from one event
+die together, and across the 71 events with at least 10 URLs the correlation is weak (ρ = 0.14, p = 0.25). We
+report the curve as descriptive. Among the apps that survive, older events lean slightly sloppier (ρ = 0.24
+across 64 events, p = 0.05), a borderline result.
 
 1,740 URLs returned a score. We excluded 161 of them from the curve under rules fixed before this run. 86 were
 canvas shells, mostly Streamlit, which show the framework and not the app. 48 hit a bot challenge before 60%
@@ -463,12 +473,17 @@ other than whether the app works.
   control does nothing), where false positives are rare. Every managed backend finding is
   confirmed by a live request.
 - **Recall is unaudited.** We have no ground truth for what the grader missed.
-- **Performance varies between runs.** Lighthouse verdicts flip on about 15% of apps from run to run near the
-  90 line. Header findings flip on under 1%, accessibility on 2%, crash findings on 3% (906 apps graded
-  twice).
-- **Multiple comparisons.** We ran 35 hypothesis tests and six axis correlations without correction. A
-  Bonferroni correction over all 41 (threshold 0.0012) keeps five results: backend exposure by builder,
+- **Verdicts vary between runs.** We compared this run with the previous one on the 805 curve eligible apps
+  graded without a challenge both times, counting each verdict that fired in either run. Lighthouse below 90
+  flipped on 15.0% of those verdicts, since scores near the line move from run to run. Security headers
+  flipped on 0.1%, accessibility on 1.5%, crash resistance on 3.0% (1 of 33 verdicts), and all other probes
+  combined on 4.5% (`docs/charts/reliability.csv`). The release notes count 906 apps because they include
+  records the curve excludes.
+- **Multiple comparisons.** We ran 38 hypothesis tests and six axis correlations without correction. A
+  Bonferroni correction over all 44 (threshold 0.0011) keeps five results: backend exposure by builder,
   slop by platform, slop against surface size, the winner performance axis, and the winner page weight rate.
+  The per URL link rot trend also passes it, but its URLs cluster by event, and the event level test does
+  not.
   The winner Lighthouse and blocking time gaps (p ≈ 0.003) and the within event results (p ≈ 0.03) fall
   outside it. They agree with the corrected results and we read them as supporting evidence. The MLH
   difference (p = 0.018) also falls outside it. The null results, including every winner comparison outside
@@ -515,9 +530,13 @@ exception. Results grouped by event shift, because 75 graded apps lose their eve
 | RQ6: host QS rank | ρ = −0.03, p = 0.82 | ρ = −0.13, p = 0.35 |
 | RQ6: MLH member vs not | p = 0.018 | p = 0.029 |
 
-The per event medians in Section 4.8 also move for the 41 events that had an exploitable app. The other RQ6
+The per event medians in Section 4.8 also move for the 41 events that had an exploitable app, and the link
+rot shares in Section 2.2 rise by up to four points because withheld records leave their events. The other RQ6
 tests stay null on the anonymized file. The headline winner results in Section 4.7 do not depend on events and
 reproduce exactly.
+
+The run to run flip rates in Section 6 need the previous run as well (`--repeat multihacksv25c2.jsonl`). That
+run is not published, and the anonymized ids are random, so the flip rates cannot be rebuilt from the release.
 
 No rerun can match this one exactly, since the apps change or disappear. A new run over the Appendix A events
 measures the same population at a later date.
@@ -601,6 +620,9 @@ From `docs/charts/tests.csv`, plus the three winner slop rows from `docs/charts/
 | within event: slop outside performance | Wilcoxon signed rank | 29 events | 0.97 | winners higher in 12, lower in 17 |
 | within event: worst security or quality above 20 | Wilcoxon signed rank | 29 events | 0.42 | winners higher in 20, lower in 9 |
 | within event: worst security or quality above 40 | Wilcoxon signed rank | 29 events | 0.92 | winners higher in 12, lower in 15 |
+| link rot: dead URL vs months since the event, per URL | point biserial | 2,676 | 10⁻⁶ | r = 0.09; URLs cluster by event |
+| link rot: event dead URL rate vs event age | Spearman, events | 71 | 0.25 | ρ = 0.14 |
+| survivors: event median slop vs event age | Spearman, events | 64 | 0.05 | ρ = 0.24 |
 | event median slop vs host QS 2026 rank | Spearman, events | 54 | 0.82 | ρ = −0.03, 95% CI −0.30 to 0.24 |
 | event median slop vs Devpost participants | Spearman, events | 65 | 0.64 | ρ = 0.06 |
 | admissions gate, yes vs no | Mann-Whitney U, events | 14 / 51 | 0.41 | medians 46.9 vs 51.7 |
