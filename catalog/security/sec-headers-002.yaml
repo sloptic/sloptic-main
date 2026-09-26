@@ -8,7 +8,7 @@ penalty: 8    # risk=freq×sev: the master backstop for the whole XSS class (+ c
               # 12->8: a corpus audit found missing-headers is near-universal (fires ~90%) and, being a single
               # one-config-block fix, was dominating the score (headers+csp = 22% of total / 71% of the
               # security axis). Trimming the top header keeps it clearly ABOVE the charset/info-disclosure
-              # floor and the other headers, but below the unconditional-misconfig tier (rate-limit 15) — so a
+              # floor and the other headers, but below the unconditional-misconfig tier (rate-limit 30) — so a
               # one-commit header fix no longer buys back a quarter of the score. Other headers held
               # (nosniff 3 / HSTS 5 / clickjacking 5 / referrer 2 / x-powered-by 2): narrow, conditional.
 severity: {cvss: "n/a", vrt: "P5", range: [8, 8], default: 8, tier: chore-floor}   # CSP; XSS-class backstop
