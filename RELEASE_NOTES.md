@@ -1,4 +1,4 @@
-# Sloptic v3.0.0
+# Sloptic v3.0.1
 
 Sloptic grades any deployed web app, whatever its stack or purpose, and returns one
 **slop score** you can compare across apps (lower is better, `0` means nothing found),
@@ -11,7 +11,18 @@ precision and diagnostics. Version 2.0 is different: it is a **new ruler**. New 
 continuous scoring changed what the number measures, and the reference curve moved to **2026.3**, so
 a 2.0 score does not compare to a 1.x one. A 2.0 percentile is quoted against 2026.3. Version 2.1 keeps that 2026.3 ruler, so a 2.1 grade compares directly to a 2.0 one, and it adds the egress sandbox the hosted service needs to accept public URL submissions safely. Version 2.2 keeps it as well, and spends its changes on the crawl, on a second frozen curve for the passive battery, and on the client the hosted service needs to verify an event.
 
-Version 3.0 is the next **new ruler**. Accessibility becomes its own axis, performance is corrected for the speed of the box that measured it, and new detection reaches classes the 2.x battery could not, so the reference curves move to **2026.4** (full) and **passive-2026.2** (passive). A 3.0 score does not compare to a 2.x one, and a 3.0 percentile is quoted against 2026.4, or against passive-2026.2 for a passive grade.
+Version 3.0 is the next **new ruler**. Accessibility becomes its own axis, performance is corrected for the speed of the box that measured it, and new detection reaches classes the 2.x battery could not, so the reference curves move to **2026.4** (full) and **passive-2026.2** (passive). A 3.0 score does not compare to a 2.x one, and a 3.0 percentile is quoted against 2026.4, or against passive-2026.2 for a passive grade. Version 3.0.1 keeps both 3.0 curves, so a 3.0.1 grade compares directly to a 3.0.0 one.
+
+## What's new in 3.0.1
+
+- **Report card copy that matches what the probes test.** `qa-a11y-001` fires on any axe WCAG 2 A/AA violation,
+  priced by impact, not only on critical ones; its card now says so and leads with contrast, which accounts for
+  most of its fires. `sec-sqli-002`, `-003` and `-005` are the login form test of `sec-sqli-001` with different
+  payloads; their cards no longer describe other query surfaces. The report only diagnostics `perf-dom-001`,
+  `perf-font-001`, `perf-lcp-001` and `perf-minify-001` get card copy.
+- **Penalty rationale matches the catalog.** `docs/PENALTY_RATIONALE.md` now lists `backnav-001` at 25,
+  `deeplink-001` at 28 and `dos-001` at 15, the prices the grade uses. No price changed.
+- **Release assets.** The GitHub Release carries only the wheel and the sdist.
 
 ## What's new in 3.0.0
 
