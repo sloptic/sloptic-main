@@ -41,6 +41,7 @@ corpus lane runs unscoped so its behavior stays identical to the curve it measur
 """
 import contextlib
 import contextvars
+import functools
 import ipaddress
 import os
 import socket
@@ -55,6 +56,8 @@ _install_lock = threading.Lock()
 _origin_scope: contextvars.ContextVar = contextvars.ContextVar("sloptic_egress_origin", default=None)
 # Reentrancy flag: our own validation resolve must use the real resolver, not recurse into the guard.
 _in_guard: contextvars.ContextVar = contextvars.ContextVar("sloptic_egress_in_guard", default=False)
+# Hosts allowed past the ORIGIN PIN (never past the address predicate). See exempt_host.
+_scope_exempt: contextvars.ContextVar = contextvars.ContextVar("sloptic_egress_exempt", default=frozenset())
 
 
 class EgressRefused(socket.gaierror):
@@ -68,15 +71,25 @@ def mode() -> str:
     return os.environ.get("SLOPTIC_EGRESS", "on").strip().lower()
 
 
+_NAT64 = ipaddress.ip_network("64:ff9b::/96")   # RFC 6052 well-known NAT64 prefix (embeds a v4 in the low 32 bits)
+_V4COMPAT = ipaddress.ip_network("::/96")        # deprecated IPv4-compatible IPv6 (also embeds a v4)
+
+
 def check_ip(ip: str, *, allow_loopback: bool = False) -> bool:
     """True only for a PUBLIC unicast address. IPv4-mapped IPv6 is normalized first, so
-    ``::ffff:10.0.0.1`` cannot slip past as a v6 literal."""
+    ``::ffff:10.0.0.1``, ``64:ff9b::10.0.0.1`` (NAT64), and ``::10.0.0.1`` cannot slip past as v6 literals."""
     try:
         addr = ipaddress.ip_address(ip)
     except ValueError:
         return False
-    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
-        addr = addr.ipv4_mapped
+    if isinstance(addr, ipaddress.IPv6Address):
+        # Unwrap any IPv6 form that embeds an IPv4 and judge THAT, so a private v4 cannot ride in as a
+        # v6 literal: v4-mapped (::ffff:x), NAT64 (64:ff9b::x), and deprecated v4-compatible (::x). A
+        # PUBLIC embedded v4 still passes, so grading over a DNS64 network keeps working.
+        if addr.ipv4_mapped is not None:
+            addr = addr.ipv4_mapped
+        elif addr in _NAT64 or (addr in _V4COMPAT and not addr.is_unspecified and not addr.is_loopback):
+            addr = ipaddress.IPv4Address(int(addr) & 0xFFFFFFFF)
     if allow_loopback and addr.is_loopback:
         return True
     return not (
@@ -110,6 +123,62 @@ def origin_scope(origin: str):
         _origin_scope.reset(tok)
 
 
+def current_scope() -> tuple[str, int] | None:
+    """The active origin scope on THIS thread, or None. Read by the browser route filter to scope its
+    TOP-LEVEL navigations (see browser._install_egress_filter): a grant for one origin authorizes grading
+    that origin, and a redirect must not carry the authenticated crawl somewhere the grant never covered."""
+    return _origin_scope.get()
+
+
+@contextlib.contextmanager
+def exempt_host(host: str):
+    """Allow ONE fixed host past the origin pin for the duration of the block.
+
+    This is a deliberate hole in `origin_scope`, so the reason it is safe has to be stated rather than
+    assumed. The origin pin exists because a grant for one origin must not become a relay to anywhere else,
+    and what makes a relay dangerous is that the TARGET picks the destination, by redirecting us. This
+    exemption inverts that: the host is a constant WE chose (a provider's own validation endpoint), so the
+    target cannot steer it. Pass a literal. Never pass a host derived from a response, a bundle, or anything
+    else the target controls, or this becomes the relay the pin was written to prevent.
+
+    Nothing else is relaxed. The public-address predicate still runs, so an exempt host that resolves to
+    loopback, a private range or cloud metadata is still refused. Only the origin equality check is skipped,
+    and only for the exact host named here.
+    """
+    tok = _scope_exempt.set(frozenset(_scope_exempt.get()) | {host.lower().rstrip(".")})
+    try:
+        yield
+    finally:
+        _scope_exempt.reset(tok)
+
+
+def scope_bound(fn):
+    """Bind `fn` to the CALLER's origin scope so it stays scoped when a worker thread runs it.
+
+    A ContextVar does not cross a thread boundary. A thread started by ThreadPoolExecutor begins with a
+    fresh, empty Context, so `_origin_scope.get()` there returns its default of None and the scope check in
+    `_guarded_getaddrinfo` silently does not run, leaving only the public address predicate, which a
+    third-party victim passes by definition. Any callable handed to a pool has to be wrapped in this, or a
+    grant for one origin becomes a relay to any public host the target redirects at.
+
+    Capture happens on the SUBMITTING thread, where the scope is live, and re-entry happens inside the
+    worker. When there is no scope (every corpus and reference lane, which never enters one) this returns
+    the callable itself, so those paths are byte for byte what they were.
+    """
+    scope = _origin_scope.get()
+    if scope is None:
+        return fn
+
+    @functools.wraps(fn)
+    def scoped(*args, **kwargs):
+        tok = _origin_scope.set(scope)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _origin_scope.reset(tok)
+    return scoped
+
+
 def _guarded_getaddrinfo(host, port, *args, **kwargs):
     if host is None or _in_guard.get():
         return _real_getaddrinfo(host, port, *args, **kwargs)
@@ -122,7 +191,7 @@ def _guarded_getaddrinfo(host, port, *args, **kwargs):
     scope = _origin_scope.get()
     if scope is not None:
         h = host.lower().rstrip(".") if isinstance(host, str) else host
-        if h != scope[0] or (isinstance(port, int) and port != scope[1]):
+        if h not in _scope_exempt.get() and (h != scope[0] or (isinstance(port, int) and port != scope[1])):
             raise EgressRefused(
                 f"egress refused: {host}:{port} leaves the scoped origin {scope[0]}:{scope[1]}")
 

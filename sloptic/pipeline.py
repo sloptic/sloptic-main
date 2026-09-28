@@ -8,8 +8,10 @@ so multiple vulnerable endpoints cost more than one but less than linearly.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import inspect
 import os
+import threading
 import time
 from dataclasses import dataclass, field, replace
 
@@ -24,11 +26,23 @@ from . import auth, egress, lighthouse, platform_id, safety, secretscan
 from .aggregate import compute_axis_slop, compute_slop_score, coverage_metrics
 from .deploy import Deployer
 from .discovery import discover, surface_metrics
-from .net import challenge_onset, is_bot_challenge, make_client, request_counts, set_trace_probe, start_trace
+from .net import challenge_onset, is_bot_challenge, make_client, request_counts, reset_challenge_onset, set_trace_probe, start_trace
 
 # A late-challenge grade is kept only if at least this fraction of the catalog ran BEFORE the WAF tripped (so
 # most outcomes saw the real app). Below it, too much of the grade is contaminated -> withhold like an entry challenge.
 _MIN_VALID_FRACTION = 0.6
+
+# The battery fans probes out PER DISCOVERED ROUTE, so cost scales with surface, not page count. A cap keeps
+# Sloptic on the population it measures: hackathon apps. Across every graded surface (n=76) the median was 25
+# routes, p90 60, max 342 — and one 643-route blog archive kept a single probe running for 4+ minutes and blew
+# three 900s wall clocks. Above the cap the grade is REFUSED (a clean failure naming the reason), never
+# truncated: a half-fanned battery is not a measurement of anything, and a truncated one would rank against
+# whole batteries.
+_MAX_SURFACE_ROUTES = 400
+
+
+class SurfaceTooLarge(RuntimeError):
+    """The discovered surface is beyond the population Sloptic grades; refusal, not a partial grade."""
 from .probes import (MATCHERS, PREDICATES, _email_account, _prime_email, _rebuild_account, _repro_from_resp,
                      describe)
 from .schema import Form, Outcome, Probe, Profile, Report, Severity
@@ -304,6 +318,68 @@ def _severity_penalty(sev: Severity, ev: dict) -> int:
     return int(min(hi, max(lo, point)))
 
 
+_PROBE_DEADLINE_S = float(os.environ.get("SLOPTIC_PROBE_TIMEOUT", "120"))
+# One probe's wall clock. The v24 discovery run attributed 107 of its 120 timeouts to a SINGLE probe hanging
+# (after 54-88 of 106 had already run fine) and eating the whole 900s budget, DNF-ing a grade that was 80%
+# done. 120s is ~20x a normal probe (whole-battery p95 is 573s over ~106 probes) and env-tunable; a catalog
+# probe may set its own `max_seconds`.
+
+
+def _probe_deadline(probe: Probe) -> float:
+    v = probe.probe.get("max_seconds") if probe.probe else None
+    try:
+        return float(v) if v is not None else _PROBE_DEADLINE_S
+    except (TypeError, ValueError):
+        return _PROBE_DEADLINE_S
+
+
+def _run_bounded(thunk, timeout_s: float):
+    """Run `thunk()` in a daemon thread; return `(result, hung)`.
+
+    This is the GIL-honest per-probe deadline. A hang that is waiting on a SOCKET (an httpx read, a
+    Playwright sync call blocked on the browser) has RELEASED the GIL, so the abandoned thread just stays
+    parked there while the grade continues — one slow probe costs its 120s slice instead of the whole grade,
+    and the probe lands in blocked_probes for the retry pass to recover. A hang that genuinely pins the GIL
+    still wedges the process (the parent's 900s SIGKILL remains the backstop, exactly as before) — this never
+    makes anything worse.
+
+    The thread runs inside a COPY of the submitting context, captured on the caller's thread: the probe's
+    tally, request cap, challenge-onset recorder, trace probe id and egress scope all live in ContextVars,
+    and a fresh thread would read their defaults (the same blindness the fan-out pools had). The copy also
+    flows into any fan-out the probe itself spawns.
+
+    `result is None` with hung=False means the thunk returned None or raised (callers convert to N/A, exactly
+    like the loop's old except)."""
+    box: list = []
+    done = threading.Event()
+    ctx_run = contextvars.copy_context().run
+
+    def _target():
+        try:
+            box.append(ctx_run(thunk))
+        except BaseException:                  # mirrors the loop's old per-probe except; never re-raise here
+            pass
+        finally:
+            done.set()
+
+    threading.Thread(target=_target, daemon=True, name="hl-bounded-probe").start()
+    if done.wait(timeout_s):
+        return (box[0] if box else None), False
+    return None, True                          # abandoned: the daemon thread dies with the process
+
+
+def _app_wide_challenge(client: httpx.Client, origin: str) -> bool:
+    """A challenge marker tripped mid-grade: is it APP-WIDE, or a PER-PATH WAF block (Cloudflare's 1020 on a
+    sensitive path like /.env, a Vercel `deny`) with the app itself still fully reachable? Confirm against the
+    ORIGIN. Fail CLOSED -- an origin we cannot reach counts as app-wide -- so an app-wide block is never scored
+    as a false clean. The CF 1020 page carries no distinguishing header (unlike Vercel `deny`), so re-fetching
+    the origin is the only reliable discriminator."""
+    try:
+        return is_bot_challenge(client.get(origin))
+    except Exception:
+        return True
+
+
 def _run_probe(probe: Probe, ctx: _Ctx, client: httpx.Client, profile: Profile) -> list[Outcome]:
     """Resolve one probe to its outcome(s): applicability gate, then an oracle predicate or a
     declarative fan-out across discovered targets. One Outcome per (probe x target)."""
@@ -485,6 +561,14 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
             return Report(slop_score=0, outcomes=[], surface=surface_metrics(profile))
         outcomes: list[Outcome] = []
         total = len(catalog)
+        # SURFACE SCALE GATE: refuse targets whose discovered surface is beyond the population Sloptic
+        # measures, BEFORE the battery fans out over it. Both profile paths (fresh crawl / frozen cache)
+        # converge here, so this is the one checkpoint.
+        if len(profile.routes) > _MAX_SURFACE_ROUTES:
+            raise SurfaceTooLarge(
+                f"surface too large ({len(profile.routes)} discovered routes out of "
+                f"{_MAX_SURFACE_ROUTES} max). Due to capacity constraints we are unable to "
+                f"support apps this large.")
         # bind the client + probes to the ORIGIN (a --target may carry an entry path; discover() crawls
         # from it, but probes construct base_url + "/probe/path" and need the bare origin). profile.base_url
         # is already normalized to the origin by discover().
@@ -513,12 +597,13 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
             except Exception:   # best-effort side check: a failed probe fetch must never gate the grade
                 pass
             # SHELL-ONLY SHORT-CIRCUIT: discovery found a canvas-shell host (Streamlit) whose real app did NOT
-            # render — 'error' (crash screen) or 'stuck' (won't come up). The full browser battery would grind the
+            # render -- 'error' (crash screen), 'stuck' (won't come up), or 'empty' (a title-only / unhydrated
+            # entry that rendered nothing and captured no surface). The full browser battery would grind the
             # framework shell (no networkidle, register/upload/domxss all timing out) for ~480s and DNF on the
             # grade timeout — for a record is_shell_only EXCLUDES from the curve regardless. Stop here with the
             # shell state recorded (excluded, never read as a clean grade) instead of burning the budget. A
             # RENDERED shell (render_state 'rendered') falls through and grades its real surface normally.
-            if profile.render_state in ("error", "stuck"):
+            if profile.render_state in ("error", "stuck", "empty"):
                 return Report(slop_score=0, outcomes=[], surface=surface_metrics(profile),
                               platform=platform_id.classify_live(client, origin), trace=trace_sink or [])
             # EAGER EMAIL PRIME: fire the email registration NOW -- before the ~2-3min Lighthouse run and the probe
@@ -561,24 +646,44 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
             # grade's score is order-independent, so this never perturbs a clean grade.
             catalog = sorted(catalog, key=lambda p: safety.order_weight(p.id))
             cat_index = {p.id: i for i, p in enumerate(catalog)}
+            hung_probes: list[str] = []
             for i, probe in enumerate(catalog):
                 set_trace_probe(probe.id)                      # tag every request (for --trace AND the always-on
                 #                                                challenge-onset watch); cheap ContextVar set
                 if on_progress:
                     on_progress(i, total, probe, None)              # starting probe i (0-indexed)
-                try:
-                    probe_outcomes = _run_probe(probe, ctx, client, profile)
-                except Exception:   # a single probe must NEVER DNF the whole grade: run() accumulates outcomes
-                    # and only commits them at the end, so one uncaught edge case (e.g. a multipart repro's
-                    # RequestNotRead — a StreamError, not an httpx.HTTPError, so the declarative fetch guard
-                    # misses it) would abort the loop and discard EVERY finding (179/1043 apps DNF'd this way).
-                    # Degrade the one probe to N/A; the suite is the backstop for a probe that ALWAYS raises.
+
+                def _thunk(probe=probe):
+                    # a single probe must NEVER DNF the whole grade: run() accumulates outcomes and only
+                    # commits them at the end, so one uncaught edge case would abort the loop and discard
+                    # EVERY finding (179/1043 apps DNF'd that way). Degrade the one probe to N/A.
+                    try:
+                        return _run_probe(probe, ctx, client, profile)
+                    except Exception:
+                        return [_outcome(probe, "not_applicable", 0, probe.probe.get("target", ""))]
+
+                if "browser" in probe.applicability.requires:
+                    probe_outcomes = _thunk()   # INLINE: Playwright's sync API is thread-affine (greenlets
+                    hung = False                # bind to the creating thread), so a browser probe moved to a
+                else:                           # fresh thread breaks it — the crawler-wedge lesson. The v24
+                    probe_outcomes, hung = _run_bounded(_thunk, _probe_deadline(probe))
+                if hung:
+                    # the probe blew its own wall clock: record it BLOCKED, not clean — it lands on the record
+                    # (so the audit sees it) and in blocked_probes, where the post-run retry pass recovers it
+                    hung_probes.append(probe.id)
+                    probe_outcomes = []
+                if probe_outcomes is None:
                     probe_outcomes = [_outcome(probe, "not_applicable", 0, probe.probe.get("target", ""))]
                 outcomes.extend(probe_outcomes)
                 if on_progress:
                     on_progress(i + 1, total, probe, probe_outcomes)  # done: i+1 probes completed
-                if challenge_onset():   # a CONFIRMED challenge tripped during/before this probe -> STOP: every
-                    break               # request past here hits the interstitial, not the app (and stops hammering)
+                if challenge_onset():
+                    # A confirmed challenge tripped on this probe's request. Halt ONLY if it is app-wide: a
+                    # per-path WAF block (Cloudflare 1020 on /.env, a Vercel deny) leaves the app reachable, so
+                    # halting there abandons the rest of the gradeable battery. Confirm against the origin.
+                    if _app_wide_challenge(client, origin):
+                        break             # app-wide: every request past here hits the interstitial, not the app
+                    reset_challenge_onset()   # per-path block on a reachable app -> keep grading the battery
             # OFF-SCORE diagnostic: identify the hosting platform + AI builder from one origin fetch (headers +
             # served HTML). Inside the client block so it reuses the session; never raises -> never DNFs a grade.
             plat = platform_id.classify_live(client, origin)
@@ -602,21 +707,37 @@ def run(deployer: Deployer, catalog: list[Probe], render=None, headers=None, on_
         if onset_probe:
             bot_challenge = True
             onset_idx = cat_index.get(onset_probe, total)
-            if onset_idx < _MIN_VALID_FRACTION * total:   # too little clean data -> ungradeable, like an entry challenge
-                bp, ia = _blocked(catalog)                # nothing usable ran -> the whole battery is blocked
-                return Report(slop_score=0, outcomes=[], surface=surface_metrics(profile), platform=plat,
-                              bot_challenge=True, challenge_stage="entry", challenge_onset=onset_probe,
-                              request_counts=req_counts, blocked_probes=bp, incomplete_axes=ia,
-                              trace=trace_sink or [])
             outcomes = [o for o in outcomes if cat_index.get(o.probe_id, total) < onset_idx]
             blocked_probes, incomplete_axes = _blocked(catalog[onset_idx:])   # the tail a challenge cut off
-            stage = "late"
+            # Below the keepable fraction the battery is too partial to rank -- eligibility keeps it off the
+            # curve and benchmark.rank() refuses it -- but the pre-onset outcomes are still real measurements
+            # of the app. The old behaviour WITHHELD them (slop 0, nothing stored), which reported a grade cut
+            # short as if nothing had run and cost a full re-grade to recover. They now stand as a LIMITED
+            # grade: a partial score the web presents as such, with only the tail booked for retry_blocked.
+            stage = "limited" if onset_idx < _MIN_VALID_FRACTION * total else "late"
         elif end_challenged:
             bot_challenge, stage = True, "late"
+        if hung_probes:   # per-probe-deadline abandonments (a probe blew its 120s wall): mark them blocked so the
+            # retry pass recovers them, and their axes incomplete. Merged HERE, after the challenge-onset finalize
+            # sets blocked_probes/incomplete_axes -- doing it before that init (as it once did) read an unbound
+            # `blocked_probes` and crashed the grade whenever a probe hung (UnboundLocalError, 71 apps in v25).
+            blocked_probes = sorted(set(blocked_probes) | set(hung_probes))
+            incomplete_axes = sorted(set(incomplete_axes)
+                                     | {p.bundle for p in catalog if p.id in set(hung_probes)})
         surface = surface_metrics(profile)
         if ctx.lighthouse:   # capture the Lighthouse performance score (0-100) onto the record -- the perf axis
             perf = lighthouse.perf_score(ctx.lighthouse)   # already grades on it; this surfaces it for the stats.
             surface["lighthouse"] = {"performance": round(perf * 100) if perf is not None else None}
+            # Host speed during the run. Nothing in Lighthouse normalizes for it: under the default `simulate`
+            # throttling the real browser is never CPU throttled, so the trace carries the box's actual load,
+            # and Lantern scales that by a fixed 4x. Without this on the record a perf shift between corpora
+            # cannot be told apart from a busier grading box, and a live single app grade (whole machine)
+            # cannot be compared against a curve built at four grades per box.
+            bi = lighthouse.benchmark_index(ctx.lighthouse)
+            if bi is not None:
+                env = (lighthouse._lhr(ctx.lighthouse).get("environment") or {})
+                surface["lighthouse"]["benchmark_index"] = bi
+                surface["lighthouse"]["benchmark_index_spread"] = env.get("benchmarkIndexSpread")
         sess = _captured_session(ctx)               # the session the grade established -> a retry replays it, no re-walk
         attempted = (ctx.browser_register is not None
                      or (isinstance(ctx._email_cache, dict) and "_authed_headers" in ctx._email_cache))

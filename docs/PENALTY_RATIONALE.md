@@ -97,7 +97,7 @@ The XSS probes confirm by executing in a real browser, so execution is the fire 
 | Open redirect | `redirect-001` | 6.1 | P4 | 25 to 55, default 25 (external host 40, auth flow 55) |
 | Cleartext HTTP | `tls-001` | 5.9 | P4 | 30 (CWE-319) |
 | Missing rate limit | `ratelimit-001` | 5.3 | P4 | 30 (CWE-770 and CWE-799) |
-| Decompression bomb DoS | `dos-001` | 7.5 availability | P4 | 12 to 30 |
+| Decompression bomb DoS | `dos-001` | 7.5 availability | P4 | 15 |
 
 ## 5. The security header floor, and why it is cheap
 
@@ -125,8 +125,8 @@ Quality and performance failures are not vulnerabilities, so CVSS does not descr
 | Crash on malformed input (5xx) | `crash-010` | reliability | 55 |
 | Race condition under concurrency | `race-001/002` | reliability | 50 |
 | Dead control | `deadctrl-001` | functional suitability | 30, primary CTA 50 |
-| Broken deep link | `deeplink-001` | functional suitability | 15 |
-| Dead back button | `backnav-001` | functional suitability | 12 |
+| Broken deep link | `deeplink-001` | functional suitability | 28 |
+| Dead back button | `backnav-001` | functional suitability | 25 |
 | Accessibility barrier | `a11y-001/002` | usability (accessibility) | per rule sum, below |
 
 Data integrity leads, because a save that silently loses or corrupts the user's data breaks the one promise the app made. A crash returns a 5xx where a graceful 4xx belonged, which the RFC treats as a server fault, so it is priced above the every user interface defects but below data loss.

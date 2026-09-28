@@ -1,0 +1,4 @@
+component,winner_median,non_winner_median,mann_whitney_p_two_sided
+Total slop,52.7,47.6,0.21571818271797794
+Everything but performance,33.5,33.2,0.47778702602437584
+Performance axis,10.9,5.8,0.0010112850766674998

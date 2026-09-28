@@ -1,6 +1,6 @@
 id: qa-seo-001
-bundle: qa
-category: seo
+bundle: accessibility
+category: mobile-visibility
 pool: public
 evidence_model: provable
 penalty: 12   # missing viewport/description hits ALL acquisition (very high frequency) but is

@@ -46,11 +46,13 @@ from functools import lru_cache
 
 _HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))     # repo root on path, so the lazy `import sloptic` resolves when run as a script
-from sloptic.eligibility import (is_shell_only, is_ungradeable_challenge,  # noqa: E402  (needs the path insert above)
+from sloptic.eligibility import (is_limited_battery, is_shell_only, is_ungradeable_challenge,  # noqa: E402  (needs the path insert above)
                                  is_wrong_owner, wrong_owner_reason)
 _DEFAULT_CURVE = _HERE.parent / "validation" / "benchmark-curve.json"
-_AXES = ("security", "qa", "performance")
-_PREFIX = {"sec-": "security", "qa-": "qa", "perf-": "performance"}
+_PASSIVE_CURVE = _HERE.parent / "validation" / "benchmark-curve-passive.json"
+_AXES = ("security", "qa", "accessibility", "performance")
+_PREFIX = {"sec-": "security", "qa-a11y": "accessibility", "qa-seo": "accessibility",
+           "qa-": "qa", "perf-": "performance"}   # longest prefixes FIRST: qa-a11y/qa-seo are the accessibility carve-out, every other qa- probe stays qa
 _LANDMARKS = (10, 25, 50, 75, 90, 95, 99)
 # A fired probe in one of these classes means "not certifiable", independent of rank: the app is exploitable
 # now, and a favourable comparison to equally-broken peers is not a mitigation.
@@ -66,6 +68,13 @@ _ABSOLUTE_PROBES = {"sec-exposure-001", "sec-exposure-002", "sec-exposure-003", 
                     "sec-exposure-007"}
 
 
+def _read_text(path) -> str:
+    """A run file, plain or gzipped (the published anonymized dataset ships as .jsonl.gz)."""
+    import gzip
+    p = pathlib.Path(path)
+    return gzip.decompress(p.read_bytes()).decode() if p.name.endswith(".gz") else p.read_text()
+
+
 def _is_gate(finding: dict) -> bool:
     """A fired finding meaning 'exploitable now', reported whatever the rank: an absolute-gate category, or a
     named secret-file exposure inside the mixed `exposure` category."""
@@ -79,6 +88,42 @@ def _axis_of(probe_id: str) -> str | None:
     return None
 
 
+def _passive_full_counts() -> tuple:
+    """(n_passive, n_full) from the live catalog: the battery sizes that tell a passive grade from a full
+    one. Falls back to the shipped 2.1 sizes if the catalog cannot load."""
+    try:
+        from sloptic import safety
+        from sloptic.catalog import default_catalog_dir, load_catalog
+        cat = load_catalog(str(default_catalog_dir()))
+        return len(safety.passive_catalog(cat)), len(cat)
+    except Exception:
+        return 44, 102
+
+
+def _probe_set(record: dict, n_passive: int) -> str:
+    """Which battery produced this grade: 'passive', 'full', or 'subset'. A passive-only run's
+    coverage.probes_total is the passive battery (<= n_passive); a full run is the whole catalog; an
+    arbitrary --probe run carries probe_filter and belongs to neither curve. This is the guiding-principle
+    'never mix measurements' turned into a check."""
+    if record.get("probe_filter"):
+        return "subset"
+    total = (record.get("coverage") or {}).get("probes_total")
+    if total is None:
+        return "full"                        # legacy record with no coverage: treat as full
+    return "passive" if total <= n_passive else "full"
+
+
+def _guard_mode(record: dict, curve: dict) -> None:
+    """Refuse to rank a grade against a curve built from a different battery."""
+    want = curve.get("probe_set", "full")    # an untagged (older) curve is the full curve
+    got = _probe_set(record, _passive_full_counts()[0])
+    if got != want:
+        raise ValueError(
+            f"mode mismatch: this is a '{got}' grade but {curve.get('version')} is the '{want}' curve. "
+            f"A passive grade ranks only on the passive curve and a full grade only on the full curve, "
+            f"because they measure different probe batteries.")
+
+
 def _eligible(r: dict) -> bool:
     """A row that belongs in the reference distribution (see the exclusions in the module docstring)."""
     return bool(
@@ -88,6 +133,7 @@ def _eligible(r: dict) -> bool:
         and r.get("functional") is not False     # DNF ranks below every working app, not inside the curve
         and not str(r.get("project") or "").startswith("anchor-")
         and not is_ungradeable_challenge(r)      # entry-challenge withhold -> scored 0, nothing was graded
+        and not is_limited_battery(r)            # challenge-cut partial -> a real score over too small a battery
         and not is_shell_only(r)                 # canvas-shell host (Streamlit) -> graded the framework, not the app
         and not is_wrong_owner(r)                # S3 bucket / Jira / no-code site / editor url -> not the team's app
     )
@@ -169,6 +215,50 @@ def _max_penalty(record: dict) -> float:
     return max((f.get("penalty") or 0 for f in record.get("findings") or []), default=0)
 
 
+# --- perf normalization for host-CPU contention (see docs/PERF_NORMALIZATION.md) --------------------------
+# Perf is the one axis that measures TIME, so a grade on a faster/idler box under-reports perf slop. benchmark_index
+# is Lighthouse's CPU-speed reading; a grade above the reference speed had it too easy and gets slop added back.
+# k is a CONSTANT fit from the v25 A/B in SLOP space (same apps at conc 1 vs 4); bi_ref is the reference contention
+# condition, computed per curve as the population's median benchmark_index and frozen INTO the curve. A curve with
+# no perf_norm (a pre-instrumentation corpus, or the frozen 2026.3) ranks un-normalized -> this is inert until a
+# curve carries params, which is why it is coherent to land before the freeze.
+_PERF_NORM_K = 0.013        # perf slop added back per benchmark_index unit above bi_ref (v25 A/B, slop-space)
+_PERF_NORM_CAP = 600.0      # cap the correction (~8 slop pts) so a wildly-fast box can't over-penalize
+
+
+def _bi_of(record: dict):
+    return ((record.get("observed_surface") or {}).get("lighthouse") or {}).get("benchmark_index")
+
+
+def _perf_norm_params(rows: list):
+    """The normalization params to freeze into a curve: k+cap are constants, bi_ref is this population's median
+    benchmark_index (its contention condition). None when no row carries benchmark_index (a pre-instrumentation
+    corpus) -> the curve gets no params and ranks un-normalized."""
+    bis = sorted(b for r in rows if (b := _bi_of(r)) is not None)
+    if not bis:
+        return None
+    return {"k": _PERF_NORM_K, "bi_ref": round(statistics.median(bis), 1), "bi_cap": _PERF_NORM_CAP}
+
+
+def _normalized(record: dict, params) -> dict:
+    """A shallow copy of `record` with the perf axis slop -- and thus slop_score, since the axes sum to it --
+    corrected for host-CPU contention. A grade on a faster-than-reference box under-reported perf slop, so add
+    it back; a reference-or-slower box, a missing benchmark_index, or no perf axis is a no-op (returns the record
+    unchanged). One-sided: only a faster box is corrected, a slower one is never rewarded."""
+    bi = _bi_of(record)
+    axis = record.get("axis_slop") or {}
+    if not params or bi is None or "performance" not in axis:
+        return record
+    over = min(max(bi - params["bi_ref"], 0.0), params["bi_cap"])
+    if over <= 0:
+        return record
+    add = params["k"] * over
+    rec = dict(record)
+    rec["axis_slop"] = {**axis, "performance": round(axis["performance"] + add, 1)}
+    rec["slop_score"] = round(record.get("slop_score", 0) + add, 1)
+    return rec
+
+
 def _key(slop, has_cat, maxpen, potential, ncats) -> tuple:
     """The rank key, LOWER is better: slop asc; clean (0) before catastrophe (1); SMALLER worst finding
     (max_penalty) asc -- weakest-link, one severe trapdoor beats the same slop spread over moderate findings;
@@ -194,11 +284,20 @@ def _rank_score_only(dist: list, score) -> tuple:
     return round(100 * better / n), round(100 * worse / n)
 
 
-def build(recs: list, version: str, source: str, status: str = "provisional") -> dict:
-    rows = [r for r in recs if _eligible(r)]
+def build(recs: list, version: str, source: str, status: str = "provisional",
+          probe_set: str = "full") -> dict:
+    n_passive = _passive_full_counts()[0]
+    rows = [r for r in recs if _eligible(r) and _probe_set(r, n_passive) == probe_set]
     if not rows:
-        sys.exit("ERROR: no eligible rows (need deployed + scored + not anchor/subset/dead/DNF)")
+        sys.exit(f"ERROR: no eligible '{probe_set}' rows (need deployed + scored, from the {probe_set} "
+                 f"battery, not anchor/subset/dead/DNF). A passive curve needs a --passive-only corpus run.")
     idx = _catalog_index()
+    # Perf normalization for host-CPU contention: compute this population's reference box-speed, then correct
+    # each row's perf slop (and total) BEFORE freezing the distributions, so the curve is built on normalized
+    # perf and a live grade normalized the same way places consistently. Inert when no row carries a
+    # benchmark_index (params is None). See docs/PERF_NORMALIZATION.md.
+    perf_norm = _perf_norm_params(rows)
+    rows = [_normalized(r, perf_norm) for r in rows]
     # the empirical distribution: one [slop, catastrophe(0/1), max_penalty, slop_potential, categories] row per app, no
     # identities. This is what makes the overall percentile exact and the tiebreaks possible; the landmark
     # summaries below stay for human reading and the per-axis (spiky, non-granular) ranks. Rows are sorted by
@@ -211,9 +310,10 @@ def build(recs: list, version: str, source: str, status: str = "provisional") ->
     # status rides ON the curve and into every ranked result. A curve built before the catalog's calibration
     # settles will be regraded, and a percentile quoted from it must say so: a provisional number presented as
     # final is the failure mode a versioned reference exists to prevent.
-    curve = {"version": version, "source": source, "status": status,
+    curve = {"version": version, "source": source, "status": status, "probe_set": probe_set,
              "population": "live hackathon web apps", "n": len(rows), "comparator": list(_COMPARATOR),
-             "overall": _pcts([r["slop_score"] for r in rows]), "axes": {}, "dist": dist}
+             "overall": _pcts([r["slop_score"] for r in rows]), "axes": {}, "dist": dist,
+             **({"perf_norm": perf_norm} if perf_norm else {})}
     for axis in _AXES:
         vals = [(r.get("axis_slop") or {}).get(axis, 0) for r in rows if _axis_applicable(r).get(axis)]
         if vals:
@@ -261,6 +361,9 @@ def _band(pct: int) -> str:
 # distribution right, so the cut points have to move with it. RE-DERIVE THESE AFTER EVERY CALIBRATION RUN; they
 # are a property of the corpus and the catalog together, and 90 probes will not be 90 forever.
 _LIMITED_ENGAGEMENT_BELOW = 40
+# The passive battery is a different instrument: 44 checks, so the same corpus-derived FRACTION of
+# the full battery's threshold applies to it. 40 of 102 and 18 of 44 are the same line.
+_LIMITED_ENGAGEMENT_BELOW_PASSIVE = 18
 _SURFACE_NARROW_BELOW, _SURFACE_BROAD_ABOVE = 48, 58
 
 # UNTESTED FAMILIES is OURS, not the spec's, and is kept under its own name for exactly that reason: Limited
@@ -323,10 +426,13 @@ def reporting_bundle(record: dict) -> dict:
     if takes_input and not any(_kind_ran(record, k) for k in _INPUT_KINDS):
         untested.append("input-validation")
         why.append("takes text input but neither input-validation nor xss ran")
-    status = "limited_engagement" if applicable < _LIMITED_ENGAGEMENT_BELOW else "completed"
+    # Mode-aware: a passive grade tops out at 44 applicable probes, so the full battery's floor
+    # would flag almost every passive grade whose app is simply small.
+    mode = record.get("mode") or "full"
+    floor = _LIMITED_ENGAGEMENT_BELOW_PASSIVE if mode == "passive" else _LIMITED_ENGAGEMENT_BELOW
+    status = "limited_engagement" if applicable < floor else "completed"
     if status == "limited_engagement":
-        why.append(f"only {applicable} probes applicable (Limited Engagement below "
-                   f"{_LIMITED_ENGAGEMENT_BELOW})")
+        why.append(f"only {applicable} probes applicable (Limited Engagement below {floor})")
     return {"status": status, "probes_applicable": applicable, "slop_detected": fired,
             "attack_surface_coverage": _surface_coverage(applicable),
             "clean_rate": round(100 * (applicable - fired) / applicable, 1) if applicable else None,
@@ -337,11 +443,26 @@ def rank(curve: dict, score, record: dict | None = None) -> dict:
     """Place one app on the frozen curve. Lower slop is better, so a LOW percentile is good: pct is the share
     of the reference population this app is cleaner than... inverted at the end for readability."""
     dist = curve.get("dist")
+    if record is not None:
+        _guard_mode(record, curve)
+        if is_ungradeable_challenge(record) or is_limited_battery(record):
+            raise ValueError(
+                "challenge-cut grade: a bot challenge stopped this battery before it was measured in full, so "
+                "its partial score has no placement on the curve. The score stands as a limited measurement; "
+                "the blocked tail is what a retry pass recovers.")
+    # Normalize the incoming grade for host-CPU contention iff THIS curve was frozen with params (a live grade
+    # on an idle box under-reported perf slop; add it back so it places against the curve's contention
+    # condition). A curve without perf_norm -- the 2026.3 ruler, or any pre-instrumentation build -- is a no-op,
+    # so this is inert until a normalized curve exists. Both the total `score` and the per-axis slop move.
+    perf_norm = curve.get("perf_norm")
+    if record is not None and perf_norm:
+        record = _normalized(record, perf_norm)
+        score = record["slop_score"]
     potential = ncats = None
     if dist is not None and record is not None:
         idx = _catalog_index()
         potential, ncats = _slop_potential(record, idx), _categories_applied(record)
-        pct, cleaner_than = _rank_on_dist(dist, _key(int(score), _has_catastrophe(record),
+        pct, cleaner_than = _rank_on_dist(dist, _key(score, _has_catastrophe(record),
                                                      _max_penalty(record), potential, ncats))
     elif dist is not None:
         pct, cleaner_than = _rank_score_only(dist, score)     # a bare score has no tiebreak keys: slop alone
@@ -355,7 +476,7 @@ def rank(curve: dict, score, record: dict | None = None) -> dict:
     if record:
         if potential is not None:
             out["slop_potential"] = potential
-            out["defended"] = max(potential - int(score), 0)  # worst-case damage held off, the tiebreak signal
+            out["defended"] = round(max(potential - score, 0))  # worst-case damage held off, the tiebreak signal
             out["categories_applied"] = ncats
         applicable = _axis_applicable(record)
         for axis, part in curve["axes"].items():
@@ -426,7 +547,12 @@ def main() -> None:
     b = sub.add_parser("build", help="freeze a reference curve from a corpus run")
     b.add_argument("results")
     b.add_argument("--version", required=True, help="curve version, e.g. 2026.1 (a badge must cite one)")
-    b.add_argument("--out", default=str(_DEFAULT_CURVE))
+    b.add_argument("--out", default=None,
+                   help="curve path (default: the full curve, or the passive curve under --passive)")
+    b.add_argument("--passive", action="store_true",
+                   help="build the PASSIVE-FLOOR curve from a --passive-only corpus run (the 44-probe "
+                        "battery the anonymous web tier uses); writes benchmark-curve-passive.json and tags "
+                        "it probe_set=passive so a full grade can never rank against it")
     b.add_argument("--status", default="provisional", choices=("provisional", "final"),
                    help="provisional (default) until the catalog's calibration settles and the corpus is "
                         "regraded; it is stamped on the curve and shown with every rank")
@@ -439,11 +565,13 @@ def main() -> None:
     args = ap.parse_args()
 
     if args.cmd == "build":
-        recs = [json.loads(l) for l in pathlib.Path(args.results).read_text().splitlines() if l.strip()]
-        curve = build(recs, args.version, pathlib.Path(args.results).name, args.status)
-        pathlib.Path(args.out).write_text(json.dumps(curve, indent=2) + "\n")
+        recs = [json.loads(l) for l in _read_text(args.results).splitlines() if l.strip()]
+        probe_set = "passive" if args.passive else "full"
+        out = args.out or (str(_PASSIVE_CURVE) if args.passive else str(_DEFAULT_CURVE))
+        curve = build(recs, args.version, pathlib.Path(args.results).name, args.status, probe_set=probe_set)
+        pathlib.Path(out).write_text(json.dumps(curve, indent=2) + "\n")
         o = curve["overall"]
-        print(f"\n  froze {args.out}  ({curve['version']}, {curve['status']}, "
+        print(f"\n  froze {out}  ({curve['version']} {curve['probe_set']}, {curve['status']}, "
               f"n={o['n']} from {curve['source']})")
         print(f"  overall  p10 {o['p10']}  p25 {o['p25']}  median {o['p50']}  p75 {o['p75']}  "
               f"p90 {o['p90']}  p99 {o['p99']}  max {o['max']}")
@@ -457,7 +585,7 @@ def main() -> None:
     curve = json.loads(pathlib.Path(args.curve).read_text())
     record = None
     if args.results:
-        rows = [json.loads(l) for l in pathlib.Path(args.results).read_text().splitlines() if l.strip()]
+        rows = [json.loads(l) for l in _read_text(args.results).splitlines() if l.strip()]
         cands = [r for r in rows if not args.app or args.app in str(r.get("repo", "")) + str(r.get("project", ""))]
         cands = [r for r in cands if r.get("slop_score") is not None]
         if not cands:
@@ -466,7 +594,10 @@ def main() -> None:
     score = args.score if args.score is not None else record and record["slop_score"]
     if score is None:
         sys.exit("ERROR: give a score, or --results with --app")
-    res = rank(curve, score, record)
+    try:
+        res = rank(curve, score, record)
+    except ValueError as e:
+        sys.exit(f"ERROR: {e}")
     if args.json:
         json.dump(res, sys.stdout, indent=2)
         print()

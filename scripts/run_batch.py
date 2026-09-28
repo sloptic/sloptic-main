@@ -265,7 +265,8 @@ def _tldr_line(done, total, label, rec, secs, eta, tail, url=""):
     miss = ("missed: " + ", ".join(dict.fromkeys(m.get("kind", "?") for m in missed))) if missed else ""
     if rec.get("bot_challenge"):   # WAF tripped: show WHERE (onset probe) + whether the grade was kept or withheld
         onset = rec.get("challenge_onset") or "end"
-        kept = "kept" if rec.get("challenge_stage") == "late" else "withheld"
+        _st = rec.get("challenge_stage")
+        kept = "kept" if _st == "late" else "partial" if _st == "limited" else "withheld"
         miss = f"⚠ challenge@{onset} ({kept})"
     return f"{prog} {label:<30} {score:<20} {miss:<34} ·{secs:4.0f}s {eta_s}{tag}"
 
@@ -301,6 +302,8 @@ def _build_cmd(j, args, ckpt):
         cmd += ["--login", args.login]
     for pat in (getattr(args, "probe", None) or ()):   # subset the catalog per target (recall runs)
         cmd += ["--probe", pat]
+    if getattr(args, "passive_only", False):            # passive-floor corpus: the anonymous web-tier battery
+        cmd += ["--passive-only"]
     if args.llm_reasoning:
         cmd += ["--llm-reasoning"]
     for h in (args.headers or []):
@@ -445,6 +448,8 @@ def main():
                          "scraped hackathon does ~zero network (default: $HL_CACHE_DIR/devpost-ingest.jsonl).")
     ap.add_argument("--no-ingest-cache", action="store_true", dest="no_ingest_cache",
                     help="forward to devpost_repos: disable the ingest cache (fetch every page/project fresh).")
+    ap.add_argument("--passive-only", action="store_true", dest="passive_only",
+                    help="grade every target with ONLY the passive battery (for the passive-floor corpus)")
     ap.add_argument("--results", required=True, metavar="FILE", help="JSONL to append results to")
     ap.add_argument("--no-browser", dest="browser", action="store_false",
                     help="skip the browser-rendered surface (faster; default is browser ON for grading — "

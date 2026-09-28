@@ -41,7 +41,7 @@ from pathlib import Path
 _HERE = Path(__file__).resolve().parent
 _ROOT = _HERE.parent
 sys.path.insert(0, str(_ROOT))
-from sloptic.aggregate import compute_axis_slop, compute_slop_score  # noqa: E402
+from sloptic.aggregate import compute_axis_slop, compute_slop_score, contributions  # noqa: E402
 from sloptic.catalog import load_catalog  # noqa: E402
 from sloptic.schema import Outcome  # noqa: E402
 
@@ -137,6 +137,10 @@ def merge(main_rec, retry_rec, bundle_of):
         outs = [_to_outcome(f) for f in findings]
         merged["slop_score"] = compute_slop_score(outs)
         merged["axis_slop"] = compute_axis_slop(outs)
+        # each finding's stored contribution was computed against ITS OWN record's fired set, so a merge
+        # invalidates every one of them (the dampers see a different neighbourhood now). Recompute on the
+        # merged set, or the column silently stops summing to the merged score.
+        merged["findings"] = [{**f, "contribution": c} for f, c in zip(findings, contributions(outs))]
     merged["blocked_probes"] = sorted(still_blocked)
     merged["incomplete_axes"] = sorted({bundle_of[p] for p in still_blocked if p in bundle_of})
     merged["retry"] = {

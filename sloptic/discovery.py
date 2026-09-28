@@ -83,6 +83,21 @@ _AUTHED_ROUTES = ["/dashboard", "/home", "/app", "/account", "/profile",
 _VENDOR_FIELD = re.compile(r"turnstile|recaptcha|h-?captcha|__requestverification|g-recaptcha", re.I)
 
 
+# A rendered entry below this many VISIBLE chars is a title-only / unhydrated shell: the SPA never populated a
+# body (broken build, failed hydration, or nothing deployed). idea-forge-web renders just its <title> "Idea
+# Forge" (10 chars); a real one-page app renders real copy (envi-seven, 514). Tight so a genuine minimal splash,
+# whose title plus any button/link label already clears this, is spared.
+_EMPTY_RENDER_MAX_CHARS = 24
+
+
+def _render_visible_text(html: str) -> str:
+    """A rendered DOM -> visible text, <script>/<style> stripped (neither paints as page text, and their bodies
+    would false-match as content). Judges a title-only entry; mirrors deploy_and_grade._visible_text without
+    importing from scripts/ into the package."""
+    t = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", " ", html, flags=re.S | re.I)
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", t)).strip()
+
+
 def _auth_triggers(markup: str) -> tuple[bool, bool]:
     """Scan a page's BUTTON/LINK labels (not arbitrary text -> low FP) for a login/signup trigger. Returns
     (has_login_trigger, has_signup_trigger). Catches the button/link/CTA logins a password-form check misses."""
@@ -1198,6 +1213,16 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
         # those requests.
         endpoints = [e for e in endpoints
                      if _in_base_scope((e.path or "/").split("?")[0], scope_url)]
+        # An endpoint whose CONCRETE path still carries an unresolved {placeholder} is a route TEMPLATE, not a
+        # reachable endpoint. openapi.ingest concretizes its own path params ({id}->1, keeping the braced form
+        # only in raw_path for injection), so a brace surviving in `path` is a raw SDK route string mined from a
+        # JS bundle. base44's /api/apps/{app_id}/entities/{entity_name} scaffold is the dominant case: identical
+        # across every base44 app (it is the PLATFORM's generic entity API, not the team's), unreachable without
+        # the app's real UUID, so requested literally it 404s -- and a 404 counts as reached surface (baseline
+        # < 500), inflating surface_size to ~450 on 4 base44 apps (and 10 others) with phantom endpoints that no
+        # probe can test. Drop them: a concrete endpoint never carries a literal brace, and requesting the
+        # template tests nothing. (raw_path keeps its braces untouched -- that is where injection reads them.)
+        endpoints = [e for e in endpoints if "{" not in (e.path or "")]
         # Baseline each endpoint with a well-formed (read-only GET) request: an env-var-gated endpoint
         # (dummy Supabase/API key) 500s on EVERYTHING, so a baseline 5xx marks it reached-but-DEAD. This
         # separates "healthy-observed" surface (parity's real denominator) from merely "reached", and lets
@@ -1213,6 +1238,7 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
 
     browser_ok = False
     render_state = None        # Streamlit render outcome (rendered|error|stuck) -> the capture-based shell_only signal
+    entry_render_chars = None  # visible-text size of the ENTRY render, for the title-only shell check at the end
     backend_tables: list = []  # managed-backend tables the app's own runtime traffic read (RLS probe input)
     host_tiers: dict = {}     # off-score: where the app's runtime traffic goes (same-origin / BaaS / vendor /
     if render is not None:    # other off-origin) — populated from the observed net once the browser render runs
@@ -1247,6 +1273,12 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
             # is_shell_only EXCLUDES from the curve regardless. Return NOW with just the state so the pipeline
             # short-circuits. A 'rendered' shell falls through and is crawled + graded normally.
             return Profile(base_url=base_url, landing_path=start_path, render_state=render_state)
+        if render_state is None and rendered:
+            # Capture the ENTRY render's visible-text size for the title-only shell check, which is evaluated
+            # at the END of discovery (not here) so a thin SPA whose real forms/inputs live on sub-routes is
+            # judged on its FULL harvested surface, never short-circuited before phase 2 renders those routes.
+            entry_dom = rendered.get(start_path) or next(iter(rendered.values()), "")
+            entry_render_chars = len(_render_visible_text(entry_dom)) if entry_dom else None
         if rendered:
             browser_ok = True  # a real render returned HTML -> the browser actually launched/works
             any_response = True
@@ -1486,6 +1518,28 @@ def discover(base_url: str, render=None, max_pages: int = MAX_PAGES, max_depth: 
                     landing_path = start_path
         except (httpx.HTTPError, httpx.InvalidURL):
             pass
+    # TITLE-ONLY / UNHYDRATED SHELL (the 404-shell gate's render layer): after the FULL crawl + render, a
+    # non-canvas host (render_state None) whose entry rendered under _EMPTY_RENDER_MAX_CHARS visible chars AND
+    # that harvested NO surface at all -- no forms, no endpoints, no route beyond the entry -- is a parked or
+    # broken SPA. idea-forge-web renders only its <title> "Idea Forge" (10 chars) with 0 forms / 0 endpoints;
+    # a real one-page app renders real copy (envi-seven, 514) or exposes a control. render_state 'empty' ->
+    # is_shell_only EXCLUDES it from the reference distribution, a probabilistic shell CLASSIFICATION, never a
+    # dead-url DNF (a slow-hydrating real SPA can render short too). Judged HERE on the full surface so a thin
+    # entry whose forms live on sub-routes is spared. Complements deploy_and_grade._dead_url_reason, whose
+    # ghost check needs entry==ghost to render the SAME dead shell -- idea-forge-web's ghost is a real host
+    # 404, so only this catches it.
+    # Re-drop unresolved {placeholder} templates at the FINAL chokepoint. The crawl-phase filter above runs
+    # before the render / mining / perceive phases re-add endpoints (obs_eps, mined, conv, searches, perceived),
+    # and a SPA that loads its SDK at runtime -- base44's /api/apps/{app_id}/... scaffold -- re-introduces the
+    # braced templates there, so the earlier filter alone left them on the surface. A concrete endpoint never
+    # carries a literal brace and requesting the template tests nothing; off-score (surface_size is not in the
+    # curve), but it keeps the reported surface honest and lets the empty-shell check below see a true count.
+    endpoints = [e for e in endpoints if "{" not in (e.path or "")]
+    if (render_state is None and entry_render_chars is not None
+            and entry_render_chars < _EMPTY_RENDER_MAX_CHARS
+            and not forms and not endpoints
+            and not [r for r in routes if r not in (start_path, "/")]):
+        render_state = "empty"
     return Profile(base_url=base_url, landing_path=landing_path, routes=list(routes), forms=forms,
                    capabilities=capabilities, endpoints=endpoints, host_tiers=host_tiers,
                    backend_tables=backend_tables, render_state=render_state)
@@ -1548,8 +1602,25 @@ def surface_metrics(profile: Profile) -> dict:
     return {
         "routes": len(app_routes),
         "routes_all": len(profile.routes),           # incl. vendor assets, for reference
-        "routes_list": app_routes[:12],              # the actual APP route PATHS (vendor-stripped, capped) —
+        "routes_list": app_routes[:40],              # the actual APP route PATHS (vendor-stripped, capped) —
                                                      # lets the coverage auditor render sub-routes, not just "/"
+                                                     # ORDER IS UNCHANGED. scripts/deploy_and_grade reads this to
+                                                     # pick sub-routes to interact with and takes the first four,
+                                                     # so raising the cap appends and cannot alter what it probes.
+        # WHAT was found, beside how many. Purely additive: `forms` and `endpoints` above keep their
+        # counts, nothing here feeds surface_size, applicability or ranking, and no existing consumer
+        # reads these keys. A report can say which forms and endpoints a grade actually saw instead of
+        # a bare number the reader cannot check.
+        "forms_list": [
+            f"{(f.method or 'get').upper()} {f.action or '(same page)'}"
+            + (f" ({', '.join(f.fields[:6])})" if f.fields else "")
+            for f in forms
+        ][:40],
+        "endpoints_list": [
+            f"{(e.method or 'get').upper()} {e.raw_path or e.path}"
+            + (f" [{e.baseline_status}]" if e.baseline_status else "")
+            for e in eps
+        ][:40],
         # WHICH PAGE THE HOMEPAGE PROBES ACTUALLY GRADED. Every `target: /` probe — a11y, seo, headers, perf,
         # dev-build — routes through _home_path, which resolves to THIS, not to the origin root. On a sub-path
         # deployment they grade /Project rather than the host's not-found shell, so a row without it cannot say
@@ -1557,6 +1628,8 @@ def surface_metrics(profile: Profile) -> dict:
         # this codebase; recording the resolved value makes a regression visible in the data instead of only in
         # a re-read of the code.
         "landing_path": profile.landing_path,
+        "graded_origin": profile.base_url,   # the origin ACTUALLY graded after redirect settling
+        #     (a same-host http->https upgrade is adopted), so a record says which scheme answered
         "forms": len(forms),
         "inputs": inputs,
         "endpoints": len(healthy_eps),               # healthy = responds to a baseline without a 5xx

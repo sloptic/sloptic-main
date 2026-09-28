@@ -89,3 +89,74 @@ def test_html_is_self_contained(monkeypatch):
     h = rc.to_html(card)
     assert '<div class="rc">' in h and "Expected" in h
     assert "<html" not in h.lower() and "http-equiv" not in h.lower()       # body only, no external refs
+
+
+def test_actual_line_surfaces_list_and_dict_evidence_and_hides_noise():
+    """The 'what we saw' line names the SPECIFIC failing detail: an a11y finding must list its failed rules
+    and impact counts (previously dropped because they are list/dict), and must NOT leak internal scoring
+    noise (penalty_override), the off-score advisory set, the repro request, or the tool-version stamp."""
+    a11y = {"probe_id": "qa-a11y-001", "target": "/", "targets": ["/"], "penalty": 20, "reason": "a11y",
+            "bundle": "accessibility", "category": "accessibility",
+            "evidence": {"violations": 3, "rules": ["color-contrast", "button-name", "image-alt"],
+                         "impacts": {"critical": 2, "serious": 1}, "contrast_shortfall": 0.42,
+                         "engine": "axe-core", "penalty_override": 20.0,
+                         "advisory_a11y": {"rules": ["region"], "impacts": {"moderate": 1}},
+                         "repro": {"method": "GET", "url": "https://x"}, "versions": {"lighthouse": "13.4.1"}}}
+    line = rc._actual(a11y)
+    # the failing rules are named in PLAIN LANGUAGE, not as raw axe ids
+    assert "text is too low-contrast to read" in line and "a button has no readable label" in line
+    assert "color-contrast" not in line and "button-name" not in line   # the raw slugs are gone
+    assert "critical=2" in line and "serious=1" in line                 # impact counts surfaced
+    assert "contrast_shortfall = 0.42" in line
+    for noise in ("penalty_override", "advisory_a11y", "region", "lighthouse", "GET"):
+        assert noise not in line, f"{noise!r} is internal/off-score noise and must not render"
+
+
+def test_a11y_rule_ids_translate_to_plain_language_with_a_graceful_fallback():
+    seen = rc._actual({"probe_id": "qa-a11y-001", "evidence": {"violations": 2,
+                        "rules": ["image-alt", "label"], "impacts": {"critical": 2}}})
+    assert "an image is missing alt text" in seen and "a form field has no label" in seen
+    assert "violations" not in seen                          # the bare count is dropped, the named rules replace it
+    # an unmapped (future) axe rule degrades to its de-hyphenated id, never a raw slug or a crash
+    assert "some new rule" in rc._actual({"probe_id": "qa-a11y-001", "evidence": {"rules": ["some-new-rule"]}})
+
+
+def test_actual_line_truncates_long_lists():
+    f = {"probe_id": "p", "evidence": {"rules": [f"r{i}" for i in range(12)]}}
+    line = rc._actual(f)
+    assert "+4 more" in line                                            # 8 shown + "+4 more"
+
+
+def test_actual_falls_back_to_reason_when_evidence_is_only_request_metadata():
+    # a missing-header finding used to read "status = 200; elapsed_ms = 18" -- request metadata that says
+    # nothing about the absent header. With metadata skipped, the line falls back to the finding's reason.
+    f = {"probe_id": "sec-headers-002", "reason": "missing header: content-security-policy", "penalty": 8,
+         "evidence": {"status": 200, "elapsed_ms": 18}}
+    assert rc._actual(f).startswith("missing header: content-security-policy")
+    assert "status" not in rc._actual(f) and "elapsed_ms" not in rc._actual(f)
+
+
+def test_actual_drops_bare_boolean_flags():
+    # a flag like no_tls=True / render_broken=False only restates the finding in machine terms; the origin
+    # (the finding-specific value) stays.
+    f = {"probe_id": "sec-tls-001", "reason": "served over plain http", "penalty": 30,
+         "evidence": {"no_tls": True, "upgrades_to_https": False, "origin": "http://x.example"}}
+    line = rc._actual(f)
+    assert "origin = http://x.example" in line
+    assert "no_tls" not in line and "upgrades_to_https" not in line
+
+
+def test_a11y_line_shows_where_each_violation_occurred():
+    # the point of the card: the exact element, not just that a violation exists. axe gives a CSS selector
+    # per failing node; the line names the rule AND where it fired.
+    from sloptic.browser import _node_loc
+    assert _node_loc({"target": ["button.cta"]}) == "button.cta"
+    assert _node_loc({"target": [["#frame", "input#email"]]}) == "#frame input#email"   # iframe-nested
+    ev = {"rules": ["color-contrast", "label"], "impacts": {"serious": 1, "critical": 1},
+          "locations": {"color-contrast": [".hero h1", "button.cta"], "label": ["#email"]}}
+    line = rc._actual({"probe_id": "qa-a11y-001", "target": "/", "evidence": ev})
+    assert "text is too low-contrast to read (at .hero h1, button.cta)" in line
+    assert "a form field has no label (at #email)" in line
+    assert "locations" not in line                       # the raw dict is consumed inline, not dumped
+    # a record without locations (pre-capture) still renders the rule cleanly, no crash
+    assert "a form field has no label" in rc._actual({"probe_id": "qa-a11y-001", "evidence": {"rules": ["label"]}})

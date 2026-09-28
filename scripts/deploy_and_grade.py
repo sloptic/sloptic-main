@@ -45,9 +45,10 @@ sys.path.insert(0, str(_ROOT))
 from sloptic import browser  # noqa: E402
 from sloptic.jsonl import append_jsonl  # noqa: E402
 from sloptic.scope import off_target  # noqa: E402
-from sloptic.aggregate import CATEGORY_DECAY, _damped_total  # noqa: E402
+from sloptic.aggregate import CATEGORY_DECAY, _damped_total, contributions  # noqa: E402
 from sloptic.catalog import load_catalog, select_probes  # noqa: E402
 from sloptic import provenance  # noqa: E402
+from sloptic.ruler import ruler  # noqa: E402
 from sloptic.deploy import RemoteDeployer  # noqa: E402
 from sloptic.pipeline import run  # noqa: E402
 from sloptic.schema import profile_from_dict, profile_to_dict  # noqa: E402
@@ -314,7 +315,12 @@ _VERDICT_RANK = {"not_applicable": 0, "clean": 1}   # a probe that JUDGED (clean
 # evidence keys worth keeping on an unfired verdict: bulky repro/response bodies live on FIRES, so a clean/n-a
 # entry keeps only its light audit signal (status, what it measured, WHY it was n/a). Bounds the size blow-up.
 _VERDICT_EV_KEYS = ("na_reason", "status", "records", "sources", "app_sources", "sensitive_columns",
-                    "checked", "tried", "collection", "endpoint", "fails")
+                    "checked", "tried", "collection", "endpoint", "fails",
+                    # advisory_a11y (WCAG 2.2 / best-practice, OFF-SCORE) rides on the CLEAN a11y outcome too, so
+                    # the corpus can measure whether an advisory rule fires on apps the SCORED set misses -- the
+                    # decorrelation the promotion decision needs. Without it here the clean-outcome advisory was
+                    # computed and thrown away, and advisory only ever appeared on already-firing apps.
+                    "advisory_a11y")
 
 
 def _verdicts(outcomes: list) -> list[dict]:
@@ -820,7 +826,17 @@ def execute(plan: dict, repo: pathlib.Path, verbose: bool = False, build_timeout
 class GradeTimeout(Exception):
     """The grading phase blew its wall-clock budget. A pathological target — e.g. every HTML response
     hangs the socket — makes each fan-out probe pay a full read timeout per route, so grading can grind
-    for tens of minutes. This bounds it so one broken app can't stall a batch."""
+    for tens of minutes. This bounds it so one broken app can't stall a batch.
+
+    Carries WHERE it died. The grade runs in a child that gets SIGKILLed on expiry, so anything the child
+    knew dies with it and a DNF used to say only "900s elapsed". That left the corpus unable to answer the
+    one question that sizes the fix: is the tail discovery hanging, Lighthouse, or a probe fanning out? The
+    child now streams phase and probe markers up the queue it already owns, so the parent knows the last
+    one reached when it pulls the trigger."""
+
+    def __init__(self, msg, phase=None, probe=None, done=None, total=None):
+        super().__init__(msg)
+        self.phase, self.probe, self.done, self.total = phase, probe, done, total
 
 
 def _grade_heartbeat(done, total, probe, outcomes):
@@ -876,7 +892,7 @@ def _grade_phase_line(name, label, important):
 def _grade_worker(url, use_browser, features, q, cached_profile=None, cache_key=None, repo_url=None,
                   proactive=False, model=DEFAULT_MODEL, browser_auth=False, session_headers=None,
                   llm_reasoning=False, recon=False, controlled_deploy=False, trace=False, login_creds=None,
-                  probe_filter=None, email_cfg=None):
+                  probe_filter=None, email_cfg=None, passive_only=False):
     os.setsid()   # own process group so the parent can SIGKILL this child AND its headless chrome together
     try:
         render = browser.render_routes if use_browser else None
@@ -903,9 +919,21 @@ def _grade_worker(url, use_browser, features, q, cached_profile=None, cache_key=
         if cached_profile is None:   # a cache HIT reuses the frozen surface -> no discovery, no delay to explain
             _kinds = "crawl" + (" + browser-render" if use_browser else "") + (" + LLM perception" if proactive else "")
             print(f"  discovering surface ({_kinds}) — this runs before the first probe ...", flush=True)
-        report = run(RemoteDeployer(url, health_timeout=20),
-                     select_probes(load_catalog(str(_ROOT / "catalog")), probe_filter),
-                     render=render, on_progress=_grade_heartbeat, on_phase=_grade_phase_line,
+        catalog = select_probes(load_catalog(str(_ROOT / "catalog")), probe_filter)
+        if passive_only:                       # anonymous web-tier battery: drop every active probe before the run
+            from sloptic import safety
+            catalog = safety.passive_catalog(catalog)
+        def _phase_sink(name, label, important):
+            q.put(("phase", name))            # the parent's breadcrumb; survives the SIGKILL the child won't
+            _grade_phase_line(name, label, important)
+
+        def _progress_sink(done, total, probe, outcomes):
+            if outcomes is None:              # the pre-run tick: this probe is the one now in flight
+                q.put(("probe", probe.id, done, total))
+            _grade_heartbeat(done, total, probe, outcomes)
+
+        report = run(RemoteDeployer(url, health_timeout=20), catalog,
+                     render=render, on_progress=_progress_sink, on_phase=_phase_sink,
                      seed_features=features, headers=session_headers,
                      cached_profile=cached_profile, on_profile=on_profile, perceive=perceive,
                      browser_register=browser_register, recon=recon,
@@ -937,7 +965,7 @@ def _hard_kill_group(p) -> None:
 def grade(url: str, use_browser: bool, timeout=None, features=None,
           cached_profile=None, cache_key=None, repo_url=None, proactive=False, model=DEFAULT_MODEL,
           browser_auth=False, session_headers=None, llm_reasoning=False, recon=False, controlled_deploy=False,
-          trace=False, login_creds=None, probe_filter=None, email_cfg=None):
+          trace=False, login_creds=None, probe_filter=None, email_cfg=None, passive_only=False):
     """Grade the running app in a CHILD PROCESS. A subprocess (not an in-process SIGALRM) because a signal
     can't interrupt a Playwright CPU-spin (the browser probes), but an EXTERNAL SIGKILL of the child + its
     chrome always works. `timeout` is the grading phase's OWN wall-clock budget (independent of deploy time,
@@ -949,12 +977,25 @@ def grade(url: str, use_browser: bool, timeout=None, features=None,
     p = ctx.Process(target=_grade_worker,
                     args=(url, use_browser, features, q, cached_profile, cache_key, repo_url, proactive, model,
                           browser_auth, session_headers, llm_reasoning, recon, controlled_deploy, trace,
-                          login_creds, probe_filter, email_cfg))
+                          login_creds, probe_filter, email_cfg, passive_only))
     p.start()
+    phase = probe_id = None
+    done = total = None
+    deadline = None if timeout is None else time.monotonic() + timeout
     try:
-        result = q.get(timeout=timeout)              # timeout=None (direct run) blocks until the child reports
-    except queue.Empty:                              # a SET timeout (batch) elapsed -> None -> hard-kill below
-        result = None
+        while True:                                  # drain breadcrumbs until the RESULT arrives or time runs out
+            try:
+                msg = q.get(timeout=None if deadline is None else max(0.0, deadline - time.monotonic()))
+            except queue.Empty:                      # a SET timeout (batch) elapsed -> hard-kill below
+                result = None
+                break
+            if msg[0] == "phase":
+                phase = msg[1]
+            elif msg[0] == "probe":
+                _, probe_id, done, total = msg
+            else:                                    # ("ok", report) / ("err", text): the grade settled
+                result = msg
+                break
     except KeyboardInterrupt:                         # Ctrl-C on an uncapped run -> take the child + its chrome down
         _hard_kill_group(p)
         raise
@@ -963,7 +1004,11 @@ def grade(url: str, use_browser: bool, timeout=None, features=None,
         sys.stderr.flush()
     if result is None:                               # timed out (or the child vanished) -> hard-kill the group
         _hard_kill_group(p)
-        raise GradeTimeout(f"grading exceeded {timeout}s")
+        where = f" in phase {phase}" if phase else ""
+        if probe_id:
+            where += f" at probe {probe_id}" + (f" ({done}/{total})" if total else "")
+        raise GradeTimeout(f"grading exceeded {timeout}s{where}", phase=phase, probe=probe_id,
+                           done=done, total=total)
     p.join(5)
     kind, payload = result
     if kind == "err":
@@ -1017,6 +1062,22 @@ _PLACEHOLDER = re.compile(
     r"we'?ll be back (soon|shortly)|temporarily (unavailable|down)|service (temporarily )?unavailable|"
     r"site is (down|offline)|parked (domain|free)|future home of|default (web )?page|"
     r"welcome to nginx|apache2? (ubuntu )?default page|\bit works!", re.I)
+# PLATFORM 404 pages served at HTTP 200: the edge answers 200 with its own error page when the deployment
+# does not exist (Netlify "503 - No Server Found" for a deleted deploy, GitHub Pages "There isn't a GitHub
+# Pages site here" on preview/custom-domain setups). The liveness gate sees 200 and grades the PLATFORM's
+# error page: five v24 apps clustered at exactly 12.5 (the header tax on the shell) this way.
+_PLATFORM_404 = re.compile(
+    r"there isn'?t a github pages site here|site not found\b|\bno server found\b|"
+    r"deployment (?:could|can)not be found|deployment_not_found|this deployment does not exist|"
+    r"\b503\b[^\n]{0,30}no server", re.I)
+# A deployment shipping the framework's UNTOUCHED starter page: the entire visible content is the template
+# default (leherg's whole page read "Vite + React + TS" and nothing else). Exact-match only, so it cannot
+# touch a real app that merely mentions a framework name — the page must be NOTHING BUT the default.
+_STARTER_DEFAULTS = frozenset({
+    "vite + react + ts", "vite + react - ts", "vite + vue + ts", "vite + svelte + ts",
+    "vite + solid + ts", "vite + preact + ts", "vite + lit + ts", "vite + vanilla + ts",
+    "create react app", "next.js app", "welcome to your angular app",
+})
 # A broken build/route serving the JS/CSS BUNDLE as the page body — the browser paints raw source as visible
 # text (the dominant Bolt/Netlify break: ~28 of bolt3's 42 DNFs). HTTP 200, so a status check misses it, and
 # it often carries no 'not found' words. These markers are dense in source and ~absent in real UI copy.
@@ -1060,6 +1121,14 @@ def _dead_shell_reason(html: str):
     server-default splash, or a raw source dump. The text patterns check only the PROMINENT top of the visible
     text (low FP — a real app that merely mentions 'coming soon' for a future feature isn't flagged)."""
     vis = _visible_text(html)[:1500]
+    if _PLATFORM_404.search(vis):
+        return "platform 404 served at HTTP 200 (the deployment does not exist)"
+    low = vis.strip().lower()
+    if len(low) <= 200 and any(low.startswith(d) for d in _STARTER_DEFAULTS):
+        return "unmodified starter template (the framework default page, nothing shipped)"
+        # prefix-match, bounded: <title> text survives _visible_text, so the untouched starter reads
+        # "vite + react + ts vite + react + ts". A real app's page carries copy after the title, blowing
+        # the 200-char bound, so only the template default itself matches.
     if _CLIENT_404.search(vis):
         return "client-side 404 (renders 'not found' at HTTP 200)"
     if _PLACEHOLDER.search(vis):
@@ -1305,6 +1374,8 @@ def main():
     ap.add_argument("--build-timeout", type=int, default=480, dest="build_timeout",
                     help="kill a docker build after N seconds (default 480). Lower = better batch "
                          "throughput but risks false-killing a genuinely heavy build; 300 is aggressive")
+    ap.add_argument("--passive-only", action="store_true", dest="passive_only",
+                    help="run ONLY passive probes (the anonymous web-tier battery); no active testing")
     ap.add_argument("--grade-timeout", type=int, default=600, dest="grade_timeout",
                     help="wall-clock cap (seconds) on the grading phase, externally enforced by killing the "
                          "grade subprocess + its process group (even a Playwright CPU-spin OR a wedged Lighthouse "
@@ -1377,6 +1448,8 @@ def main():
         "concurrency": os.environ.get("HL_CONCURRENCY"),   # set by run_batch; None for a standalone grade
     })
     result = {"contract_version": provenance.CONTRACT_VERSION,   # absent on older rows, and absence means 1
+              "ruler": ruler(),   # the frozen reference this grade is interpreted against (sloptic.ruler): a
+              #                      stored card never reads as current after the ruler moves at a release
               "repo": args.repo, "deployed": False, "attempts_used": 0, "browser": args.browser,
               **({"probe_filter": probe_filter} if probe_filter else {}),
               "source": "url" if args.url_ingest else "repo", "model": args.model, "ts": time.time(),
@@ -1509,11 +1582,18 @@ def main():
                            session_headers=_parse_headers(args.headers), llm_reasoning=args.llm_reasoning,
                            recon=args.recon, controlled_deploy=args.controlled_deploy, trace=args.trace,
                            login_creds=_parse_login(args.login), probe_filter=args.probe,
-                           email_cfg=(args.email_domain, args.email_endpoint, args.email_token))
+                           email_cfg=(args.email_domain, args.email_endpoint, args.email_token),
+                           passive_only=args.passive_only)
         except GradeTimeout as e:
             timings["grade_s"] = round(time.monotonic() - _t, 1)
             result["grade_timeout"] = True         # deployed but ungradeable in budget (broken/pathological
             result["timeout"] = "grade"            # target); the 'took forever' signal + shows in stats
+            # WHERE it died, so the corpus can attribute its DNF tail instead of guessing. `discover` without
+            # a following `discovered` is a discovery hang; `probes` names the probe that was in flight.
+            result["timeout_phase"] = e.phase
+            if e.probe:
+                result["timeout_probe"] = e.probe
+                result["timeout_progress"] = [e.done, e.total]
             result["deploy_error"] = f"GRADE TIMEOUT (>{args.grade_timeout}s)"
             print(f"\n  GRADE TIMEOUT — {e}. Target too pathological to grade in budget; "
                   f"recorded, moving on.")
@@ -1537,18 +1617,21 @@ def main():
         # 61 identical x-content-type-options rows). The score damper already handles the penalty; the
         # findings list shouldn't carry 60 duplicates. Keep `count` + up to 5 sample targets. stats.py
         # expands by `count` when it rebuilds the damped subtotals, so the score math is unaffected.
+        # `contribution` is what the row actually ADDED to the score after the dampers, summed over the
+        # rows it collapses, so the column sums to slop_score across the whole (collapsed) list.
         findings, _seen = [], {}
-        for o in slop:
+        for o, share in zip(slop, contributions(report.outcomes)):
             key = (o.probe_id, o.reason)
             f = _seen.get(key)
             if f is not None:
                 f["count"] += 1
+                f["contribution"] = round(f["contribution"] + share, 6)
                 if o.target and o.target not in f["targets"] and len(f["targets"]) < 5:
                     f["targets"].append(o.target)
                 continue
             f = {"probe_id": o.probe_id, "bundle": o.bundle, "category": o.category, "penalty": o.penalty,
                  "group": o.variant_group_id, "reason": o.reason, "target": o.target, "count": 1,
-                 "targets": [o.target] if o.target else [], "evidence": o.evidence}
+                 "contribution": share, "targets": [o.target] if o.target else [], "evidence": o.evidence}
             _seen[key] = f
             findings.append(f)
         result.update(slop_score=report.slop_score, axis_slop=report.axis_slop,

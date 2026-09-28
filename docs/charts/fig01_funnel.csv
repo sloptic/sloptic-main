@@ -1,0 +1,7 @@
+stage,apps,pct_of_attempted
+Attempted (live URL on Devpost),2685,100.0
+"Graded, curve eligible",1579,58.8
+"Dead URL (link rot, 4xx, 5xx)",800,29.8
+"Not an app, or other",155,5.8
+Timed out or aborted,117,4.4
+Bot challenge at entry,34,1.3

@@ -74,3 +74,39 @@ def test_measure_survives_partial_failures():
             raise lh.PSIError("boom")
         return v
     assert lh.measure("http://x", runs=3, runner=flaky)["runs"] == 2   # medianed over the 2 survivors
+
+
+# ── host speed: recorded because nothing in Lighthouse corrects for it ──────────────────────────────────
+def _rep_bi(bi, perf=0.8):
+    r = {"audits": {}, "categories": {"performance": {"score": perf}}}
+    if bi is not None:
+        r["environment"] = {"benchmarkIndex": bi}
+    return r
+
+
+def test_benchmark_index_is_read_from_the_report_environment():
+    assert lh.benchmark_index(_rep_bi(1342.5)) == 1342.5
+    assert lh.benchmark_index({"lighthouseResult": _rep_bi(900)}) == 900     # PSI-wrapped shape too
+
+
+def test_benchmark_index_absent_or_junk_is_none_not_a_crash():
+    assert lh.benchmark_index(_rep_bi(None)) is None                        # no environment block at all
+    assert lh.benchmark_index({"environment": {}}) is None
+    assert lh.benchmark_index({"environment": {"benchmarkIndex": "fast"}}) is None
+
+
+def test_measure_medians_the_host_speed_and_records_its_spread():
+    """The median is the host's speed for this grade. The spread across the three runs is a contention
+    signal in its own right: a quiet box repeats its benchmark closely, a loaded one does not."""
+    reports = iter([_rep_bi(1200.0), _rep_bi(1000.0), _rep_bi(1100.0)])
+    c = lh.measure("http://x", runs=3, runner=lambda u, **k: next(reports))
+    env = lh._lhr(c)["environment"]
+    assert env["benchmarkIndex"] == 1100.0
+    assert env["benchmarkIndexSpread"] == 200.0
+
+
+def test_a_report_without_a_host_index_leaves_no_environment_key():
+    """Absence stays absence. A record carrying benchmark_index: null would read as 'measured and unknown'."""
+    c = lh.measure("http://x", runs=2, runner=lambda u, **k: _rep_bi(None))
+    assert "benchmarkIndex" not in (lh._lhr(c).get("environment") or {})
+    assert lh.benchmark_index(c) is None

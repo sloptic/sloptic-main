@@ -48,3 +48,26 @@ def test_grade_timeout_interrupts_a_hanging_target():
         assert 2.0 < elapsed < 20.0, elapsed
     finally:
         srv.shutdown()
+
+
+def test_a_timeout_names_the_phase_it_died_in():
+    """The child is SIGKILLed on expiry, so whatever it knew dies with it and a DNF used to say only that
+    900s elapsed. That left the corpus unable to attribute its DNF tail: discovery hanging and a probe
+    fanning out look identical from outside. The child now streams phase and probe markers up the queue it
+    already owns, so the parent still holds the last one when it pulls the trigger."""
+    srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), _Hang)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        try:
+            grade(f"http://127.0.0.1:{srv.server_address[1]}", use_browser=False, timeout=3)
+            raise AssertionError("grade() should have raised GradeTimeout on a hanging target")
+        except GradeTimeout as e:
+            # it got far enough to report at least one phase before the hang ate the budget
+            assert e.phase in ("discover", "discovered", "lighthouse", "lighthouse_done", "probes"), e.phase
+            assert e.phase in str(e)                      # and the message a human reads says so too
+            if e.probe:                                   # if it died mid-battery, the probe is named
+                assert e.total and 0 <= e.done <= e.total
+                assert e.probe in str(e)
+    finally:
+        srv.shutdown()

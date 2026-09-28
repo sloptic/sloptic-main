@@ -13,11 +13,12 @@ import pathlib
 import subprocess
 import sys
 import textwrap
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import asdict
 
 from . import browser, egress, runcache, safety
-from .aggregate import CATEGORY_DECAY
+from .aggregate import CATEGORY_DECAY, contributions
+from .ruler import ruler
 from .catalog import ProbeSelectionError, default_catalog_dir, load_catalog, select_probes
 from .deploy import DockerDeployer, RemoteDeployer, SubprocessDeployer
 from .ingest import SubmissionError, extract_submission
@@ -46,13 +47,18 @@ def _grade_record(report, source: str) -> dict:
     outcomes — the ranker reads their category for the absolute gate and their probe_id for coverage; the rest
     (axis_slop, coverage.applied/ran_kinds, observed_surface) drive the per-axis rank, slop_potential and the
     completeness bundle."""
-    findings = [asdict(o) for o in report.outcomes if o.outcome == "slop_detected"]
+    # `penalty` is what the fault is worth alone; `contribution` is what it actually added after the
+    # dampers, so a report can list both and have the column sum to slop_score. See aggregate.contributions.
+    fired = [o for o in report.outcomes if o.outcome == "slop_detected"]
+    findings = [{**asdict(o), "contribution": c} for o, c in zip(fired, contributions(report.outcomes))]
     rec = {"repo": source, "deployed": True, "slop_score": report.slop_score,
            "axis_slop": report.axis_slop, "coverage": report.coverage, "observed_surface": report.surface,
            "platform": report.platform, "bot_challenge": report.bot_challenge,
            "challenge_stage": report.challenge_stage, "challenge_onset": report.challenge_onset,
            "request_counts": report.request_counts, "blocked_probes": report.blocked_probes,
-           "incomplete_axes": report.incomplete_axes, "findings": findings}
+           "incomplete_axes": report.incomplete_axes, "findings": findings,
+           "ruler": ruler()}   # the frozen reference this grade is interpreted against, so a stored card never
+    #                            reads as current after the ruler moves (see sloptic.ruler)
     # v2.0 Family 2: carry the OFF-SCORE a11y advisory candidates even when a11y is CLEAN (so not in `findings`).
     # The decorrelated apps are exactly the ones clean on the scored a11y carrier but failing an advisory rule,
     # so the re-grade needs their advisory data to measure decorrelation before promoting any of it to the score.
@@ -82,11 +88,43 @@ def _coverage_text(report) -> str:
 def _axis_line(report) -> str:
     # per-axis decomposition of the total (unbounded, same units); subtotals sum to slop_score. An axis a
     # challenge cut short is flagged ⚠ — its subtotal is a floor (untested probes could only ADD slop).
-    order = ["security", "qa", "performance"]
+    order = ["security", "qa", "accessibility", "performance"]
     inc = set(report.incomplete_axes or [])
     parts = [f"{b} {report.axis_slop.get(b, 0)}{' ⚠' if b in inc else ''}"
              for b in order if b in report.axis_slop or b in inc]
     return "    " + " · ".join(parts) if parts else ""
+
+
+def _fully_na_axes(report):
+    """Axes whose probes ALL read n/a: a whole battery that silently did not run. Lighthouse unreachable,
+    for one, takes the entire performance axis, and axis_slop OMITS a clean axis rather than zeroing it, so
+    a clean axis and a never-ran axis look identical without this. Returns [(axis, n_na, reason)]."""
+    c = report.coverage or {}
+    ran, na = Counter(), Counter()
+    for v in (c.get("by_kind") or {}).values():
+        b = v.get("bundle")
+        if b:
+            ran[b] += v.get("ran", 0)
+            na[b] += v.get("na", 0)
+    # probe-id prefixes per axis, LONGEST/most-specific first: qa-a11y and qa-seo are the accessibility
+    # carve-out and must not be claimed by the qa- prefix they happen to share.
+    prefix = {"security": ("sec-",), "accessibility": ("qa-a11y", "qa-seo"),
+              "qa": ("qa-",), "performance": ("perf-",)}
+
+    def _axis_of(pid: str):
+        for axis, pres in prefix.items():
+            if pid.startswith(pres):
+                return axis
+        return None
+
+    out = []
+    for axis in ("security", "qa", "accessibility", "performance"):
+        if ran[axis] == 0 and na[axis] > 0:      # had probes, none ran -> a silently deleted axis
+            reasons = Counter(r for pid, r in (c.get("na_reasons_by_probe") or {}).items()
+                              if _axis_of(pid) == axis)
+            top = reasons.most_common(1)
+            out.append((axis, na[axis], top[0][0] if top else "unknown"))
+    return out
 
 
 def _summary_text(report, source: str) -> str:
@@ -112,6 +150,10 @@ def _summary_text(report, source: str) -> str:
     cov = _coverage_text(report)
     if cov:
         lines += ["", cov]
+    for axis, n_na, reason in _fully_na_axes(report):
+        lines += ["",
+                  f"  ⚠ {axis} did not run: all {n_na} probes n/a ({reason}).",
+                  f"    a missing axis is omitted, not zeroed, so this is NOT a clean {axis}."]
     lines += [
         "",
         f"  {len(slop)} slop · {clean} clean · {na} n/a        ({len(outs)} checks incl. fan-out)",
@@ -177,7 +219,7 @@ def _score_breakdown_text(report, decay: float = CATEGORY_DECAY) -> str:
 
     lines = ["  how the score is built"
              "   (variant group fires once at its max · then within a category each further hit ×%.1f)" % decay, ""]
-    order = {"security": 0, "qa": 1, "performance": 2}
+    order = {"security": 0, "qa": 2, "accessibility": 1, "performance": 3}
     bundles = sorted({b for b, _ in cat_pens}, key=lambda b: order.get(b, 9))
     bundle_sub = {}
     for bundle in bundles:

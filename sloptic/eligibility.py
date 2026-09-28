@@ -30,15 +30,25 @@ def is_ungradeable_challenge(rec: dict) -> bool:
     return rec.get("challenge_stage") == "entry" or (bool(rec.get("bot_challenge")) and not rec.get("challenge_stage"))
 
 
+def is_limited_battery(rec: dict) -> bool:
+    """A mid-grade challenge tripped BEFORE the keepable fraction of the battery (pipeline._MIN_VALID_FRACTION).
+    The record keeps the pre-onset outcomes -- a real PARTIAL measurement the web presents as a limited grade --
+    but too little of the battery ran to compare against the curve, so it is excluded here alongside entry
+    withholds and refused by benchmark.rank(). The blocked tail is what retry_blocked recovers; a recovery that
+    completes the battery clears the stage."""
+    return rec.get("challenge_stage") == "limited"
+
+
 def is_shell_only(rec: dict) -> bool:
     """True when the grade is a canvas-shell (Streamlit) capture rather than the real app, so it's excluded from
     the reference distribution and never certifiable. CAPTURE-BASED: once the render-await runs it records a
     `render_state`, and the app is shell-only iff we never reached it — 'error' (Streamlit crash screen) or
-    'stuck' (won't come up); 'rendered' is a REAL grade that counts. Legacy records predate render_state, so
+    'stuck' (won't come up), or 'empty' (a title-only / unhydrated entry that rendered no content and
+    captured no surface -- a non-canvas shell); 'rendered' is a REAL grade that counts. Legacy records predate render_state, so
     fall back to the platform heuristic (exclude every Streamlit app), the pre-render-fix behaviour."""
     rs = (rec.get("observed_surface") or {}).get("render_state")
     if rs is not None:
-        return rs in ("error", "stuck")
+        return rs in ("error", "stuck", "empty")
     return ((rec.get("platform") or {}).get("host_platform") or "") in SHELL_ONLY_PLATFORMS
 
 

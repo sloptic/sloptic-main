@@ -15,6 +15,7 @@ import html
 import json
 import os
 import re
+import contextvars
 import secrets
 import statistics
 import time
@@ -24,7 +25,7 @@ from dataclasses import replace
 
 import httpx
 
-from . import auth, baas, browser, depscan, email_verify, lighthouse, oob, secretscan
+from . import auth, baas, browser, depscan, egress, email_verify, lighthouse, oob, provider_validate, secretscan
 from .net import make_client, request_counts
 from .schema import Endpoint
 from .discovery import _CATCHALL_PROBE, _body_sig, _registrable_domain
@@ -599,8 +600,8 @@ def _reproduces(send, signal) -> bool:
     return bool(signal(send()))
 
 
-def _tech_boolean(c, method, reqfn) -> bool:
-    """Strict boolean-blind, gated THREE ways against the AI-corpus confounds — a content-reflective search or
+def _tech_boolean(c, method, reqfn, benign=None) -> bool:
+    """Strict boolean-blind, gated FOUR ways against the AI-corpus confounds — a content-reflective search or
     an LLM in the response path can fake a true/false split, and both did on v18 (0/2 scored boolean fires were
     real). (1) NOISE FLOOR: two DIFFERENT inert benign values; if THEY already diverge the output is content-
     driven (an LLM/TTS/proxy varies with the input) -> suppress (error-based still runs). (2) DETERMINISM: the
@@ -609,14 +610,22 @@ def _tech_boolean(c, method, reqfn) -> bool:
     not a boolean, and the old 'reproduce on a second pair' passed because ANY two LLM outputs differ. (3)
     DIRECTIONAL SPLIT: TRUE (OR 1=1, every row) must DOMINATE FALSE (OR 1=2, a subset), reproduced on a second
     pair — roadio's geocoder returned a different-sized place per string (FALSE > TRUE, the wrong direction) and
-    tripped the old symmetric divergence. This is the differential-control form of the causal-specificity
-    invariant above; the three gates together are what a content-reflective endpoint cannot fake."""
+    tripped the old symmetric divergence. (4) NEGATIVE CONTROL: FALSE must MATCH the benign baseline. `1' OR
+    '1'='2' --` is semantically inert — the OR clause is false and the comment eats the tail, so for a genuinely
+    injectable parameter it reduces to the benign query and answers with the SAME result set; a FALSE response
+    that stands on its own means the app is treating the raw string as content, not as SQL (the v24 corpus FP:
+    a flaky edge cache let a search endpoint pass gates 1-3 once, and an LLM paper-search streamed three
+    arbitrary sizes). This is the differential-control form of the causal-specificity invariant above; the four
+    gates together are what a content-reflective endpoint cannot fake."""
     if _diverges(_do(c, method, reqfn(_SQLI_NOISE_A)), _do(c, method, reqfn(_SQLI_NOISE_B))):
         return False   # (1) content-reflective endpoint -> the differential oracle is confounded
     true1 = _do(c, method, reqfn(_SQLI_TRUE))
     if _diverges(true1, _do(c, method, reqfn(_SQLI_TRUE))):
         return False   # (2) identical requests already diverge -> generative/LLM endpoint, not a SQL result set
-    if not _boolean_split(true1, _do(c, method, reqfn(_SQLI_FALSE))):
+    false1 = _do(c, method, reqfn(_SQLI_FALSE))
+    if benign is not None and _diverges(false1, benign):
+        return False   # (4) the negative control: FALSE must collapse onto the benign result set
+    if not _boolean_split(true1, false1):
         return False   # (3) TRUE must select a SUPERSET of FALSE, not merely differ in size (rejects the geocoder)
     return _boolean_split(_do(c, method, reqfn(_SQLI_TRUE)), _do(c, method, reqfn(_SQLI_FALSE)))  # reproduce the split
 
@@ -696,6 +705,11 @@ def api_sqli(ctx, probe) -> bool | None:
                 continue  # proxies a third-party API -> latency/output track the upstream, not a DB (confounded)
             if not _endpoint_is_live(ctx, c, ep.raw_path, method, base):
                 continue  # phantom endpoint (root or per-prefix catch-all shell) -> not a real SQL sink
+            ct = (base.headers.get("content-type") or "").lower()
+            if "text/event-stream" in ct or base.text.lstrip()[:6] == "data:":
+                continue  # a GENERATOR stream (an LLM answering over SSE) is content-driven by definition:
+                          # every content differential is generation variance, not a SQL oracle (the cognify
+                          # v24 FP streamed three arbitrary sizes for benign/true/false at 90 points)
             eps_tested.append(ep.raw_path)
             if budget <= 0:
                 break
@@ -709,11 +723,11 @@ def api_sqli(ctx, probe) -> bool | None:
                 tested = True
                 slots_tested += len(slots)
 
-                def _sqli_send(slot, ep=ep, method=method):
+                def _sqli_send(slot, ep=ep, method=method, benign=base):
                     reqfn = lambda v: _sqli_request(ep, slot, v)
                     try:
                         err, err_pay = _tech_error(c, method, reqfn)
-                        if err or _tech_boolean(c, method, reqfn):
+                        if err or _tech_boolean(c, method, reqfn, benign=benign):
                             return slot, {"via": "error" if err else "boolean", "err": err,
                                           "pay": err_pay if err else _SQLI_TRUE, "reqfn": reqfn,
                                           "method": method, "path": ep.raw_path}
@@ -1469,6 +1483,14 @@ def _fan_out_first(send, specs, oracle, pool=_INJECT_POOL, cap_check=None):
     each other's measured response time into false positives; those probes keep their sequential path."""
     it = iter(specs)
     hit = None
+    # A pool thread starts with an empty Context, so everything the grade keeps in ContextVars — the egress
+    # origin scope, the request tally the per-probe cap reads, the challenge-onset recorder, the trace probe
+    # id — silently reads its default inside the worker (the v24 blind spot: the injection fan out was
+    # uncapped AND its WAF challenges went unrecorded). Submitting through a COPY of the submitting thread's
+    # context hands the worker the live values; shared-object holders (the tally dict, the onset recorder)
+    # make the worker's writes visible back on the main thread. scope_bound stays as the explicit scope
+    # guarantee beside it.
+    send = egress.scope_bound(send)
     with ThreadPoolExecutor(max_workers=max(1, pool)) as ex:
         pending = set()
 
@@ -1479,7 +1501,9 @@ def _fan_out_first(send, specs, oracle, pool=_INJECT_POOL, cap_check=None):
                 nxt = next(it, None)
                 if nxt is None:
                     return
-                pending.add(ex.submit(send, nxt))
+                # a FRESH copy per submit: Context.run is single-entry, and workers reusing one shared
+                # Context object would raise "already entered" on concurrent submits, killing every send
+                pending.add(ex.submit(contextvars.copy_context().run, send, nxt))
         _refill()
         while pending and hit is None:
             done, keep = wait(pending, return_when=FIRST_COMPLETED)
@@ -3244,6 +3268,51 @@ def bundle_leaks_secret(ctx, probe) -> bool | None:
     return False
 
 
+# A bundle can carry several AIza keys (Firebase config plus Maps, say). Check a few, not all: each is one
+# request against someone's quota, and the finding is "at least one is live", which the first hit settles.
+_MAX_GOOGLE_KEY_CHECKS = 3
+
+
+def gemini_key_live_in_bundle(ctx, probe) -> bool | None:
+    """A Google `AIza` key in the client bundle that ACTUALLY reaches the Gemini API.
+
+    The one predicate that asks a third party rather than the target, because this format cannot be decided
+    any other way. The same 39 characters serve a Firebase web key (public by design) and a Gemini API key
+    (a billing credential), and an existing Firebase key silently gains Gemini access when that API is
+    enabled on the project, so neither the format nor what the bundle calls can tell them apart. See
+    provider_validate.
+
+    Fires only on a key the provider itself confirms, so the public-by-design case can never be scored. That
+    confirmation IS the `validated_live` rung the disclosed-secret ladder already priced at 92 and that
+    nothing had ever been able to set.
+
+    ACTIVE battery only: it spends a request against the app owner's own credential, so it belongs where
+    ownership was attested. N/A with no bundle, no candidate key, or a check that could not complete.
+    """
+    blob = _client_bundle(ctx)
+    if not blob.strip():
+        return None
+    candidates = secretscan.google_api_keys(blob)
+    if not candidates:
+        ctx.evidence.update(google_key_candidates=0)
+        return None                                  # no AIza key at all: nothing to decide
+    checked = 0
+    for key in candidates[:_MAX_GOOGLE_KEY_CHECKS]:
+        checked += 1
+        live = provider_validate.gemini_key_is_live(key)
+        if live:
+            ctx.evidence.update(google_key_candidates=len(candidates), keys_checked=checked,
+                                validated_live=True, provider="google-gemini",
+                                key=secretscan._mask(key), source="client-bundle")
+            return True
+        if live is None:                             # could not tell -> N/A, never a clean verdict
+            ctx.evidence.update(google_key_candidates=len(candidates), keys_checked=checked,
+                                na_reason="provider unreachable")
+            return None
+    ctx.evidence.update(google_key_candidates=len(candidates), keys_checked=checked, validated_live=False)
+    return False                                     # every candidate refused: public-by-design keys
+
+
 # v2.0 FAMILY 1 -- deploy-time "works on my machine" failure. A dev host / private IP / unset env var stringified
 # into a backend URL: the page renders but its data layer is dead for every visitor, invisible to a "does it
 # load" check. Requires the URL form (https?://...), so a bare `("0.0.0.0", PORT)` bind or a `hostname ===
@@ -4200,6 +4269,110 @@ def _firestore_readable(client, base: str, project: str, api_key: str, collectio
     return None if reached else "unreachable"
 
 
+# ---- sec-backend-004: an anon-listable Supabase Storage bucket -----------------------------------------
+# Storage policies are SEPARATE from table RLS, so this is a distinct exposure from sec-backend-001, not a
+# widening of it: a team can lock every table and still leave the file store open, or the reverse. Listing a
+# bucket needs a SELECT policy on storage.objects granted to anon -- "public bucket" only allows downloading a
+# known URL, never enumerating -- so anon listing is a real misconfiguration, not the intended public-asset
+# feature. But like anon table READ, bare "listing works" is intent-dependent: a public gallery legitimately
+# lists its own assets. So this fires on SENSITIVITY, never on listing alone (the backend-001 principle:
+# object-path sensitivity, never the bucket name), and records the rest for the corpus audit to tune.
+_STORAGE_LIST = "/storage/v1/object/list/"
+_STORAGE_BUCKET_REF = re.compile(r"""/storage/v1/object/(?:public|sign|authenticated)/([A-Za-z0-9][A-Za-z0-9_-]{0,60})/"""
+                                 r"""|\.storage\s*\.from\(\s*["']([A-Za-z0-9][A-Za-z0-9_-]{0,60})["']""")
+_STORAGE_COMMON = ("avatars", "uploads", "files", "documents", "images", "media", "attachments",
+                   "user-uploads", "profile-images", "photos", "public", "assets")
+# A bucket whose NAME denotes per-user or private content (not a public-asset bucket). Weaker signal than the
+# per-user path structure below, used only as a fallback sensitivity reason.
+_PRIVATE_BUCKET = re.compile(r"doc|upload|attach|receipt|invoice|kyc|identity|passport|resume|cv\b|"
+                             r"medical|report|submission|private|user|avatar", re.I)
+_UUID_SEG = re.compile(r"(?:^|/)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:/|$)", re.I)
+_EMAIL_SEG = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+
+def _storage_buckets(blob: str) -> list[str]:
+    """Bucket names the bundle names (public/sign URLs, storage.from('x')), then a common fallback."""
+    mined = []
+    for m in _STORAGE_BUCKET_REF.finditer(blob):
+        mined.append(m.group(1) or m.group(2))
+    mined = list(dict.fromkeys([b for b in mined if b]))
+    return (mined + [b for b in _STORAGE_COMMON if b not in mined])[:16]
+
+
+def _storage_sensitive(bucket: str, names: list[str]):
+    """(reason, sample) if the listing is a sensitive exposure, else None. Two rungs, strongest first: object
+    paths that reveal PER-USER structure (a UUID or an email as a path segment) prove cross-user enumeration,
+    which no app intends; failing that, a bucket whose name denotes private content is a weaker fire."""
+    for n in names:
+        if _UUID_SEG.search(n) or _EMAIL_SEG.search(n):
+            return "per-user paths enumerable by anon (cross-user file access)", n
+    if _PRIVATE_BUCKET.search(bucket):
+        return "a private-content bucket is listable by anon", bucket
+    return None
+
+
+def _storage_listable(client, base: str, keys: list[str], buckets: list[str]):
+    """{bucket, objects, reason, repro} for the first bucket an anon key can list SENSITIVELY, 'unreachable'
+    if the storage host never answered (-> N/A), else None. Lists at most a page; never downloads."""
+    reached = False
+    for key in keys[:3]:
+        hdr = {"apikey": key, "Content-Type": "application/json"}
+        if key.startswith("eyJ"):
+            hdr["Authorization"] = "Bearer " + key
+        for bucket in buckets:
+            try:
+                r = client.post(base + _STORAGE_LIST + bucket,
+                                json={"prefix": "", "limit": 100}, headers=hdr, timeout=6.0)
+            except (httpx.HTTPError, httpx.InvalidURL):
+                continue
+            reached = True
+            if r.status_code != 200:
+                continue                              # 400/401/403/404: no such bucket, or listing refused
+            try:
+                objs = r.json()
+            except ValueError:
+                continue
+            if not isinstance(objs, list) or not objs:
+                continue                              # empty bucket or non-array: nothing enumerated
+            names = [o.get("name", "") for o in objs if isinstance(o, dict)]
+            sens = _storage_sensitive(bucket, names)
+            if sens:
+                return {"bucket": bucket, "objects": len(objs), "reason": sens[0],
+                        "sample": secretscan._mask(sens[1]) if "@" in sens[1] else sens[1],
+                        "repro": _repro("POST", base + _STORAGE_LIST + bucket, status=200,
+                                        matched=sens[0])}
+    return "unreachable" if not reached else None
+
+
+def storage_bucket_listable(ctx, probe) -> bool | None:
+    """A Supabase Storage bucket an anonymous client can LIST, exposing other users' uploaded files.
+
+    Distinct from sec-backend-001 (that reads the DATABASE): storage policies are separate, so this fires
+    where the tables are locked but the file store is not. Gated on sensitivity, never bare listing, because
+    a public-asset gallery legitimately lists itself: fires only when object paths reveal per-user structure
+    (cross-user enumeration) or the bucket denotes private content. N/A with no Supabase config, no bucket
+    that lists, or an unreachable storage host. Read-only: it lists a page and never downloads an object."""
+    blob = _client_bundle(ctx)
+    base = _supabase_base(blob, ctx)
+    if not base:
+        return None                                   # no Supabase gateway in the client -> nothing to test
+    keys = [m.group(0) for m in _JWT.finditer(blob)] + _SUPABASE_PUB.findall(blob)
+    if not keys:
+        return None
+    with httpx.Client(timeout=8.0, follow_redirects=True, verify=False) as ext:
+        hit = _storage_listable(ext, base, keys, _storage_buckets(blob))
+    if isinstance(hit, dict):
+        ctx.evidence.update(backend="supabase-storage", host=base, bucket=hit["bucket"],
+                            objects_listed=hit["objects"], bulk_read=True, reason=hit["reason"],
+                            sample=hit["sample"], repro=hit["repro"])
+        return True
+    if hit == "unreachable":
+        ctx.evidence.update(checked=True, reachable=False)
+        return None                                   # storage host never answered -> egress blocked / N/A
+    ctx.evidence.update(checked=True, reachable=True, listable=False)
+    return False
+
+
 def exposed_backend_readable(ctx, probe) -> bool | None:
     """Managed backend (Supabase/Firebase) shipped without row-level security: mine the client bundle for
     the config + public key, then read the DB with that key. Fire if real rows come back. N/A when no such
@@ -4554,6 +4727,183 @@ def session_token_in_local_storage(ctx, probe) -> bool | None:
         account.client.close()
 
 
+# ---- sec-session-006: a session/access token carried in a URL query string --------------------------------
+# The session family checks cookie flags (001-003), a weak id (004) and localStorage (005); nothing looks at
+# the URL. A REUSABLE session or access token in a query string leaks three ways with no legitimate form: the
+# Referer header hands it to every third-party resource the page loads, it lands in browser history, and it is
+# written to server and proxy access logs. That is CWE-598, and unlike a missing HttpOnly flag it is an ACTIVE
+# leak of a live credential, not merely weak storage. Scoped to the QUERY string only: a token in the URL
+# FRAGMENT (the OAuth implicit / magic-link shape) is not sent to the server or the referrer, so it is a
+# different, lesser thing and sec-session-005's territory. Single-use email-flow tokens are excluded, because a
+# reset/verify link in a URL is the standard pattern and does not carry a reusable session.
+_SESSION_QP_NAME = re.compile(r"^(?:access[_-]?token|session[_-]?token|session|sessionid|sid|auth[_-]?token|"
+                              r"authtoken|jwt|bearer|id[_-]?token|refresh[_-]?token)$", re.I)
+_JWT_QP_NAME = re.compile(r"^(?:token|auth|t|key|jwt|access[_-]?token)$", re.I)   # generic: only a JWT value fires
+_ONE_TIME_QP = re.compile(r"reset|verif|confirm|invite|magic|recovery|signup|token[_-]?hash|otp|oob|"
+                          r"csrf|xsrf|nonce|state|challenge", re.I)
+_QUERY_PARAM = re.compile(r"[?&](?P<k>[A-Za-z][A-Za-z0-9_-]{0,30})=(?P<v>[A-Za-z0-9._~-]{8,})")
+_JWT_VALUE = re.compile(r"^eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{4,}$")
+
+
+# One-time INBOUND flow paths. A token in a confirm/verify/reset/OAuth-callback URL hits the referrer and
+# the log ONCE, on an email or redirect landing, and is the vendor's link design rather than the app's slop.
+# A session token in an ORDINARY navigation URL rides every request and is the real leak, so the path decides.
+_ONE_TIME_PATH = re.compile(r"confirm|verif|reset|recover|/callback|magic|activate|/oauth", re.I)
+
+
+def _url_session_token(urls):
+    """(param, value, kind, url) for the first NAVIGATION url carrying a session/access token, else None.
+    A clearly session-named param fires on any substantial value; a generic token-ish param fires ONLY on a
+    JWT-shaped value (a one-time reset token, not a JWT, does not). Handshake param names and one-time inbound
+    flow PATHS never fire. Literal values only, so a `?access_token=${var}` template cannot match."""
+    for u in urls:
+        head, sep, tail = u.partition("?")
+        if not sep:
+            continue                                  # no query string (a fragment token is not sent -> skip)
+        query = tail.split("#", 1)[0]
+        if _ONE_TIME_PATH.search(head):
+            continue                                  # inbound email/redirect landing, not a navigation leak
+        for m in _QUERY_PARAM.finditer("?" + query):
+            k, v = m.group("k"), m.group("v")
+            if _ONE_TIME_QP.search(k):
+                continue
+            if v.startswith(("pk.", "pk_")):
+                continue                         # a PUBLISHABLE key (Mapbox pk.*, Stripe pk_*) is public by
+                                                 # design, the same exclusion secretscan gives Firebase AIza
+            if _SESSION_QP_NAME.match(k) and len(v) >= 12:
+                return k, v, ("jwt" if _JWT_VALUE.match(v) else "opaque"), u
+            if _JWT_QP_NAME.match(k) and _JWT_VALUE.match(v):
+                return k, v, "jwt", u
+    return None
+
+
+def _candidate_urls(routes, bundle, origin=""):
+    """URL-ish strings to inspect: the discovered routes (paths the app itself navigated to), plus query-
+    bearing URLs from the served client content. Absolute URLs are kept ONLY when they point at the graded
+    origin: a token in a THIRD party's URL (a Loom embed id, a Mapbox API call) is their parameter, not this
+    app's session, and the two v24 fires were exactly that (a `sid` on loom.com — which reached the routes
+    list through discovery recording an external embed — and an `access_token` on api.mapbox.com)."""
+    origin_host = urllib.parse.urlparse(origin).netloc.lower().removeprefix("www.") if origin else None
+
+    def _own(u):
+        if "://" not in u:
+            return True                          # a relative URL: the app's own by construction
+        try:
+            host = urllib.parse.urlparse(u).netloc.lower().removeprefix("www.")
+        except ValueError:
+            return False
+        return bool(origin_host) and host == origin_host
+
+    urls = [u for u in routes if _own(u)]
+    for m in re.findall(r'[^\s"\'<>()]+\?[^\s"\'<>()]+', bundle):
+        if _own(m):
+            urls.append(m)                       # an absolute URL back at THIS app: its own session surface
+    return list(dict.fromkeys(urls))[:400]
+
+
+# ---- qa-scaffold-001: unreplaced generator boilerplate on a linked page -----------------------------------
+# AI scaffolders emit pages (About, Pricing, Contact) the team never fills in, so the app links to a route
+# whose visible text is still template filler. This is the same class as a dead control: the app declares a
+# page exists and the page contains nothing the team wrote. Kept a STRICT ARTIFACT MATCH, never a completeness
+# judgment -- the moment it asks "is this page finished" it grades intent, and a design tool showing sample
+# content would false-fire. So it fires only on strings no shipped app deliberately shows a user: classic
+# filler, an LLM's own meta-text leaked into content, or an unfilled bracket placeholder. The multi-token
+# template defaults must CO-OCCUR (a lone "Feature One" heading is not enough) to stay clear of real copy.
+_SCAFFOLD_ARTIFACT = re.compile(
+    r"lorem ipsum dolor|as an ai language model|as a large language model|i cannot fulfill that|"
+    r"i'?m sorry,? but i can'?t|\byour name here\b|your company name here|yourname@example\.com|"
+    r"replace this with your|\blorem ipsum\b", re.I)
+# A SINGLE bracket placeholder is NOT evidence: backtrack-ten's v24 fire was deliberate product copy
+# ("your guardians get an alert: '[Your Name] is slouching!'" — an example message showing what the alert
+# looks like). An UNFILLED TEMPLATE shows many of them, so require 2+ DISTINCT placeholders on one page.
+_SCAFFOLD_BRACKETS = re.compile(r"\[your name\]|\[your company\]|\[company name\]|\[insert[^\]]{0,30}\]"
+                                r"|\[product name\]|\[date\]", re.I)
+_SCAFFOLD_PAIRS = (
+    (re.compile(r"\bfeature one\b", re.I), re.compile(r"\bfeature two\b", re.I)),
+    (re.compile(r"\bcard title\b", re.I), re.compile(r"\bcard description\b", re.I)),
+    (re.compile(r"\bsection one\b", re.I), re.compile(r"\bsection two\b", re.I)),
+)
+_TAGS = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.I | re.S)
+_ANYTAG = re.compile(r"<[^>]+>")
+
+
+def _visible_text(html: str) -> str:
+    """Rendered-ish text: drop script/style blocks, strip tags, collapse whitespace. Keeps the match on what
+    a user would SEE, so a generator string that survives only inside a JS bundle does not false-fire."""
+    t = _TAGS.sub(" ", html)
+    t = _ANYTAG.sub(" ", t)
+    return re.sub(r"\s+", " ", t)
+
+
+def _scaffold_hit(text: str) -> str | None:
+    m = _SCAFFOLD_ARTIFACT.search(text)
+    if m:
+        return m.group(0).strip().lower()
+    brackets = {b.group(0).lower() for b in _SCAFFOLD_BRACKETS.finditer(text)}
+    if len(brackets) >= 2:
+        return "unfilled placeholders: " + ", ".join(sorted(brackets)[:3])
+    for a, b in _SCAFFOLD_PAIRS:
+        if a.search(text) and b.search(text):
+            return a.pattern.strip("\\b")
+    return None
+
+
+def scaffold_content_on_route(ctx, probe) -> bool | None:
+    """A route the app links to whose visible text is unreplaced generator boilerplate: lorem ipsum, an LLM's
+    own meta-text, an unfilled bracket placeholder, or a template's default Feature One/Two block. Fires on the
+    first such route (one finding). Strict artifact match on visible text, never a completeness judgment. N/A
+    when no linked page was reachable to read."""
+    seen = 0
+    for path in list(dict.fromkeys(getattr(ctx.profile, "routes", None) or ["/"]))[:20]:
+        if path.split("?")[0].endswith((".js", ".mjs", ".css", ".json", ".png", ".jpg", ".svg", ".ico",
+                                        ".map", ".txt", ".woff", ".woff2", ".xml")):
+            continue
+        try:
+            r = ctx.client.get(_at(ctx, path.split("?")[0]))
+        except (httpx.HTTPError, httpx.InvalidURL):
+            continue
+        if r.status_code != 200 or "html" not in r.headers.get("content-type", "").lower():
+            continue
+        seen += 1
+        hit = _scaffold_hit(_visible_text(r.text[:400_000]))
+        if hit:
+            ctx.evidence.update(route=path.split("?")[0], artifact=hit,
+                                reason="a linked page still shows generator boilerplate")
+            return True
+    if seen == 0:
+        ctx.evidence["na_reason"] = "no linked HTML page was reachable to read"
+        return None
+    ctx.evidence.update(pages_scanned=seen, scaffold=False)
+    return False
+
+
+def session_token_in_url(ctx, probe) -> bool | None:
+    """A reusable session or access token in a URL query string (CWE-598): it leaks via Referer to third
+    parties, into browser history, and into server logs. Scans the discovered routes (which carry the query
+    strings the app actually used) and the served client content for a session-named param, or a generic
+    token param holding a JWT. Excludes single-use reset/verify links. N/A when nothing was reachable to scan."""
+    routes = getattr(ctx.profile, "routes", None) or []
+    bundle = ""
+    with contextlib.suppress(Exception):
+        bundle = _client_bundle(ctx)
+    urls = _candidate_urls(routes, bundle, ctx.base_url)
+    if not urls:
+        return None
+    hit = _url_session_token(urls)
+    if hit:
+        k, v, kind, url = hit
+        ctx.evidence.update(param=k, value=_mask_token(v), value_kind=kind, cwe="CWE-598",
+                            route=url.partition("?")[0],
+                            reason="session/access token in a URL query string (leaks via referrer, history, logs)")
+        return True
+    ctx.evidence.update(checked=True, token_in_url=False)
+    return False
+
+
+def _mask_token(v: str) -> str:
+    return v[:6] + "..." + v[-4:] if len(v) > 12 else v[:3] + "..."
+
+
 # A genuine login backend REJECTS wrong creds with an auth-shaped answer. A client-side-auth SPA (Supabase/
 # Firebase from the browser) or a platform-hosted static page just echoes a 200 shell — or 405/404 — for the
 # POST: there's no server auth of the app's to rate-limit, so a "no rate limiting" finding there is a phantom
@@ -4880,7 +5230,16 @@ def csrf_missing(ctx, probe) -> bool | None:
                 # request -> not acceptance (the dominant FP: a cross-site POST to an http:// URL -> 308 https)
                 if _same_resource_redirect(str(resp.url), loc):
                     continue
-                ctx.evidence.update(vulnerable=True, form=form.action, method=method, status=resp.status_code)
+                # a redirect to a DIFFERENT host forwarded the request off the submitted app entirely (a
+                # domain move / gateway bounce) — nothing here processed it, so it is not an acceptance.
+                # governancex's 307 to its own canonical domain fired the v24 corpus at 45 points.
+                dest_host = (urllib.parse.urlsplit(urllib.parse.urljoin(str(resp.url), loc)).netloc
+                             or "").lower().removeprefix("www.")
+                here_host = urllib.parse.urlsplit(str(resp.url)).netloc.lower().removeprefix("www.")
+                if dest_host and dest_host != here_host:
+                    continue
+                ctx.evidence.update(vulnerable=True, form=form.action, method=method, status=resp.status_code,
+                                    redirect_location=loc[:200])   # recorded so a 3xx fire is AUDITABLE
                 return True
             if resp.status_code < 400:
                 # a 2xx that just returns the served PAGE isn't a state change — an SPA answers 200 with its
@@ -4994,7 +5353,7 @@ def _shell_ok(ctx) -> bool:
     dead (render_state error/stuck). Skipping a known-dead app stops each perf probe re-waiting ~12s on an app
     that will never paint (which stacked up across render_metrics/web_vitals/FCP and DNF'd stuck Streamlit apps
     on the grade timeout). A rendered app (or a non-Streamlit one) still awaits/normal-renders."""
-    return getattr(getattr(ctx, "profile", None), "render_state", None) not in ("error", "stuck")
+    return getattr(getattr(ctx, "profile", None), "render_state", None) not in ("error", "stuck", "empty")
 
 
 
@@ -5028,6 +5387,8 @@ def console_errors_present(ctx, probe) -> bool:
     ctx.evidence.update(js_errors=res["total"], first_party=res["first_party"],
                         third_party=res["third_party"], sources=res.get("sources"),
                         engine="pageerror+console")
+    if res.get("examples"):        # the actual error text (off-score) so the card shows WHAT threw, not just a count
+        ctx.evidence["errors"] = res["examples"]
     if res["first_party"] <= 0:
         return False
     broken = _console_broken_render(res)
@@ -5189,6 +5550,12 @@ def a11y_violations_present(ctx, probe) -> bool:
         impacts[level] = impacts.get(level, 0) + 1
     ctx.evidence.update(violations=len(scored), rules=sorted({v["id"] for v in scored})[:15],
                         impacts=impacts, engine="axe-core", penalty_override=_a11y_penalty(impacts, contrast_pen))
+    # WHERE each rule failed (off-score, report-card only): a few example CSS selectors per rule, so the card
+    # can say "text is too low-contrast to read (at .hero h1)" instead of just naming the rule. Never enters
+    # the score, which counts rules, not nodes.
+    locations = {v["id"]: v["nodes"][:3] for v in scored if v.get("nodes")}
+    if locations:
+        ctx.evidence["locations"] = locations
     if worst_shortfall is not None:
         ctx.evidence["contrast_shortfall"] = round(worst_shortfall, 2)
     if advisory:   # OFF-SCORE: captured for the 2026.3 re-grade to measure decorrelation, never scored here
@@ -5302,8 +5669,10 @@ def idor_horizontal(ctx, probe) -> bool | None:
 def _fanout(work, n: int):
     """Run `work` (a no-arg callable) n times concurrently; return the n results in submit order.
     The shared concurrency primitive for the self-as-oracle race/load probes."""
+    work = egress.scope_bound(work)     # the scope does not cross into a pool thread on its own
     with ThreadPoolExecutor(max_workers=n) as ex:
-        return [f.result() for f in [ex.submit(work) for _ in range(n)]]
+        # a fresh copy per submit — see the single-entry note in _fan_out_first
+        return [f.result() for f in [ex.submit(contextvars.copy_context().run, work) for _ in range(n)]]
 
 
 def _concurrent_creates(base_url, path, cookies, data, n: int = 12):
@@ -6433,6 +6802,11 @@ def host_header_injection(ctx, probe) -> bool:
                     r = c.get(path, headers={hdr: marker})
                 except (httpx.HTTPError, httpx.InvalidURL):
                     continue
+                if r.status_code >= 400:
+                    continue   # an ERROR page reflects all sorts of things — S3's NoSuchBucket answer echoes
+                               # the injected Host as the <BucketName> it looked up and did not find (the
+                               # bye-buy v24 FP at 40 points). Only a 2xx/3xx reflection can be operative: a
+                               # cacheable page or a redirect the app actually built.
                 if marker in r.headers.get("location", "") or marker in r.text:
                     ctx.evidence.update(reflected=True, via=hdr, target=path,
                                         repro=_repro_from_resp(r, matched="injected Host '%s' reflected" % marker))
@@ -7374,11 +7748,13 @@ PREDICATES = {
     "debug_mode_enabled": debug_mode_enabled,
     "leaks_error_detail": leaks_error_detail,
     "exposed_backend_readable": exposed_backend_readable,
+    "storage_bucket_listable": storage_bucket_listable,
     "anon_bulk_data_exposed": anon_bulk_data_exposed,
     "filter_injection": filter_injection,
     "backend_schema_disclosed": backend_schema_disclosed,
     "authenticated_backend_readable": authenticated_backend_readable,
     "bundle_leaks_secret": bundle_leaks_secret,
+    "gemini_key_live_in_bundle": gemini_key_live_in_bundle,
     "unreachable_backend_reference": unreachable_backend_reference,
     "internal_address_disclosed": internal_address_disclosed,
     "oauth_redirect_localhost": oauth_redirect_localhost,
@@ -7387,6 +7763,8 @@ PREDICATES = {
     "source_map_exposed": source_map_exposed,
     "session_cookie_missing_flag": session_cookie_missing_flag,
     "session_token_in_local_storage": session_token_in_local_storage,
+    "session_token_in_url": session_token_in_url,
+    "scaffold_content_on_route": scaffold_content_on_route,
     "login_no_rate_limit": login_no_rate_limit,
     "csrf_missing": csrf_missing,
     "idor_horizontal": idor_horizontal,
@@ -7468,12 +7846,14 @@ _PREDICATE_REASONS = {
     "debug_mode_enabled": "framework debug mode is on in production (interactive debugger / DEBUG page -> source, settings, env and an RCE console exposed)",
     "leaks_error_detail": "an induced server error leaked a stack trace or a database error to the user (info disclosure + a broken error path)",
     "exposed_backend_readable": "the app's managed backend (Supabase/Firebase) is world-readable with its own public key -> the whole database is exposed (missing row-level security)",
+    "storage_bucket_listable": "a Supabase Storage bucket is listable by an anonymous client, so strangers can enumerate other users' uploaded files (a storage SELECT policy granted to anon; separate from table RLS)",
     "filter_injection": "a query parameter reaches the data store's FILTER expression (PostgREST/NoSQL filter injection: the caller controls what the query matches)",
     "anon_bulk_data_exposed": "an anonymous request returned bulk records carrying personal or financial data "
                               "(no authorization on a data-export route)",
     "backend_schema_disclosed": "the managed backend discloses its schema to anyone (table list at the API "
                                "root, or database errors naming columns)",
     "authenticated_backend_readable": "any logged-in user reads every other user's data -> broken authenticated-tier RLS/Rules (the IDOR equivalent on a BaaS app; missing per-user row filtering)",
+    "gemini_key_live_in_bundle": "a Google AIza key in the client bundle REACHES the Gemini API (confirmed against Google, not inferred from its format) -> anyone can spend this project's inference budget and read its uploaded files",
     "bundle_leaks_secret": "a hardcoded SECRET key (Stripe sk_ / OpenAI / AWS secret / GitHub PAT / private key) is shipped in the client JS bundle -> account/DB takeover (public anon/publishable keys are not flagged)",
     "unreachable_backend_reference": "the shipped client bundle calls a backend no visitor can reach (localhost / a private IP / an unset env var) -> the app renders but its data layer is dead in production",
     "internal_address_disclosed": "the client bundle hardcodes an internal-only address (a private/link-local IP or an *.internal/.corp hostname) -> leaks infrastructure topology to any source-viewer (recon); loopback/localhost is not flagged",
@@ -7483,6 +7863,8 @@ _PREDICATE_REASONS = {
     "source_map_exposed": "a production JS bundle serves its .map -> the original source is reconstructable (business logic, hidden endpoints, and secrets a minified scan misses)",
     "session_cookie_missing_flag": "session cookie missing the {flag} flag",
     "session_token_in_local_storage": "session token persisted in localStorage (readable by any XSS on the origin — unlike an HttpOnly cookie)",
+    "session_token_in_url": "a reusable session/access token is carried in a URL query string (CWE-598) -> leaks via the Referer header, browser history and server logs",
+    "scaffold_content_on_route": "a page the app links to still shows generator boilerplate (lorem ipsum, an AI model's meta-text, or an unfilled placeholder) -> shipped unfinished",
     "csrf_missing": "state-changing POST accepted cross-site with no token / SameSite",
     "idor_horizontal": "another account's object was readable by id (broken access control)",
     "idor_user_record": "one account's private user record was readable by another account by id (horizontal IDOR / broken object-level auth)",

@@ -83,18 +83,37 @@ _CONTENT: dict[str, tuple[str, str, str]] = {
     "sec-secrets-002": ("No hardcoded server secret (Stripe `sk_`, OpenAI, AWS secret, GitHub PAT, private key) ships in the bundle.",
                         "A server-side secret is embedded in client code — anyone viewing source has full use of it.",
                         "Never put server secrets in the client; call the third party from your backend. Rotate the leaked key now."),
+    "sec-secrets-003": ("No Google API key in the bundle can reach the Gemini API.",
+                        "A key in your client code is a live Gemini credential, confirmed against Google. Anyone "
+                        "who views source can spend your inference budget and read files you uploaded to it. A "
+                        "Firebase or Maps key becomes one automatically once the Generative Language API is "
+                        "enabled on the same project, with no warning and no change to your code.",
+                        "Rotate the key, then restrict it: application (referrer) restrictions do NOT block "
+                        "Gemini, only API restrictions do. Call Gemini from your backend and keep the key there."),
     "sec-hosthdr-001": ("The `Host` / `X-Forwarded-Host` header is not reflected into URLs or redirects.",
                         "Host-header injection — attacker-controlled hosts poison generated links (password-reset hijack, cache poisoning).",
                         "Validate `Host` against an allow-list of known domains; build absolute URLs from config, not the request header."),
     "sec-dos-001": ("Compressed request bodies are size-capped before decompression.",
                     "Zip-bomb DoS — a tiny gzip body inflates to gigabytes and exhausts server memory.",
                     "Cap the decompressed size and set a request-body limit; reject oversized payloads early."),
+    "sec-backend-004": ("No storage bucket can be listed by an anonymous visitor.",
+                        "A stranger can enumerate a storage bucket and see other users' uploaded files. "
+                        "Storage access is controlled separately from your database, so locking your tables "
+                        "did not lock this: it needs its own policy.",
+                        "Remove any anon SELECT policy on storage.objects. A bucket marked public still must "
+                        "not be listable; serve known object URLs instead of granting list access."),
     "sec-backend-001": ("The managed backend (Supabase/Firebase) enforces row-level security.",
                         "The database is world-readable/writable through the public anon key — anyone can read or modify all rows.",
                         "Enable RLS / security rules and scope the anon key; never rely on client-side checks for authorization."),
     "sec-session-002": ("The session cookie sets a `SameSite` attribute.",
                         "Without `SameSite` the session cookie rides along on cross-site requests — a CSRF exposure.",
                         "Set `SameSite=Lax` (or Strict) plus `Secure` and `HttpOnly` on the session cookie."),
+    "sec-session-006": ("No session or access token is carried in a URL.",
+                        "A reusable login token sits in a page URL. It leaks to any third-party site the "
+                        "page links to through the referrer, into browser history, and into server logs, so "
+                        "anyone who sees one of those can replay the session.",
+                        "Move the token out of the URL: keep the session in an HttpOnly cookie, or post the "
+                        "token in a request body. Rotate any token already exposed this way."),
     "sec-session-005": ("The session token lives in an `HttpOnly` cookie, not `localStorage`.",
                         "A token in `localStorage` is readable by any XSS on the origin — one injection steals every session.",
                         "Store the session in an `HttpOnly`, `Secure` cookie so page scripts (and injected ones) can't read it."),
@@ -129,15 +148,15 @@ _CONTENT: dict[str, tuple[str, str, str]] = {
     "sec-sqli-001": ("The login query is parameterized; a crafted username/password cannot alter the SQL.",
                      "SQL injection: a payload in an auth field changed the query's logic (the classic `' OR '1'='1` shape), so an attacker reads or bypasses with no valid credentials.",
                      "Use parameterized queries / an ORM; never build SQL by string-concatenating request data. Same fix clears all SQLi variants."),
-    "sec-sqli-002": ("Input reaches SQL only as a bound parameter, so injected operators cannot execute.",
-                     "SQL injection reached the database via a second query surface. The engine executed attacker-supplied SQL, exposing read/modify/exfiltrate paths over your data.",
-                     "Parameterize every query; validate and type-narrow inputs. Do not concatenate request data into SQL anywhere."),
-    "sec-sqli-003": ("A crafted parameter cannot change query structure; the DB treats it strictly as data.",
-                     "SQL injection confirmed through a data/search parameter (boolean/union/error-based reach). Attacker-controlled SQL runs against your database.",
-                     "Parameterize the query and reject unexpected types; an ORM or prepared statement closes this class."),
-    "sec-sqli-005": ("Every query binds its inputs; no request value is spliced into SQL text.",
-                     "SQL injection reached the database on a further endpoint. Any reachable concatenated query is a full read/write breach of the data layer.",
-                     "Audit for string-built SQL across the whole app and parameterize it; one leftover concatenation reopens the entire class."),
+    "sec-sqli-002": ("The login query is parameterized; a numeric tautology in the username or password cannot alter the SQL.",
+                     "SQL injection on the login form: the numeric tautology `' OR 1=1 -- ` changed the query's logic, so an attacker signs in with no valid credentials. Same test as sec-sqli-001 with a different payload.",
+                     "Use parameterized queries or an ORM for the login lookup. The same fix clears every SQL injection variant."),
+    "sec-sqli-003": ("The login query is parameterized; a string tautology in the username or password cannot alter the SQL.",
+                     "SQL injection on the login form: the string tautology `' OR 'a'='a' -- ` changed the query's logic, so an attacker signs in with no valid credentials. Same test as sec-sqli-001 with a different payload.",
+                     "Use parameterized queries or an ORM for the login lookup. The same fix clears every SQL injection variant."),
+    "sec-sqli-005": ("The login query is parameterized; an unterminated tautology in the username or password cannot alter the SQL.",
+                     "SQL injection on the login form: `' OR '1'='1`, with no comment to close the query, changed its logic, so an attacker signs in with no valid credentials. Same test as sec-sqli-001 with a different payload.",
+                     "Use parameterized queries or an ORM for the login lookup. The same fix clears every SQL injection variant."),
     "sec-xss-002": ("Stored/user-persisted content is encoded on output so a saved payload renders as text.",
                     "Stored XSS: a payload saved through the app was served back executable, so it runs in every viewer's session (session theft, account takeover, worming).",
                     "Encode on output for the HTML context; sanitize rich input server-side; add a script-constraining CSP as defense-in-depth."),
@@ -213,12 +232,18 @@ _CONTENT: dict[str, tuple[str, str, str]] = {
                          "The shipped bundle hardcodes a private/link-local IP or an `*.internal`/`.corp` hostname, leaking your internal network topology to anyone who reads the source (recon for an attacker).",
                          "Keep internal hostnames/IPs out of client code; route through a public gateway and inject only public origins at build time."),
     # ---- qa ----------------------------------------------------------------------------------------
-    "qa-a11y-001": ("The page has no critical accessibility violations (alt text, form labels, `lang`, control names).",
-                    "Broken for screen-reader/keyboard users — and a reliable proxy for a rushed, unfinished UI.",
-                    "Add `alt` on images, labels on inputs, a `lang` on `<html>`, and accessible names on controls; verify with axe DevTools."),
+    "qa-a11y-001": ("The rendered page has no axe WCAG 2 A/AA violations (contrast, alt text, form labels, `lang`, control names); each violation is priced by its impact level.",
+                    "Some users cannot read or operate the page: low contrast text shuts out low vision users, and unlabeled controls shut out screen reader users.",
+                    "Raise text contrast to at least 4.5:1, add `alt` on images, labels on inputs, a `lang` on `<html>`, and accessible names on controls; verify with axe DevTools."),
     "qa-a11y-002": ("The page passes the baseline accessibility hard-checks (`lang`, alt, form-control names, page title).",
                     "A fundamental accessibility element is missing — the page is unusable for assistive tech.",
                     "Add the missing `lang`/title/label/alt; these are one-line fixes with outsized impact."),
+    "qa-scaffold-001": ("Every linked page shows content you wrote, not generator filler.",
+                        "A page your app links to still shows scaffold text: lorem ipsum, an AI assistant in "
+                        "its own words, or an unfilled placeholder like [Your Name]. Visitors who click "
+                        "through reach a page that was never finished.",
+                        "Fill in or remove the page. If a route was generated speculatively and is not "
+                        "needed, delete it and its nav link rather than shipping a stub."),
     "qa-seo-001": ("Best-practice meta tags are present (at least `viewport` and `description`).",
                    "Missing `viewport` breaks mobile layout; missing `description` hurts discoverability — signs of an unfinished page.",
                    "Add `<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">` and a `<meta name=\"description\">`."),
@@ -325,6 +350,18 @@ _CONTENT: dict[str, tuple[str, str, str]] = {
     "perf-ttfb-001": ("Time-to-first-byte is under ~1s.",
                       "The server is slow to respond — often a cold start or an unoptimized request handler.",
                       "Keep the instance warm, cache expensive work, and profile the slow handler."),
+    "perf-dom-001": ("The page keeps its DOM small enough for fast style, layout and interaction.",
+                     "A very large DOM slows every style recalculation and layout, so interactions lag on slower phones.",
+                     "Render long lists virtually, remove hidden or duplicated markup, and split large views into separate routes."),
+    "perf-font-001": ("Web fonts show fallback text while they load (`font-display: swap` or similar).",
+                      "Text stays invisible until the web font arrives, so a slow connection shows a blank page.",
+                      "Set `font-display: swap` (or `optional`) on each `@font-face`, and preload the primary font."),
+    "perf-lcp-001": ("The largest image or text block is discoverable from the HTML and not lazy loaded.",
+                     "The main content element is found late or lazy loaded, which delays Largest Contentful Paint.",
+                     "Reference the hero image directly in the HTML, remove `loading=\"lazy\"` from it, and add `fetchpriority=\"high\"`."),
+    "perf-minify-001": ("Shipped JavaScript and CSS are minified.",
+                        "Unminified bundles send more bytes than needed, and usually mean a development build reached production.",
+                        "Build with your bundler's production mode, which minifies JavaScript and CSS by default."),
     "perf-load-001": ("Endpoints stay up under a short concurrent burst.",
                       "An endpoint 5xx'd under concurrent load — it won't survive even a small crowd of real users.",
                       "Handle concurrency safely (connection pooling, limits, backpressure); don't crash under parallel requests."),
@@ -335,7 +372,8 @@ _GENERIC = ("A durability check for this issue passed on well-built apps.",
             "",  # filled from the finding's own `reason`
             "Review the observed evidence below and address the underlying issue.")
 
-_AXIS_TITLE = {"security": "Security", "qa": "Quality & Correctness", "performance": "Performance"}
+_AXIS_TITLE = {"security": "Security", "accessibility": "Accessibility",
+               "qa": "Quality & Correctness", "performance": "Performance"}
 
 
 def card_copy(probe_id: str, reason: str = "") -> tuple[str, str, str]:
@@ -357,10 +395,119 @@ def _pool_map(catalog_root: str | pathlib.Path) -> dict[str, str]:
         return {}
 
 
+# Evidence keys kept OUT of the "what we saw" line, so it reads as the finding rather than a debug dump. This
+# is the SINGLE source of "what we saw" (the site renders `actual` and no longer dumps raw evidence beside it),
+# so the line has to carry the specific detail and nothing else. Dropped:
+#   - scoring / rendering internals and large blobs handled elsewhere;
+#   - REQUEST METADATA that is not the finding (a missing-header finding was reading `status = 200; elapsed_ms
+#     = 18`, which says nothing about the absent header -- with these gone the line falls back to the reason);
+#   - PERF scoring internals (the `metrics` dict carries the real numbers);
+#   - bookkeeping COUNTERS a reader does not act on.
+# Boolean values are dropped wholesale: a flag like `no_tls = True` / `render_broken = False` only restates the
+# finding (already shown as the reason) in machine terms.
+_ACTUAL_SKIP = frozenset({
+    "engine", "penalty_override", "report_only", "advisory_a11y", "repro", "versions", "na_reason", "reason",
+    "status", "elapsed_ms", "content_len", "content_type", "target",          # request metadata, not the finding
+    "runs", "tier", "score",                          # perf composite internals (audit/display name the finding)
+    "keys_checked", "google_key_candidates", "links_checked", "first_party",  # counters a reader won't act on
+    "third_party", "cross_origin_subresources", "threshold", "sources",
+    "value_kind", "cwe",                                                      # jargon the reason already conveys
+    "violations",                                    # a11y: a bare count, redundant with the named rules below
+    "locations",                                     # a11y: consumed inline by the rules rendering, not on its own
+})
+
+# Accessibility is the single most common finding (~64% of apps) and the least self-explanatory, because axe
+# reports raw rule IDs (`button-name`, `color-contrast`) that mean nothing to a builder. Translate the ones the
+# corpus actually produces (these ~28 cover it; the top 16 are ~97%) into what is actually wrong. An unmapped
+# rule falls back to its de-hyphenated id, so a new axe rule degrades gracefully rather than showing a raw slug.
+_A11Y_RULE_HUMAN = {
+    "color-contrast": "text is too low-contrast to read",
+    "button-name": "a button has no readable label",
+    "meta-viewport": "the page blocks zoom (the viewport tag disables scaling)",
+    "label": "a form field has no label",
+    "select-name": "a dropdown has no label",
+    "link-name": "a link has no readable text",
+    "html-has-lang": "the page doesn't declare its language",
+    "scrollable-region-focusable": "a scrollable area can't be reached by keyboard",
+    "document-title": "the page has no title",
+    "image-alt": "an image is missing alt text",
+    "svg-img-alt": "an SVG image has no text alternative",
+    "nested-interactive": "interactive controls are nested inside each other",
+    "link-in-text-block": "a link isn't distinguishable from the text around it",
+    "frame-title": "an embedded frame has no title",
+    "aria-input-field-name": "an input has no accessible name",
+    "aria-command-name": "a control has no accessible name",
+    "aria-progressbar-name": "a progress bar has no accessible name",
+    "aria-prohibited-attr": "an element uses an ARIA attribute it isn't allowed",
+    "aria-hidden-focus": "a focusable element is hidden from screen readers",
+    "aria-valid-attr-value": "an ARIA attribute has an invalid value",
+    "aria-allowed-attr": "an element uses an ARIA attribute it isn't allowed",
+    "aria-required-children": "an ARIA role is missing required child elements",
+    "aria-roles": "an element uses an invalid ARIA role",
+    "list": "a list isn't marked up correctly",
+    "listitem": "a list item isn't inside a proper list",
+    "definition-list": "a definition list isn't marked up correctly",
+    "dlitem": "a definition-list item isn't inside a proper list",
+    "meta-refresh": "the page auto-refreshes, which can trap users",
+}
+
+
+def _a11y_rule(rule: str) -> str:
+    return _A11Y_RULE_HUMAN.get(rule, str(rule).replace("-", " "))
+
+
+# The hand-rolled perf probes report a bare `value`; without a label + unit "value = 7954031" is unreadable.
+# Keyed by probe id because `value` is also a token elsewhere (sec-session-006), which must stay verbatim.
+_PERF_VALUE = {
+    "perf-weight-001": ("total page weight", lambda v: f"{float(v) / 1_000_000:.1f} MB"),
+    "perf-ttfb-001": ("server response time", lambda v: f"{int(float(v))} ms"),
+    "perf-requests-001": ("network requests", lambda v: f"{int(float(v))}"),
+    "perf-dom-001": ("DOM elements", lambda v: f"{int(float(v))}"),
+}
+
+
 def _actual(finding: dict) -> str:
-    """A plain-language 'what we saw' line from the finding evidence + where it fired."""
+    """A plain-language 'what we saw' line from the finding evidence + where it fired. Lists and shallow dicts
+    are rendered (the failing a11y `rules` and their `impacts`, the inert-control `labels`, the exposed backend
+    host, the perf `metrics`); request metadata, scoring internals, and bare boolean flags are dropped so the
+    line reads as the finding, not a debug dump. When nothing finding-specific is left (a header was simply
+    absent), it falls back to the finding's own `reason` rather than showing `status = 200`."""
     ev = finding.get("evidence") or {}
-    parts = [f"{k} = {v}" for k, v in ev.items() if k not in ("engine",) and not isinstance(v, (dict, list))]
+    pid = finding.get("probe_id", "")
+    parts = []
+    for k, v in ev.items():
+        if k in _ACTUAL_SKIP or isinstance(v, bool) or v is None or v == "" or v == [] or v == {}:
+            continue
+        if k == "value":
+            if ev.get("display"):                      # a perf audit with Lighthouse's own human string -> use it
+                continue
+            if pid in _PERF_VALUE:                     # a bare-number perf probe -> label it with its unit
+                label, fmt = _PERF_VALUE[pid]
+                try:
+                    parts.append(f"{label}: {fmt(v)}")
+                    continue
+                except (TypeError, ValueError):
+                    pass                               # non-numeric -> fall through to the generic render
+        if isinstance(v, list):
+            if k == "rules":                          # a11y axe rule ids -> plain language + WHERE each fired
+                locs = ev.get("locations") or {}
+                items = []
+                for x in v[:8]:
+                    desc = _a11y_rule(x)
+                    where = locs.get(x) or []
+                    if where:
+                        desc += f" (at {', '.join(str(w) for w in where[:2])})"
+                    items.append(desc)
+                parts.append(", ".join(items) + (f", +{len(v) - 8} more" if len(v) > 8 else ""))
+                continue
+            shown = ", ".join(str(x) for x in v[:8])
+            parts.append(f"{k}: {shown}" + (f", +{len(v) - 8} more" if len(v) > 8 else ""))
+        elif isinstance(v, dict):
+            inner = ", ".join(f"{kk}={vv}" for kk, vv in v.items() if not isinstance(vv, (dict, list)))
+            if inner:
+                parts.append(f"{k}: {inner}")
+        else:
+            parts.append(f"{k} = {v}")
     detail = "; ".join(parts) if parts else finding.get("reason", "")
     targets = finding.get("targets") or ([finding["target"]] if finding.get("target") else [])
     where = f"  (seen on: {', '.join(str(t) for t in targets[:5])})" if targets else ""
@@ -397,7 +544,7 @@ def build_card(record: dict, catalog_root: str | pathlib.Path | None = None, org
         return {"url": url, "project": record.get("project"), "dnf": True,
                 "page_state": (record.get("coverage_audit") or {}).get("page_state"),
                 "slop_score": None, "sections": [], "hidden": {"count": 0, "penalty": 0},
-                "passed": [], "cov": record.get("coverage") or {}}
+                "passed": [], "cov": record.get("coverage") or {}, "ruler": record.get("ruler")}
 
     public, hidden = [], []
     for f in findings:
@@ -424,10 +571,25 @@ def build_card(record: dict, catalog_root: str | pathlib.Path | None = None, org
     return {"url": url, "project": record.get("project"), "dnf": False,
             "slop_score": record.get("slop_score"), "axis_slop": record.get("axis_slop") or {},
             "sections": sections, "hidden": hidden_block, "passed": passed_cats, "cov": cov,
-            "winner": record.get("winner")}
+            "winner": record.get("winner"),
+            # the frozen reference this grade's score is quoted against, read from the RECORD (never the current
+            # curve): a stored grade carries the ruler it was produced under, a legacy record predating the
+            # stamp carries None -> the renderer labels it legacy rather than silently reading it as current.
+            "ruler": record.get("ruler")}
 
 
 # ---- renderers -------------------------------------------------------------------------------------
+
+def _ruler_label(card: dict) -> str:
+    """A human label for the frozen reference this grade was produced under. A record predating the stamp has
+    no ruler, and says so, so it is never read as the current one -- the whole point of stamping it."""
+    r = card.get("ruler")
+    if not r:
+        return "Ruler unspecified — this grade predates ruler labeling; not comparable to a current score"
+    if isinstance(r, dict):
+        return "Ruler " + " · ".join(str(v) for v in (r.get("full"), r.get("passive")) if v)
+    return f"Ruler {r}"
+
 
 def to_markdown(card: dict) -> str:
     """Portable markdown rendering of a report card."""
@@ -438,11 +600,13 @@ def to_markdown(card: dict) -> str:
     if card.get("dnf"):
         L.append(f"**Not scored — graded non-functional (`{card.get('page_state')}`).** "
                  "The app didn't present a working surface to test. Get it serving a functional page, then re-grade.")
+        L.append(f"\n_{_ruler_label(card)}_")
         return "\n".join(L)
 
     L.append(f"**Slop score: {card['slop_score']}**  (lower is better — deduction-only)")
     if card.get("axis_slop"):
         L.append("  ·  " + "  ·  ".join(f"{k}: {v}" for k, v in card["axis_slop"].items()))
+    L.append(f"\n_{_ruler_label(card)}_")
     cov = card.get("cov") or {}
     if cov:
         n_fail = sum(len(s["entries"]) for s in card["sections"]) + card["hidden"]["count"]
@@ -506,13 +670,15 @@ def to_html(card: dict) -> str:
     .passed{background:var(--card);border:1px solid var(--line);border-left:3px solid var(--good);border-radius:8px;padding:12px 16px;font-size:14px}
     .hidden{background:var(--card);border:1px dashed var(--line);border-radius:8px;padding:14px 16px;font-size:14px;color:var(--muted)}
     .dnf{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:18px;font-size:15px}
+    .ruler{color:var(--muted);font-size:12px;margin:8px 0 2px;font-style:italic}
     </style>"""
     out = [css, '<div class="rc">', f"<h1>Durability Report Card</h1>",
            f'<div class="url">{e(card["url"])}</div>']
     if card.get("dnf"):
         out.append(f'<div class="dnf"><b>Not scored — graded non-functional '
                    f'({e(str(card.get("page_state")))}).</b> The app didn\'t present a working surface to test. '
-                   "Get it serving a functional page, then re-grade.</div></div>")
+                   "Get it serving a functional page, then re-grade.</div>")
+        out.append(f'<div class="ruler">{e(_ruler_label(card))}</div></div>')
         return "".join(out)
 
     out.append(f'<div class="score">{e(str(card["slop_score"]))}<span style="font-size:15px;color:var(--muted);font-weight:400"> slop · lower is better</span></div>')
@@ -523,6 +689,7 @@ def to_html(card: dict) -> str:
         n_fail = sum(len(s["entries"]) for s in card["sections"]) + card["hidden"]["count"]
         out.append(f'<div class="cov">{e(str(cov.get("probes_applicable","?")))} durability checks applied · '
                    f'{n_fail} flagged · {max(cov.get("probes_applicable",0)-n_fail,0)} passed</div>')
+    out.append(f'<div class="ruler">{e(_ruler_label(card))}</div>')
 
     def block(entry):
         return (f'<div class="f"><div class="t"><span>{e(entry["title"])}</span>'

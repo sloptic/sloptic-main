@@ -1,0 +1,18 @@
+id: sec-backend-004
+bundle: security
+category: backend-exposure
+# NOT in backend-anon-exposure: that group is the DATABASE being readable (sec-backend-001/003). Storage
+# policies are independent, so an app can pass those and fail this, or the reverse -- a distinct finding.
+pool: public
+evidence_model: oracle
+penalty: 70   # nominal; severity_ref resolves it. Anon enumeration of a private file store (other users'
+              # uploads) is disclosure at the anon-data tier; the predicate sets bulk_read.
+severity_ref: anon-data-exposure
+applicability:
+  requires: [at_least_one_http_endpoint_exists]
+probe:
+  predicate: storage_bucket_listable
+  # Mine the bundle for a Supabase gateway + public key + bucket names, then POST /storage/v1/object/list/
+  # <bucket> with that key (host-restricted, read-only, lists one page, never downloads). Fires only when the
+  # listing is SENSITIVE (per-user paths, or a private-content bucket), never on a listable public-asset
+  # bucket. N/A when there is no Supabase config, no bucket lists, or the storage host is unreachable.

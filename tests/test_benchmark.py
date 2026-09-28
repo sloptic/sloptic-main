@@ -14,15 +14,17 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
+import pytest  # noqa: E402
 from benchmark import (  # noqa: E402
-    _axis_applicable, _band, _catalog_index, _key, _percentile_of, _slop_potential, build, rank)
+    _axis_applicable, _band, _catalog_index, _key, _normalized, _percentile_of, _perf_norm_params, _probe_set,
+    _slop_potential, build, rank)
 
 
 def _app(slop, security=0, qa=0, perf=0, applied=None, findings=None, **kw):
     rec = {"deployed": True, "slop_score": slop,
            "axis_slop": {"security": security, "qa": qa, "performance": perf},
            "coverage": {"applied": applied if applied is not None
-                        else ["sec-headers-001", "qa-a11y-001", "perf-cwv-001"]},
+                        else ["sec-headers-001", "qa-crash-010", "qa-a11y-001", "perf-cwv-001"]},
            "findings": findings or []}
     rec.update(kw)
     return rec
@@ -72,7 +74,8 @@ def test_an_axis_with_no_applicable_surface_is_unranked_not_well_ranked():
     # the trap: an app whose auth surface was never reachable has security slop 0, which would out-rank an
     # app that HAD the surface and got it right. Absence of a finding is not a pass.
     curve = build(_corpus(), "t", "s")
-    dark = _app(20, security=0, qa=20, applied=["qa-a11y-001", "perf-cwv-001"])   # no sec-* probe applied
+    # qa-crash-010: a probe that stayed qa after the v3.0 promotion (qa-a11y-001 moved to accessibility)
+    dark = _app(20, security=0, qa=20, applied=["qa-crash-010", "perf-cwv-001"])  # no sec-* probe applied
     res = rank(curve, 20, dark)
     assert res["axes"]["security"] == {"applicable": False}
     assert res["axes"]["qa"]["applicable"] is True and "percentile" in res["axes"]["qa"]
@@ -171,3 +174,89 @@ def test_a_served_secret_file_gates_but_a_source_map_does_not():
     assert rank(curve, 12, env)["absolute_gates"] == ["exposure"]
     assert rank(curve, 12, git)["absolute_gates"] == ["exposure"]
     assert "absolute_gates" not in rank(curve, 12, smap)     # same category, not exploitable, not a gate
+
+
+def _graded(total, slop):
+    """A minimally eligible record carrying a battery size, for the passive/full split."""
+    return {"deployed": True, "slop_score": slop, "functional": True,
+            "coverage": {"probes_total": total, "applied": ["sec-headers-001"], "ran_kinds": ["headers"]},
+            "findings": [], "axis_slop": {"security": slop}}
+
+
+def test_probe_set_reads_the_battery_size():
+    assert _probe_set(_graded(102, 10), 44) == "full"
+    assert _probe_set(_graded(44, 10), 44) == "passive"
+    assert _probe_set({"probe_filter": True, "coverage": {"probes_total": 44}}, 44) == "subset"
+    assert _probe_set({"slop_score": 5}, 44) == "full"     # no coverage -> legacy full
+
+
+def test_build_keeps_the_two_batteries_apart():
+    recs = [_graded(102, s) for s in (10, 20, 30)] + [_graded(44, s) for s in (5, 8, 12)]
+    full = build(recs, "2026.3", "t", probe_set="full")
+    passive = build(recs, "passive-2026.1", "t", probe_set="passive")
+    assert full["probe_set"] == "full" and full["n"] == 3
+    assert passive["probe_set"] == "passive" and passive["n"] == 3
+    assert [row[0] for row in full["dist"]] == [10, 20, 30]     # only the full rows
+    assert [row[0] for row in passive["dist"]] == [5, 8, 12]    # only the passive rows
+
+
+def test_rank_refuses_a_cross_mode_placement():
+    passive = build([_graded(44, s) for s in (5, 8, 12)], "passive-2026.1", "t", probe_set="passive")
+    with pytest.raises(ValueError):
+        rank(passive, 20, _graded(102, 20))       # a full grade may not rank on the passive curve
+    assert rank(passive, 8, _graded(44, 8))["percentile"] is not None    # a passive grade may
+    full = build([_graded(102, s) for s in (10, 20, 30)], "2026.3", "t")
+    full.pop("probe_set")                          # a legacy untagged curve is treated as full
+    assert rank(full, 20, _graded(102, 20))["percentile"] is not None
+
+
+def test_rank_uses_the_exact_fractional_score_not_its_integer_floor():
+    # build() stores raw fractional slop; rank() must query the same, or a 21.6 app keyed as 21 jumps
+    # ahead of everyone scoring 21.0 to 21.9. Here the 21.4 app is cleaner, the rest worse.
+    curve = build([_graded(102, s) for s in (21.4, 21.8, 22.3, 30.0)], "2026.3", "t")
+    res = rank(curve, 21.6, _graded(102, 21.6))
+    assert res["percentile"] == 25          # exactly one of four (21.4) is cleaner
+    assert res["cleaner_than_pct"] == 75     # the int(21.6)=21 bug would read 0 / 100
+
+
+# --- perf normalization for host-CPU contention (docs/PERF_NORMALIZATION.md) ------------------------------
+
+def _bi(slop, bi, perf=0, **kw):
+    """An app carrying a Lighthouse benchmark_index, for the normalization tests."""
+    return _app(slop, perf=perf, observed_surface={"lighthouse": {"benchmark_index": bi}}, **kw)
+
+
+def test_normalized_adds_perf_slop_for_a_faster_box_and_is_one_sided():
+    params = {"k": 0.013, "bi_ref": 1437, "bi_cap": 600.0}
+    fast = _normalized(_bi(15, 1764, perf=5), params)      # 327 over ref -> +0.013*327 = +4.3
+    assert fast["axis_slop"]["performance"] == 9.3 and fast["slop_score"] == 19.3
+    assert _normalized(_bi(15, 1437, perf=5), params)["slop_score"] == 15      # at ref -> no-op
+    assert _normalized(_bi(15, 1200, perf=5), params)["slop_score"] == 15      # slower -> no-op (one-sided)
+    assert _normalized(_app(15, perf=5), params)["slop_score"] == 15           # no benchmark_index -> no-op
+    # the cap bounds the correction
+    capped = _normalized(_bi(15, 5000, perf=5), params)
+    assert capped["slop_score"] == round(15 + 0.013 * 600.0, 1)
+
+
+def test_build_freezes_perf_norm_only_when_benchmark_index_is_present():
+    plain = build(_corpus(), "t", "s")                     # the corpus rows carry no benchmark_index
+    assert "perf_norm" not in plain                        # -> inert, ranks un-normalized (the 2026.3 case)
+    withbi = build([_bi(s, 1400 + s, perf=s // 4) for s in range(10, 210, 2)], "t", "s")
+    assert withbi["perf_norm"]["k"] == 0.013 and withbi["perf_norm"]["bi_ref"] > 0
+
+
+def test_rank_against_a_curve_without_perf_norm_is_unchanged():
+    # the coherence guarantee: the frozen 2026.3 curve has no perf_norm, so a grade ranks exactly as before.
+    curve = build(_corpus(), "t", "s")
+    app = _bi(40, 1764, perf=20, security=20)               # even a fast-box grade is untouched here
+    before = rank(curve, app["slop_score"], app)
+    assert before["slop"] == 40                             # score NOT normalized against a params-less curve
+
+
+def test_rank_against_a_perf_norm_curve_corrects_a_fast_box_grade():
+    curve = build([_bi(s, 1437, perf=s // 4, security=s // 3) for s in range(10, 210, 2)], "t", "s")
+    assert "perf_norm" in curve
+    fast = _bi(40, 1900, perf=20, security=20)              # graded on a much faster box than the curve's ref
+    out = rank(curve, fast["slop_score"], fast)
+    assert out["slop"] > 40                                 # slop added back -> worse, not the raw 40
+    assert out["axes"]["performance"]["slop"] > 20          # the perf axis specifically is corrected

@@ -153,7 +153,9 @@ def test_vulnerable_app_accrues_slop():
     # a CVSS x Bugcrowd-VRT range placed by observed evidence, see catalog/_severity_classes.yaml + docs/
     # SCORING_V2_SPEC.md): a confirmed SQLi is 90, a served .env / .aws / a live server-secret / a Werkzeug
     # RCE debugger is 90-98, an IDOR that read a record is 55, missing headers stay a 2-8 chore floor.
-    assert report.axis_slop == {"security": 930.7, "qa": 240.3, "performance": 60.0}   # 1-decimal float scoring;
+    # v3.0: accessibility is its own axis (carved out of qa — total-preserving: 930.7 + 198.8 + 41.5 + 60.0
+    # is the same 1231.0 the three-axis layout scored)
+    assert report.axis_slop == {"security": 930.7, "qa": 198.8, "accessibility": 41.5, "performance": 60.0}   # 1-decimal float scoring;
     #     so performance is just perf-load-001 (28 -> 60: it 5xx'd under load -> the observed_5xx escalator).
     #     All three axes are v2 authority-anchored now: security CVSS x Bugcrowd-VRT, qa ISO-25010 x Nielsen
     #     (crash 16->55, race 30->50, input 16->30, links 12->25), perf-load on its reliability band.
@@ -368,3 +370,16 @@ def test_register_reuses_a_seeded_crawl_session_instead_of_registering_again(mon
         assert "_a" in calls
     finally:
         client.close()
+
+
+def test_a_hung_probe_does_not_crash_the_grade_and_lands_in_blocked_probes(monkeypatch):
+    # Regression (v25: 71 apps DNF'd this way): the per-probe deadline's hung-probe handling read
+    # `blocked_probes` before it was initialized in the finalize, so ANY probe that blew its wall clock crashed
+    # the whole grade with UnboundLocalError instead of being abandoned. Force every bounded probe to report
+    # hung and assert the grade still COMPLETES, with the hung probes recorded blocked (for the retry pass).
+    import sloptic.pipeline as pl
+    monkeypatch.setattr(pl, "_run_bounded", lambda thunk, timeout: (None, True))
+    report = run(SubprocessDeployer(str(REFS / "vulnerable" / "app.py")), _catalog())
+    assert report is not None                       # did NOT crash (the bug was an UnboundLocalError here)
+    assert report.blocked_probes                    # hung probes recorded blocked, not silently lost
+    assert report.incomplete_axes                   # and their axes flagged incomplete

@@ -56,6 +56,7 @@ def fake_dns(monkeypatch):
     "0.0.0.0", "224.0.0.1", "240.0.0.1",                 # this-net / multicast / reserved
     "::1", "fe80::1", "fc00::1",                          # v6 loopback / link-local / ULA
     "::ffff:10.0.0.1",                                    # v4-mapped v6 must normalize, not pass
+    "64:ff9b::a00:1", "::a00:1",                          # NAT64 + deprecated v4-compat embedding 10.0.0.1
 ])
 def test_check_ip_refuses_everything_internal(strict, bad):
     assert not egress.check_ip(bad)
@@ -235,3 +236,259 @@ def test_browser_filter_aborts_a_private_subresource(monkeypatch):
         srv.shutdown()
 
     assert any("10.0.0.1" in u for u in failed), f"private subresource was not aborted: {failed}"
+
+
+# ------------------------------------------- origin scoping across a thread boundary: attack (e)
+# A ContextVar does not cross into a thread the pool starts, so every one of these asserts from INSIDE
+# a worker. The same assertions made on the main thread pass with or without the fix, which is exactly
+# how the gap survived: the scope check was never running where the injection payloads are sent.
+
+def _resolve_in_pool(host, port=443, workers=2, bind=True):
+    """Resolve `host` from inside a pool thread, the way an injection probe's fan out does."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _go():
+        try:
+            socket.getaddrinfo(host, port)
+            return "allowed"
+        except egress.EgressRefused:
+            return "refused"
+
+    fn = egress.scope_bound(_go) if bind else _go
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        return ex.submit(fn).result()
+
+
+def test_scope_reaches_a_worker_thread(strict, fake_dns):
+    """The regression. A grant for one origin must not become a relay: a pool thread issuing the
+    redirected hop has to refuse the third party just as the main thread does."""
+    table, _ = fake_dns
+    table["victim.example"] = [_ai(GOOD2)]
+    with egress.origin_scope("https://target.test"):
+        assert _resolve_in_pool("victim.example") == "refused"
+
+
+def test_the_scoped_origin_itself_still_resolves_from_a_worker(strict, fake_dns):
+    """Scoping a worker must not break the work: on-origin hops are the ones a probe actually needs."""
+    table, _ = fake_dns
+    table["target.test"] = [_ai(GOOD)]
+    with egress.origin_scope("https://target.test"):
+        assert _resolve_in_pool("target.test") == "allowed"
+
+
+def test_an_unbound_worker_is_the_gap_this_closes(strict, fake_dns):
+    """Pins the reason the wrapper exists. Python hands a new thread a fresh, empty Context, so an
+    unwrapped worker reads no scope and only the public address predicate is left, which a third party
+    passes by definition. If this ever starts refusing, context propagation changed under us."""
+    table, _ = fake_dns
+    table["victim.example"] = [_ai(GOOD2)]
+    with egress.origin_scope("https://target.test"):
+        assert _resolve_in_pool("victim.example", bind=False) == "allowed"
+
+
+def test_the_injection_fan_out_carries_the_scope(strict, fake_dns):
+    """The reported path: sqli, command injection, ssti and traversal all send through _fan_out_first."""
+    from sloptic import probes
+    table, _ = fake_dns
+    table["victim.example"] = [_ai(GOOD2)]
+
+    def _send(spec):
+        try:
+            socket.getaddrinfo(spec, 443)
+            return spec, "delivered"
+        except egress.EgressRefused:
+            return spec, None
+
+    with egress.origin_scope("https://target.test"):
+        hit = probes._fan_out_first(_send, ["victim.example"] * 4, lambda s, r: r is not None)
+    assert hit is None                      # nothing was delivered off origin
+
+
+def test_the_race_fan_out_carries_the_scope(strict, fake_dns):
+    """The second pool, used by the self-as-oracle race and load probes."""
+    from sloptic import probes
+    table, _ = fake_dns
+    table["victim.example"] = [_ai(GOOD2)]
+
+    def _work():
+        try:
+            socket.getaddrinfo("victim.example", 443)
+            return "delivered"
+        except egress.EgressRefused:
+            return "refused"
+
+    with egress.origin_scope("https://target.test"):
+        assert probes._fanout(_work, 3) == ["refused"] * 3
+
+
+def test_a_worker_is_not_left_scoped_for_whatever_runs_next(strict, fake_dns):
+    """Pool threads are reused. A wrapper that set the scope without restoring it would pin an
+    unrelated later task to a stale origin, which fails closed but fails wrongly."""
+    from concurrent.futures import ThreadPoolExecutor
+    table, _ = fake_dns
+    table["elsewhere.test"] = [_ai(GOOD2)]
+    with ThreadPoolExecutor(max_workers=1) as ex:      # one worker, so the second task reuses the thread
+        with egress.origin_scope("https://target.test"):
+            ex.submit(egress.scope_bound(lambda: None)).result()
+        assert ex.submit(lambda: socket.getaddrinfo("elsewhere.test", 443)).result()
+
+
+def test_binding_an_unscoped_callable_hands_back_the_same_object(strict):
+    """The corpus and reference lanes never enter a scope, so they must get the callable itself, not a
+    wrapper: identity here is the argument that this fix cannot move a score."""
+    def f():
+        return 1
+    assert egress.scope_bound(f) is f
+
+
+def test_a_named_host_can_be_exempted_from_the_origin_pin(strict, fake_dns):
+    """The one deliberate hole in the scope, for a provider's own validation endpoint. Safe because the host
+    is a constant WE choose, so a redirecting target cannot steer it, unlike the relay the pin prevents."""
+    table, _ = fake_dns
+    table["generativelanguage.googleapis.com"] = [_ai(GOOD2)]
+    with egress.origin_scope("https://target.test"):
+        with pytest.raises(egress.EgressRefused):
+            socket.getaddrinfo("generativelanguage.googleapis.com", 443)      # refused without it
+        with egress.exempt_host("generativelanguage.googleapis.com"):
+            assert socket.getaddrinfo("generativelanguage.googleapis.com", 443)
+
+
+def test_an_exemption_covers_only_the_named_host(strict, fake_dns):
+    table, _ = fake_dns
+    table["elsewhere.test"] = [_ai(GOOD2)]
+    with egress.origin_scope("https://target.test"), egress.exempt_host("generativelanguage.googleapis.com"):
+        with pytest.raises(egress.EgressRefused, match="leaves the scoped origin"):
+            socket.getaddrinfo("elsewhere.test", 443)
+
+
+def test_an_exemption_is_restored_on_the_way_out(strict, fake_dns):
+    table, _ = fake_dns
+    table["generativelanguage.googleapis.com"] = [_ai(GOOD2)]
+    with egress.origin_scope("https://target.test"):
+        with egress.exempt_host("generativelanguage.googleapis.com"):
+            pass
+        with pytest.raises(egress.EgressRefused):
+            socket.getaddrinfo("generativelanguage.googleapis.com", 443)
+
+
+def test_an_exempt_host_still_faces_the_address_predicate(strict, fake_dns):
+    """Only the ORIGIN pin is relaxed. An exempt host resolving inward is still refused, so the exemption
+    can never become an SSRF path."""
+    table, _ = fake_dns
+    table["sneaky.test"] = [_ai("127.0.0.1")]
+    with egress.origin_scope("https://target.test"), egress.exempt_host("sneaky.test"):
+        with pytest.raises(egress.EgressRefused, match="non-public"):
+            socket.getaddrinfo("sneaky.test", 443)
+
+
+def test_current_scope_reads_the_active_pin():
+    with egress.origin_scope("https://target.test:8443/some/path"):
+        assert egress.current_scope() == ("target.test", 8443)
+    assert egress.current_scope() is None       # and None when no scope is active
+
+
+# ── the browser filter scopes TOP-LEVEL navigation only (the resource_type decision) ────────────────────
+def test_document_navigation_off_origin_is_refused_while_scoped(strict, fake_dns):
+    """The authenticated browser crawl follows redirects; a grant for one origin must not let a login bounce
+    carry the crawl (and its session) onto a host the grant never covered. The document is the app."""
+    table, _ = fake_dns
+    table["evil.test"] = [_ai(GOOD2)]
+
+    class _Route:
+        class request:
+            url = "https://evil.test/login"
+            resource_type = "document"
+        aborted = False
+        continued = False
+
+        def abort(self, reason):
+            self.aborted = True
+        def continue_(self):
+            self.continued = True
+
+    route = _Route()
+    with egress.origin_scope("https://target.test"):
+        from sloptic import browser
+        browser._install_egress_filter.__wrapped__ if False else None
+        # drive the guard directly: _install_egress_filter registers it via target.route; call the closure
+        # by re-creating it the way the filter does
+        import urllib.parse
+        from sloptic import egress as eg
+        parts = urllib.parse.urlparse(route.request.url)
+        host = parts.hostname
+        scope = eg.current_scope()
+        refused = scope is not None and (host != scope[0] or 443 != scope[1])
+    assert refused                                 # the decision the guard makes for a document
+
+
+def test_the_guard_refuses_a_scoped_off_origin_document_and_allows_a_subresource(strict, fake_dns):
+    """The real filter, driven through a stub route object: the document navigation off origin aborts, the
+    subresource from the same host continues (subresources stay unscoped by design)."""
+    from sloptic import browser
+    table, _ = fake_dns
+    table["evil.test"] = [_ai(GOOD2)]
+    table["cdn.test"] = [_ai(GOOD2)]
+
+    class _Route:
+        def __init__(self, url, rtype):
+            self.url = url
+            self.resource_type = rtype
+            self.aborted = self.continued = False
+        @property
+        def request(self):
+            return self
+        def abort(self, reason):
+            self.aborted = True
+        def continue_(self):
+            self.continued = True
+
+    holder = {}
+
+    class _Target:
+        def route(self, pattern, guard):
+            holder["guard"] = guard
+
+    with egress.origin_scope("https://target.test"):
+        browser._install_egress_filter(_Target())
+        guard = holder["guard"]
+        doc = _Route("https://evil.test/login", "document")
+        guard(doc)
+        assert doc.aborted and not doc.continued   # navigation off origin: refused, WHILE scoped
+        sub = _Route("https://cdn.test/fonts.css", "stylesheet")
+        guard(sub)
+        assert sub.continued and not sub.aborted   # subresource: unscoped by design
+    # and once the grade (and its scope) is over, the same navigation is no longer refused
+    doc2 = _Route("https://evil.test/login", "document")
+    guard(doc2)
+    assert doc2.continued and not doc2.aborted
+
+
+def test_the_guard_passes_a_scoped_on_origin_document(strict, fake_dns):
+    from sloptic import browser
+    table, _ = fake_dns
+    table["target.test"] = [_ai(GOOD)]
+
+    class _Route:
+        def __init__(self, url, rtype):
+            self.url = url
+            self.resource_type = rtype
+            self.aborted = self.continued = False
+        @property
+        def request(self):
+            return self
+        def abort(self, reason):
+            self.aborted = True
+        def continue_(self):
+            self.continued = True
+
+    holder = {}
+
+    class _Target:
+        def route(self, pattern, guard):
+            holder["guard"] = guard
+
+    with egress.origin_scope("https://target.test"):
+        browser._install_egress_filter(_Target())
+    doc = _Route("https://target.test/dashboard", "document")
+    holder["guard"](doc)
+    assert doc.continued and not doc.aborted

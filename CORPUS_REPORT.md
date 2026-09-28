@@ -1,300 +1,586 @@
-# The Shape of AI Era Web App Slop
+# Durability of Hackathon Web Apps
 
-### A black box quality audit of 1,625 live hackathon web apps
+### A black box study of 1,579 live apps from 80 hackathons
 
-**Reference release:** `2026.3` (provisional) · **Instrument:** Sloptic, a deductions only black box grader · **Population:** live hackathon submissions · **Run:** 2,685 apps attempted, 1,625 graded, 38 hours of wall clock
+**Curve:** `2026.4` (final) · **Instrument:** Sloptic 3.0, a deductions only black box grader · **Run:** `multihacksv26retried.jsonl`, graded 2026-09-21 to 2026-09-23 · **Data:** `multihacksv26-anon.jsonl.gz` (v3.0.0 release), `validation/corpus-figures-active.json`, figures in `docs/charts/`
 
----
-
-## TL;DR
-
-We pointed one black box grader at every submission we could find from 80 hackathons and asked one question. From the outside, what does AI era failure actually look like?
-
-- Slop is overwhelmingly **chronic**. On 1,625 live apps the failure is the missing floor: no security headers, slow heavy pages, broken accessibility, a button that does nothing. Exploitable holes stay rare, only **2.9%** of apps carry one, and essentially none an injection or remote code execution class.
-- **But the corpus is not benign.** A quarter of apps, **26%**, carry an **acute** finding (priced 40 or more), and a clear majority, **59%**, carry at least one **significant** finding (21 or more), a problem past the cosmetic floor. 85% of the acute tier is functional: a crash, a dead deploy, an unusably slow page. These apps break far more often than they get hacked.
-- The acute danger that remains **moved into the managed backend, and this run finally reached it.** The single largest exploitable class is a world readable or writable Supabase or Firebase backend, **18 apps**, several of them serving plaintext passwords or bulk emails to any anonymous visitor.
-- **The AI builder signal is a leaking backend.** AI built apps leak their managed backend at **13%** (11 of 82), more than ten times the population rate, and it is the dominant risk in that cohort. A backend probe added this cycle is what made the exposure visible.
-- **Winners are not cleaner.** The apps the judges picked carry **12% more** median slop than the ones they passed over, so human judged merit does not predict whether the thing holds up.
-- **The dangerous surface is thin because it sits out of reach.** Only **14%** of apps have a drivable signup we can get behind, only **18%** run an own backend we could inject, and a Vercel bot challenge blocked the deep security tail on **404** apps. A low acute number measures reachability and leaves the code's safety unproven.
-- The median app realizes about **2.3%** of the slop it could carry if every applicable probe fired. Per app, slop is the exception. It is the diffuse universal floor, spread across the whole population, that adds up.
+> Every number here comes from `scripts/stats.py` run on the file above, except the run to run flip rates in
+> Section 6, which compare it with the previous run (`multihacksv25c2.jsonl`). The aggregate figures are in
+> `validation/corpus-figures-active.json` (`--corpus-json`). The figures and every hypothesis test are in
+> `docs/charts/` (`--charts`), and each image has a CSV next to it with the exact values it plots.
+> Nothing in this report names an app or a team.
 
 ---
 
-## 1. The question we started with
+## Abstract
 
-AI assisted building made shipping a web app nearly free, and the galleries filled up with submissions that look finished. The security research is loud about what that costs. Veracode's 2025 report, over 100 models on 80 tasks, found **45%** of AI generated code introduces an OWASP Top 10 flaw and that AI written code carries **2.74 times** more vulnerabilities than human written code, a number that had not budged by early 2026. The Cloud Security Alliance put the share of AI generated solutions carrying a design flaw or a known vulnerability at **62%**.
+We graded every live web app we could find in the Devpost galleries of 80 hackathons. Of 2,685 submissions
+with a URL, 1,579 produced a valid grade. We used Sloptic, a grader that probes an app from the outside and
+returns a slop score: the sum of deductions for failures that count against any app. Lower is better. Sloptic
+is open source and runs as a public service at sloptic.org, where teams grade their own apps and organizers
+grade their events. This corpus is the reference population those grades are ranked against.
 
-Those numbers all come from reading source. We wanted the other view, the one an outsider gets.
+The median app scores 48.0 and no app scores 0. About two thirds of all slop comes from three sources:
+missing security headers, accessibility failures, and Lighthouse performance below 90. Each of the four
+header probes fires on 90 to 98% of apps.
+Worse problems are common too. 27.5% of apps have at least one critical finding (priced above 40), and most of
+those are functional: a crash on bad input, or a page too slow to use. 4.7% of apps (75) are exploitable
+today. Most of those ship a live API credential in their client code or leave a managed database open to
+anonymous reads.
 
-> When you look at a large population of real, deployed, AI era web apps from the street, with no source and no spec, **what does the failure actually look like?** A field of exploitable vulnerabilities, or something else?
+Three comparisons stand out. AI builder apps are no sloppier overall (p = 0.16), but they leave their backend
+open about 22 times as often as hand built apps (13.4% against 0.6%, p < 10⁻⁹). Hackathon winners are no
+cleaner than the apps they beat. They match their peers on crashes, leaks, dead controls and every other
+security or quality measure, and differ only on performance: their pages are heavier and slower (p = 0.001).
+The four axes of the score are close to independent (every pairwise |ρ| ≤ 0.14).
 
-This is our answer from one instrument's black box view of 1,625 apps.
+Event prestige predicts nothing either. Across 54 university hosted events, the host's QS World University
+Ranking does not correlate with the event's median slop (ρ = −0.03, p = 0.82). Admissions gates, event size
+and format make no difference.
 
-## 2. The dataset, and how it narrowed
+---
 
-We scraped the public project galleries of **80 hackathons** on Devpost for submissions that shipped a live URL, then graded every URL that answered. The attrition down the funnel is itself a finding.
+## 1. Introduction
 
-| stage | count |
-|---|---:|
-| submissions with a gradeable URL | 2,685 |
-| **graded successfully** | **1,625** |
-| dead URL (link rot, 4xx, 5xx) | 757 |
-| timed out or ran away, killed | 113 |
-| bot challenge withheld the grade | 90 |
-| not a web app, or other | 100 |
+AI tools made it cheap to ship a web app that looks finished. Most research on what that costs reads source
+code. Veracode's 2025 study found that 45% of AI generated code samples introduced an OWASP Top 10 flaw. The
+Cloud Security Alliance put the share of AI generated solutions with a design flaw or known vulnerability at
+62%.
 
-Nearly **40%** of everything ever submitted is already gone, lost to expired domains, spun down free tiers, and plain link rot. Half a year after a hackathon, a large share of what teams proudly shipped does not resolve. That is a durability fact of its own, though it also means the graded population is a survivor set. The apps here are the ones that stayed up.
+We took the opposite view. A user, an attacker, or a judge sees a running app with no source and no spec. We
+wanted to know what failure looks like from there, across a large population of deployed apps. We did it with
+Sloptic, the grader behind sloptic.org, which teams and hackathon organizers use to grade their own apps.
+Every percentile Sloptic reports is a rank against the curve frozen from this corpus, so the study also
+documents that reference population.
 
-The events span North America (the majority, largely US and Canadian university hackathons), Europe (London, Barcelona, Ireland), Latin America (Monterrey), and Asia Pacific (Singapore, Malaysia, Australia), concentrated in 2025 and 2026, with one 2023 edition kept as a pre AI era anchor. The population is young, collegiate, built against a one or two day deadline, and built in the AI era. It is a clean look at what teams ship when speed is everything and the tooling writes much of the code, and it is deliberately not a sample of production software. The 80 events are listed in Appendix A.
+We asked six questions.
 
-## 3. How the grade works, in one breath
+- **RQ1.** What does the distribution of slop look like, and what is it made of?
+- **RQ2.** How much of it is exploitable, and what kind?
+- **RQ3.** Do apps built with an AI app builder carry more slop than hand built ones?
+- **RQ4.** Do hackathon winners hold up better than the apps they beat?
+- **RQ5.** How much of each app can a black box grader reach?
+- **RQ6.** Do prestigious or selective events produce apps that hold up better?
 
-Sloptic is a **black box** grader. It reads no source, needs no spec, and returns one **slop score** that is deductions only and unbounded, where lower is better and `0` means nothing was found. The score splits into three axes (security, quality, performance) whose subtotals sum exactly to the total. Penalties are risk priced (frequency times severity) and damped, so one root cause counts once no matter how many ways we detect it. Because it ignores the stack, the same **102 probes** run identically against every app, which is what makes 1,625 unrelated apps comparable on one number. And every grade ships a coverage report, so a `0` that means "clean" is never confused with a `0` that means "we could not reach the surface." It grades the unauthenticated observable surface, and it grades only failures that are independent of intent, defects no matter what the app is for.
+## 2. Data
 
-The score also ranks, which a scanner does not. A raw number becomes a percentile against a frozen reference curve, and because many apps share a score, ties break in a fixed order, a catastrophe first (an exploitable app never percentiles above a clean one at the same number), then the single worst finding (a smaller worst trapdoor ranks ahead of a bigger one), then how much of its worst case the app actually defended. Two apps at 50 are not treated as equal.
+### 2.1 Collection
 
-## 4. First look at the number
+We scraped the public galleries of 80 Devpost hackathons (Appendix A) and kept every submission that listed a
+live URL. That gave 2,685 apps. Most events are North American university hackathons from 2025 and 2026. The
+rest are in Europe, Latin America and Asia Pacific. One 2023 edition stays in as an older reference point.
+These apps are young, small, and built in a day or two.
+
+### 2.2 Attrition
+
+![Submission outcomes](docs/charts/fig01_funnel.png)
+
+| outcome | apps | share of attempted |
+|---|---:|---:|
+| graded and curve eligible | 1,579 | 58.8% |
+| dead URL (link rot, 4xx, 5xx) | 800 | 29.8% |
+| not an app, or other | 155 | 5.8% |
+| timed out or aborted | 117 | 4.4% |
+| bot challenge at entry | 34 | 1.3% |
+
+Almost 30% of the links were dead. The graded set is a survivor sample, and the dead share grows with the
+time since the event:
+
+![Dead links by event age](docs/charts/fig14_link_rot.png)
+
+Under three months after an event, 15% of links were dead. From three to twelve months the share held near
+29%, and past eighteen months it reached 48%. Per URL, the trend is strong (p < 10⁻⁶), but URLs from one event
+die together, and across the 71 events with at least 10 URLs the correlation is weak (ρ = 0.14, p = 0.25). We
+report the curve as descriptive. Among the apps that survive, older events lean slightly sloppier (ρ = 0.24
+across 64 events, p = 0.05), a borderline result.
+
+1,740 URLs returned a score. We excluded 161 of them from the curve under rules fixed before this run. 86 were
+canvas shells, mostly Streamlit, which show the framework and not the app. 48 hit a bot challenge before 60%
+of the battery ran. 21 pointed at a third party page (a slide deck, a package registry, an app store listing)
+and not the team's own app. 6 were challenged at entry. Every statistic below uses the 1,579 eligible apps
+unless it says otherwise.
+
+### 2.3 Bot challenges
+
+Vercel's bot protection challenged the grader on 553 of its 1,107 apps (50%). Across the whole run, 588
+records (21.9%) saw a challenge. Most challenges (506) came after every probe had run, so those grades are
+complete and kept. On 162 kept apps an axis is marked incompletely tested because the edge blocked some of
+its probes (security on 161 of them). The heavy probes tripped it most: `sec-dos-001` (131), `sec-upload-002`
+(79), `sec-cmdi-001` (69) and `sec-hosthdr-001` (55).
+
+### 2.4 Event attributes
+
+For RQ6 we coded each of the 80 events, in `validation/event-attributes.csv`, before comparing any of the
+codes against scores. Every code comes from an external source by a fixed rule.
+
+| attribute | source | rule |
+|---|---|---|
+| host university | Devpost location and organizer | the university whose campus hosts the event, or whose student body runs it; otherwise independent |
+| QS rank | QS World University Rankings 2026 | the host's printed rank, the midpoint of a band, or the parent's rank for a campus QS does not list separately |
+| admissions gate | Devpost eligibility text | yes when it says accept, admit, approve, apply, application or invited |
+| MLH member | MLH season listings, 2024 to 2026 | the same event appears within three days of its Devpost start date |
+| format | Devpost location | online when Devpost lists the event as online |
+| size | Devpost | registered participants |
+
+67 events have a university host (59 distinct universities), and 66 of those have a QS rank. The ranks run
+from 1 (MIT) to the 1001 to 1200 band. 18 events have an admissions gate, 47 are MLH members, and 10 ran
+online.
+
+The admissions gate is narrower than selectivity. HackMIT, for example, admits by application but shows no
+gate on Devpost. Other events use the field only to limit registration ("Indiana University students only"),
+which our rule reads as no gate.
+
+## 3. Method
+
+### 3.1 The instrument
+
+Sloptic reads no source and needs no spec. It crawls and renders the app, maps its routes, forms and
+endpoints, then runs a fixed battery of 106 probes. Each probe tests one failure that counts against any app:
+a missing security header, a crash on malformed input, a control that does nothing, a live credential in the
+bundle, a database open to anonymous reads. A probe that does not apply returns N/A with a reason.
+
+Each finding carries a penalty priced as frequency times severity. The penalties sum to the slop score, which
+has no upper bound. Two dampers keep one flaw from counting many times: techniques that detect the same flaw
+fire once, and each extra finding in the same category counts 0.6 times the one before. The score splits into
+four axes that sum exactly to the total: security, quality, accessibility and performance.
+
+No language model contributes to the number. Accessibility runs on pinned axe-core 4.10.2, and performance
+on pinned Lighthouse 13.4.1 (mobile preset, median of three runs).
+
+### 3.2 The reference curve
+
+This run is the frozen reference curve `2026.4`. Every full battery grade, on sloptic.org or from the package,
+becomes a percentile against it. Passive grades rank against a separate curve, `passive-2026.2`, frozen from a
+run of the 45 probe passive battery over the same URLs (1,702 eligible apps). The curve applies a small
+performance correction for how busy the grading box was (`docs/PERF_NORMALIZATION.md`), so its median is 48.4.
+The tables in this report use raw scores, where the median is 48.0.
+
+### 3.3 Severity
+
+We sort findings into five bands by penalty: minor (1 to 10), moderate (11 to 20), serious (21 to 30), severe
+(31 to 40) and critical (41 and up). Two derived levels use each app's single worst finding. An app is
+**acute** if its worst finding is critical, and **significant** if its worst finding is serious or above.
+**Exploitable** is narrower: the app has at least one finding an attacker can use today, such as a live
+credential or an open database.
+
+### 3.4 Statistical tests
+
+Slop is skewed, so we compare groups with rank tests: Mann-Whitney U for two groups and Kruskal-Wallis for
+several. For rates we use Fisher's exact test. For association we use Spearman's ρ. The confidence interval
+on the median is a percentile bootstrap (2,000 resamples, seed 0). We treat p < 0.05 as significant and did
+not correct for multiple comparisons. Appendix B lists every test.
+
+RQ6 compares events, not apps, since apps from one event are not independent. The outcome is each event's
+median slop, over the 65 events with at least five graded apps. We fixed the six RQ6 tests before running
+them and report all six.
+
+## 4. Results
+
+### 4.1 Score distribution (RQ1)
+
+![Slop score distribution](docs/charts/fig02_distribution.png)
 
 | statistic | value |
-|---|---|
-| mean | 58.5 |
-| median | 50.0 |
-| max | 239.1 |
-| distinct score values | 849 of 1,625 (52% unique) |
-| landmarks (p10 / p25 / p50 / p75 / p90 / p95 / p99) | 17.6 / 29.6 / 50.0 / 77.4 / 108.2 / 130.4 / 179.9 |
+|---|---:|
+| n | 1,579 |
+| median (95% CI) | 48.0 (45.9 to 51.0) |
+| mean | 58.6 |
+| standard deviation | 40.4 |
+| Q1 / Q3 | 27.6 / 78.2 |
+| p90 / p99 | 115.5 / 178.7 |
+| min / max | 1.0 / 337.5 |
+| skewness / excess kurtosis | 1.40 / 2.94 |
+| distinct values | 832 (52.7%) |
 
-The distribution behaves like a ruler. It is smooth and right skewed, a dense cluster of lightly taxed apps and a long thin tail of the badly broken. Continuous scoring on the performance and contrast axes spreads it out further, so more than half the apps land on a value no other app shares, and the biggest single pileup, 64 apps sitting on exactly 13.7, is under 4% of the population. That 13.7 is the pure header floor, the score an app carries when the only thing wrong with it is the headers it never set. It is the closest thing this corpus has to a "clean" app, and 64 of them found it.
+The distribution has one peak and a long right tail. No app scored 0, and the lowest scored 1.0.
 
-## 5. What the number is made of
+The most common score is 13.7, shared by 83 apps (5.3%). That is what the four missing security headers cost
+on their own. 45 apps have no finding except missing headers.
 
-| axis | share of total slop | median | what it looks like |
-|---|---:|---:|---|
-| quality | **41%** | 20.0 | a broad spread, driven by accessibility, dead controls, and crashes |
-| security | 32% | 13.7 | the header floor dominates, the median and the 75th percentile both at 13.7 |
-| performance | 28% | 13.7 | continuous now, so only 29% of apps score a clean zero |
+### 4.2 Score composition (RQ1)
 
-That is already a shift from the prior run, where security led at 42% and performance was mostly zeros. Continuous performance scoring and a batch of new quality probes moved quality to the top.
+![Slop by axis](docs/charts/fig03_axes.png)
 
-The single categories concentrate harder still, at **performance 28%, security headers 23%, accessibility 18%**, so three categories carry two thirds of all the slop in the corpus.
+| axis | share of all slop | median | mean | apps with any |
+|---|---:|---:|---:|---:|
+| security | 34.6% | 13.7 | 20.3 | 1,572 |
+| performance | 24.4% | 6.5 | 14.3 | 1,378 |
+| quality | 22.6% | 0.0 | 13.3 | 896 |
+| accessibility | 18.3% | 9.5 | 10.7 | 1,052 |
 
-| fires on | probe |
-|---:|---|
-| 98% | missing Content-Security-Policy |
-| 97% | no clickjacking defense |
-| 90% | missing `X-Content-Type-Options` |
-| 90% | missing `Referrer-Policy` |
-| 84% | a Core Web Vitals audit below its bar |
-| 71% | the overall Lighthouse score below its bar |
-| 67% | a critical accessibility violation |
+Medians count apps with nothing on that axis as zero. Security is almost always present and usually small.
+The median and both quartiles all sit at the header floor of 13.7. Quality is the reverse. Most apps have none, but
+the top quarter carry 30 or more.
 
-A finding at 98% is nearly a constant. It taxes everyone and separates no one. The signal that actually ranks apps lives in the middle, the accessibility tiers, the spread of Core Web Vitals, dead controls at 13%, and the rare severe classes below. That middle band is where two apps at "looks done" pull apart.
+By category, three sources carry about two thirds of all slop: Lighthouse performance (24.1%), security
+headers (22.6%) and accessibility (18.1%). After those come crash resistance (8.2%), dead controls (7.2%) and
+secrets exposure (4.3%).
 
-## 6. How bad is it, and what does "bad" mean?
+![Axis correlation](docs/charts/fig04_axis_correlation.png)
 
-We priced every finding into a severity tier, each band ten points wide, and counted the apps carrying at least one.
+The axes barely move together. The strongest pairwise Spearman correlation is 0.14, between security and
+performance, and quality against performance is −0.01. Lighthouse score against all slop outside performance
+gives ρ = −0.07.
 
-| tier (priced penalty) | findings | apps with at least one | expected per app |
-|---|---:|---:|---:|
-| **critical (40+)** | 495 | **426 (26%)** | 0.30 |
-| severe (31 to 40) | 257 | 239 (15%) | 0.16 |
-| serious (21 to 30) | 660 | 563 (35%) | 0.41 |
-| moderate (11 to 20) | 893 | 757 (47%) | 0.55 |
-| minor (1 to 10) | 7,076 | 1,618 (100%) | 4.35 |
+### 4.3 Fire frequency
 
-Apps land in several tiers at once, so the cleaner read is each app's single worst finding, which sorts every app into exactly one band.
+![Most frequent findings](docs/charts/fig05_fire_frequency.png)
 
-| an app's worst finding | apps | reading |
-|---|---:|---|
-| 40 or more, acute | 426 (26%) | it crashes, leaks, or is unusable |
-| 21 or more, significant | 957 (59%) | at least one problem past cosmetic |
-| 11 or more | 1,279 (79%) | above the pure hygiene floor |
+The four header probes fire on 90 to 98% of apps. 1,550 of 1,579 apps (98.2%) send no Content Security Policy.
+A probe that fires on nearly every app barely changes the ranking. The spread comes from the middle of the
+chart: accessibility fires on 65.5% of apps, Lighthouse below 90 on 62.8%, a dead control on 13.6%, an
+unpinned third party script on 11.5%, and a crash on malformed input on 8.7%.
 
-The median app's worst finding is a **27**, which sits in the significant band, so the typical app's single biggest problem is already more than cosmetic. Splitting the acute tier by axis shows what "acute" is made of.
+Four probes never applied to any app: `qa-race-001`, `qa-race-002`, `sec-idor-002` and `sec-idor-003`. Each
+needs a surface (a drivable signup, or a create and read API pair) that no app exposed to us. Another 45
+probes applied somewhere and never fired.
 
-| critical (40+) findings | count | share |
+### 4.4 Severity
+
+![Worst finding per app](docs/charts/fig06_worst_finding.png)
+
+| each app's worst finding | apps | share |
 |---|---:|---:|
-| quality | 213 | 43% |
-| performance | 206 | 42% |
-| security | 76 | 15% |
+| critical (41+) | 435 | 27.5% |
+| severe (31 to 40) | 152 | 9.6% |
+| serious (21 to 30) | 331 | 21.0% |
+| moderate (11 to 20) | 334 | 21.2% |
+| minor (1 to 10) | 327 | 20.7% |
 
-Quality and performance make up 85% of the acute tier. A catastrophically slow page (Lighthouse red) and a crash on malformed input dominate it, then a deploy that will not stay up and a backend left open to anyone, with real breaches the thin 15% that remains. Only **59 apps (3.6%)** carry a security critical at all, and **47 (2.9%)** an exploitable one.
+58.1% of apps (918) are significant: their worst finding is serious or above. The median worst finding is 27
+(Q1 12, Q3 46.1). Performance and accessibility account for much of that. Counting only security and quality
+findings, 31.5% of apps (498) are significant and 17.4% (275) are acute.
 
-So the corpus reads at three levels.
+No single probe drives those tiers. 25 probes put an app in the acute tier, and a crash on malformed input
+accounts for half of those apps; the rest each reach under 2% of the corpus. 85% of acute apps and 81% of
+significant ones fail on exactly one probe (`docs/charts/severity_breakdown.csv`).
 
-- **Acute, 26%.** Broken enough to fail a real user or leak to a real attacker: a crash, a dead deploy, an unusable page, an open backend.
-- **Significant, 59%.** At least one finding past the cosmetic floor: a dead control, a broken link, a missing rate limit, a page slow enough to notice.
-- **The floor, everyone.** Missing headers, middling accessibility, orange performance. No app escapes it.
+Most of the acute tier is functional failure. Of the 506 critical findings, 43.1% are quality and 36.2% are
+performance, which leaves 20.8% for security. The top critical findings are a Lighthouse score in the red (178
+apps), a crash on malformed input (137), and a client bundle pointing at a backend real visitors cannot reach
+(23). A password reset email that never arrives accounts for 15.
 
-The part that should sting is how little of the significant band has any excuse. A dead control, a broken link, a crash on bad input, a missing label, a backend left open, each is a couple of prompts to repair or delete for a team that had a day or more and an AI writing the code. They do not ship because they are hard, they ship because the demo never exercises them, it clicks the three buttons that work and never the dead fourth, and never sends the input that 500s the API. Performance is no exception, whatever the team meant to build. A page that takes five to ten seconds has already lost the user, who does not care how many features are loading, so optimizing it is simply the job. It can cost more than two prompts, and harder to fix still has to ship fixed. A finding at 21 or more, anywhere in this band, is the part of the app nobody went back to, which is the exact part a durability grader exists to see.
+### 4.5 Exploitable findings (RQ2)
 
-## 6.1 Within security, the chronic floor
+![Exploitable apps by class](docs/charts/fig07_exploitable.png)
 
-Within the security axis alone, splitting every finding into **acute**, exploitable right now, and **chronic**, a missing mitigation, the population is lopsided.
+75 apps (4.7%) have at least one exploitable finding.
 
-| tier | rate | what it is |
-|---|---:|---|
-| any acute finding | **2.9%** | 47 of 1,625 apps |
-| injection or remote code execution | **~0.1%** | one blind command injection, one stored XSS, both flagged for a rerun in isolation |
-| **managed backend exposure** | **1.1%** | 18 apps, a Supabase or Firebase table readable or writable by anyone, several leaking passwords or emails |
-| a served secret or source file | 1.3% | a shipped `.env`, a served `.git`, a key baked into the bundle |
-| access control or data exposure | 0.4% | a protected resource reachable with no credentials |
-| chronic hygiene, representative | 67 to 98% | headers, performance, accessibility |
-
-About **3%** of apps are exploitable, essentially none through an injection hole, while **67 to 98%** are missing basic hygiene. The functionality is mostly there, and the boring nonfunctional floor is pervasively absent. That is the empirical signature of AI era slop from the outside, chronic rot across the board with few smoking guns.
-
-The small acute slice, though, changed shape in a way we did not expect. Before this cycle's backend probe, the largest acute class was a served secret file, and we treated the exploitable danger as hidden behind authentication where a black box grader could not reach it. This run reaches part of it. The **largest acute class is now managed backend exposure**, a Supabase or Firebase backend left open to an anonymous client because row level security was never switched on. And we do not guess at these. The probe confirms each one by reading a real row or completing a real anonymous insert. One Firestore `users` collection handed back documents carrying a `password` field. A Supabase `profiles` table leaked `email` and `phone`. A `candidates` table accepted an anonymous insert. The acute danger did not vanish and it did not stay fully hidden. Part of it walked into plain sight, in a database that ships open by default, in front of a probe that knows to ask.
-
-## 7. Why the dangerous surface is so thin
-
-The acute rate is low because the danger sits mostly **out of reach from the street**. Reachability holds the number down, and whether the code is safe is a separate question the grade cannot settle from outside.
-
-**First, most apps have no backend to attack.** Of the 1,106 apps whose runtime traffic we could classify, the tiers overlap (one app talks to several at once), so read these as overlapping memberships, where one app can sit in several rows.
-
-| host tier | apps carrying it (of 1,106) | reachable from the street? |
-|---|---:|---|
-| same origin static frontend | 670 (61%) | no backend to inject |
-| a consumed vendor | 222 (20%) | not the app's surface |
-| an own backend | 203 (18%) | yes |
-| opaque, unattributable | 190 (17%) | not probed, flagged, no clean bill |
-| a managed backend | 173 (16%) | only through its config |
-
-You cannot inject SQL into a static site, and a managed backend's only misconfiguration knob is its access rules. Only **18%** of these apps run an own backend we could reach, so the injection classes have almost nowhere to land.
-
-**Second, we cannot get behind the login.** The authed surface, where the real logic lives, needs an account, and most apps do not give us a drivable one.
-
-| auth shape | share of 1,625 |
+| class | apps |
 |---|---:|
-| no auth at all | 56% |
-| a drivable password signup | **14%** |
-| signup present but not drivable (SSO, SDK, wizard) | 14% |
-| SSO only, no signup to drive | 7% |
-| a login wall with no signup | 9% |
+| live credential in the client bundle | 43 |
+| open managed backend | 18 |
+| served `.git` directory or hidden file | 10 |
+| stored XSS | 3 |
+| access control bypass | 2 |
+| anonymous data exposure | 1 |
+| SQL injection | 1 |
 
-Only **14%** of apps let us self register and reach the data plane, and of those 233, just **14 carried an authed surface finding**. The most common, on 8 of them, is a signup that promises a confirmation email and never sends it, so you register, the app tells you to check your inbox, nothing arrives, and the account is stranded before it starts. It is the broken not hackable tier again, one login deeper, and invisible to anyone who does not actually try to sign up. The authenticated half of every app is a surface we mostly cannot open.
+An app with two classes counts in both rows. The largest class is a live credential shipped to the browser.
+The most common case, on 27 apps, is a Google API key that can call the Gemini API. The second class is a
+Supabase or Firebase database left open. On 16 apps, row level security was off and an anonymous client could
+read or write rows; on 5 of them it could read records in bulk. Every backend finding is confirmed by a live
+request.
 
-**Third, a bot challenge blocked the deep probes on hundreds of apps.** Two thirds of the corpus lives on Vercel, and Vercel's edge threw a challenge at **29% of the whole run** (**66% of the Vercel apps**). Most of those, 690, challenged only after all the probes had run, so the grade is valid. But 90 were withheld outright, and on **404 apps the security axis was left not clean tested**, the challenge tripped exactly on the heavy security probes (`sec-hosthdr`, `sec-cmdi`, `sec-dos`, `sec-upload`). So even where a backend exists, the WAF often stands between us and it.
+Classic injection barely registers: one SQL injection and three stored XSS. Section 4.10 shows this is a limit
+of reach.
 
-Together those three say something other than "these apps are secure." The modern stack has hidden the dangerous surface behind a static frontend, a login, and a WAF. The 3% acute rate is a floor, and it is a finding about the modern stack as much as about the apps.
+### 4.6 AI builders (RQ3)
 
-## 8. The AI builder question
+The grader identifies Lovable and Bolt apps from their served markup.
 
-The whole AI slop worry rests on one testable claim, whether AI built apps are sloppier than hand deployed ones. Because the grader fingerprints the builder from served markup (Lovable ships `cdn.gpteng.co`, Bolt its own signature), we can check.
+| builder | n | median slop | security mean | quality mean | accessibility mean | performance mean |
+|---|---:|---:|---:|---:|---:|---:|
+| hand built | 1,497 | 47.9 | 19.9 | 13.1 | 10.7 | 14.2 |
+| Lovable | 73 | 50.2 | 24.2 | 15.4 | 12.5 | 17.0 |
+| Bolt | 9 | 55.2 | 45.5 | 29.3 | 10.0 | 1.8 |
 
-| group | n | median slop | security (mean) | quality (mean) | performance (mean) |
-|---|---:|---:|---:|---:|---:|
-| hand built | 1,543 | 49.7 | 18.1 | 23.4 | 16.3 |
-| Lovable | 71 | 52.6 | 23.0 | 28.9 | 19.0 |
-| Bolt | 11 | 68.9 | 41.5 | 44.0 | 6.3 |
+Overall, Lovable apps are not significantly sloppier than hand built apps (one sided Mann-Whitney, p = 0.16).
+Bolt has only 9 apps, too few to test.
 
-First, **the Lovable performance premium is gone from the score.** In the prior corpus Lovable ran a median of 72 against 49, an all performance gap at p = 1.1e-5. Here it is 52.6 against 49.7, and a one sided Mann-Whitney test lands at **p = 0.056**, just outside significance. Hand built apps got a little sloppier too, mostly on the newly continuous performance axis, and the gap closed.
+The difference is in the backend. 11 of the 82 AI builder apps (13.4%) have an exposed managed backend,
+against 9 of 1,497 hand built apps (0.6%). That is about 22 times the rate (odds ratio 25.6, Fisher's exact
+test, p = 4.4 × 10⁻¹⁰). Both builders offer Supabase as a built in backend.
 
-Second, **AI built apps stand out on security.** Lovable's security mean rose above hand built, Bolt's is far above, and the mechanism is concrete. **Managed backend exposure fires on 11 of the 82 Lovable and Bolt apps, 13%**, against roughly 1% across the population. The AI builder habit of wiring a Supabase or Firebase backend and shipping without configuring its access rules is the dominant AI builder risk now, and the new probe is what made it visible. The story moved from heavy bundles to open databases.
+### 4.7 Winners (RQ4)
 
-## 9. Do the winners hold up?
+![Median slop, winners and non winners](docs/charts/fig08_winners.png)
 
-The corpus carries each app's contest result, which let us ask a question we could not resist, whether the apps the judges loved also hold up.
+The dataset records which apps won a prize at their event. 247 of the graded apps did.
 
-| group | n | median slop | Lighthouse green |
+| comparison | winners | non winners | p (two sided) |
 |---|---:|---:|---:|
-| winners | 253 | **54.9** | 24.8% |
-| non winners | 1,372 | 49.1 | 29.4% |
+| median total slop | 52.7 | 47.6 | 0.22 |
+| median slop outside performance | 33.5 | 33.2 | 0.48 |
+| median performance axis | 10.9 | 5.8 | 0.001 |
+| median Lighthouse score | 78 | 83.5 | 0.003 |
+| median observed surface size | 26 | 25 | 0.70 |
 
-The winners are not cleaner. They ship a **12% higher** median slop and perform slightly worse, and the gap holds on both measures. The likeliest reason is ambition, since a winning app tends to attempt more and more surface is more room for slop to land. Whatever the cause, the point stands, because judging rewards the idea, the demo, and the execution, and none of those predict durability. This one number is the cleanest case for the whole instrument, an objective durability read that carries a signal the human judging does not.
+Winners score 11% higher on median slop, but the gap is not significant. The whole difference is
+performance: winners have a lower Lighthouse score (30.2% reach green against 36.8%) and nearly twice the
+median performance slop.
 
-## 9.1 Who ships the cleanest, by event and by stack
+Outside performance, the groups are the same. That holds for the findings that vary most between apps:
 
-Slop varies more than threefold across events. The sloppiest hackathons (median slop, at least ten graded apps) are hack-brown-2026 at 105.8, ellehacks-2026 at 79.6, and hackeurope at 67.5; the cleanest are oregonhacks at 28.3, wildhacks-2026 at 30.2, and la-hacks-2025 at 33.7. Prestige does not track cleanliness, the flagship events sit in the middle of the pack.
+| finding | winners | non winners | p |
+|---|---:|---:|---:|
+| crash on malformed input | 6.9% | 9.0% | 0.33 |
+| dead control | 13.0% | 13.7% | 0.84 |
+| secret in the bundle | 3.6% | 2.6% | 0.39 |
+| exploitable | 5.3% | 4.7% | 0.63 |
+| worst security or quality finding above 20 | 32.0% | 31.5% | 0.88 |
+| worst security or quality finding above 40 | 17.0% | 17.5% | 0.93 |
 
-By hosting stack the pattern is sharper, and it makes the report's recurring point for us. Streamlit apps are the cleanest of any platform, a median slop of **0**, and the reason is thinness, since a Streamlit app is a frontend with almost no attackable surface, so there is nothing to find. Vercel and GitHub Pages sit low too (medians around 45), both frontend heavy. Render, Firebase, and Lovable sit at the sloppy end (medians of 58 to 67), because that is where a real backend and a real feature set live, which is more surface to get wrong. A low score can mean a clean app or a thin one, which is exactly why the coverage report ships with every grade.
+The last two rows count only security and quality findings. The one gap outside performance is accessibility:
+59.5% of winners have a finding against 67.3% of non winners (p = 0.019). It does not survive correction, so
+we treat it as exploratory.
 
-## 10. Under the hood of the two heavy axes
+Winners ship heavier pages, though their observed surface (routes, forms and endpoints) is no larger.
 
-Accessibility and performance are 46% of all the slop, so we opened both up.
+| measure | winners | non winners | p |
+|---|---:|---:|---:|
+| page weight audit flagged | 21.1% | 12.2% | 0.0004 |
+| total blocking time, median | 440 ms | 300 ms | 0.003 |
+| largest contentful paint, median | 4.4 s | 3.9 s | 0.06 |
+| first contentful paint, median | 2.5 s | 2.7 s | 0.69 |
+| time to first byte, median | 20 ms | 20 ms | 0.81 |
 
-**Accessibility is, in practice, a contrast test.** Of the 1,087 apps with an accessibility finding, one rule dominates.
+The paint and timing medians cover only apps below 90, since green apps record no metrics. Server response and
+first paint are equal. Winners differ in page weight and main thread work.
 
-| rule | share of the 1,087 |
-|---|---:|
-| color contrast | **80%** |
-| button name (an unlabeled icon button) | 14% |
-| missing viewport meta | 8% |
-| a form control with no label | 6% |
-| everything else | 3 to 5% each |
+The gap survives two controls. Grading conditions do not explain it: the box was equally loaded for both
+groups (median `benchmark_index` 1452 against 1437, p = 0.32). Event mix does not either. In the 29 events
+with at least three winners and three non winners, winners carry more performance slop in 21 (Wilcoxon p =
+0.027) and a lower Lighthouse score in 19 (p = 0.04). Slop outside performance splits 12 to 17 (p = 0.97), and
+the acute share splits 12 to 15 (p = 0.92).
 
-Four times out of five, an accessibility finding is text you cannot read against its background. That is not a coincidence. Contrast is the one accessibility failure that no framework can prevent (you pick the colors), that the trendy muted palettes AI reaches for actively cause, and that is checked against every text node on the page. The rest, the missing lang, the empty title, the unlabeled input, barely fire, because every modern scaffold already gets them right. Automation solved the accessibility checklist and left the design judgment, which is exactly where the failures now concentrate.
+Judges pick apps that match their peers on durability and run heavier in the browser.
 
-**Performance is a story of fast servers and heavy fronts.** The Lighthouse metrics separate cleanly into two halves.
+### 4.8 Platforms and events
 
-| metric | median | tail |
-|---|---:|---|
-| TTFB (server response) | **20 ms** | fast, most apps sit on a CDN edge |
-| CLS (layout stability) | **0.00** | stable, frameworks reserve layout by default |
-| LCP (largest paint) | 4.0 s | slow, main content takes four seconds |
-| TBT (main thread blocking) | 370 ms | median fine, but the mean is 7.4 seconds and the max is **168 seconds** |
+![Slop by host platform](docs/charts/fig09_by_platform.png)
 
-The server is not the problem. Layout is not the problem. The problem is the shipped bundle, a median page weighing **4.0 MB** (one weighs 124 MB), some shipping over 2,000 requests, a handful locking the main thread for minutes. TTFB and CLS the platform and the framework hand you for free. LCP, TBT, and page weight are the parts the builder controls, and they are the parts that are heavy. Performance slop is a bundle discipline problem wearing an infrastructure costume.
+Slop differs by host platform (Kruskal-Wallis across the 10 platforms with at least 10 apps, p = 3.7 × 10⁻⁶).
+Static hosts sit lowest: Cloudflare Pages at a median of 45.1, Vercel at 45.4 (1,057 apps) and GitHub Pages at
+46.4. Hosts that run a backend sit higher: Firebase at 63.9 and Google Cloud Run at 66.3. Apps on unidentified
+hosts, mostly custom domains, have the highest median at 70.6. Across all apps, slop correlates weakly with
+observed surface size (ρ = 0.14, p < 10⁻⁷).
 
-And the axes move together. Across the corpus a lower overall score goes with a better Lighthouse score (Spearman rho of -0.57), so the app that skips the security floor tends to skip the performance one too. Slop is a habit that runs across the axes, and the teams that hardened one thing tended to harden the rest.
+Events differ less. Among the 49 events with at least 10 graded apps, the medians range from 26.4 to 101.8. A
+Kruskal-Wallis test gives p = 0.03, weak evidence given the number of tests.
 
-## 11. What never fired, and the reach frontier
+| sloppiest events (median) | | cleanest events (median) | |
+|---|---:|---|---:|
+| `hack-brown-2026` (n 12) | 101.8 | `vibehack-london-2026` (n 21) | 26.4 |
+| `ellehacks-2026` (n 14) | 71.0 | `oregonhacks` (n 28) | 26.8 |
+| `diamondhacks-2026` (n 27) | 67.9 | `bostonhacks-2025` (n 13) | 32.9 |
+| `hackpsu-spring-2026` (n 15) | 64.7 | `unihack2026` (n 52) | 35.9 |
+| `swamphacks-xi` (n 18) | 63.3 | `cs-girlies-wellness-hackathon` (n 31) | 36.8 |
 
-A grader is as interesting for what it cannot say as for what it can. Four probes never reached a target on any of the 1,625 apps (the two IDOR record probes, one race condition probe), and the entire injection cluster, SQLi, SSTI, file upload, fired essentially zero times. We resisted reading that as "these apps are safe from injection." On a corpus that is two thirds static frontends behind a WAF, the injection probes have almost no reachable surface, and the request volume tells you they tried hard for it, since the injection and upload probes are the highest fan out in the battery (one XXE probe sent 864 requests to a single app). A low fire rate for a class here means "unreachable," not "rare," and only a corpus with more server native apps would separate the two.
+The largest and best known events land in the middle. Section 4.9 tests that directly.
 
-## 12. A few apps that broke the mold
+### 4.9 Prestige and selectivity (RQ6)
 
-The anomaly list is where the fuzzer bugs and the truly broken apps hide, so we always read it by hand. Exactly one app scored a clean `0` (a thin landing page with no real surface, so its clean 0 marks thinness and the 0% clean floor essentially holds). At the other end, the worst 40 apps are a catalog of the acute tail, `theoceanguard.tech` at 239 (a leaked backend plus a crash plus broken accessibility), a run of Lovable and Bolt apps carrying backend exposure at 98, and a cluster of apps failing `availability` at 85 (a page that would not stay up under load). The tail is orderly, the same few severe classes stacked.
+![Event median slop by host rank and event type](docs/charts/fig13_prestige.png)
 
-## 13. Is the ruler trustworthy?
+None of the prestige or selectivity measures predicts how well an event's apps hold up.
 
-We put the ruler through four honesty checks, because a comparable number is worthless if it drifts or lies.
+| measure | result | p |
+|---|---|---:|
+| host QS 2026 rank (54 ranked events) | ρ = −0.03 (95% CI −0.30 to 0.24) | 0.82 |
+| Devpost participants (65 events) | ρ = 0.06 | 0.64 |
+| admissions gate: yes (14) vs no (51) | median 46.9 vs 51.7 | 0.41 |
+| MLH member: yes (42) vs no (23) | median 52.2 vs 43.9 | 0.018 |
+| format: in person (56) vs online (9) | median 51.0 vs 45.0 | 0.21 |
+| host: university (54) vs independent (11) | median 50.1 vs 52.3 | 0.56 |
 
-The first check is stability, and the score is deterministic by construction. No model sits in the number, since the perception LLM only proposes targets and a deterministic probe alone decides every fire, at temperature 0 with a cached plan. The two seasoned engines are pinned (axe-core 4.10.2, Lighthouse 13.4.1, the latter a median of three runs to tame its timing swing), repeat runs of the prior engine correlated at 0.97 or higher with no drift, and 2.0 adds probes while keeping that determinism.
+The QS result is a clean null. The tested hosts run from MIT, Stanford and Harvard (ranked 1, 3 and 5) to
+universities ranked near 700, and their events' median slop does not move with rank. The confidence interval
+rules out any correlation stronger than about 0.3 in either direction.
 
-Coverage is the second check, and the average app ran **53 of the 102 probes**, a median of 57% of the battery. That bound ships with every grade, so a score reads as "tested on most of what applied," not "clean."
+The one difference points the other way: MLH member events are sloppier, 52.2 against 43.9. We treat it as
+a lead. All 9 online events and 10 of the 11 independent ones are non MLH, so the comparison
+mixes in format and host. Among in person university events alone, the gap shrinks to 51.7 against 41.5 (12
+non MLH events, p = 0.06). It also fails the multiple comparison correction in Section 6.
 
-Parity, the third check, produced a refusal, and a useful one. We asked the tool for a cross stack false negative comparison, contrasting SPA against server rendered apps, and it refused correctly, because every app in this corpus arrived as a bare URL with no source, so it is a single stack with nothing to contrast, and the lens says "cannot assess" instead of inventing a clean bill. A tool that tells you when it cannot measure something is worth more than one that always answers.
+These are event level tests with modest power, so they cannot exclude a small prestige effect. They do show
+that prestige is not a useful predictor.
 
-Precision is the fourth check. The automated audit recognizes a fixed list of false positive classes and is blunt that it is not a true precision number. Of the 14,561 scored fires, **zero of the known false positive classes survived**, but only 40 are positively vouched and **62% carry no precision rule at all**, dominated by the deterministic presence checks (a header is absent, a control is dead) where false positive risk is structurally low. Eleven fires are flagged as real findings on the wrong owner's page (a rate limit or a bundle secret on a shared catch all host), which dissolve when a team submits its own URL. We also audited the fired findings by hand, and the backend exposure driver is clean, **18 of 18** confirmed by a real read or write, with the residual a handful of scope errors at the margin (one middleware bypass check firing on a Cloudflare path). None of it touches the high volume penalty mass or the acute findings. The audit cannot tell "no rule needed" from "no rule written," and we can, so we report the unaudited mass as unaudited instead of claiming a precision we have not measured.
+### 4.10 Reach (RQ5)
 
-## 14. What it all means
+![Auth shape and backend tier](docs/charts/fig12_reach.png)
 
-The median app's **worst case slop**, the score it would carry if every applicable probe fired, is around **1,954**, while its actual median score is **50**, so it realizes about **2.3%** of its potential failure surface. It defends nearly everything it exposes, and fails on the diffuse hygiene it never thought about. That gap is the whole finding in one number.
+A black box grader only tests what it can reach, and three things limit that here.
 
-So the story of this corpus, from the outside, is "AI writes **functional** code that ships without the boring universal floor," no headers, heavy bundles, unreadable text, a dead button, sometimes a localhost backend still pointing at the developer's laptop. The popular version, "AI writes insecure code that gets exploited," is the rarer case here. The acute danger is real but rare, and the slice that remains has partly surfaced in the managed backend, where the danger now lives in a configuration toggle. The apps stayed about as dangerous as before, and what changed is that the danger moved somewhere a grader can, for once, walk right up to it.
+Most apps have no backend we can attack. We observed runtime traffic on 1,052 apps. Only 195 of them (19%)
+call a backend of their own that the grader can probe. 169 (16%) use a managed backend, which the grader can
+only test through its access rules. The largest tier is same origin traffic (636 apps, 60%), typical of a
+static frontend. The tiers overlap.
 
-## 15. Limitations, stated openly
+Most apps have no account we can create. 883 apps (56%) have no auth at all. Only 226 (14%) offer a password
+signup the grader can complete. Of those 226, 13 had a finding behind the login. The most common was a
+confirmation or reset email that never arrived.
 
-- **Unauthenticated surface only.** A defect behind a login we cannot establish is undercounted. The acute rate is a floor, and Section 7 shows how large a floor.
-- **The injection surface is dark, and that is a matter of reach.** Two thirds static frontends behind a WAF give injection nowhere to land, so a zero fire rate there proves nothing about the code.
-- **Recall is unaudited, and precision is vouched only where a rule exists.** This provisional release guarantees stability and precision on the classes with explicit rules or a confirmed read or write. Everything else is unaudited and carries no endorsement.
-- **Independent of intent.** Sloptic grades the universal floor and leaves the worth of a feature alone. Originality and product quality are out of scope by design.
-- **One population.** These are young, small, frontend heavy hackathon apps, so do not read the distribution as production software.
+Bot challenges limit the rest. On 161 apps the security axis is incompletely tested.
 
-## 16. Reproduce
+The injection probes show the cost. `sec-cmdi-001` applied to 934 apps, sent a median of 74 requests to each,
+and fired on none. On a population of static frontends behind a web application firewall, a zero fire rate
+means the probes found nothing to inject into.
+
+### 4.11 Performance and accessibility detail
+
+![Lighthouse performance scores](docs/charts/fig10_lighthouse.png)
+
+The median Lighthouse score is 83 (Q1 66, Q3 93, n = 1,538). 35.8% of apps reach green (90 or above) and carry
+no performance slop. Among the 991 apps with a performance finding:
+
+| metric | median | worst |
+|---|---:|---:|
+| time to first byte | 20 ms | 1.08 s |
+| cumulative layout shift | 0.00 | 3.3 |
+| first contentful paint | 2.7 s | 74.6 s |
+| largest contentful paint | 4.0 s | 125.9 s |
+| total blocking time | 320 ms | 167.8 s |
+
+Servers answer in a median 20 ms, and layouts hold still. The slow part is what the page ships. The median
+flagged page weighs 4.1 MB, and the heaviest weighs 124 MB. A few apps block the main thread for minutes (up
+to 168 s).
+
+![Accessibility violations by axe rule](docs/charts/fig11_a11y_rules.png)
+
+1,034 apps (65.5%) have an accessibility violation. Color contrast accounts for 80.5% of them. Unlabeled
+buttons follow at 13.7%, then a viewport that blocks zoom (7.1%) and unlabeled form fields (6.6%). Missing
+page language and missing titles are rare (under 4%).
+
+## 5. Discussion
+
+Slop, as this report measures it, is whatever counts against an app no matter what the app does. Most of it is
+invisible from where the team sits, which is how it ships. Lighthouse loads each app as a mid range phone on
+slow 4G would: 150 ms round trips, 1.6 Mbps down, and CPU work slowed four times. The team builds and demos on
+a fast laptop, where a 4 MB page appears instantly. Contrast failures, which account for 80.5% of apps with an
+accessibility finding, are invisible to builders with good eyesight on a bright screen, and an unlabeled
+button is invisible to anyone who never hears the page read aloud. A crash on malformed input needs input no
+one on the team types, a dead control needs a click the demo never makes, and a missing header or a leaked key
+leaves the page working.
+
+The typical app works but skips basic hygiene: it sends no security headers, ships a heavy bundle, and has
+text that fails contrast. Past that floor, 58% of apps have at least one real problem, such as a dead button,
+a crash on bad input, a slow page, or a reset email that never comes.
+
+Exploitable flaws are rarer, at 4.7%, and concentrate in two places: API keys pasted into client code, and
+databases connected without access rules. Both are configuration mistakes.
+
+If every probe that applied to an app had fired at its highest rung, the median app would score 2,078. It
+scores 48.0, or 2.2% of that. Slop is a thin layer spread across nearly every app.
+
+Winning a hackathon says nothing about durability, the AI builder risk sits in the backend, and the four axes
+are independent. A single number needs its axis breakdown, and judging cannot replace a durability check.
+
+Prestige cannot replace one either. Who gets in, who wins, and where the event is held all measure something
+other than whether the app works.
+
+## 6. Limitations
+
+- **Survivor bias.** 30% of links were dead before we graded them.
+- **Unauthenticated surface.** We reached a login protected surface on at most 14% of apps. Flaws behind a
+  login are undercounted, so the exploitable rate is a lower bound.
+- **Injection is unreachable here.** Most apps are static frontends, and a firewall challenged the heavy
+  probes on 161 more. A zero fire rate for injection says nothing about injection risk.
+- **Precision is partly audited.** The automatic audit found none of its known false positive classes among
+  14,254 findings on all 1,734 scored records, but it has rules for only some probes: 62% of the penalty
+  inside the score comes from probes without one. Most of that is presence checks (a header is missing, a
+  control does nothing), where false positives are rare. Every managed backend finding is
+  confirmed by a live request.
+- **Recall is unaudited.** We have no ground truth for what the grader missed.
+- **Verdicts vary between runs.** We compared this run with the previous one on the 805 curve eligible apps
+  graded without a challenge both times, counting each verdict that fired in either run. Lighthouse below 90
+  flipped on 15.0% of those verdicts, since scores near the line move from run to run. Security headers
+  flipped on 0.1%, accessibility on 1.5%, crash resistance on 3.0% (1 of 33 verdicts), and all other probes
+  combined on 4.5% (`docs/charts/reliability.csv`). The release notes count 906 apps because they include
+  records the curve excludes.
+- **Multiple comparisons.** We ran 38 hypothesis tests and six axis correlations without correction. A
+  Bonferroni correction over all 44 (threshold 0.0011) keeps five results: backend exposure by builder,
+  slop by platform, slop against surface size, the winner performance axis, and the winner page weight rate.
+  The per URL link rot trend also passes it, but its URLs cluster by event, and the event level test does
+  not.
+  The winner Lighthouse and blocking time gaps (p ≈ 0.003) and the within event results (p ≈ 0.03) fall
+  outside it. They agree with the corrected results and we read them as supporting evidence. The MLH
+  difference (p = 0.018) also falls outside it. The null results, including every winner comparison outside
+  performance and every prestige measure, do not depend on correction.
+- **Event coding.** The admissions gate reads Devpost's eligibility text, which misses events that select
+  applicants elsewhere. The QS rank measures the host university's standing, not the event's.
+- **One population.** These are hackathon apps. The results do not describe production software.
+- **Intent is out of scope.** The grader measures failures that count against any app. It does not judge
+  whether an idea is good.
+
+## 7. Conclusion
+
+Seen from outside, hackathon web apps mostly fail the same way. The floor is missing everywhere, real
+functional problems are common, and exploitable flaws are rare and clustered in leaked keys and open
+databases. AI builders do not make apps sloppier overall, but their apps leave the backend open about 22
+times as often.
+Winning does not predict durability, and neither does the prestige or selectivity of the event. The axes
+are independent, so a durability score has to report each one separately.
+
+## 8. Reproducibility
+
+The raw run file, `multihacksv26retried.jsonl`, is not published. Each record carries the app's URL, its hosts,
+session cookies, and the evidence behind its findings, including where a leaked credential or an open table
+sits. Releasing it would hand out a list of exploitable apps.
+
+We publish an anonymized version instead: `multihacksv26-anon.jsonl.gz` (2.7 MB), attached to the `v3.0.0`
+GitHub release and built by `scripts/anonymize_run.py`. It keeps every record, including the dead and
+excluded ones, and the fields the analysis reads. It drops URLs, hosts, project names, cookies, routes, and all
+finding evidence except numbers, flags, Lighthouse metrics and axe rule ids. Column names in open tables are
+reduced to the categories we count (email, password). Every app gets a random id.
+
+One more field is withheld. On the 82 records with an exploitable finding, the event is replaced with
+`withheld`, so the file never says which event holds an exploitable app. Winner flags stay.
+
+The anonymized file reproduces every number and figure in this report, the frozen curve included, with one
+exception. Results grouped by event shift, because 75 graded apps lose their event:
+
+| result | this report | anonymized file |
+|---|---:|---:|
+| slop across events, Kruskal-Wallis p | 0.03 | 0.08 |
+| within event: performance axis (winners higher / lower) | 21 / 8, p = 0.027 | 18 / 11, p = 0.05 |
+| within event: Lighthouse score (winners higher / lower) | 10 / 19, p = 0.04 | 11 / 17, p = 0.12 |
+| within event: slop outside performance | p = 0.97 | p = 0.93 |
+| RQ6: host QS rank | ρ = −0.03, p = 0.82 | ρ = −0.13, p = 0.35 |
+| RQ6: MLH member vs not | p = 0.018 | p = 0.029 |
+
+The per event medians in Section 4.8 also move for the 41 events that had an exploitable app, and the link
+rot shares in Section 2.2 rise by up to four points because withheld records leave their events. The other RQ6
+tests stay null on the anonymized file. The headline winner results in Section 4.7 do not depend on events and
+reproduce exactly.
+
+The run to run flip rates in Section 6 need the previous run as well (`--repeat multihacksv25c2.jsonl`). That
+run is not published, and the anonymized ids are random, so the flip rates cannot be rebuilt from the release.
+
+No rerun can match this one exactly, since the apps change or disappear. A new run over the Appendix A events
+measures the same population at a later date.
 
 ```sh
-# freeze the reference distribution from a corpus run
-uv run python scripts/benchmark.py build <run>.jsonl --version 2026.3
+# the numbers
+uv run python scripts/stats.py multihacksv26-anon.jsonl.gz --all           # full text report
+uv run python scripts/stats.py multihacksv26-anon.jsonl.gz --corpus-json   # the figures JSON
 
-# place any single app on that curve
+# the figures and tests.csv
+uv run --with matplotlib --with scipy python scripts/stats.py multihacksv26-anon.jsonl.gz --charts
+
+# the frozen curve, and ranking one app against it
+uv run python scripts/benchmark.py build multihacksv26-anon.jsonl.gz --version 2026.4 --status final --out curve.json
 uv run python -m sloptic.cli --target https://your-app.example.com --out app.jsonl
 uv run python scripts/benchmark.py rank --results app.jsonl
-
-# read the full picture yourself
-uv run python scripts/stats.py <run>.jsonl              # the default report
-uv run python scripts/stats.py <run>.jsonl --parity     # cross stack visibility
-uv run python scripts/stats.py <run>.jsonl --precision  # the false positive audit
 ```
 
-## Sources
+## References
 
-Background figures on AI generated code are external; every corpus figure is this instrument's own measurement over the 2026.3 population.
+- [Veracode, 2025 GenAI Code Security Report](https://www.veracode.com/resources/analyst-reports/2025-genai-code-security-report/)
+- [Veracode, Spring 2026 GenAI Code Security update](https://www.veracode.com/blog/spring-2026-genai-code-security/)
+- [Cloud Security Alliance, AI generated code vulnerability research note (2026)](https://labs.cloudsecurityalliance.org/research/csa-research-note-ai-codegen-vulnerability-debt-20260406-csa/)
 
-- [Veracode 2025 GenAI Code Security Report](https://www.veracode.com/resources/analyst-reports/2025-genai-code-security-report/) (45% of AI generated code introduces an OWASP Top 10 flaw; 2.74x the vulnerabilities of human written code)
-- [Veracode, Spring 2026 GenAI Code Security update](https://www.veracode.com/blog/spring-2026-genai-code-security/) (the 45% pass rate had not improved through early 2026)
-- [Cloud Security Alliance, AI generated code vulnerability research](https://labs.cloudsecurityalliance.org/research/csa-research-note-ai-codegen-vulnerability-debt-20260406-csa/) (62% carry a design flaw or a known vulnerability)
-
-## Appendix A: the 80 hackathons
+## Appendix A: Hackathons
 
 Devpost event slugs, as ingested:
 
@@ -321,4 +607,51 @@ biggest-little-hackathon-2026  ellehacks-2026  hackrpi-2025          vibe-coder-
 codecrunch-305hackathon-fall25  henhacks-2026  hack-for-humanity-26  hack-for-humanity-2026
 ```
 
-*Every figure is aggregate over the 2026.3 population. No per app identities are stored or reported.*
+## Appendix B: Hypothesis tests
+
+From `docs/charts/tests.csv`, plus the three winner slop rows from `docs/charts/fig08_winners.csv`.
+
+| hypothesis | test | n | p | detail |
+|---|---|---|---:|---|
+| Lovable slop > hand built slop | Mann-Whitney U, one sided | 73 / 1,497 | 0.16 | |
+| backend exposure, AI builder vs hand built | Fisher exact | 82 / 1,497 | 4.4 × 10⁻¹⁰ | 11/82 vs 9/1,497, OR 25.6 |
+| total slop, winners vs non winners | Mann-Whitney U, two sided | 247 / 1,332 | 0.22 | medians 52.7 vs 47.6 |
+| slop outside performance, winners vs non winners | Mann-Whitney U, two sided | 247 / 1,332 | 0.48 | medians 33.5 vs 33.2 |
+| performance axis, winners vs non winners | Mann-Whitney U, two sided | 247 / 1,332 | 0.001 | medians 10.9 vs 5.8 |
+| Lighthouse score, winners vs non winners | Mann-Whitney U, two sided | 242 / 1,296 | 0.0034 | medians 78 vs 83.5 |
+| surface size, winners vs non winners | Mann-Whitney U, two sided | 247 / 1,332 | 0.70 | medians 26 vs 25 |
+| crash on malformed input, winners vs non winners | Fisher exact | 247 / 1,332 | 0.33 | 6.9% vs 9.0% |
+| dead control, winners vs non winners | Fisher exact | 247 / 1,332 | 0.84 | 13.0% vs 13.7% |
+| secret in the bundle, winners vs non winners | Fisher exact | 247 / 1,332 | 0.39 | 3.6% vs 2.6% |
+| exploitable, winners vs non winners | Fisher exact | 247 / 1,332 | 0.63 | 5.3% vs 4.7% |
+| worst security or quality finding above 20 | Fisher exact | 247 / 1,332 | 0.88 | 32.0% vs 31.5% |
+| worst security or quality finding above 40 | Fisher exact | 247 / 1,332 | 0.93 | 17.0% vs 17.5% |
+| any accessibility finding (exploratory) | Fisher exact | 247 / 1,332 | 0.019 | 59.5% vs 67.3% |
+| Lighthouse below 90, winners vs non winners | Fisher exact | 247 / 1,332 | 0.015 | 69.6% vs 61.5% |
+| page weight audit flagged, winners vs non winners | Fisher exact | 247 / 1,332 | 0.0004 | 21.1% vs 12.2% |
+| total blocking time, apps below 90 | Mann-Whitney U, two sided | 171 / 812 | 0.003 | medians 440 vs 300 ms |
+| largest contentful paint, apps below 90 | Mann-Whitney U, two sided | 171 / 812 | 0.06 | medians 4.4 vs 3.9 s |
+| first contentful paint, apps below 90 | Mann-Whitney U, two sided | 171 / 812 | 0.69 | medians 2.5 vs 2.7 s |
+| time to first byte, apps below 90 | Mann-Whitney U, two sided | 171 / 813 | 0.81 | medians 20 vs 20 ms |
+| grading box load, winners vs non winners | Mann-Whitney U, two sided | 247 / 1,332 | 0.32 | medians 1452 vs 1437 |
+| within event: performance axis | Wilcoxon signed rank | 29 events | 0.027 | winners higher in 21 of 29 |
+| within event: Lighthouse score | Wilcoxon signed rank | 29 events | 0.04 | winners lower in 19 of 29 |
+| within event: slop outside performance | Wilcoxon signed rank | 29 events | 0.97 | winners higher in 12, lower in 17 |
+| within event: worst security or quality above 20 | Wilcoxon signed rank | 29 events | 0.42 | winners higher in 20, lower in 9 |
+| within event: worst security or quality above 40 | Wilcoxon signed rank | 29 events | 0.92 | winners higher in 12, lower in 15 |
+| link rot: dead URL vs months since the event, per URL | point biserial | 2,676 | 10⁻⁶ | r = 0.09; URLs cluster by event |
+| link rot: event dead URL rate vs event age | Spearman, events | 71 | 0.25 | ρ = 0.14 |
+| survivors: event median slop vs event age | Spearman, events | 64 | 0.05 | ρ = 0.24 |
+| event median slop vs host QS 2026 rank | Spearman, events | 54 | 0.82 | ρ = −0.03, 95% CI −0.30 to 0.24 |
+| event median slop vs Devpost participants | Spearman, events | 65 | 0.64 | ρ = 0.06 |
+| admissions gate, yes vs no | Mann-Whitney U, events | 14 / 51 | 0.41 | medians 46.9 vs 51.7 |
+| MLH member, yes vs no | Mann-Whitney U, events | 42 / 23 | 0.018 | medians 52.2 vs 43.9 |
+| format, in person vs online | Mann-Whitney U, events | 56 / 9 | 0.21 | medians 51.0 vs 45.0 |
+| host, university vs independent | Mann-Whitney U, events | 54 / 11 | 0.56 | medians 50.1 vs 52.3 |
+| slop across host platforms (n ≥ 10) | Kruskal-Wallis | 10 groups, 1,565 | 3.7 × 10⁻⁶ | |
+| slop across events (n ≥ 10) | Kruskal-Wallis | 49 groups, 1,410 | 0.03 | |
+| slop vs observed surface size | Spearman | 1,579 | 2.9 × 10⁻⁸ | ρ = 0.14 |
+| axis pairs | Spearman | 1,579 | | ρ from −0.01 to 0.14 |
+| median slop | percentile bootstrap, 2,000 resamples | 1,579 | | 95% CI 45.9 to 51.0 |
+
+*All figures are aggregate over the 2026.4 population. The report stores and reports no per app identities.*

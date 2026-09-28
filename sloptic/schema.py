@@ -122,7 +122,7 @@ class Profile:
     backend_tables: list[str] = field(default_factory=list)  # managed-backend (Supabase/Firestore) collections the
     #     app's OWN runtime traffic read — OBSERVED, so a minified or dynamically-built table name that never
     #     appears as a bundle string literal is still testable by the RLS probes. Never guessed.
-    render_state: str | None = None  # canvas-shell host (Streamlit) render outcome: rendered|error|stuck; None otherwise
+    render_state: str | None = None  # render outcome: rendered|error|stuck (canvas-shell host) | empty (title-only/unhydrated shell); None otherwise
 
     @property
     def form_endpoints(self) -> list[str]:  # back-compat for predicates that target form actions
@@ -194,7 +194,10 @@ class Report:
     bot_challenge: bool = False                            # target served a WAF/challenge/sleep page at some point
     challenge_stage: str = ""                              # "entry" (challenge from the first fetch -> ungradeable, excluded)
     #                                                        vs "late" (all probes ran, THEN the origin challenged -> the
-    #                                                        grade completed and is VALID -> kept). "" = no challenge.
+    #                                                        grade completed and is VALID -> kept) vs "limited" (the
+    #                                                        challenge cut the battery below the keepable fraction -> the
+    #                                                        pre-onset outcomes stand as a PARTIAL score, kept off the
+    #                                                        curve and refused by rank(); the tail retries). "" = none.
     challenge_onset: str = ""                              # probe whose traffic first tripped a WAF status (diagnose the trigger)
     request_counts: dict = field(default_factory=dict)     # {probe_id: request count} — which probes send abnormally many
     blocked_probes: list = field(default_factory=list)     # probes that DID NOT run because a challenge tripped mid-grade

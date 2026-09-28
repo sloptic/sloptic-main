@@ -98,3 +98,27 @@ def test_malformed_specs_do_not_raise():
     weird = {"paths": {"/x": {"get": {"parameters": ["notadict", {"no": "name"}]}}, "/y": "nope"}}
     eps = parse_endpoints(weird)
     assert _by_key(eps, "/x", "get").query_params == []
+
+
+def test_undeclared_path_template_is_dropped_by_discovery_but_declared_is_concretized():
+    """discovery drops an endpoint whose CONCRETE path still carries a {placeholder}: openapi concretizes only
+    DECLARED path params, so a spec that lists /api/apps/{app_id}/entities/{entity_name} with no declared
+    params (base44's SDK scaffold, served on every base44 app) leaves the braces in `path` -- a route template,
+    not a reachable endpoint, that 404s requested literally and inflates surface_size. A DECLARED param is
+    concretized to a real path and survives. Mirrors the filter in discovery.discover()."""
+    spec = {
+        "openapi": "3.0.0",
+        "paths": {
+            "/api/apps/{app_id}/entities/{entity_name}": {"get": {}},            # base44: no declared params
+            "/users/{id}": {"get": {"parameters": [{"in": "path", "name": "id"}]}},  # declared -> concretized
+        },
+    }
+    eps = parse_endpoints(spec)
+    kept = [e for e in eps if "{" not in (e.path or "")]                 # the discovery.discover() filter
+    kept_paths = {e.path for e in kept}
+    assert "/users/1" in kept_paths                                     # declared param concretized -> survives
+    assert not any("{" in (e.path or "") for e in kept)                 # no braced template survives
+    assert "/api/apps/{app_id}/entities/{entity_name}" not in kept_paths
+    # the concretized survivor keeps its braced template in raw_path -- that is where injection reads it
+    users = next(e for e in kept if e.path == "/users/1")
+    assert users.raw_path == "/users/{id}"

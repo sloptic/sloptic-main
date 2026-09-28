@@ -34,3 +34,6 @@ terminal output of test.md
 # who we scanned is another. Keep the *pattern* here so a regenerated list is covered without anyone rememb-
 # ering to add it.
 *.urls.txt
+
+# the anonymized corpus dataset ships as a GitHub release asset, not in git
+*.jsonl.gz

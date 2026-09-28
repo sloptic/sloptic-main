@@ -1,48 +1,54 @@
-"""PNG charts for the corpus writeup (LinkedIn article + PDF carousel, read on phones). Imported by
-stats.py --charts; a normal stats run never imports matplotlib.
+"""PNG figures and significance tests for CORPUS_REPORT.md. Imported by stats.py --charts; a normal stats run
+never imports matplotlib or scipy.
 
-Every chart writes `<name>.png` PLUS a sibling `<name>.csv` holding the exact numbers it plots, so the article
-prose and the images can never drift. Each image carries a provenance footer (run file + sloptic version + n),
-because a chart that leaves the repo needs to carry its own source.
+Every figure plots the curve-eligible population (stats._is_graded, the same predicate as the curve and the
+figures JSON) and most read their numbers straight from corpus_json(), so the report prose, the figures JSON and
+the images cannot drift. Each figure writes `<name>.png` plus a sibling `<name>.csv` holding the exact numbers
+it plots, and carries a provenance footer (run file, sloptic version, n). tests.csv holds every hypothesis test
+the report quotes.
 
-Phone-optimized: ~1600px wide at 2x, large sans-serif labels, one accent against grey, no gradients / 3D /
-chartjunk, direct data labels on bars instead of legends.
+Style: one accent against grey, direct data labels, no legends where a label will do, no 3D or gradients.
 """
 import csv
+import itertools
 import statistics
-import sys
+from collections import Counter, defaultdict
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))  # so `import benchmark` resolves (same dir)
-
-ACCENT = "#2563eb"   # one accent (blue) -- the element the eye should land on
-MUTED = "#9aa7b8"    # everything else
+ACCENT = "#2563eb"
+ACCENT2 = "#f59e0b"
+MUTED = "#9aa7b8"
 INK = "#0f172a"
 FAINT = "#64748b"
+GRID = "#eef1f5"
 
-# Chart-1 acute sets, at PROBE level. exposure-006 (source map) is the "moderate" 11% tier -> excluded.
-# csrf/dos excluded from "exploitable" (victim-action / availability, not a compromise-now smoking gun).
-_RCE = {"sec-cmdi-001", "sec-sqli-001", "sec-sqli-002", "sec-sqli-003", "sec-sqli-004", "sec-sqli-005",
-        "sec-ssti-001", "sec-upload-001"}
-_ACUTE = _RCE | {
-    "sec-xss-001", "sec-xss-002", "sec-domxss-001", "sec-lfi-001", "sec-xxe-001", "sec-ssrf-001",
-    "sec-filterinj-001", "sec-hosthdr-001", "sec-split-001", "sec-redirect-001", "sec-upload-002",
-    "sec-authbypass-001", "sec-idor-001", "sec-idor-002", "sec-idor-003", "sec-idor-004", "sec-idor-005",
-    "sec-backend-001", "sec-backend-002", "sec-backend-003", "sec-exposure-001", "sec-exposure-002",
-    "sec-exposure-003", "sec-exposure-004", "sec-exposure-005", "sec-exposure-007", "sec-exposure-008",
-    "sec-secrets-001", "sec-secrets-002"}
+AXES = ["security", "qa", "accessibility", "performance"]
+AXIS_LABEL = {"security": "Security", "qa": "Quality", "accessibility": "Accessibility",
+              "performance": "Performance"}
 
+# plain names for the probes a reader meets in the fire frequency chart
+PROBE_LABEL = {
+    "sec-headers-002": "No Content-Security-Policy", "sec-headers-004": "No clickjacking defense",
+    "sec-headers-005": "No Referrer-Policy", "sec-headers-001": "No X-Content-Type-Options",
+    "qa-a11y-001": "Accessibility violation (axe)", "perf-lighthouse-001": "Lighthouse performance below 90",
+    "qa-deadctrl-001": "A control that does nothing", "sec-sri-001": "Third party script without SRI",
+    "qa-crash-010": "Crash on malformed input", "sec-headers-003": "No HSTS",
+    "sec-exposure-006": "Source maps shipped", "qa-console-001": "Uncaught JavaScript error",
+    "qa-links-001": "Broken internal link", "qa-seo-001": "Missing basic meta tags",
+    "sec-secrets-003": "Google key that reaches Gemini",
+}
 
-def _fired(scored, pid):
-    return sum(any(f.get("probe_id") == pid for f in r.get("findings") or []) for r in scored)
+AXE_LABEL = {"color-contrast": "Text contrast too low", "button-name": "Button with no name",
+             "meta-viewport": "Zoom disabled", "label": "Form field with no label",
+             "select-name": "Dropdown with no name", "link-name": "Link with no text",
+             "html-has-lang": "No page language", "document-title": "No page title",
+             "scrollable-region-focusable": "Scroll area unreachable by keyboard", "image-alt": "Image with no alt text"}
 
-
-def _fired_any(scored, ids):
-    return sum(any(f.get("probe_id") in ids for f in r.get("findings") or []) for r in scored)
-
-
-def _pct_label(v):
-    return f"{v:.0f}%" if v >= 10 else f"{v:.1f}%"
+# the exploitable classes, by the category of the gating finding
+EXPLOIT_CLASS = {"secrets-exposure": "Live credential in the bundle", "backend-exposure": "Open managed backend",
+                 "exposure": "Served .git or hidden file", "xss": "Stored XSS",
+                 "access-control": "Access control bypass", "data-exposure": "Anonymous data exposure",
+                 "sql-injection": "SQL injection"}
 
 
 def _write_csv(path, header, rows):
@@ -69,199 +75,752 @@ def _sloptic_version():
     return "dev"
 
 
-def _finish(fig, out, name, run, ver, n):
-    """Shared layout close-out: auto-margins for labels, reserve a footer band, stamp provenance, save PNG."""
-    fig.tight_layout(rect=(0, 0.05, 1, 1))
-    _footer(fig, run, ver, n)
-    fig.savefig(out / name, facecolor="white")
+class _Ctx:
+    def __init__(self, plt, out, run, ver, n):
+        self.plt, self.out, self.run, self.ver, self.n = plt, out, run, ver, n
+
+    def finish(self, fig, name):
+        fig.tight_layout(rect=(0, 0.05, 1, 1))
+        fig.text(0.5, 0.015, f"Source: {self.run}, Sloptic {self.ver}, n = {self.n:,} curve eligible apps",
+                 ha="center", va="bottom", fontsize=9, color=MUTED)
+        fig.savefig(self.out / f"{name}.png", facecolor="white")
+        self.plt.close(fig)
 
 
-def _footer(fig, run_name, version, n):
-    fig.text(0.5, 0.02, f"{run_name}   ·   sloptic {version}   ·   n = {n:,} graded apps   ·   "
-             f"scripts/charts.py", ha="center", va="bottom", fontsize=9.5, color=MUTED)
-
-
-# ---- Chart 1: prevalence, chronic vs acute (the hero) --------------------------------------------------
-def _chart1(plt, scored, n, out, run, ver):
-    chronic = [("No Content-Security-Policy", "sec-headers-002"), ("No clickjacking defense", "sec-headers-004"),
-               ("No X-Content-Type-Options", "sec-headers-001"), ("No Referrer-Policy", "sec-headers-005"),
-               ("Critical accessibility violation", "qa-a11y-001"), ("Login with no rate limiting", "sec-ratelimit-001")]
-    rows = [(lab, 100 * _fired(scored, pid) / n, "chronic") for lab, pid in chronic]
-    rows.append(("Any exploitable vulnerability", 100 * _fired_any(scored, _ACUTE) / n, "acute"))
-    rows.append(("Remote code execution", 100 * _fired_any(scored, _RCE) / n, "acute"))
-
-    # custom y so a gap (a "visual break") sits between the chronic block and the acute stubs
-    ypos = [8, 7, 6, 5, 4, 3, 1, 0]
-    labels = [r[0] for r in rows]
-    vals = [r[1] for r in rows]
-    colors = [ACCENT if r[2] == "acute" else MUTED for r in rows]
-
-    fig, ax = plt.subplots(figsize=(8.8, 6.6))
-    ax.barh(ypos, vals, color=colors, height=0.72, zorder=3)
-    ax.set_yticks(ypos)
-    ax.set_yticklabels(labels)
-    ax.set_xlim(0, 108)
-    for yp, v, k in zip(ypos, vals, [r[2] for r in rows]):
-        ax.text(v + 1.5, yp, _pct_label(v), va="center", ha="left", fontsize=15,
-                fontweight="bold", color=ACCENT if k == "acute" else INK)
-    ax.axhline(2, color="#d7dee7", lw=1.2, ls=(0, (2, 3)), zorder=1)
-    ax.text(107, 2.35, "CHRONIC  —  missing hygiene", ha="right", va="bottom", fontsize=11,
-            color=FAINT, fontweight="bold")
-    ax.text(107, 1.65, "ACUTE  —  exploitable holes", ha="right", va="top", fontsize=11,
-            color=ACCENT, fontweight="bold")
-    ax.set_xlabel(f"% of graded apps (n = {n:,})")
-    ax.set_title("Chronic, not acute", loc="left", pad=14)
+def _style(ax, grid="y"):
     ax.tick_params(length=0)
     ax.set_axisbelow(True)
-    ax.xaxis.grid(True, color="#eef1f5", lw=1)
-    _finish(fig, out, "chart1_prevalence.png", run, ver, n)
-    plt.close(fig)
-    _write_csv(out / "chart1_prevalence.csv", ["finding", "pct_of_graded_apps", "tier", "n_graded"],
-               [[r[0], round(r[1], 2), r[2], n] for r in rows])
+    if grid:
+        getattr(ax, f"{grid}axis").grid(True, color=GRID, lw=1)
 
 
-# ---- Chart 2: defended vs realized ---------------------------------------------------------------------
-def _chart2(plt, scored, n, out, run, ver):
-    from benchmark import _catalog_index, _slop_potential
-    idx = _catalog_index()
-    slop = [r["slop_score"] for r in scored]
-    pot = [_slop_potential(r, idx) for r in scored]
-    med_s, med_p = statistics.median(slop), statistics.median(pot)
-    defended = 100 * (1 - med_s / med_p)
-
-    fig, ax = plt.subplots(figsize=(7.6, 5.6))
-    bars = ax.bar([0, 1], [med_p, med_s], width=0.55, color=[MUTED, ACCENT], zorder=3)
-    ax.set_xticks([0, 1])
-    ax.set_xticklabels(["Worst-case slop\n(if every applicable\nprobe fired)", "Actual slop\n(median app)"])
-    ax.set_ylim(0, med_p * 1.18)
-    for b, v in zip(bars, [med_p, med_s]):
-        ax.text(b.get_x() + b.get_width() / 2, v + med_p * 0.02, f"{v:.0f}", ha="center", va="bottom",
-                fontsize=20, fontweight="bold", color=INK)
-    ax.annotate(f"the median app defends\n{defended:.0f}% of its worst-case\nfailure surface",
-                xy=(1, med_s), xytext=(0.62, med_p * 0.62), fontsize=15, color=ACCENT, fontweight="bold",
-                ha="center", va="center")
-    ax.set_ylabel("slop score (lower is better)")
-    ax.set_title("Slop is the rare exception", loc="left", pad=14)
-    ax.tick_params(length=0)
-    ax.set_axisbelow(True)
-    ax.yaxis.grid(True, color="#eef1f5", lw=1)
-    _finish(fig, out, "chart2_defended.png", run, ver, n)
-    plt.close(fig)
-    _write_csv(out / "chart2_defended.csv", ["metric", "median_slop", "n_graded"],
-               [["worst_case_potential", round(med_p), n], ["actual", round(med_s), n],
-                ["defended_pct", round(defended, 1), n]])
+def _scored(f):
+    """Same rule as stats._scored: report_only diagnostics and zero cost fires never count as a finding."""
+    if (f.get("evidence") or {}).get("report_only"):
+        return False
+    return (f.get("penalty") or 0) > 0
 
 
-# ---- Chart 3: score distribution -----------------------------------------------------------------------
-def _chart3(plt, scored, n, out, run, ver):
-    scores = [r["slop_score"] for r in scored]
-    med = statistics.median(scores)
-    fig, ax = plt.subplots(figsize=(8.4, 5.4))
-    counts, edges, _ = ax.hist(scores, bins=10, color=MUTED, edgecolor="white", linewidth=1.2, zorder=3)
-    ax.axvline(med, color=ACCENT, lw=2.5, zorder=4)
-    ax.text(med, max(counts) * 1.02, f"median {med:.0f}", color=ACCENT, fontsize=15, fontweight="bold",
-            ha="center", va="bottom")
-    ax.set_xlabel("slop score (lower is better)")
-    ax.set_ylabel("number of apps")
-    ax.set_title("One smooth, unimodal distribution", loc="left", pad=14)
-    ax.tick_params(length=0)
-    ax.set_axisbelow(True)
-    ax.yaxis.grid(True, color="#eef1f5", lw=1)
-    _finish(fig, out, "chart3_distribution.png", run, ver, n)
-    plt.close(fig)
-    _write_csv(out / "chart3_distribution.csv", ["bucket_low", "bucket_high", "count"],
-               [[round(edges[i], 1), round(edges[i + 1], 1), int(counts[i])] for i in range(len(counts))])
+def _axis(r, a):
+    return (r.get("axis_slop") or {}).get(a, 0) or 0
 
 
-# ---- Chart 4: backend tier -----------------------------------------------------------------------------
-def _chart4(plt, recs, n, out, run, ver):
-    def tiers(r):
-        s = r.get("observed_surface") or {}
-        t = s.get("host_tiers") if isinstance(s, dict) else None
-        return t if isinstance(t, dict) and isinstance(t.get("counts"), dict) else None
-    tiered = [t for r in recs for t in [tiers(r)] if t and sum(t["counts"].values())]
-    nt = len(tiered)
-    spec = [("Same-origin frontend", "same_origin"), ("Third-party vendor", "vendor"),
-            ("Opaque (unattributable)", "opaque"), ("Own backend (injectable)", "own_backend"),
-            ("Managed backend (BaaS)", "managed_baas")]
-    rows = [(lab, sum(1 for t in tiered if (t["counts"] or {}).get(k))) for lab, k in spec]
-    rows.sort(key=lambda x: -x[1])
-    labels = [r[0] for r in rows]
-    counts = [r[1] for r in rows]
-    colors = [ACCENT if lab.startswith("Own backend") else MUTED for lab in labels]
+def _lh(r):
+    lh = (r.get("observed_surface") or {}).get("lighthouse")
+    return lh.get("performance") if isinstance(lh, dict) else None
 
-    fig, ax = plt.subplots(figsize=(8.6, 5.4))
-    y = list(range(len(rows)))
-    ax.barh(y, counts, color=colors, height=0.66, zorder=3)
+
+def _hbar(ctx, name, title, labels, values, xlabel, fmt, highlight=None, csv_rows=None, csv_header=None,
+          xmax=None, size=(9, 5.6)):
+    fig, ax = ctx.plt.subplots(figsize=size)
+    y = list(range(len(labels)))
+    colors = [ACCENT if (highlight and highlight(i)) else MUTED for i in y]
+    ax.barh(y, values, color=colors, height=0.68, zorder=3)
     ax.set_yticks(y)
     ax.set_yticklabels(labels)
     ax.invert_yaxis()
-    ax.set_xlim(0, max(counts) * 1.45)
-    for yp, c in zip(y, counts):
-        ax.text(c + max(counts) * 0.02, yp, f"{c}  ({100 * c / nt:.0f}%)", va="center", ha="left",
-                fontsize=14, fontweight="bold", color=INK)
-    ax.set_xlabel(f"apps with observed runtime traffic (n = {nt:,})\ntiers overlap, do not sum to 100%")
-    ax.set_title("The backend is mostly out of reach", loc="left", pad=14)
-    ax.tick_params(length=0)
-    ax.set_axisbelow(True)
-    ax.xaxis.grid(True, color="#eef1f5", lw=1)
-    _finish(fig, out, "chart4_backend_tier.png", run, ver, n)
-    plt.close(fig)
-    _write_csv(out / "chart4_backend_tier.csv", ["tier", "apps", "pct_of_traffic_bearing", "n_traffic_bearing"],
-               [[r[0], r[1], round(100 * r[1] / nt, 1), nt] for r in rows])
+    top = xmax or max(values) * 1.28
+    ax.set_xlim(0, top)
+    for yp, v in zip(y, values):
+        ax.text(v + top * 0.012, yp, fmt(v), va="center", ha="left", fontsize=12, fontweight="bold", color=INK)
+    ax.set_xlabel(xlabel)
+    ax.set_title(title, loc="left", pad=12)
+    _style(ax, "x")
+    ctx.finish(fig, name)
+    if csv_rows is not None:
+        _write_csv(ctx.out / f"{name}.csv", csv_header, csv_rows)
 
 
-# ---- Chart 5: winners vs non-winners -------------------------------------------------------------------
-def _chart5(plt, scored, n, out, run, ver):
-    win = [r["slop_score"] for r in scored if r.get("winner") is True]
-    non = [r["slop_score"] for r in scored if r.get("winner") is False]
-    mw, mn = statistics.median(win), statistics.median(non)
-    fig, ax = plt.subplots(figsize=(7.6, 5.6))
-    bp = ax.boxplot([win, non], vert=True, widths=0.5, patch_artist=True, showfliers=False,
-                    medianprops=dict(color=ACCENT, linewidth=2.5))
-    for patch in bp["boxes"]:
-        patch.set(facecolor="#eef1f5", edgecolor=MUTED, linewidth=1.4)
+# ---- fig 1: the funnel ---------------------------------------------------------------------------------
+def fig_funnel(ctx, fj):
+    a = fj["attrition"]
+    dnf = a["dnf_by_reason"]
+    names = {"dead URL (link rot / 4xx / 5xx)": "Dead URL (link rot, 4xx, 5xx)",
+             "other": "Not an app, or other", "ungraded (grade aborted / timed out)": "Timed out or aborted",
+             "entry challenge (WAF withheld the grade)": "Bot challenge at entry"}
+    rows = [("Attempted (live URL on Devpost)", a["attempted"]), ("Graded, curve eligible", a["graded"])]
+    rows += [(names.get(k, k), v) for k, v in sorted(dnf.items(), key=lambda x: -x[1])]
+    _hbar(ctx, "fig01_funnel", "Submission outcomes", [r[0] for r in rows], [r[1] for r in rows],
+          "apps", lambda v: f"{v:,}  ({100 * v / a['attempted']:.0f}%)", highlight=lambda i: i == 1,
+          xmax=a["attempted"] * 1.45,
+          csv_rows=[[r[0], r[1], round(100 * r[1] / a["attempted"], 1)] for r in rows],
+          csv_header=["stage", "apps", "pct_of_attempted"])
+
+
+# ---- fig 2: the distribution ---------------------------------------------------------------------------
+def fig_distribution(ctx, fj):
+    d = fj["distribution"]
+    bins = [b for b in d["bins"] if b[0] < 250]
+    tail = sum(b[2] for b in d["bins"] if b[0] >= 250)
+    fig, ax = ctx.plt.subplots(figsize=(10, 5.6))
+    ax.bar([b[0] + 5 for b in bins], [b[2] for b in bins], width=9.2, color=MUTED, zorder=3)
+    top = max(b[2] for b in bins)
+    for key, lab, col in [("q1", "Q1", FAINT), ("median", "median", ACCENT), ("q3", "Q3", FAINT),
+                          ("p90", "p90", FAINT)]:
+        v = d[key]
+        med = key == "median"
+        # dashed lines stop below the median label row so no label crosses a line
+        ax.vlines(v, 0, top * (1.1 if med else 1.0), color=col, lw=2.2 if med else 1.3,
+                  linestyles="-" if med else (0, (3, 3)), zorder=4)
+        ax.text(v + (-1.5 if key == "q1" else 1.5), top * (1.12 if med else 1.02), f"{lab} {v:.0f}", color=col,
+                fontsize=12, fontweight="bold", ha="right" if key == "q1" else "left", va="bottom")
+    ax.set_ylim(0, top * 1.24)
+    ax.text(248, top * 0.25, f"{tail} {'app' if tail == 1 else 'apps'} above 250\n(max {d['max']:.0f})", ha="right", fontsize=11,
+            color=FAINT)
+    ax.set_xlabel("slop score, 10 point bins (lower is better)")
+    ax.set_ylabel("apps")
+    ax.set_title("Slop score distribution", loc="left", pad=12)
+    _style(ax)
+    ctx.finish(fig, "fig02_distribution")
+    _write_csv(ctx.out / "fig02_distribution.csv", ["bin_low", "bin_high", "apps"], d["bins"])
+
+
+# ---- fig 3: the four axes ------------------------------------------------------------------------------
+def fig_axes(ctx, fj, graded):
+    sp = fj["axis_split"]
+    order = sorted(AXES, key=lambda a: -sp[a]["share_pct"])
+    fig, (a1, a2) = ctx.plt.subplots(1, 2, figsize=(12, 5.4), gridspec_kw={"width_ratios": [1, 1.25]})
+    shares = [sp[a]["share_pct"] for a in order]
+    y = list(range(len(order)))
+    a1.barh(y, shares, color=[ACCENT if i == 0 else MUTED for i in y], height=0.66, zorder=3)
+    a1.set_yticks(y)
+    a1.set_yticklabels([AXIS_LABEL[a] for a in order])
+    a1.invert_yaxis()
+    a1.set_xlim(0, max(shares) * 1.3)
+    for yp, v in zip(y, shares):
+        a1.text(v + 0.6, yp, f"{v:.0f}%", va="center", fontsize=13, fontweight="bold", color=INK)
+    a1.set_xlabel("share of all slop in the corpus")
+    a1.set_title("Share of total slop", loc="left", pad=10, fontsize=16)
+    _style(a1, "x")
+    data = [[_axis(r, a) for r in graded] for a in order]
+    bp = a2.boxplot(data, vert=True, widths=0.55, patch_artist=True, showfliers=False,
+                    medianprops=dict(color=ACCENT, linewidth=2.4))
+    for p in bp["boxes"]:
+        p.set(facecolor=GRID, edgecolor=MUTED, linewidth=1.3)
     for w in bp["whiskers"] + bp["caps"]:
-        w.set(color=MUTED, linewidth=1.4)
-    ax.set_xticks([1, 2])
-    ax.set_xticklabels([f"Winners\n(n = {len(win)})", f"Non-winners\n(n = {len(non)})"])
-    ax.text(1, mw, f"  median {mw:.0f}", va="center", ha="left", color=ACCENT, fontsize=14, fontweight="bold")
-    ax.text(2, mn, f"  median {mn:.0f}", va="center", ha="left", color=ACCENT, fontsize=14, fontweight="bold")
-    ax.set_ylabel("slop score (lower is better)")
-    ax.set_title("Winners look like everyone else", loc="left", pad=14)
+        w.set(color=MUTED, linewidth=1.3)
+    a2.set_xticks(range(1, len(order) + 1))
+    a2.set_xticklabels([AXIS_LABEL[a] for a in order], fontsize=12)
+    a2.set_ylabel("axis subtotal per app")
+    a2.set_title("Subtotal per app, outliers hidden", loc="left", pad=10, fontsize=16)
+    _style(a2)
+    ctx.finish(fig, "fig03_axes")
+    _write_csv(ctx.out / "fig03_axes.csv", ["axis", "share_pct", "median", "q1", "q3", "mean", "max"],
+               [[a, sp[a]["share_pct"], sp[a]["median"], sp[a]["q1"], sp[a]["q3"], sp[a]["mean"], sp[a]["max"]]
+                for a in order])
+
+
+# ---- fig 4: axis independence --------------------------------------------------------------------------
+def fig_axis_corr(ctx, graded, ss):
+    m = [[1.0] * 4 for _ in range(4)]
+    rows = []
+    for i, j in itertools.combinations(range(4), 2):
+        rho, p = ss.spearmanr([_axis(r, AXES[i]) for r in graded], [_axis(r, AXES[j]) for r in graded])
+        m[i][j] = m[j][i] = float(rho)
+        rows.append([AXES[i], AXES[j], round(float(rho), 3), float(p)])
+    fig, ax = ctx.plt.subplots(figsize=(7.4, 6.2))
+    im = ax.imshow(m, cmap="Blues", vmin=-0.2, vmax=1.0)
+    ax.set_xticks(range(4))
+    ax.set_yticks(range(4))
+    ax.set_xticklabels([AXIS_LABEL[a] for a in AXES], fontsize=12, rotation=20)
+    ax.set_yticklabels([AXIS_LABEL[a] for a in AXES], fontsize=12)
+    for i in range(4):
+        for j in range(4):
+            ax.text(j, i, f"{m[i][j]:.2f}", ha="center", va="center", fontsize=14, fontweight="bold",
+                    color="white" if m[i][j] > 0.6 else INK)
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    ax.set_title("Axis correlation, Spearman ρ", loc="left", pad=12, fontsize=17)
     ax.tick_params(length=0)
-    ax.set_axisbelow(True)
-    ax.yaxis.grid(True, color="#eef1f5", lw=1)
-    _finish(fig, out, "chart5_winners.png", run, ver, n)
-    plt.close(fig)
-    _write_csv(out / "chart5_winners.csv", ["group", "n", "median_slop", "mean_slop"],
-               [["winners", len(win), round(mw, 1), round(statistics.mean(win), 1)],
-                ["non_winners", len(non), round(mn, 1), round(statistics.mean(non), 1)]])
+    for s in ax.spines.values():
+        s.set_visible(False)
+    ctx.finish(fig, "fig04_axis_correlation")
+    _write_csv(ctx.out / "fig04_axis_correlation.csv", ["axis_a", "axis_b", "spearman_rho", "p_value"], rows)
+    return rows
 
 
-def render_all(recs, out_dir="docs/charts", run_name="run.jsonl"):
-    """Generate all five charts + sibling CSVs into out_dir. Lazy matplotlib import."""
+# ---- fig 5: fire frequency -----------------------------------------------------------------------------
+def fig_fire_frequency(ctx, fj, top=14):
+    ff = fj["fire_frequency"][:top]
+    _hbar(ctx, "fig05_fire_frequency", "Most frequent findings",
+          [PROBE_LABEL.get(f["probe_id"], f["probe_id"]) for f in ff], [f["pct"] for f in ff],
+          "% of graded apps", lambda v: f"{v:.0f}%" if v >= 10 else f"{v:.1f}%",
+          highlight=lambda i: ff[i]["probe_id"].startswith("sec-headers"), xmax=112, size=(10, 7),
+          csv_rows=[[f["probe_id"], PROBE_LABEL.get(f["probe_id"], ""), f["apps"], f["pct"]] for f in ff],
+          csv_header=["probe_id", "label", "apps", "pct"])
+
+
+# ---- fig 6: worst finding per app ----------------------------------------------------------------------
+def fig_worst_finding(ctx, graded):
+    bands = [("Minor (1 to 10)", 0, 10), ("Moderate (11 to 20)", 10, 20), ("Serious (21 to 30)", 20, 30),
+             ("Severe (31 to 40)", 30, 40), ("Critical (41+)", 40, 10 ** 9)]
+    worst = [max((f.get("penalty") or 0 for f in r.get("findings") or [] if _scored(f)), default=0) for r in graded]
+    counts = [sum(1 for w in worst if lo < w <= hi) for _, lo, hi in bands]
+    n = len(graded)
+    _hbar(ctx, "fig06_worst_finding", "Worst finding per app", [b[0] for b in bands], counts,
+          "apps (each app counted once, in its worst band)", lambda v: f"{v:,}  ({100 * v / n:.0f}%)",
+          highlight=lambda i: i == 4,
+          csv_rows=[[b[0], c, round(100 * c / n, 1)] for b, c in zip(bands, counts)],
+          csv_header=["worst_finding_band", "apps", "pct"])
+    return counts
+
+
+# ---- fig 7: the exploitable slice ----------------------------------------------------------------------
+def fig_exploitable(ctx, graded):
+    from benchmark import _is_gate
+    per = Counter()
+    apps = 0
+    for r in graded:
+        cats = {f.get("category") for f in r.get("findings") or [] if _is_gate(f)}
+        if cats:
+            apps += 1
+            for c in cats:
+                per[EXPLOIT_CLASS.get(c, c)] += 1
+    rows = per.most_common()
+    _hbar(ctx, "fig07_exploitable", f"Exploitable apps by class (n = {apps})", [r[0] for r in rows],
+          [r[1] for r in rows], "apps (an app with two classes counts in both)", lambda v: f"{v}",
+          highlight=lambda i: i < 2, csv_rows=[[r[0], r[1]] for r in rows] + [["distinct_apps", apps]],
+          csv_header=["class", "apps"])
+
+
+# ---- fig 8: winners ------------------------------------------------------------------------------------
+def fig_winners(ctx, graded, ss):
+    W = [r for r in graded if r.get("winner") is True]
+    N = [r for r in graded if r.get("winner") is False]
+    parts = [("Total slop", lambda r: r["slop_score"]),
+             ("Everything but performance", lambda r: r["slop_score"] - _axis(r, "performance")),
+             ("Performance axis", lambda r: _axis(r, "performance"))]
+    rows = []
+    for lab, fn in parts:
+        a, b = [fn(r) for r in W], [fn(r) for r in N]
+        p = float(ss.mannwhitneyu(a, b, alternative="two-sided").pvalue)
+        rows.append([lab, statistics.median(a), statistics.median(b), p])
+    fig, ax = ctx.plt.subplots(figsize=(10, 5.6))
+    x = list(range(len(rows)))
+    ax.bar([i - 0.19 for i in x], [r[1] for r in rows], width=0.36, color=ACCENT, zorder=3,
+           label=f"Winners (n = {len(W)})")
+    ax.bar([i + 0.19 for i in x], [r[2] for r in rows], width=0.36, color=MUTED, zorder=3,
+           label=f"Non winners (n = {len(N)})")
+    top = max(max(r[1], r[2]) for r in rows)
+    for i, r in enumerate(rows):
+        ax.text(i - 0.19, r[1] + top * 0.015, f"{r[1]:.1f}", ha="center", va="bottom", fontsize=12,
+                fontweight="bold", color=ACCENT)
+        ax.text(i + 0.19, r[2] + top * 0.015, f"{r[2]:.1f}", ha="center", va="bottom", fontsize=12,
+                fontweight="bold", color=INK)
+        ptxt = f"p = {r[3]:.3f}" if r[3] >= 0.001 else f"p = {r[3]:.1e}"
+        ax.text(i, max(r[1], r[2]) + top * 0.1, ptxt, ha="center", fontsize=12, color=FAINT)
+    ax.set_ylim(0, top * 1.28)
+    ax.set_xticks(x)
+    ax.set_xticklabels([r[0] for r in rows])
+    ax.set_ylabel("median slop")
+    ax.legend(frameon=False, loc="upper right", fontsize=12)
+    ax.set_title("Median slop, winners and non winners", loc="left", pad=12)
+    _style(ax)
+    ctx.finish(fig, "fig08_winners")
+    _write_csv(ctx.out / "fig08_winners.csv", ["component", "winner_median", "non_winner_median",
+                                               "mann_whitney_p_two_sided"], rows)
+    return rows
+
+
+# ---- fig 9: by host platform ---------------------------------------------------------------------------
+def fig_stack(ctx, graded, min_n=10):
+    by = defaultdict(list)
+    for r in graded:
+        by[(r.get("platform") or {}).get("host_platform") or "unknown"].append(r["slop_score"])
+    keep = sorted([(k, v) for k, v in by.items() if len(v) >= min_n], key=lambda kv: statistics.median(kv[1]))
+    fig, ax = ctx.plt.subplots(figsize=(10, 6))
+    bp = ax.boxplot([v for _, v in keep], vert=False, widths=0.6, patch_artist=True, showfliers=False,
+                    medianprops=dict(color=ACCENT, linewidth=2.4))
+    for p in bp["boxes"]:
+        p.set(facecolor=GRID, edgecolor=MUTED, linewidth=1.3)
+    for w in bp["whiskers"] + bp["caps"]:
+        w.set(color=MUTED, linewidth=1.3)
+    ax.set_yticks(range(1, len(keep) + 1))
+    ax.set_yticklabels([f"{k}  (n = {len(v)}, median {statistics.median(v):.0f})" for k, v in keep], fontsize=12)
+    ax.set_xlabel("slop score (outliers hidden)")
+    ax.set_title("Slop by host platform", loc="left", pad=12)
+    _style(ax, "x")
+    ctx.finish(fig, "fig09_by_platform")
+    _write_csv(ctx.out / "fig09_by_platform.csv", ["platform", "n", "median", "q1", "q3"],
+               [[k, len(v), round(statistics.median(v), 1), round(statistics.quantiles(v, n=4)[0], 1),
+                 round(statistics.quantiles(v, n=4)[2], 1)] for k, v in keep])
+    return keep
+
+
+# ---- fig 10: Lighthouse ---------------------------------------------------------------------------------
+def fig_lighthouse(ctx, fj, graded):
+    lh = [s for s in (_lh(r) for r in graded) if s is not None]
+    o = fj["lighthouse"]["overall"]
+    fig, ax = ctx.plt.subplots(figsize=(10, 5.4))
+    edges = list(range(20, 105, 5))
+    counts = [sum(1 for s in lh if lo <= s < lo + 5 or (lo == 100 and s == 100)) for lo in edges[:-1]]
+    counts[-1] += sum(1 for s in lh if s == 100)
+    colors = ["#ef4444" if lo < 50 else ACCENT2 if lo < 90 else "#16a34a" for lo in edges[:-1]]
+    ax.bar([lo + 2.5 for lo in edges[:-1]], counts, width=4.6, color=colors, zorder=3)
+    top = max(counts)
+    ax.axvline(o["median"], color=INK, lw=2, zorder=4)
+    ax.text(o["median"] - 1, top * 1.06, f"median {o['median']}", ha="right", va="bottom", fontsize=12,
+            fontweight="bold")
+    ax.text(95, top * 1.06, f"{o['pct_green']:.0f}% green (90+)", ha="center", va="bottom", fontsize=12,
+            color="#16a34a", fontweight="bold")
+    ax.set_ylim(0, top * 1.2)
+    ax.set_xlabel("Lighthouse performance score (mobile, simulated throttling)")
+    ax.set_ylabel("apps")
+    ax.set_title("Lighthouse performance scores", loc="left", pad=12)
+    _style(ax)
+    ctx.finish(fig, "fig10_lighthouse")
+    _write_csv(ctx.out / "fig10_lighthouse.csv", ["bin_low", "bin_high", "apps"],
+               [[lo, lo + 5, c] for lo, c in zip(edges[:-1], counts)])
+
+
+# ---- fig 11: accessibility rules -----------------------------------------------------------------------
+def fig_a11y(ctx, graded, top=8):
+    rules = Counter()
+    fired = 0
+    for r in graded:
+        seen = set()
+        for f in r.get("findings") or []:
+            if f.get("probe_id") == "qa-a11y-001":
+                ev = f.get("evidence") or {}
+                for rule in (ev.get("rules") if isinstance(ev, dict) else None) or []:
+                    seen.add(rule.get("id") if isinstance(rule, dict) else rule)
+        if seen:
+            fired += 1
+            rules.update(seen)
+    rows = rules.most_common(top)
+    _hbar(ctx, "fig11_a11y_rules", "Accessibility violations by axe rule", [AXE_LABEL.get(r[0], r[0]) for r in rows],
+          [100 * r[1] / fired for r in rows], f"% of the {fired:,} apps with an axe finding",
+          lambda v: f"{v:.0f}%", highlight=lambda i: i == 0, xmax=100,
+          csv_rows=[[r[0], r[1], round(100 * r[1] / fired, 1)] for r in rows],
+          csv_header=["axe_rule", "apps", "pct_of_a11y_apps"])
+
+
+# ---- fig 12: reach ----------------------------------------------------------------------------------------
+def fig_reach(ctx, fj):
+    au = fj["auth_surface"]
+    part = au["partition"]
+    names = {"no_auth": "No auth at all", "signup_undrivable": "Signup we cannot drive",
+             "password_only": "Password signup, drivable", "login_only": "Login wall, no signup",
+             "sso_only": "SSO only", "password_and_sso": "Password + SSO, drivable"}
+    arows = sorted(part.items(), key=lambda kv: -kv[1])
+    bt = fj["backend_tier"]
+    tnames = {"same_origin": "Same origin frontend", "vendor": "Third party vendor",
+              "own_backend": "Own backend", "managed_baas": "Managed backend (BaaS)", "opaque": "Opaque host"}
+    brows = sorted([(k, bt[k]) for k in tnames], key=lambda kv: -kv[1])
+    fig, (a1, a2) = ctx.plt.subplots(1, 2, figsize=(13, 5.4))
+    for ax, rows, lab, total, hi, title in [
+            (a1, [(names[k], v) for k, v in arows], "apps", au["n"],
+             lambda k: "drivable" in k, "Auth shape"),
+            (a2, [(tnames[k], v) for k, v in brows], "apps with traffic, tiers overlap", bt["n"],
+             lambda k: k == "Own backend", "Backend tier")]:
+        y = list(range(len(rows)))
+        ax.barh(y, [r[1] for r in rows], color=[ACCENT if hi(r[0]) else MUTED for r in rows], height=0.66,
+                zorder=3)
+        ax.set_yticks(y)
+        ax.set_yticklabels([r[0] for r in rows], fontsize=12)
+        ax.invert_yaxis()
+        mx = max(r[1] for r in rows)
+        ax.set_xlim(0, mx * 1.45)
+        for yp, r in zip(y, rows):
+            ax.text(r[1] + mx * 0.02, yp, f"{r[1]}  ({100 * r[1] / total:.0f}%)", va="center", fontsize=11,
+                    fontweight="bold")
+        ax.set_xlabel(f"{lab} (n = {total:,})", fontsize=12)
+        ax.set_title(title, loc="left", pad=10, fontsize=16)
+        _style(ax, "x")
+    ctx.finish(fig, "fig12_reach")
+    _write_csv(ctx.out / "fig12_reach.csv", ["panel", "group", "apps", "n"],
+               [["auth", k, v, au["n"]] for k, v in arows] + [["backend_tier", k, v, bt["n"]] for k, v in brows])
+
+
+# ---- hypothesis tests the report quotes -----------------------------------------------------------------
+def _lh_metric(r, mid, unit):
+    """A Lighthouse metric parsed from the perf-lighthouse-001 evidence string (same parse as stats.py). Present
+    only when the app scored below 90, since green apps carry no perf finding."""
+    import re
+    for f in r.get("findings") or []:
+        if f.get("probe_id") == "perf-lighthouse-001":
+            raw = (((f.get("evidence") or {}).get("metrics") or {}).get(mid) or "")
+            m = re.search(r"(\d+(?:\.\d+)?)\s*(ms|s)?", raw.replace("\u00a0", " ").replace(",", ""))
+            if not m:
+                return None
+            v, u = float(m.group(1)), m.group(2) or ""
+            if unit == "s":
+                return v / 1000 if u == "ms" else v
+            return v * 1000 if (unit == "ms" and u == "s") else v
+    return None
+
+
+def _winner_tests(graded, W, N, ss):
+    """RQ4 follow ups: do winners differ on anything besides performance, and what makes them slower?"""
+    rows = []
+
+    def rate(label, pred, note=""):
+        a, b = sum(map(pred, W)), sum(map(pred, N))
+        p = ss.fisher_exact([[a, len(W) - a], [b, len(N) - b]]).pvalue
+        rows.append([f"winners vs non winners: {label}", "Fisher exact, two sided", len(W), len(N), float(p),
+                     f"{a}/{len(W)} ({100 * a / len(W):.1f}%) vs {b}/{len(N)} ({100 * b / len(N):.1f}%){note}"])
+
+    def fired(prefix):
+        return lambda r: any(f["probe_id"].startswith(prefix) for f in r.get("findings") or [] if _scored(f))
+
+    def worst_sec_qa(r):
+        return max([f.get("penalty") or 0 for f in r.get("findings") or [] if _scored(f)
+                    and f.get("bundle") in ("security", "qa")] or [0])
+
+    from benchmark import _has_catastrophe
+    rate("crash on malformed input", fired("qa-crash"))
+    rate("dead control", fired("qa-deadctrl"))
+    rate("secret in the bundle", fired("sec-secrets"))
+    rate("exploitable", _has_catastrophe)
+    rate("worst security or quality finding above 20", lambda r: worst_sec_qa(r) > 20)
+    rate("worst security or quality finding above 40", lambda r: worst_sec_qa(r) > 40)
+    rate("any accessibility finding", fired("qa-a11y"), ", exploratory")
+    rate("Lighthouse below 90", fired("perf-lighthouse"))
+    rate("page weight audit flagged", lambda r: any(f.get("probe_id") == "perf-weight-001"
+                                                    for f in r.get("findings") or []))
+    wf = [r for r in W if fired("perf-lighthouse")(r)]
+    nf = [r for r in N if fired("perf-lighthouse")(r)]
+    for mid, lab, unit in [("total-blocking-time", "total blocking time (ms)", "ms"),
+                           ("largest-contentful-paint", "largest contentful paint (s)", "s"),
+                           ("first-contentful-paint", "first contentful paint (s)", "s"),
+                           ("server-response-time", "time to first byte (ms)", "ms")]:
+        a = [x for x in (_lh_metric(r, mid, unit) for r in wf) if x is not None]
+        b = [x for x in (_lh_metric(r, mid, unit) for r in nf) if x is not None]
+        rows.append([f"winners vs non winners: {lab}, apps below 90 only", "Mann-Whitney U, two sided", len(a),
+                     len(b), float(ss.mannwhitneyu(a, b, alternative="two-sided").pvalue),
+                     f"medians {statistics.median(a):g} vs {statistics.median(b):g}"])
+    bench = lambda r: ((r.get("observed_surface") or {}).get("lighthouse") or {}).get("benchmark_index")  # noqa: E731
+    a, b = [x for x in map(bench, W) if x], [x for x in map(bench, N) if x]
+    rows.append(["winners vs non winners: grading box load (benchmark_index)", "Mann-Whitney U, two sided",
+                 len(a), len(b), float(ss.mannwhitneyu(a, b, alternative="two-sided").pvalue),
+                 f"medians {statistics.median(a):g} vs {statistics.median(b):g}"])
+    ev = defaultdict(list)
+    for r in graded:
+        if r.get("hackathon") != "withheld":   # the anonymized dataset withholds exploitable apps' events
+            ev[r.get("hackathon")].append(r)
+    pairs = [([r for r in rs if r.get("winner") is True], [r for r in rs if r.get("winner") is False])
+             for rs in ev.values()]
+    pairs = [(w, n) for w, n in pairs if len(w) >= 3 and len(n) >= 3]
+    within = [("performance axis, median", lambda xs: statistics.median(_axis(r, "performance") for r in xs)),
+              ("slop outside performance, median",
+               lambda xs: statistics.median(r["slop_score"] - _axis(r, "performance") for r in xs)),
+              ("share with worst security or quality finding above 20",
+               lambda xs: sum(worst_sec_qa(r) > 20 for r in xs) / len(xs)),
+              ("share with worst security or quality finding above 40",
+               lambda xs: sum(worst_sec_qa(r) > 40 for r in xs) / len(xs))]
+    for lab, fn in within:
+        d = [fn(w) - fn(n) for w, n in pairs]
+        nz = [x for x in d if x != 0]
+        rows.append([f"within event, winners minus non winners: {lab}", "Wilcoxon signed rank", len(pairs), "",
+                     float(ss.wilcoxon(nz).pvalue),
+                     f"winners higher in {sum(x > 0 for x in d)}, lower in {sum(x < 0 for x in d)}, "
+                     f"tied {len(d) - len(nz)} (events with 3+ of each)"])
+    lh = lambda xs: statistics.median(s for s in map(_lh, xs) if s is not None)  # noqa: E731
+    d = [lh(w) - lh(n) for w, n in pairs if any(_lh(r) is not None for r in w) and any(_lh(r) is not None for r in n)]
+    rows.append(["within event, winners minus non winners: Lighthouse score, median", "Wilcoxon signed rank",
+                 len(d), "", float(ss.wilcoxon([x for x in d if x != 0]).pvalue),
+                 f"winners higher in {sum(x > 0 for x in d)}, lower in {sum(x < 0 for x in d)}"])
+    return rows
+
+
+def tests(ctx, graded, ss, extra=()):
+    rows = []
+    bld = lambda r: (r.get("platform") or {}).get("builder") or "hand"   # noqa: E731
+    hand = [r["slop_score"] for r in graded if bld(r) == "hand"]
+    lov = [r["slop_score"] for r in graded if bld(r) == "lovable"]
+    rows.append(["lovable slop > hand built slop", "Mann-Whitney U, one sided", len(lov), len(hand),
+                 float(ss.mannwhitneyu(lov, hand, alternative="greater").pvalue), ""])
+    be = lambda r: any(f["probe_id"].startswith("sec-backend") for f in r.get("findings") or [])  # noqa: E731
+    ai = [r for r in graded if bld(r) in ("lovable", "bolt")]
+    hd = [r for r in graded if bld(r) == "hand"]
+    a1, h1 = sum(map(be, ai)), sum(map(be, hd))
+    odds, p = ss.fisher_exact([[a1, len(ai) - a1], [h1, len(hd) - h1]])
+    rows.append(["backend exposure rate, AI built vs hand built", "Fisher exact, two sided", len(ai), len(hd),
+                 float(p), f"{a1}/{len(ai)} vs {h1}/{len(hd)}, odds ratio {float(odds):.1f}"])
+    W = [r for r in graded if r.get("winner") is True]
+    N = [r for r in graded if r.get("winner") is False]
+    lw = [s for s in map(_lh, W) if s is not None]
+    ln = [s for s in map(_lh, N) if s is not None]
+    rows.append(["Lighthouse score, winners vs non winners", "Mann-Whitney U, two sided", len(lw), len(ln),
+                 float(ss.mannwhitneyu(lw, ln, alternative="two-sided").pvalue),
+                 f"medians {statistics.median(lw)} vs {statistics.median(ln)}"])
+    sz = lambda r: (r.get("observed_surface") or {}).get("surface_size") or 0  # noqa: E731
+    rows.append(["observed surface size, winners vs non winners", "Mann-Whitney U, two sided", len(W), len(N),
+                 float(ss.mannwhitneyu(list(map(sz, W)), list(map(sz, N)), alternative="two-sided").pvalue),
+                 f"medians {statistics.median(map(sz, W))} vs {statistics.median(map(sz, N))}"])
+    rows += _winner_tests(graded, W, N, ss)
+    by = defaultdict(list)
+    for r in graded:
+        by[(r.get("platform") or {}).get("host_platform") or "unknown"].append(r["slop_score"])
+    grp = [v for v in by.values() if len(v) >= 10]
+    rows.append(["slop differs across host platforms (n >= 10)", "Kruskal-Wallis", len(grp), sum(map(len, grp)),
+                 float(ss.kruskal(*grp).pvalue), ""])
+    ev = defaultdict(list)
+    for r in graded:
+        if r.get("hackathon") != "withheld":
+            ev[r.get("hackathon")].append(r["slop_score"])
+    eg = [v for v in ev.values() if len(v) >= 10]
+    rows.append(["slop differs across events (n >= 10)", "Kruskal-Wallis", len(eg), sum(map(len, eg)),
+                 float(ss.kruskal(*eg).pvalue), ""])
+    rho, p = ss.spearmanr([r["slop_score"] for r in graded], list(map(sz, graded)))
+    rows.append(["slop vs observed surface size", "Spearman", len(graded), "", float(p), f"rho {float(rho):.3f}"])
+    scores = [r["slop_score"] for r in graded]
+    rows.append(["distribution shape", "sample skewness / excess kurtosis", len(graded), "", "",
+                 f"skew {float(ss.skew(scores)):.2f}, excess kurtosis {float(ss.kurtosis(scores)):.2f}"])
+    import random
+    rng = random.Random(0)
+    boot = sorted(statistics.median(rng.choices(scores, k=len(scores))) for _ in range(2000))
+    rows.append(["median slop, 95% bootstrap CI", "percentile bootstrap, 2000 resamples, seed 0", len(graded),
+                 "", "", f"{boot[50]:.1f} to {boot[1949]:.1f}"])
+    rows += list(extra)
+    _write_csv(ctx.out / "tests.csv", ["hypothesis", "test", "n_a", "n_b", "p_value", "detail"], rows)
+    return rows
+
+
+# ---- RQ6: event prestige and selectivity ---------------------------------------------------------------
+EVENTS_CSV = Path(__file__).resolve().parent.parent / "validation" / "event-attributes.csv"
+MIN_EVENT_APPS = 5
+
+
+def _event_table(graded):
+    """Per event: graded app count and median slop, joined to the coded attributes. Events below MIN_EVENT_APPS
+    and the anonymized dataset's withheld group are left out."""
+    if not EVENTS_CSV.exists():
+        return []
+    attrs = {r["slug"]: r for r in csv.DictReader(open(EVENTS_CSV))}
+    by = defaultdict(list)
+    for r in graded:
+        if r.get("hackathon") in attrs:
+            by[r["hackathon"]].append(r["slop_score"])
+    return [{**attrs[e], "n": len(v), "median": statistics.median(v)} for e, v in by.items()
+            if len(v) >= MIN_EVENT_APPS]
+
+
+_FACTORS = [("admissions_gate", "Admissions gate", "yes", "no"), ("mlh_member", "MLH member", "yes", "no"),
+            ("format", "Format", "in_person", "online"), ("host_kind", "Host", "university", "independent")]
+
+
+def fig_prestige(ctx, graded, ss):
+    ev = _event_table(graded)
+    if not ev:
+        return []
+    rows = []
+    ranked = [e for e in ev if e["qs_2026_value"]]
+    x = [float(e["qs_2026_value"]) for e in ranked]
+    y = [e["median"] for e in ranked]
+    rho, p = ss.spearmanr(x, y)
+    import math
+    half = 1.96 / math.sqrt(len(ranked) - 3)   # Fisher z interval: how large a correlation the null rules out
+    lo, hi = math.tanh(math.atanh(float(rho)) - half), math.tanh(math.atanh(float(rho)) + half)
+    rows.append(["RQ6: event median slop vs host QS 2026 rank", "Spearman, events", len(ranked), "", float(p),
+                 f"rho {float(rho):.3f}, 95% CI {lo:.2f} to {hi:.2f} (QS rank 1 is best, so a negative rho would "
+                 f"mean better ranked hosts are sloppier)"])
+    size = [(float(e["devpost_participants"]), e["median"]) for e in ev if e["devpost_participants"]]
+    rho2, p2 = ss.spearmanr([a for a, _ in size], [b for _, b in size])
+    rows.append(["RQ6: event median slop vs Devpost participants", "Spearman, events", len(size), "", float(p2),
+                 f"rho {float(rho2):.3f}"])
+    for key, label, a_val, b_val in _FACTORS:
+        a = [e["median"] for e in ev if e[key] == a_val]
+        b = [e["median"] for e in ev if e[key] == b_val]
+        rows.append([f"RQ6: event median slop, {label.lower()}: {a_val} vs {b_val}", "Mann-Whitney U, events",
+                     len(a), len(b), float(ss.mannwhitneyu(a, b, alternative="two-sided").pvalue),
+                     f"median of event medians {statistics.median(a):.1f} vs {statistics.median(b):.1f}"])
+
+    fig, (a1, a2) = ctx.plt.subplots(1, 2, figsize=(14.5, 5.8), gridspec_kw={"width_ratios": [1, 1.15]})
+    gate = [e["admissions_gate"] == "yes" for e in ranked]
+    a1.scatter(x, y, s=[18 + 3 * e["n"] for e in ranked], c=[ACCENT if g else MUTED for g in gate],
+               alpha=0.85, edgecolors="white", linewidths=0.8, zorder=3)
+    a1.set_xscale("log")
+    a1.set_xlabel("host university, QS World University Rankings 2026 (log scale)\n"
+                  "blue: admissions gate, grey: open, size: graded apps")
+    a1.set_ylabel("event median slop")
+    a1.set_title(f"Event median slop by host rank (ρ = {float(rho):.2f})", loc="left", pad=10, fontsize=15)
+    _style(a1)
+    xs = []
+    for i, (key, label, a_val, b_val) in enumerate(_FACTORS):
+        for j, val in enumerate((a_val, b_val)):
+            pts = [e["median"] for e in ev if e[key] == val]
+            xpos = i * 3.6 + j * 1.5
+            xs.append((xpos, f"{val.replace('_', ' ')}\n{len(pts)}"))
+            jit = [xpos + ((k * 37) % 11 - 5) * 0.05 for k in range(len(pts))]
+            a2.scatter(jit, pts, s=16, color=ACCENT if j == 0 else MUTED, alpha=0.8, zorder=3)
+            if pts:
+                a2.hlines(statistics.median(pts), xpos - 0.4, xpos + 0.4, color=INK, lw=2, zorder=4)
+        a2.text(i * 3.6 + 0.75, 1.0, label, transform=a2.get_xaxis_transform(), ha="center", va="bottom",
+                fontsize=11, color=FAINT)
+    a2.set_xticks([t for t, _ in xs])
+    a2.set_xticklabels([l for _, l in xs], fontsize=9)
+    a2.set_xlabel("group and number of events")
+    a2.set_ylabel("event median slop")
+    a2.set_title("Event median slop by event type", loc="left", pad=22, fontsize=15)
+    _style(a2)
+    ctx.finish(fig, "fig13_prestige")
+    _write_csv(ctx.out / "fig13_prestige.csv", ["slug", "n", "median_slop", "qs_2026_value", "admissions_gate",
+                                                "mlh_member", "format", "host_kind", "devpost_participants"],
+               [[e["slug"], e["n"], round(e["median"], 1), e["qs_2026_value"], e["admissions_gate"],
+                 e["mlh_member"], e["format"], e["host_kind"], e["devpost_participants"]] for e in ev])
+    return rows
+
+
+# ---- link rot and run to run reliability --------------------------------------------------------------
+def _event_start(dates):
+    """Devpost's submission period ("Feb 14 - 15, 2026") -> its start date, or None when it has no day."""
+    import datetime as dt
+    import re
+    m = re.match(r"([A-Z][a-z]{2}) (\d{1,2})", dates or "")
+    y = re.search(r"(20\d\d)", dates or "")
+    if not (m and y):
+        return None
+    return dt.date(int(y.group(1)), dt.datetime.strptime(m.group(1), "%b").month, int(m.group(2)))
+
+
+_ROT_BINS = [(0, 3), (3, 6), (6, 9), (9, 12), (12, 18), (18, 60)]
+
+
+def fig_link_rot(ctx, recs, ss, graded=()):
+    """Share of submitted URLs that were dead at grading time, by months between the event and the grade."""
+    import datetime as dt
+    import math
+    if not EVENTS_CSV.exists():
+        return []
+    start = {r["slug"]: _event_start(r["dates"]) for r in csv.DictReader(open(EVENTS_CSV))}
+    pts = []   # (months since event, dead, event)
+    for r in recs:
+        d0, ts = start.get(r.get("hackathon")), r.get("ts")
+        if d0 and ts:
+            months = (dt.datetime.fromtimestamp(ts, dt.timezone.utc).date() - d0).days / 30.44
+            pts.append((months, bool(r.get("dead_url")), r["hackathon"]))
+    rows, labels, rates, errs = [], [], [], [[], []]
+    for lo, hi in _ROT_BINS:
+        g = [dead for m, dead, _ in pts if lo <= m < hi]
+        n, k = len(g), sum(g)
+        z = 1.96   # Wilson 95% interval
+        c = (k + z * z / 2) / (n + z * z)
+        h = z * math.sqrt(k * (n - k) / n + z * z / 4) / (n + z * z)
+        rate = 100 * k / n
+        labels.append(f"{lo} to {hi}" if hi < 60 else f"{lo}+")
+        rates.append(rate)
+        errs[0].append(rate - 100 * (c - h))
+        errs[1].append(100 * (c + h) - rate)
+        rows.append([labels[-1], n, k, round(rate, 1), round(100 * (c - h), 1), round(100 * (c + h), 1)])
+    fig, ax = ctx.plt.subplots(figsize=(10, 5.6))
+    x = list(range(len(rates)))
+    ax.bar(x, rates, width=0.62, color=MUTED, zorder=3)
+    ax.errorbar(x, rates, yerr=errs, fmt="none", ecolor=INK, elinewidth=1.3, capsize=5, zorder=4)
+    top = max(r + e for r, e in zip(rates, errs[1]))
+    for xi, r, row in zip(x, rates, rows):
+        ax.text(xi, top * 1.04, f"{r:.0f}%\nn = {row[1]:,}", ha="center", va="bottom", fontsize=11, color=INK)
+    ax.set_ylim(0, top * 1.28)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.set_xlabel("months between the event and the grade")
+    ax.set_ylabel("dead links, % of submitted URLs (95% CI)")
+    ax.set_title("Dead links by event age", loc="left", pad=12)
+    _style(ax)
+    ctx.finish(fig, "fig14_link_rot")
+    _write_csv(ctx.out / "fig14_link_rot.csv", ["months", "urls", "dead", "dead_pct", "ci_low", "ci_high"], rows)
+    out = []
+    r_pb, p_pb = ss.pointbiserialr([dead for _, dead, _ in pts], [m for m, _, _ in pts])
+    out.append(["link rot: dead URL vs months since the event, per URL", "point biserial", len(pts), "",
+                float(p_pb), f"r {float(r_pb):.3f}; URLs from one event are not independent, see the event test"])
+    by = defaultdict(list)
+    for m, dead, e in pts:
+        by[e].append((m, dead))
+    ev = [(statistics.mean(m for m, _ in v), sum(d for _, d in v) / len(v)) for v in by.values() if len(v) >= 10]
+    rho, p = ss.spearmanr([a for a, _ in ev], [b for _, b in ev])
+    out.append(["link rot: event dead URL rate vs event age", "Spearman, events with 10+ URLs", len(ev), "",
+                float(p), f"rho {float(rho):.3f}"])
+    age = {e: statistics.mean(m for m, _ in v) for e, v in by.items()}
+    gs = defaultdict(list)
+    for r in graded:
+        if r.get("hackathon") in age:
+            gs[r["hackathon"]].append(r["slop_score"])
+    sv = [(age[e], statistics.median(v)) for e, v in gs.items() if len(v) >= MIN_EVENT_APPS]
+    rho2, p2 = ss.spearmanr([a for a, _ in sv], [b for _, b in sv])
+    out.append(["survivors: event median slop vs event age", "Spearman, events with 5+ graded apps", len(sv), "",
+                float(p2), f"rho {float(rho2):.3f}"])
+    return out
+
+
+def reliability(ctx, graded, prev):
+    """Run to run stability: on apps graded (curve eligible, unchallenged) in both runs, the share of probe verdicts
+    that fired in one run but not the other, by probe family. Needs a second run of the same corpus."""
+    fam = lambda p: ("security headers" if p.startswith("sec-headers") else "accessibility (axe)" if p == "qa-a11y-001"  # noqa: E731
+                     else "crash resistance" if p.startswith("qa-crash") else "Lighthouse below 90"
+                     if p == "perf-lighthouse-001" else "all other probes")
+    cur = {r["repo"]: r for r in graded if not r.get("bot_challenge")}
+    old = {r["repo"]: r for r in prev if not r.get("bot_challenge")}
+    both = [k for k in cur if k in old]
+    agg = defaultdict(lambda: [0, 0])
+    for k in both:
+        a = {f["probe_id"] for f in cur[k].get("findings") or [] if _scored(f)}
+        b = {f["probe_id"] for f in old[k].get("findings") or [] if _scored(f)}
+        for pid in a | b:
+            agg[fam(pid)][0] += 1
+            agg[fam(pid)][1] += (pid in a) != (pid in b)
+    rows = [[f, len(both), n, k, round(100 * k / n, 1)] for f, (n, k) in sorted(agg.items(), key=lambda x: -x[1][0])]
+    _write_csv(ctx.out / "reliability.csv", ["probe_family", "apps_in_both_runs", "verdicts_fired_in_either",
+                                             "flipped", "flip_pct"], rows)
+    return rows
+
+
+def severity_breakdown(ctx, graded):
+    """Which probes put apps in the acute (>40) and significant (>20) tiers, counting only security and quality
+    findings, and how many qualifying probes each such app has. Explains how single digit probes add up."""
+    rows, summary = [], []
+    for tier, cut in (("acute", 40), ("significant", 20)):
+        per, by_count, apps = Counter(), Counter(), 0
+        for r in graded:
+            hits = {f["probe_id"] for f in r.get("findings") or [] if _scored(f)
+                    and f.get("bundle") in ("security", "qa") and (f.get("penalty") or 0) > cut}
+            if hits:
+                apps += 1
+                by_count[len(hits)] += 1
+                per.update(hits)
+        rows += [[tier, pid, c, round(100 * c / len(graded), 1)] for pid, c in per.most_common()]
+        summary.append([tier, apps, len(per), by_count[1], round(100 * by_count[1] / apps, 1)])
+    _write_csv(ctx.out / "severity_breakdown.csv", ["tier", "probe_id", "apps", "pct_of_graded"], rows)
+    _write_csv(ctx.out / "severity_breakdown_summary.csv",
+               ["tier", "apps", "probes_contributing", "apps_with_one_probe", "pct_with_one_probe"], summary)
+
+
+def render_all(graded, figures, out_dir="docs/charts", run_name="run.jsonl", recs=None, prev=None):
+    """Render every report figure (+ sibling CSVs) and tests.csv into out_dir. `graded` is the curve eligible
+    population (stats._is_graded) and `figures` is corpus_json() over the same run."""
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        from scipy import stats as ss
     except ImportError:
-        raise SystemExit("charts need matplotlib: `uv run --with matplotlib python scripts/stats.py <run> --charts`")
-    ver = _sloptic_version()
+        raise SystemExit("charts need matplotlib + scipy: "
+                         "`uv run --with matplotlib --with scipy python scripts/stats.py <run> --charts`")
     plt.rcParams.update({
         "font.family": "sans-serif", "font.sans-serif": ["DejaVu Sans", "Arial", "Helvetica"],
-        "font.size": 15, "axes.titlesize": 20, "axes.titleweight": "bold", "axes.labelsize": 15,
-        "xtick.labelsize": 14, "ytick.labelsize": 14, "axes.edgecolor": MUTED, "axes.linewidth": 0.8,
+        "font.size": 13, "axes.titlesize": 18, "axes.titleweight": "bold", "axes.labelsize": 13,
+        "xtick.labelsize": 12, "ytick.labelsize": 12, "axes.edgecolor": MUTED, "axes.linewidth": 0.8,
         "text.color": INK, "axes.labelcolor": FAINT, "xtick.color": FAINT, "ytick.color": INK,
-        "figure.facecolor": "white", "savefig.dpi": 200, "axes.spines.top": False, "axes.spines.right": False,
+        "figure.facecolor": "white", "savefig.dpi": 160, "axes.spines.top": False, "axes.spines.right": False,
     })
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    scored = [r for r in recs if r.get("slop_score") is not None and not r.get("recon")]
-    n = len(scored)
-    _chart1(plt, scored, n, out, run_name, ver)
-    _chart2(plt, scored, n, out, run_name, ver)
-    _chart3(plt, scored, n, out, run_name, ver)
-    _chart4(plt, recs, n, out, run_name, ver)
-    _chart5(plt, scored, n, out, run_name, ver)
-    return sorted(str(p) for p in out.glob("chart*"))
+    ctx = _Ctx(plt, out, run_name, _sloptic_version(), len(graded))
+    fig_funnel(ctx, figures)
+    fig_distribution(ctx, figures)
+    fig_axes(ctx, figures, graded)
+    fig_axis_corr(ctx, graded, ss)
+    fig_fire_frequency(ctx, figures)
+    fig_worst_finding(ctx, graded)
+    fig_exploitable(ctx, graded)
+    fig_winners(ctx, graded, ss)
+    fig_stack(ctx, graded)
+    fig_lighthouse(ctx, figures, graded)
+    fig_a11y(ctx, graded)
+    fig_reach(ctx, figures)
+    severity_breakdown(ctx, graded)
+    extra = fig_prestige(ctx, graded, ss)
+    if recs is not None:
+        extra += fig_link_rot(ctx, recs, ss, graded)
+    if prev is not None:
+        reliability(ctx, graded, prev)
+    tests(ctx, graded, ss, extra=extra)
+    return sorted(str(p) for p in out.glob("*") if p.suffix in (".png", ".csv"))

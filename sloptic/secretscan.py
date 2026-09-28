@@ -40,7 +40,19 @@ _PROVIDER = [
     # kebab-case identifiers with the same prefix don't false-fire — SpinKit CSS classes (sk-cube-inner-
     # wrapper-item, sk-chase-dot-...) and BCP-47 locales (sk-SK-u-ca-...) are all-lowercase-words / no digit.
     # A real high-entropy key always has both; the audit's live fires were 108-164-char base64 bodies.
-    ("openai-key", re.compile(r"\bsk-(?:proj-)?(?=[A-Za-z0-9_-]*[A-Z])(?=[A-Za-z0-9_-]*[0-9])[A-Za-z0-9_-]{32,}\b")),
+    # `sk-ant-` is Anthropic's, and it already matched this pattern -- reported as "openai-key", which is the
+    # wrong provider in the evidence a team reads. Split it out and exclude it here so a key is named correctly
+    # and is never counted as two kinds.
+    ("openai-key", re.compile(r"\bsk-(?!ant-)(?:proj-)?(?=[A-Za-z0-9_-]*[A-Z])(?=[A-Za-z0-9_-]*[0-9])[A-Za-z0-9_-]{32,}\b")),
+    ("anthropic-key", re.compile(r"\bsk-ant-(?=[A-Za-z0-9_-]*[A-Z])(?=[A-Za-z0-9_-]*[0-9])[A-Za-z0-9_-]{32,}\b")),
+    # The 2026 model-provider set. Every one of these BILLS THE HOLDER per request, so a key in a client
+    # bundle is drained by strangers rather than merely misused. All carry the same entropy guard the openai
+    # pattern needed: >=32 chars AND >=1 uppercase AND >=1 digit, so a kebab/snake identifier sharing the
+    # prefix (`hf_model_name`, `xai-explainer-utils`) cannot fire -- those are lowercase words with no digit.
+    ("groq-key", re.compile(r"\bgsk_(?=[A-Za-z0-9]*[A-Z])(?=[A-Za-z0-9]*[0-9])[A-Za-z0-9]{32,}\b")),
+    ("xai-key", re.compile(r"\bxai-(?=[A-Za-z0-9_-]*[A-Z])(?=[A-Za-z0-9_-]*[0-9])[A-Za-z0-9_-]{32,}\b")),
+    ("huggingface-token", re.compile(r"\bhf_(?=[A-Za-z0-9]*[A-Z])(?=[A-Za-z0-9]*[0-9])[A-Za-z0-9]{32,}\b")),
+    ("replicate-token", re.compile(r"\br8_(?=[A-Za-z0-9]*[A-Z])(?=[A-Za-z0-9]*[0-9])[A-Za-z0-9]{32,}\b")),
     ("google-oauth-secret", re.compile(r"\bGOCSPX-[0-9A-Za-z_-]{20,}\b")),
     ("sendgrid-key", re.compile(r"\bSG\.[0-9A-Za-z_-]{22}\.[0-9A-Za-z_-]{43}\b")),
     ("twilio-account-sid", re.compile(r"\bAC[0-9a-fA-F]{32}\b")),
@@ -182,6 +194,32 @@ def scan_blob(text: str) -> list[str]:
     if _privileged_jwt(text):
         kinds.add("supabase-service-role-key")
     return sorted(kinds)
+
+
+# Google `AIza` keys are format-ambiguous BY CONSTRUCTION, which is why they are deliberately absent from
+# _PROVIDER above. The SAME 39-char format serves a Firebase web config and a Maps key (public by design,
+# Google's own docs say they need not be treated as secrets) and a Gemini API key (Google's own docs say to
+# treat it like a password). Format alone cannot tell them apart, so a regex here would be either a false
+# positive on every Firebase app or blind to every Gemini key.
+#
+# Worse, the two are not even stable categories. Truffle Security showed in Feb 2026 that an EXISTING key,
+# created for Maps or Firebase and embedded in client code exactly as Google instructed, silently gains
+# Gemini access the moment the Generative Language API is enabled on the same project: no new key, no
+# warning, no change to the bundle. And HTTP referrer restrictions do not block Gemini, only API
+# restrictions do, so the usual "it is referrer locked" defence does not apply to this one service.
+#
+# So these are CANDIDATES, never findings. Only asking the provider can decide, which is what
+# provider_validate does, and why the finding that uses them is active-battery only.
+_GOOGLE_API_KEY = re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b")
+
+
+def google_api_keys(text: str) -> list[str]:
+    """Candidate Google API keys in a blob, deduplicated, in first-seen order.
+
+    CANDIDATES. A hit here is not a finding and must never be scored on its own: most of them are the
+    public-by-design Firebase or Maps keys every SPA ships. See the note above.
+    """
+    return list(dict.fromkeys(_GOOGLE_API_KEY.findall(text)))
 
 
 def _walk(root: Path):

@@ -1,0 +1,7 @@
+axis_a,axis_b,spearman_rho,p_value
+security,qa,0.056,0.02651984169840338
+security,accessibility,0.05,0.04505900996747106
+security,performance,0.141,1.8926991764665622e-08
+qa,accessibility,0.111,1.0492020225751508e-05
+qa,performance,-0.01,0.6888736188789188
+accessibility,performance,0.076,0.0025581544316051544

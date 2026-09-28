@@ -185,3 +185,25 @@ def test_an_absolute_gate_refuses_the_credential_even_when_fully_exercised():
 def test_a_rank_without_a_record_makes_no_certification_claim():
     res = rank(_curve(), 50)
     assert "certifiable" not in res and "reporting" not in res
+
+
+def _gate_record(applicable, mode=None):
+    cov = {"probes_applicable": applicable, "probes_total": applicable}
+    rec = {"coverage": cov, "observed_surface": {}, "findings": []}
+    if mode:
+        rec["mode"] = mode
+    return rec
+
+
+def test_limited_engagement_floor_is_mode_aware():
+    # the same corpus-derived fraction, applied to each battery's own size: a passive grade tops
+    # out at 44 applicable probes, so the full battery's floor (40) would flag almost every small
+    # passive app that the full battery's own rule would have passed (45 of 102 is fine there)
+    from scripts.benchmark import reporting_bundle
+    full = reporting_bundle(_gate_record(45))
+    assert full["status"] == "completed"
+    passive = reporting_bundle(_gate_record(30, "passive"))
+    assert passive["status"] == "completed"       # 30 of 44: the same fraction of its own battery
+    thin = reporting_bundle(_gate_record(12, "passive"))
+    assert thin["status"] == "limited_engagement"
+    assert "below 18" in thin["why"][-1]

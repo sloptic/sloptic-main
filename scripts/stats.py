@@ -13,6 +13,7 @@ Input is the JSONL that `deploy_and_grade.py --record FILE` appends (one line pe
     uv run python scripts/stats.py results.jsonl                        # the recall report (default)
     uv run python scripts/stats.py results.jsonl --all                  # all three lenses, one run
     uv run python scripts/stats.py results.jsonl --audit sec-sqli-004   # every app + evidence for one probe
+  uv run python scripts/stats.py results.jsonl --app mindmatter       # ONE app: every probe that fired, + clean/n-a/blocked
     uv run python scripts/stats.py results.jsonl --category exposure     # aggregate one category (grouped, not by probe)
     uv run python scripts/stats.py results.jsonl --json                 # machine readable summary
     uv run python scripts/stats.py results.jsonl --parity [--by X] [--csv F]   # cross stack visibility
@@ -33,6 +34,7 @@ platform / backend tier / bot challenge / request volume / email diagnostics.
 """
 import argparse
 import csv
+import gzip
 import json
 import pathlib
 import random
@@ -46,7 +48,9 @@ sys.path.insert(0, str(_ROOT))
 
 from sloptic.aggregate import CATEGORY_DECAY, _damped_total  # noqa: E402
 from sloptic.catalog import load_catalog  # noqa: E402
-from sloptic.eligibility import is_shell_only, is_ungradeable_challenge, is_wrong_owner  # noqa: E402
+from sloptic.ruler import FULL as _RULER_FULL, PASSIVE as _RULER_PASSIVE  # noqa: E402
+from sloptic.eligibility import (is_limited_battery, is_shell_only,  # noqa: E402
+                                 is_ungradeable_challenge, is_wrong_owner)
 from sloptic.schema import Outcome  # noqa: E402
 
 # probes that cannot fire without a SESSION / ACCOUNT (behind login): the authed surface cluster. Used to
@@ -60,8 +64,8 @@ _AUTHED_PROBES = frozenset({
 
 def _severity_tier(penalty):
     """A finding's severity tier, derived from its risk priced penalty (no explicit severity field in the record).
-    Clean 10 wide bands so they read plainly: minor 1..10, moderate 11..20, serious 21..30, severe 31..40, critical 40+."""
-    return ("critical" if penalty >= 40 else "severe" if penalty > 30
+    Clean 10 wide bands so they read plainly: minor 1..10, moderate 11..20, serious 21..30, severe 31..40, critical 41+ (each band's top value is the lower tier, so 40 is severe)."""
+    return ("critical" if penalty > 40 else "severe" if penalty > 30
             else "serious" if penalty > 20 else "moderate" if penalty > 10 else "minor")
 
 
@@ -70,7 +74,9 @@ def load(path):
     record's "repo" field = its TARGET (a github URL for repo grades, a live URL for url grades), so a
     submission graded BOTH ways keeps both rows (the targets are distinct), they're separate lenses."""
     recs = {}
-    for line in pathlib.Path(path).read_text().splitlines():
+    text = (gzip.decompress(pathlib.Path(path).read_bytes()).decode() if str(path).endswith(".gz")
+            else pathlib.Path(path).read_text())   # the published anonymized dataset ships gzipped
+    for line in text.splitlines():
         if not line.strip():
             continue
         try:
@@ -272,6 +278,123 @@ def audit_category(recs, query):
     print("\n  -> per finding repro: scripts/stats.py <results> --audit <probe id>")
 
 
+def app_audit(recs, query):
+    """The per-APP inverse of --audit: everything ONE app's grade recorded, so a suspicious score is
+    auditable in one place instead of by grepping the JSONL. Matches any record whose url / repo / project /
+    hackathon contains QUERY, case insensitive, so a fragment like 'mindmatter' finds the app. Prints the
+    fired probes (penalty, damped contribution, target, reason, repro/evidence), then the flip side an audit
+    needs just as much: what ran CLEAN, what read N/A and WHY, what a challenge BLOCKED, and the coverage
+    line, so 'low score' is legible as 'clean' vs 'never tested'."""
+    q = query.lower()
+    hits = [r for r in recs if q in (r.get("repo") or "").lower() or q in (r.get("url") or "").lower()
+            or q in (r.get("project") or "").lower() or q in (r.get("hackathon") or "").lower()]
+    print(f"\n=== app: {query} ===  {len(hits)} record(s)")
+    if not hits:
+        have = sorted({(r.get("repo") or "") for r in recs})
+        frag = next((h for h in have if q[:8] and q[:8] in h.lower()), None)
+        hint = f"  closest repo: {frag}" if frag else "  (try a fragment of the url, project or hackathon slug)"
+        print(hint)
+        return
+    for r in hits:
+        _app_audit_one(r)
+
+
+def _devpost_line(r):
+    """The Devpost provenance for --app: which hackathon the app entered (if any), its submission link, and
+    whether it won. All three are already on the record (run_batch threads hackathon/project/winner via --meta
+    and the urls file); this just surfaces them. A Devpost hackathon lives at <slug>.devpost.com and a
+    submission is the project's devpost.com/software/<name> URL."""
+    hack = r.get("hackathon")
+    proj = r.get("project")
+    won = r.get("winner")
+    proj_is_url = bool(proj) and str(proj).startswith("http")
+    if (not hack or hack == "(unlabeled)") and not proj_is_url:
+        return "      devpost: (not from a hackathon submission)"
+    parts = []
+    if hack and hack != "(unlabeled)":
+        slug_ok = bool(re.fullmatch(r"[a-z0-9-]+", hack))
+        parts.append(f"hackathon https://{hack}.devpost.com" if slug_ok else f"hackathon {hack}")
+    if proj_is_url:
+        parts.append(f"submission {proj}")
+    elif proj:
+        parts.append(f"project {proj}")
+    parts.append("WON" if won is True else "did not win" if won is False else "won: unknown")
+    return "      devpost: " + " | ".join(parts)
+
+
+def _app_audit_one(r):
+    """Render one record. Fired findings first (heaviest penalty last so the tail is the headline), then the
+    applied-but-clean probes, the N/A probes with their reasons, and the coverage / challenge context."""
+    import datetime
+    url = r.get("url") or r.get("repo") or "(unknown)"
+    when = datetime.datetime.fromtimestamp(r["ts"], tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M") if r.get("ts") else "?"
+    plat = (r.get("platform") or {}).get("host_platform") or "?"
+    total = (r.get("timings") or {}).get("total_s")
+    print(f"\n--- {url}")
+    print(f"      {when} utc | hackathon={r.get('hackathon') or '?'} | platform={plat} | stack={r.get('stack') or '?'}"
+          + (f" | {total:.0f}s" if isinstance(total, (int, float)) else "")
+          + (f" | graded_origin={(r.get('observed_surface') or {}).get('graded_origin')}" if (r.get('observed_surface') or {}).get('graded_origin') else ""))
+
+    print(_devpost_line(r))
+    if r.get("slop_score") is None:      # a DNF: the audit question is WHY it died
+        why = r.get("deploy_error") or "no score recorded"
+        print(f"      DNF: {why}")
+        if r.get("timeout_phase"):
+            print(f"      timeout in phase {r['timeout_phase']!r}"
+                  + (f" at probe {r['timeout_probe']} {tuple(r.get('timeout_progress') or ())}" if r.get("timeout_probe") else ""))
+        return
+
+    findings = sorted((f for f in r.get("findings", []) if _scored(f)),
+                      key=lambda f: (f.get("penalty", 0) * f.get("count", 1)))
+    print(f"      SLOP SCORE {r['slop_score']}   axes " + " / ".join(
+        f"{b} {v}" for b, v in sorted((r.get("axis_slop") or {}).items())))
+    if not findings:
+        print("      no scored findings (a 0 = every applied probe came back clean; see coverage below)")
+    for f in findings:
+        n = f.get("count", 1)
+        line = f"      {f['probe_id']:<22} {f.get('category', ''):<22} penalty={f.get('penalty', 0)}"
+        if n > 1:
+            line += f" x{n}"
+        if f.get("contribution") is not None:
+            line += f"  -> contributes {f['contribution']}"
+        print(line)
+        if f.get("targets"):
+            print(f"          targets: {', '.join(t or '-' for t in f['targets'][:5])}")
+        elif f.get("target"):
+            print(f"          target: {f['target']}")
+        print(f"          reason: {(f.get('reason') or '')[:110]}")
+        ev = dict(f.get("evidence") or {})
+        repro = ev.pop("repro", None)
+        if repro:
+            print(f"          $ {_curl(repro)}")
+            resp = [f"{k}={repro[k]}" for k in ("status", "ms") if k in repro]
+            if repro.get("matched"):
+                resp.append(f"matched={repro['matched']!r}")
+            if resp:
+                print(f"            -> {' | '.join(resp)}")
+        if ev:
+            print(f"          evidence={json.dumps(ev)[:360]}")
+
+    verdicts = r.get("verdicts") or []
+    clean = [v["probe_id"] for v in verdicts if v.get("outcome") == "clean"]
+    na = [(v["probe_id"], v.get("na_reason") or "") for v in verdicts if v.get("outcome") == "not_applicable"]
+    if clean:
+        print(f"      clean ({len(clean)}): " + ", ".join(clean))
+    if na:
+        print(f"      n/a ({len(na)}):")
+        for pid, why in na:
+            print(f"          {pid:<22} {why[:95]}")
+    if r.get("blocked_probes"):
+        print(f"      blocked by a challenge ({len(r['blocked_probes'])}): " + ", ".join(r["blocked_probes"][:12])
+              + (" ..." if len(r["blocked_probes"]) > 12 else ""))
+    if r.get("incomplete_axes"):
+        print(f"      incomplete axes (a floor, untested probes could only add): {', '.join(r['incomplete_axes'])}")
+    c = r.get("coverage") or {}
+    if c.get("probes_total"):
+        print(f"      coverage: {c.get('probes_applicable')}/{c.get('probes_total')} applicable "
+              f"({c.get('pct_applicable')}%), {c.get('probes_na')} n/a")
+
+
 def _is_graded(r):
     """A real grade that belongs in the distribution: came up, scored, not DNF/recon, and not withheld at an ENTRY
     challenge (which scores 0). The (b) distribution, (c) fire frequency, (d) winner split and (e) anomalies all
@@ -284,6 +407,7 @@ def _is_graded(r):
     return (r.get("deployed") and "slop_score" in r and r.get("functional") is not False
             and not r.get("recon")   # recon records carry host_tiers only (no probes) -> not a real grade
             and not is_ungradeable_challenge(r) and not is_shell_only(r)
+            and not is_limited_battery(r)   # challenge-cut partial: a real score over too small a battery
             and not is_wrong_owner(r))   # S3/Jira/no-code/editor: graded the third party, not the submission
 
 
@@ -319,6 +443,58 @@ def lighthouse_scores(recs):
                             "stdev": round(statistics.pstdev(xs), 1) if len(xs) >= 2 else None,
                             "green_n": green,
                             "pct_green": round(100 * green / len(xs), 1) if xs else None}}
+
+
+def _hk_row(r):
+    """One app's line in a --hackathon roster: slop (or DNF), win flag, app link, devpost submission link."""
+    slop = r.get("slop_score")
+    score = f"{slop:7.1f}" if slop is not None else "    DNF"
+    won = "WON" if r.get("winner") is True else "   "
+    app = r.get("url") or r.get("repo") or "(unknown)"
+    proj = r.get("project")
+    dp = proj if proj and str(proj).startswith("http") else "-"
+    return f"    {score}  {won}  {app}   {dp}"
+
+
+def hackathon_audit(recs, query):
+    """--hackathon: one hackathon's roster. A 5-number summary + mean/stdev over its GRADED apps' slop, then
+    every app (app link, devpost submission, slop, win) best-first, so --app can drill into any of them.
+    Matches a fragment of the hackathon slug, case-insensitive."""
+    q = query.lower()
+    hits = [r for r in recs if q in (r.get("hackathon") or "").lower()]
+    if not hits:
+        avail = sorted({r.get("hackathon") for r in recs if r.get("hackathon")})
+        print(f"\n=== hackathon: {query} ===  0 records")
+        print("  (try a fragment of a slug: " + ", ".join(avail[:6]) + (" ..." if len(avail) > 6 else "") + ")")
+        return
+    slugs = sorted({r.get("hackathon") or "(unlabeled)" for r in hits})
+    if len(slugs) > 1:
+        c = Counter(r.get("hackathon") or "(unlabeled)" for r in hits)
+        print(f"\n=== hackathon: {query} ===  matched {len(slugs)} hackathons -- narrow the fragment:")
+        for s in slugs:
+            print(f"    {c[s]:4d}  {s}")
+        return
+    slug = slugs[0]
+    graded = sorted((r for r in hits if _is_graded(r)), key=lambda r: r["slop_score"])
+    dnf = [r for r in hits if not _is_graded(r)]
+    winners = sum(1 for r in hits if r.get("winner") is True)
+    print(f"\n=== hackathon: {slug} ===  {len(hits)} apps  ({len(graded)} graded, {len(dnf)} DNF, {winners} winners)")
+    scores = [r["slop_score"] for r in graded]
+    if scores:
+        q1, q3 = (statistics.quantiles(scores, n=4, method="inclusive")[0::2]
+                  if len(scores) >= 2 else (scores[0], scores[0]))
+        sd = statistics.stdev(scores) if len(scores) >= 2 else 0.0
+        print(f"  slop:  min {scores[0]:.1f}  p25 {q1:.1f}  median {statistics.median(scores):.1f}"
+              f"  p75 {q3:.1f}  max {scores[-1]:.1f}    mean {statistics.mean(scores):.1f}  stdev {sd:.1f}")
+    else:
+        print("  slop:  (no graded apps)")
+    print(f"\n    {'slop':>7}  won  app link / devpost submission")
+    for r in graded:
+        print(_hk_row(r))
+    if dnf:
+        print(f"    --- not in the curve ({len(dnf)}: DNF / shell / limited / challenge) ---")
+        for r in sorted(dnf, key=lambda x: (x.get("slop_score") is None, x.get("slop_score") or 0)):
+            print(_hk_row(r))
 
 
 def by_hackathon(recs):
@@ -1224,20 +1400,441 @@ def diff_report(cur, prev, args):
     print(f"\n    → per probe / per app detail: --json, or --audit <probe id> on either run\n")
 
 
+def timing_json(recs: list) -> dict:
+    """How long a grade actually TAKES, as one aggregate JSON, so a hosted grader can quote an ETA from
+    measured runs instead of guessing. Separate from the corpus figures on purpose: those describe what the
+    scores look like, this describes what the machine did, and the two go stale for different reasons.
+
+    Covers every record, not just the scored ones, because an ETA has to price the ways a grade ends early:
+    a dead URL costs almost nothing, a pathological target burns the whole timeout. Aggregate only, same
+    rule as the corpus figures: platform is a group key, and no host, URL or app name appears.
+
+    The headline caveat travels inside the file. These are wall clock times from a corpus run with several
+    grades in flight at once, so they are contended, and the effective parallelism measured off the record
+    timestamps is reported next to them. Treat the numbers as an upper bound for one grade running alone.
+    """
+    import datetime
+    from benchmark import _probe_set, _passive_full_counts
+    if not recs:
+        sys.exit("timing-json: no records")
+    scored = [r for r in recs if r.get("slop_score") is not None]
+    _np = _passive_full_counts()[0]
+    battery = (Counter(_probe_set(r, _np) for r in scored).most_common(1)[0][0]
+               if scored else "full")
+    battery = "passive" if battery == "passive" else "full"
+
+    def _t(r, key="total_s"):
+        return (r.get("timings") or {}).get(key)
+
+    def _secs(xs):
+        xs = sorted(x for x in xs if isinstance(x, (int, float)))
+        if not xs:
+            return None
+
+        def p(q):   # nearest rank, so every percentile here is a duration some grade actually took
+            return round(xs[min(len(xs) - 1, max(0, round(q / 100 * (len(xs) - 1))))], 1)
+        return {"n": len(xs), "mean": round(statistics.mean(xs), 1),
+                "stdev": round(statistics.stdev(xs), 1) if len(xs) > 1 else 0.0,
+                "min": round(xs[0], 1), "p10": p(10), "p25": p(25),
+                "median": round(statistics.median(xs), 1),   # the true median, as _dist reports it elsewhere
+                "p75": p(75), "p90": p(90), "p95": p(95), "p99": p(99), "max": round(xs[-1], 1)}
+
+    # how a grade ended, in the order the runner decides it: a timeout and a dead URL both also carry a
+    # deploy_error, so the specific classes have to be read before the generic one
+    def _end(r):
+        if r.get("timeout") or r.get("grade_timeout"):
+            return "timeout"
+        if r.get("dead_url"):
+            return "dead_url"
+        if r.get("slop_score") is not None:
+            return "graded"
+        return "error"
+
+    ends = defaultdict(list)
+    for r in recs:
+        ends[_end(r)].append(r)
+    n = len(recs)
+    outcomes = {k: {"n": len(v), "share_pct": round(100 * len(v) / n, 1),
+                    "seconds": _secs([_t(r) for r in v])}
+                for k, v in sorted(ends.items(), key=lambda kv: -len(kv[1]))}
+
+    graded = ends.get("graded", [])
+    # An ETA applies to a URL that is actually up. A hosted service filters the dead ones with its own
+    # liveness check long before it quotes a wait, so the rate that matters is out of the grades that ran,
+    # not out of every row in the corpus.
+    attempted = len(graded) + len(ends.get("timeout", []))
+    reach = {"records": n, "attempted": attempted,
+             "graded_pct_of_attempted": round(100 * len(graded) / attempted, 1) if attempted else None,
+             "timeout_pct_of_attempted": (round(100 * len(ends.get("timeout", [])) / attempted, 1)
+                                          if attempted else None),
+             "note": "attempted = a grade that ran, so it either scored or hit the timeout. Dead URLs and "
+                     "errors never reached the grader and are excluded here, though outcomes still counts "
+                     "them and prices what they cost."}
+
+    by_platform = defaultdict(list)
+    for r in graded:
+        by_platform[(r.get("platform") or {}).get("host_platform") or "unknown"].append(_t(r))
+    platforms = {k: _secs(v) for k, v in sorted(by_platform.items(), key=lambda kv: -len(kv[1]))
+                 if len(v) >= 20}       # a group too small to be a stable estimate is not worth quoting
+
+    # provenance: what the run actually ran on, read off the records rather than remembered
+    prov = [r.get("provenance") or {} for r in recs]
+    flags = [p.get("flags") or {} for p in prov]
+    hosts = [p.get("host") or {} for p in prov]
+
+    def _one(vals, key, cast=None):
+        """The value the run actually used, keeping its own type: a consumer comparing concurrency to a
+        number should not be handed the string "4"."""
+        c = Counter(str(v.get(key)) for v in vals if v.get(key) is not None)
+        if not c:
+            return None
+        want = c.most_common(1)[0][0]
+        raw = next(v[key] for v in vals if str(v.get(key)) == want)
+        try:
+            return cast(raw) if cast else raw
+        except (TypeError, ValueError):
+            return raw
+
+    stamps = sorted(r["ts"] for r in recs if isinstance(r.get("ts"), (int, float)))
+    span = (stamps[-1] - stamps[0]) if len(stamps) > 1 else 0
+    busy = sum(x for x in (_t(r) for r in recs) if isinstance(x, (int, float)))
+
+    return {
+        "battery": battery,
+        "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "n_records": n,
+        "measurement": {
+            "concurrency": _one(flags, "concurrency", int),
+            "effective_parallelism": round(busy / span, 2) if span else None,
+            "wall_clock_hours": round(span / 3600, 1) if span else None,
+            "machine_hours": round(busy / 3600, 1),
+            "grade_timeout_s": _one(flags, "grade_timeout", int),
+            "browser": _one(flags, "browser", bool),
+            "cores": _one(hosts, "cores", int),
+            "cpu": _one(hosts, "cpu"),
+            "lighthouse": _one([p.get("versions") or {} for p in prov], "lighthouse"),
+            "caveat": ("wall clock under contention: the run kept several grades in flight at once on a "
+                       "4 core box, so a grade running alone is faster than these numbers. Read them as an "
+                       "upper bound, and re-measure on the serving hardware before promising anything."),
+        },
+        "seconds": _secs([_t(r) for r in graded]),            # the headline: a grade that produced a score
+        "phases": {"grade_s": _secs([_t(r, "grade_s") for r in graded]),
+                   "overhead_s": _secs([(_t(r) or 0) - (_t(r, "grade_s") or 0) for r in graded])},
+        "reach": reach,
+        "outcomes": outcomes,
+        "by_platform": platforms,
+    }
+
+
+def corpus_json(recs: list, corpus_id: str = "unspecified") -> dict:
+    """The full CORPUS_REPORT picture as ONE aggregate JSON, so the report prose and the sloptic.org
+    /findings page quote a single source and cannot drift. Renders what the default report prints, but
+    AGGREGATE ONLY: no app names, URLs, hosts, keys, or per-app rows (event slugs, platform, builder,
+    category and probe ids are group keys, not team identifiers), so the anomaly list and any host list are
+    deliberately absent. version + generated_at detect a stale vendored copy. Reuses the report's own helpers
+    (_severity_tier, lighthouse_scores, auth_surface, cat_subtotals, _dnf_reason, _dist) and the catastrophe
+    gate for the exploitable rate, so every number matches the report by construction. See --corpus-json."""
+    import datetime, hashlib
+    from benchmark import _has_catastrophe, _probe_set, _passive_full_counts
+    graded = [r for r in recs if _is_graded(r)]
+    if not graded:
+        sys.exit("corpus-json: no graded records")
+    n = len(graded)
+    scores = sorted(r["slop_score"] for r in graded)
+    # which battery produced this corpus (full 102 or passive 44), so version + curve self-label correctly
+    _np = _passive_full_counts()[0]   # load the catalog ONCE, not per record
+    probe_set = Counter(_probe_set(r, _np) for r in graded).most_common(1)[0][0]
+    curve = _RULER_PASSIVE if probe_set == "passive" else _RULER_FULL   # from sloptic.ruler: the frozen ruler, so figures never drift from the curve
+    version = "corpus-" + curve
+
+    def pctl(p):   # curve-consistent percentile (matches benchmark._pcts + the frozen 2026.3 curve)
+        i = min(n - 1, max(0, round((p / 100) * (n - 1))))
+        return round(scores[i], 1)
+
+    def _stats(xs):   # _dist, but the mean is named "mean" (not "avg") as the page expects
+        d = _dist(xs) or {}
+        if "avg" in d:
+            d["mean"] = d.pop("avg")
+        return d
+
+    # 4  distribution: full stats + landmarks + 10-wide histogram + modalities
+    W = 10
+    top = int(max(scores) // W + 1) * W
+    bins = [[lo, lo + W, sum(1 for x in scores if lo <= x < lo + W)] for lo in range(0, top, W)]
+    if bins:
+        bins[-1][2] = sum(1 for x in scores if bins[-1][0] <= x <= max(scores))
+    modes = Counter(round(x, 1) for x in scores)
+    distribution = {**_stats(scores), "p90": pctl(90), "p99": pctl(99), "bin_width": W, "bins": bins,
+                    "distinct": len(modes), "pct_unique": round(100 * len(modes) / n, 1),
+                    "top_modes": [[float(v), k] for v, k in modes.most_common(8)]}
+
+    # 5  axis split: each axis's share of total slop + its full spread
+    axes = ("security", "qa", "accessibility", "performance")
+    axv = {a: [(r.get("axis_slop") or {}).get(a, 0) or 0 for r in graded] for a in axes}
+    grand = sum(sum(v) for v in axv.values()) or 1
+    axis_split = {a: {"share_pct": round(100 * sum(axv[a]) / grand, 1), **_stats(axv[a])} for a in axes}
+
+    # 6  severity: the five 10-wide tiers (findings/apps/per-app/expected), the three cumulative levels with
+    #    verbatim definitions, the acute-tier axis composition, the worst-finding summary, and the gate rate
+    per = {t: [] for t in ("critical", "severe", "serious", "moderate", "minor")}
+    for r in graded:
+        cnt = Counter(_severity_tier(f["penalty"]) for f in r.get("findings", []) if _scored(f))
+        for t in per:
+            per[t].append(cnt.get(t, 0))
+
+    def tierstat(vals):
+        nz = [v for v in vals if v > 0]
+        var = statistics.pvariance(vals) if len(vals) > 1 else 0.0
+        return {"findings": sum(vals), "apps": len(nz), "pct_apps": round(100 * len(nz) / n, 1),
+                "per_app": ({"mean": round(statistics.mean(nz), 1), "median": round(statistics.median(nz), 1),
+                             "sd": round(statistics.pstdev(nz), 1) if len(nz) > 1 else 0.0,
+                             "min": min(nz), "max": max(nz)} if nz else None),
+                "expected_per_app": {"E": round(statistics.mean(vals), 2), "var": round(var, 2),
+                                     "sd": round(var ** 0.5, 2)}}
+    tiers = {t: tierstat(v) for t, v in per.items()}
+    worst = [max([float(f["penalty"]) for f in r.get("findings", []) if _scored(f)] or [0]) for r in graded]
+    ws = sorted(worst)
+    acute = sum(1 for w in worst if w > 40)
+    signif = sum(1 for w in worst if w > 20)   # same cut as _severity_tier's serious band (penalties are continuous)
+    floor_apps = sum(1 for w in worst if w > 0)   # apps with ANY finding -> "virtually every app", NOT a hardcoded 100%
+    exploit = sum(1 for r in graded if _has_catastrophe(r))
+    comp = Counter()
+    for r in graded:
+        for f in r.get("findings", []):
+            if _scored(f) and float(f["penalty"]) > 40:
+                pid = f.get("probe_id") or f.get("id") or ""
+                comp["security" if pid.startswith("sec-") else "performance" if pid.startswith("perf-") else "quality"] += 1
+    ctot = sum(comp.values()) or 1
+    severity = {
+        "note": "Levels are cumulative by each app's single worst finding.",
+        "levels": [
+            {"key": "acute", "label": "Acute", "threshold": "worst finding priced above 40", "apps": acute,
+             "pct": round(100 * acute / n, 1),
+             "definition": "Severe issues that noticeably degrade the user experience or allow attacker "
+                           "access, such as crashes, unusable pages, or exposed backends."},
+            {"key": "significant", "label": "Significant", "threshold": "worst finding priced above 20",
+             "apps": signif, "pct": round(100 * signif / n, 1),
+             "definition": "Findings that are not just cosmetic, such as dead controls, broken links, "
+                           "missing rate limits, overly slow pages."},
+            {"key": "floor", "label": "Hygiene", "threshold": "virtually every graded app", "apps": floor_apps,
+             "pct": round(100 * floor_apps / n, 1),
+             "definition": "E.g. missing headers, poor accessibility, orange Lighthouse score; the things "
+                           "people often skip."}],
+        "exploitable_apps": exploit, "exploitable_pct": round(100 * exploit / n, 1),
+        "exploitable_definition": "Catastrophic vulnerabilities that an attacker can exploit today.",
+        "tier_bands": {"critical": "41+", "severe": "31-40", "serious": "21-30", "moderate": "11-20",
+                       "minor": "1-10"},
+        "tiers": tiers,
+        "acute_axis_composition": {k: {"findings": comp[k], "pct": round(100 * comp[k] / ctot, 1)}
+                                   for k in ("quality", "performance", "security")},
+        "worst_finding": {"n": n, "min": round(ws[0], 1), "median": round(statistics.median(ws), 1),
+                          "q1": round(ws[max(0, round(0.25 * (n - 1)))], 1),
+                          "q3": round(ws[min(n - 1, round(0.75 * (n - 1)))], 1),
+                          "max": round(ws[-1], 1), "mean": round(statistics.mean(ws), 1)}}
+
+    # 7  lighthouse performance (the perf axis grades on this), + the winner split
+    lighthouse = {"overall": lighthouse_scores(graded)["performance"],
+                  "winners": lighthouse_scores([r for r in graded if r.get("winner") is True])["performance"],
+                  "non_winners": lighthouse_scores([r for r in graded if r.get("winner") is False])["performance"]}
+
+    # perf independence: Lighthouse vs the slop OUTSIDE performance (correlating against total slop is
+    # tautological, Lighthouse is the perf axis). Near 0 = perf quality does not predict the rest of the slop.
+    ap_pairs = []
+    for r in graded:
+        _lh = (r.get("observed_surface") or {}).get("lighthouse")
+        if isinstance(_lh, dict) and _lh.get("performance") is not None:
+            ap_pairs.append((_lh["performance"], r["slop_score"] - ((r.get("axis_slop") or {}).get("performance", 0) or 0)))
+    try:
+        _rho = round(statistics.correlation([a for a, _ in ap_pairs], [b for _, b in ap_pairs], method="ranked"), 3) if len(ap_pairs) >= 10 else None
+    except (statistics.StatisticsError, ValueError):
+        _rho = None
+    axis_independence = {"perf_vs_nonperf_slop_rho": _rho, "n": len(ap_pairs),
+                         "note": "Spearman rho of Lighthouse performance against slop with the performance "
+                                 "axis removed. Near 0 means performance quality does not predict the rest of "
+                                 "the slop, so the axes are close to independent. Correlating against total "
+                                 "slop would be tautological, since Lighthouse is essentially the perf axis."}
+
+    # 9  winners vs non winners (median, graded only)
+    win = [r["slop_score"] for r in graded if r.get("winner") is True]
+    non = [r["slop_score"] for r in graded if r.get("winner") is False]
+    wm, nm = statistics.median(win), statistics.median(non)
+    winners = {"winner": {"n": len(win), "median": round(wm, 1), "mean": round(statistics.mean(win), 1)},
+               "non_winner": {"n": len(non), "median": round(nm, 1), "mean": round(statistics.mean(non), 1)},
+               "delta_pct": round(100 * (wm - nm) / nm, 1) if nm else None}
+
+    # 9.1  by event, by stack (platform, with coverage), by builder (AI vs hand)
+    ev = defaultdict(list)
+    for r in graded:
+        ev[r.get("hackathon") or "(unlabeled)"].append(r["slop_score"])
+    by_event = sorted(({"event": k, **_stats(v)} for k, v in ev.items()), key=lambda x: -x["median"])
+    st = defaultdict(lambda: {"slop": [], "applied": []})
+    for r in graded:
+        plat = (r.get("platform") or {}).get("host_platform") or "other"
+        st[plat]["slop"].append(r["slop_score"])
+        a = (r.get("coverage") or {}).get("probes_applicable")
+        if a is not None:
+            st[plat]["applied"].append(a)
+    by_stack = sorted(({"stack": k, **_stats(v["slop"]),
+                        "probes_applied_median": round(statistics.median(v["applied"]), 1) if v["applied"] else None}
+                       for k, v in st.items() if len(v["slop"]) >= 5), key=lambda x: x["median"])
+    bl = defaultdict(list)
+    for r in graded:
+        p = r.get("platform")
+        if isinstance(p, dict):
+            bl[p.get("builder") or "hand built"].append(r["slop_score"])
+    by_builder = sorted(({"builder": k, **_stats(v)} for k, v in bl.items() if len(v) >= 5), key=lambda x: -x["n"])
+
+    # 7 / 6.1  star finding: managed backend exposure, AGGREGATE COUNTS ONLY (no hosts/keys/tables)
+    def _bef(r):
+        return [f for f in r.get("findings", []) if (f.get("probe_id") or f.get("id")) == "sec-backend-001"]
+    be = [r for r in graded if _bef(r)]
+
+    def _flag(r, k):
+        return any((f.get("evidence") or {}).get(k) for f in _bef(r))
+
+    def _cols(r):
+        out = []
+        for f in _bef(r):
+            e = f.get("evidence") or {}
+            out += (e.get("columns") or []) + (e.get("sensitive_columns") or [])
+        return " ".join(out).lower()
+
+    def _backend(r):
+        for f in _bef(r):
+            b = (f.get("evidence") or {}).get("backend")
+            if b:
+                return b
+        return "other"
+    star = {"key": "managed_backend_exposure", "apps": len(be), "pct": round(100 * len(be) / n, 1),
+            "breakdown": {"supabase": sum(1 for r in be if _backend(r) == "supabase"),
+                          "firebase": sum(1 for r in be if _backend(r) == "firebase"),
+                          "bulk_records": sum(1 for r in be if _flag(r, "bulk_read")),
+                          "with_pii_columns": sum(1 for r in be if _flag(r, "sensitive_columns")),
+                          "with_password_column": sum(1 for r in be if re.search(r"pass|pwd", _cols(r))),
+                          "with_email_column": sum(1 for r in be if re.search(r"email|e_mail", _cols(r)))}}
+
+    # supporting: fire frequency (aggregate), category concentration, backend tier, auth surface, attrition
+    pa = defaultdict(set)
+    pm = {}
+    for r in graded:
+        for f in r.get("findings", []):
+            if _scored(f):
+                pa[f["probe_id"]].add(r["repo"])            # repos used only to COUNT distinct apps, never emitted
+                pm[f["probe_id"]] = (f["bundle"], f["category"])
+    fire_frequency = [{"probe_id": pid, "bundle": pm[pid][0], "category": pm[pid][1],
+                       "apps": len(a), "pct": round(100 * len(a) / n, 1)}
+                      for pid, a in sorted(pa.items(), key=lambda x: -len(x[1]))]
+    catt = Counter()
+    for r in graded:
+        for (_, cat), v in cat_subtotals(r).items():
+            catt[cat] += v
+    ctot2 = sum(catt.values()) or 1
+    category_concentration = [{"category": k, "slop": round(v, 1), "pct": round(100 * v / ctot2, 1)}
+                              for k, v in sorted(catt.items(), key=lambda x: -x[1])]
+
+    def _tc(r):
+        srf = r.get("observed_surface")
+        t = srf.get("host_tiers") if isinstance(srf, dict) else None
+        return t if isinstance(t, dict) and isinstance(t.get("counts"), dict) else None
+    tiered = [t for r in recs for t in [_tc(r)] if t and sum(t["counts"].values())]
+    backend_tier = {"n": len(tiered),
+                    **{k: sum(1 for t in tiered if t["counts"].get(k))
+                       for k in ("same_origin", "own_backend", "managed_baas", "vendor", "opaque")}}
+    A = auth_surface(graded)
+    auth = {k: (dict(v) if isinstance(v, Counter) else v) for k, v in A.items()}
+
+    attempted = len(recs)
+    dnf = [r for r in recs if not _is_graded(r)]
+    zeros = sum(1 for r in graded if r["slop_score"] == 0)
+    bot = [r for r in recs if r.get("bot_challenge")]
+    attrition = {"attempted": attempted, "graded": n, "graded_pct": round(100 * n / attempted, 1),
+                 "dnf": len(dnf), "dnf_by_reason": dict(Counter(_dnf_reason(r) for r in dnf).most_common()),
+                 "clean_zero": zeros, "clean_pct": round(100 * zeros / n, 1),
+                 "bot_challenged": len(bot), "bot_challenged_pct": round(100 * len(bot) / attempted, 1)}
+
+    # excluded canvas-shell platforms (Streamlit) surfaced so the page says so, not a misleading median 0
+    shell = defaultdict(int)
+    for r in recs:
+        if is_shell_only(r):
+            shell[(r.get("platform") or {}).get("host_platform") or "other"] += 1
+    by_stack_excluded = sorted(({"stack": k, "apps": v,
+                                 "reason": "canvas-shell host: the grade measures the framework, not the app"}
+                                for k, v in shell.items()), key=lambda x: -x["apps"])
+
+    tss = [r.get("ts") for r in graded if isinstance(r.get("ts"), (int, float))]
+    run_date = datetime.datetime.fromtimestamp(max(tss), datetime.timezone.utc).date().isoformat() if tss else None
+    try:
+        cat = load_catalog(str(_ROOT / "catalog"))
+        cat_fp = hashlib.sha256("|".join(f"{p.id}:{p.penalty}" for p in sorted(cat, key=lambda x: x.id)).encode()).hexdigest()[:12]
+        n_probes = _np if probe_set == "passive" else len(cat)   # the battery that ran, not the whole catalog
+    except Exception:
+        cat_fp, n_probes = None, None
+    notes = {
+        "aggregate_only": "No app names, URLs, hosts, keys, or per-app rows. Group keys (event, platform, "
+                          "builder, category, probe id) are not team identifiers. The report's anomaly list "
+                          "and any host list are intentionally omitted.",
+        "severity": "levels are cumulative by each app's worst finding; tiers are the disjoint 10-wide bands.",
+        "by_event": "Includes small events; filter by n before comparing medians (a single-app event is not "
+                    "representative).",
+        "by_stack": "Graded, ranked population; probes_applied_median contextualizes a low median. Canvas-shell "
+                    "platforms are in by_stack_excluded, not here.",
+        "reach": "attempted is every submission with a gradeable URL; graded is those that returned a score."}
+    return {
+        "version": version,
+        "probe_set": probe_set,
+        "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "provenance": {"corpus_id": corpus_id, "run_date": run_date, "n_apps": n, "n_events": len(ev),
+                       "n_probes": n_probes, "catalog_fingerprint": cat_fp, "curve_version": curve, "probe_set": probe_set,
+                       "attempted": attempted},
+        "reach": {"attempted": attempted, "graded": n},
+        "attrition": attrition,
+        "distribution": distribution,
+        "axis_split": axis_split,
+        "severity": severity,
+        "lighthouse": lighthouse,
+        "axis_independence": axis_independence,
+        "winners": winners,
+        "by_event": by_event,
+        "by_stack": by_stack,
+        "by_stack_excluded": by_stack_excluded,
+        "by_builder": by_builder,
+        "star_finding": star,
+        "fire_frequency": fire_frequency,
+        "category_concentration": category_concentration,
+        "backend_tier": backend_tier,
+        "auth_surface": auth,
+        "notes": notes}
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Analyze deploy_and_grade results: the default RECALL report, plus --parity (cross stack "
                     "visibility) and --precision (false positive audit). One tool, three lenses on one file.")
     ap.add_argument("results", help="the JSONL from deploy_and_grade --record (or a filled worksheet, with --tally)")
     ap.add_argument("--audit", metavar="PROBE", help="list every app + evidence where PROBE fired, then exit")
+    ap.add_argument("--app", metavar="URL", help="audit ONE app: every probe that fired (penalty, contribution, target, reason, repro), plus clean / n-a / blocked and coverage, then exit")
+    ap.add_argument("--hackathon", metavar="SLUG", help="one hackathon roster: a 5-number slop summary + mean/stdev, then every app (link, devpost submission, slop, win), then exit. Matches a slug fragment")
     ap.add_argument("--category", metavar="CAT",
                     help="aggregate one category across the corpus (e.g. exposure, accessibility), grouped by "
                          "category instead of by probe, then exit")
     ap.add_argument("--json", action="store_true", help="emit a machine readable summary instead of the report")
+    ap.add_argument("--corpus-json", nargs="?", const="__AUTO__", dest="corpus_json",
+                    metavar="OUT", help="emit the aggregate CORPUS_REPORT figures as ONE versioned JSON "
+                         "(for sloptic.org /findings); writes to OUT (default validation/corpus-figures-{active,passive}.json "
+                         "by detected battery)")
+    ap.add_argument("--timing-json", nargs="?", const="__AUTO__", dest="timing_json",
+                    metavar="OUT",
+                    help="emit HOW LONG a grade takes as one aggregate JSON (for a hosted grader's ETA); "
+                         "writes to OUT (default validation/grade-timing.json). Keyed by battery and MERGED "
+                         "into the file, so running it once on the full corpus and once on the passive one "
+                         "leaves both lanes in a single file. Separate from --corpus-json on purpose.")
     ap.add_argument("--sigma", type=float, default=2.0, help="high outlier threshold in stdevs (default 2)")
     ap.add_argument("--charts", action="store_true",
-                    help="render the corpus writeup PNG charts (+ sibling CSVs) to docs/charts/, then exit "
-                         "(needs matplotlib: run via `uv run --with matplotlib`)")
+                    help="render the CORPUS_REPORT figures (+ sibling CSVs and tests.csv) to docs/charts/, then exit "
+                         "(needs matplotlib + scipy: `uv run --with matplotlib --with scipy`)")
+    ap.add_argument("--repeat", metavar="PREV",
+                    help="with --charts: a second run of the same corpus; writes run to run verdict flip rates to "
+                         "docs/charts/reliability.csv")
     # --- PARITY mode (cross stack visibility): observed vs expected surface, blind spots ---
     ap.add_argument("--parity", action="store_true", help="run the cross stack PARITY dashboard instead of the report")
     ap.add_argument("--by", default="routing", choices=["routing", "framework", "api_style"],
@@ -1262,6 +1859,33 @@ def main():
     recs = load(args.results)
     if not recs:
         sys.exit("no records")
+    if args.corpus_json:
+        cj = corpus_json(recs, corpus_id=pathlib.Path(args.results).name.split(".jsonl")[0])
+        out = args.corpus_json
+        if out == "__AUTO__":   # default: name by the detected battery (active = full, passive = 44-probe floor)
+            out = "validation/corpus-figures-%s.json" % ("passive" if cj["probe_set"] == "passive" else "active")
+        open(out, "w").write(json.dumps(cj, indent=2) + "\n")
+        print(f"wrote {out}  (version {cj['version']}, n={cj['provenance']['n_apps']}, "
+              f"generated {cj['generated_at']})")
+        return
+    if args.timing_json:
+        tj = timing_json(recs)
+        out = args.timing_json if args.timing_json != "__AUTO__" else "validation/grade-timing.json"
+        doc = {"version": "grade-timing-1", "batteries": {}}
+        try:                           # merge: keep the OTHER battery's block instead of clobbering it
+            prev = json.loads(open(out).read())
+            if isinstance(prev.get("batteries"), dict):
+                doc["batteries"] = prev["batteries"]
+        except (json.JSONDecodeError, OSError):
+            pass                       # no file yet, or an unreadable one: write a fresh document
+        doc["batteries"][tj["battery"]] = tj
+        doc["generated_at"] = tj["generated_at"]
+        open(out, "w").write(json.dumps(doc, indent=2) + "\n")
+        kept = [b for b in doc["batteries"] if b != tj["battery"]]
+        print(f"wrote {out}  (battery {tj['battery']}, n={tj['n_records']}, "
+              f"median {tj['seconds']['median']}s over {tj['seconds']['n']} graded"
+              + (f"; kept {', '.join(kept)}" if kept else "") + ")")
+        return
     if args.diff:
         diff_report(recs, load(args.diff), args)
         return
@@ -1277,14 +1901,21 @@ def main():
     if args.audit:
         audit(recs, args.audit)
         return
+    if args.app:
+        app_audit(recs, args.app)
+        return
+    if args.hackathon:
+        hackathon_audit(recs, args.hackathon)
+        return
     if args.category:
         audit_category(recs, args.category)
         return
     if args.charts:
-        import pathlib
-
         from charts import render_all
-        written = render_all(recs, run_name=pathlib.Path(args.results).name)
+        run = pathlib.Path(args.results)
+        prev = [r for r in load(args.repeat) if _is_graded(r)] if args.repeat else None
+        written = render_all([r for r in recs if _is_graded(r)], corpus_json(recs, corpus_id=run.name.split(".jsonl")[0]),
+                             run_name=run.name, recs=recs, prev=prev)
         print(f"wrote {len(written)} charts + sibling CSVs to docs/charts/ (run: {pathlib.Path(args.results).name})")
         for p in written:
             print("  " + p)
@@ -1767,16 +2398,20 @@ def main():
         for r in graded:
             lh = (r.get("observed_surface") or {}).get("lighthouse")
             if isinstance(lh, dict) and lh.get("performance") is not None and isinstance(r.get("slop_score"), (int, float)):
-                pairs.append((lh["performance"], r["slop_score"]))
+                # NON-perf slop (total minus the perf axis). Correlating perf against TOTAL slop is tautological:
+                # Lighthouse IS the perf axis (rho ~-0.99 against it) and perf is a big share of the total, so
+                # that only measures perf vs itself. The real question is whether perf predicts the REST.
+                nonperf = r["slop_score"] - ((r.get("axis_slop") or {}).get("performance", 0) or 0)
+                pairs.append((lh["performance"], nonperf))
         if len(pairs) >= 10:
             try:
                 rho = statistics.correlation([p for p, _ in pairs], [s for _, s in pairs], method="ranked")
             except (statistics.StatisticsError, ValueError):
                 rho = None
             if rho is not None:
-                rel = ("independent, the axes measure different things" if abs(rho) < 0.2 else
+                rel = ("independent: perf quality does not predict the rest of the slop" if abs(rho) < 0.2 else
                        "cleaner apps also perf better" if rho < 0 else "cleaner apps perf worse")
-                print(f"     slop vs perf (Spearman, n {len(pairs)}): rho {rho:+.2f}   ({rel})")
+                print(f"     perf vs NON-perf slop (Spearman, n {len(pairs)}): rho {rho:+.2f}   ({rel})")
 
     # (c)
     sec(f"PER PROBE FIRE FREQUENCY  (# of the {len(graded)} graded apps each probe fired on)")
